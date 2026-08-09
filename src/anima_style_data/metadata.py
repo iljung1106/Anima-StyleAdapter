@@ -125,7 +125,9 @@ def _iter_batches(metadata_cfg: dict[str, Any]) -> Iterator[pa.RecordBatch]:
 def _valid_row(row: dict[str, Any], selection_cfg: dict[str, Any]) -> bool:
     if not row.get("id") or not row.get("md5"):
         return False
-    if not (row.get("file_url") or row.get("large_file_url") or row.get("original_url")):
+    if selection_cfg.get("require_download_url", True) and not (
+        row.get("file_url") or row.get("large_file_url") or row.get("original_url")
+    ):
         return False
     artist = row.get("tag_string_artist")
     if not artist:

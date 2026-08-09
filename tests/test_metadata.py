@@ -1,4 +1,4 @@
-from anima_style_data.metadata import _select_artist_candidates
+from anima_style_data.metadata import _select_artist_candidates, _valid_row
 
 
 def _row(image_id: int, day: int) -> dict:
@@ -48,3 +48,25 @@ def test_exact_md5_is_removed_before_candidate_count():
     rows = [_row(index, index) for index in range(1, 5)]
     rows[-1]["md5"] = rows[-2]["md5"]
     assert _select_artist_candidates("artist", rows, cfg) is None
+
+
+def test_mirror_selection_does_not_require_source_url():
+    row = _row(1, 1)
+    row.update(
+        {
+            "file_url": None,
+            "tag_string_artist": "artist",
+            "tag_count_artist": 1,
+            "is_pending": False,
+            "is_flagged": False,
+            "is_deleted": False,
+            "is_banned": False,
+        }
+    )
+    cfg = {
+        "require_download_url": False,
+        "require_single_artist": True,
+        "allowed_extensions": ["jpg"],
+    }
+
+    assert _valid_row(row, cfg)

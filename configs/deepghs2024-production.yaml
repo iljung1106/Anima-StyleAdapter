@@ -1,0 +1,98 @@
+metadata:
+  repo_id: deepghs/danbooru2024
+  revision: 0316dd8a78ba3355e0e65666a6808b9ca94e7c5a
+  file_pattern: metadata.parquet
+  include_files: []
+  local_glob: data/deepghs2024/metadata.parquet
+  batch_rows: 65536
+  max_batches: null
+
+selection:
+  seed: 20260810
+  artist_count: 5000
+  images_per_artist: 30
+  candidate_multiplier: 2.0
+  artist_pool_multiplier: 2.0
+  per_artist_scan_cap: 1000
+  date_windows_days: [730, 1095, 1460]
+  artist_recency_tau_days: 1460
+  image_recency_tau_days: 365
+  require_single_artist: true
+  require_download_url: false
+  allowed_extensions: [jpg, jpeg, png, webp]
+  exclude_pending: true
+  exclude_flagged: true
+  exclude_deleted: true
+  exclude_banned: true
+
+download:
+  concurrency: 16
+  progress_every: 1000
+  requests_per_second: 2.0
+  min_requests_per_second: 0.5
+  max_requests_per_second: 2.75
+  rate_increase_every: 200
+  rate_increase_step: 0.25
+  rate_limit_backoff_factor: 0.8
+  rate_limit_cooldown_seconds: 120
+  timeout_seconds: 60
+  retries: 3
+  max_file_mb: 80
+  user_agent: "AnimaStyleAdapterDataPrep/0.1"
+
+deepghs:
+  repo_id: deepghs/danbooru2024
+  revision: 0316dd8a78ba3355e0e65666a6808b9ca94e7c5a
+  cutoff_date: "9999-12-31"
+  max_workers: 12
+  batch_size: 1000
+  import_dir: null
+
+dedup:
+  phash_distance: 6
+  dhash_distance: 8
+  require_both_hashes: true
+
+tagger:
+  repo_id: ashen-sensored/wd-eva02-tagger-2026-canary
+  revision: c45a59a3f17c0ca6066072b1c213e0c12a90e242
+  architecture: eva02_large_patch14_448
+  input_size: 448
+  threshold: 0.6025
+  score_store_threshold: 0.10
+  sparse_top_k: 512
+  batch_size: 16
+  num_workers: 4
+  device: cuda
+  shard_rows: 2000
+  content_exclude_tags: []
+
+caption:
+  version: anima-tags-v1
+  rating_map:
+    general: safe
+    sensitive: sensitive
+    questionable: nsfw
+    explicit: explicit
+  include_rating: true
+  include_characters: true
+  include_general: true
+
+cradio:
+  torchhub_repo: NVlabs/RADIO
+  torchhub_ref: c0f37017930e9dda53f93424cf4bf39fc51f287e
+  model_version: c-radio_v4-so400m
+  adaptor_name: siglip2-g
+  patch_size: 16
+  max_side: 1024
+  max_pixels: 1048576
+  min_side: 16
+  batch_size: 4
+  device: cuda
+  amp_dtype: bfloat16
+  storage_dtype: float16
+  content_scale: 1.0
+  normalize_residual: true
+  shard_rows: 128
+
+output_dir: data/deepghs2024-production

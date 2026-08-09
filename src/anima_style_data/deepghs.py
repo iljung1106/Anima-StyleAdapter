@@ -104,7 +104,9 @@ def download_deepghs_candidates(
         raise RuntimeError(
             "No Hugging Face token detected. Set HF_HOME to the directory containing token."
         )
-    pool = Danbooru2024DataPool(hf_token=token)
+    pool = Danbooru2024DataPool(
+        revision=str(cfg.get("revision", "main")), hf_token=token
+    )
     batch_size = max(int(cfg.get("batch_size", 1000)), 1)
     max_workers = max(int(cfg.get("max_workers", 12)), 1)
     started_at = time.monotonic()
@@ -174,6 +176,7 @@ def download_deepghs_candidates(
         "metadata_md5_mismatches": mismatched,
         "cutoff_date": cutoff_date,
         "repo_id": cfg["repo_id"],
+        "revision": cfg.get("revision", "main"),
     }
     write_json(destination / "deepghs_summary.json", summary)
     return summary
