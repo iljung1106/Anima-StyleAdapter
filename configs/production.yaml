@@ -39,6 +39,13 @@ download:
   max_file_mb: 80
   user_agent: "AnimaStyleAdapterDataPrep/0.1"
 
+deepghs:
+  repo_id: deepghs/danbooru2024
+  cutoff_date: "2024-11-13"
+  max_workers: 12
+  batch_size: 1000
+  import_dir: data/deepghs_benchmark
+
 dedup:
   phash_distance: 6
   dhash_distance: 8

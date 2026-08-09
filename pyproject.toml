@@ -9,6 +9,7 @@ description = "Scalable Danbooru data preparation for the Anima Style Adapter pr
 requires-python = ">=3.10"
 dependencies = [
   "aiohttp>=3.9",
+  "cheesechaser>=0.2.2",
   "huggingface-hub>=0.28",
   "numpy>=1.26",
   "Pillow>=10.2",

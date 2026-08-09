@@ -10,6 +10,7 @@ from .caption import create_anima_captions
 from .config import load_config, output_dir
 from .cradio import extract_cradio_features
 from .dedup import deduplicate
+from .deepghs import download_deepghs_candidates
 from .download import download_candidates
 from .metadata import select_candidates
 from .tagger import tag_images
@@ -33,6 +34,7 @@ def build_parser() -> argparse.ArgumentParser:
     for command, help_text in (
         ("select", "Select artists and oversampled image candidates"),
         ("download", "Download and checksum selected candidates"),
+        ("deepghs", "Download eligible candidates from the indexed Danbooru2024 mirror"),
         ("dedup", "Decode, hash, remove near-duplicates, and make final manifest"),
         ("tag", "Run the WD EVA02 tagger into resumable Parquet shards"),
         ("caption", "Build ordered Anima and content caption shards"),
@@ -52,6 +54,8 @@ def main() -> None:
         _run(select_candidates, config, destination)
     elif args.command == "download":
         _run(download_candidates, config, destination)
+    elif args.command == "deepghs":
+        _run(download_deepghs_candidates, config, destination)
     elif args.command == "dedup":
         _run(deduplicate, config, destination)
     elif args.command == "tag":
