@@ -81,6 +81,7 @@ cradio_probe:
 
 tap_resampler_experiment:
   seed: 20260810
+  selected_variant: spatial_l20_l24
   source_split: train
   artist_count: 1000
   images_per_artist: 10

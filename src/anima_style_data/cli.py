@@ -17,6 +17,7 @@ from .feature_probe import evaluate_probe_features, extract_probe_features, run_
 from .metadata import select_candidates
 from .tagger import tag_images
 from .tap_resampler import (
+    evaluate_selected_tap_variant,
     extract_tap_features,
     run_tap_resampler_experiment,
     train_tap_resampler_variants,
@@ -53,6 +54,7 @@ def build_parser() -> argparse.ArgumentParser:
         ("probe", "Extract and evaluate C-RADIO feature candidates"),
         ("tap-extract", "Cache spatial taps and SigLIP globals for the resampler experiment"),
         ("tap-train", "Train and evaluate configured tap-resampler variants"),
+        ("tap-test", "Evaluate the validation-selected tap variant on meta-test artists"),
         ("tap-experiment", "Extract features, then train all tap-resampler variants"),
         ("prepare", "Run selection, download, and duplicate removal"),
         ("all", "Run every stage, including tagger and C-RADIO models"),
@@ -93,6 +95,8 @@ def main() -> None:
         _run(extract_tap_features, config, destination)
     elif args.command == "tap-train":
         _run(train_tap_resampler_variants, config, destination)
+    elif args.command == "tap-test":
+        _run(evaluate_selected_tap_variant, config, destination)
     elif args.command == "tap-experiment":
         _run(run_tap_resampler_experiment, config, destination)
     elif args.command in {"prepare", "all"}:

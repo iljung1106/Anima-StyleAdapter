@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 import random
 import time
+import json
 from collections import defaultdict
 from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
@@ -792,6 +793,93 @@ def train_tap_resampler_variants(config: dict[str, Any], destination: Path) -> d
     summary = {"variants": results}
     write_json(root / "evaluation.json", summary)
     return summary
+
+
+def evaluate_selected_tap_variant(
+    config: dict[str, Any], destination: Path
+) -> dict[str, Any]:
+    """Evaluate the validation-selected checkpoint once on held-out artists."""
+    import torch
+
+    cfg = config["tap_resampler_experiment"]
+    training = cfg["training"]
+    root = _experiment_dir(destination)
+    validation_path = root / "evaluation.json"
+    if not validation_path.exists():
+        raise FileNotFoundError("Run tap-train before the final meta-test")
+    validation = json.loads(validation_path.read_text(encoding="utf-8"))
+    selected_name = str(cfg.get("selected_variant", validation["variants"][0]["name"]))
+    variants = {str(item["name"]): item for item in cfg["variants"]}
+    if selected_name not in variants:
+        raise ValueError(f"Unknown selected_variant: {selected_name}")
+    variant = variants[selected_name]
+    validation_row = next(
+        (item for item in validation["variants"] if item["name"] == selected_name), None
+    )
+    if validation_row is None:
+        raise RuntimeError(f"Selected variant has no validation result: {selected_name}")
+
+    feature_dir = root / "features"
+    rows = read_records(feature_dir / "manifest.parquet")
+    test_rows = [row for row in rows if row["experiment_split"] == "meta_test"]
+    test_rows.sort(
+        key=lambda row: (
+            str(row.get("style_id", row["artist"])),
+            int(row["experiment_sample_rank"]),
+        )
+    )
+    if not test_rows:
+        raise RuntimeError("No meta_test rows found")
+
+    spatial_dim = int(rows[0]["spatial_dim"])
+    global_kind = str(variant.get("global", "none"))
+    global_dim = (
+        int(rows[0]["siglip_visual_dim"])
+        if global_kind == "siglip_visual"
+        else spatial_dim
+    )
+    device = str(training.get("device", "cuda"))
+    model = build_tap_resampler_model(
+        taps=[int(value) for value in variant["taps"]],
+        reconstruction_taps=[int(value) for value in cfg["reconstruction_taps"]],
+        spatial_dim=spatial_dim,
+        global_kind=global_kind,
+        global_dim=global_dim,
+        model_dim=int(training["model_dim"]),
+        latent_tokens=int(training["latent_tokens"]),
+        heads=int(training["heads"]),
+        resampler_layers=int(training["resampler_layers"]),
+        decoder_layers=int(training["decoder_layers"]),
+        style_dim=int(training["style_dim"]),
+    ).to(device)
+    checkpoint_path = root / "runs" / selected_name / "checkpoint.pt"
+    if not checkpoint_path.exists():
+        raise FileNotFoundError(f"Missing selected checkpoint: {checkpoint_path}")
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    model.load_state_dict(checkpoint["model"])
+    test_metrics = _evaluate_model(
+        model,
+        test_rows,
+        feature_dir,
+        variant,
+        cfg,
+        device,
+        batch_size=int(training["evaluation_batch_size"]),
+        prefetch_workers=int(training.get("prefetch_workers", 4)),
+        prefetch_batches=int(training.get("prefetch_batches", 8)),
+    )
+    result = {
+        "selection_rule": "highest validation mean_top1, checked for reconstruction/cost Pareto",
+        "selected_variant": selected_name,
+        "validation": validation_row,
+        "meta_test": test_metrics,
+        "meta_test_artists": len(
+            {str(row.get("style_id", row["artist"])) for row in test_rows}
+        ),
+        "meta_test_images": len(test_rows),
+    }
+    write_json(root / "final_test.json", result)
+    return result
 
 
 def run_tap_resampler_experiment(config: dict[str, Any], destination: Path) -> dict[str, Any]:

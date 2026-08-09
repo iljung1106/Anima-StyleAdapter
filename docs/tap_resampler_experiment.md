@@ -31,3 +31,11 @@ HF_HOME=/workspace/.cache/huggingface \
 ```
 
 특징 추출과 학습은 각각 `tap-extract`, `tap-train`으로 분리 실행할 수도 있다. 특징 shard와 학습 checkpoint는 중단 후 재개되며, 완료된 variant는 `force: false`일 때 자동으로 건너뛴다. 결과는 `data/anima500k-human/tap_resampler_experiment/evaluation.json`에 기록한다.
+
+Validation 결과로 후보를 확정한 뒤 `selected_variant`를 설정하고, 보존한 meta-test 작가는 한 번만 평가한다.
+
+```bash
+.venv/bin/anima-data --config configs/anima500k-human.yaml tap-test
+```
+
+최종 결과는 `tap_resampler_experiment/final_test.json`에 기록한다.
