@@ -41,3 +41,5 @@ Validation 결과로 후보를 확정한 뒤 `selected_variant`를 설정하고,
 ```
 
 최종 결과는 `tap_resampler_experiment/final_test.json`에 기록한다.
+
+실행 결과와 최종 선택은 [tap_resampler_experiment_results.md](tap_resampler_experiment_results.md)에 기록했다.
