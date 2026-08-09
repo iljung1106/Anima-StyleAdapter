@@ -1,0 +1,43 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "anima-style-data"
+version = "0.1.0"
+description = "Scalable Danbooru data preparation for the Anima Style Adapter project"
+requires-python = ">=3.10"
+dependencies = [
+  "aiohttp>=3.9",
+  "huggingface-hub>=0.28",
+  "numpy>=1.26",
+  "Pillow>=10.2",
+  "pyarrow>=15",
+  "PyYAML>=6",
+]
+
+[project.optional-dependencies]
+tagger = [
+  "safetensors>=0.4",
+  "timm>=1.0",
+  "torch>=2.4",
+]
+test = ["pytest>=8"]
+features = [
+  "einops>=0.8",
+  "safetensors>=0.4",
+  "timm>=1.0",
+  "torch>=2.1",
+  "torchvision>=0.16",
+  "transformers>=4.51,<5",
+]
+
+[project.scripts]
+anima-data = "anima_style_data.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

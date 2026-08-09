@@ -1,0 +1,81 @@
+metadata:
+  repo_id: Shio-Koube/Danbooru-2026-parquet-metadata
+  revision: 203df76a018bd5d463c37666c394b88b5acaa202
+  file_pattern: "output_part_*.parquet"
+  include_files: [output_part_09.parquet]
+  local_glob: null
+  batch_rows: 20000
+  max_batches: 2
+
+selection:
+  seed: 20260809
+  artist_count: 2
+  images_per_artist: 2
+  candidate_multiplier: 2.0
+  artist_pool_multiplier: 3.0
+  per_artist_scan_cap: 100
+  date_windows_days: [730, 1460, 3650]
+  artist_recency_tau_days: 1460
+  image_recency_tau_days: 365
+  require_single_artist: true
+  allowed_extensions: [jpg, jpeg, png, webp]
+  exclude_pending: true
+  exclude_flagged: true
+  exclude_deleted: true
+  exclude_banned: true
+
+download:
+  concurrency: 4
+  timeout_seconds: 30
+  retries: 2
+  max_file_mb: 40
+  user_agent: "AnimaStyleAdapterDataPrep/0.1-smoke"
+
+dedup:
+  phash_distance: 6
+  dhash_distance: 8
+  require_both_hashes: true
+
+tagger:
+  repo_id: ashen-sensored/wd-eva02-tagger-2026-canary
+  revision: c45a59a3f17c0ca6066072b1c213e0c12a90e242
+  architecture: eva02_large_patch14_448
+  input_size: 448
+  threshold: 0.6025
+  score_store_threshold: 0.10
+  sparse_top_k: 512
+  batch_size: 2
+  num_workers: 0
+  device: cpu
+  shard_rows: 100
+  content_exclude_tags: []
+
+caption:
+  version: anima-tags-v1
+  rating_map:
+    general: safe
+    sensitive: sensitive
+    questionable: nsfw
+    explicit: explicit
+  include_rating: true
+  include_characters: true
+  include_general: true
+
+cradio:
+  torchhub_repo: NVlabs/RADIO
+  torchhub_ref: c0f37017930e9dda53f93424cf4bf39fc51f287e
+  model_version: c-radio_v4-so400m
+  adaptor_name: siglip2-g
+  patch_size: 16
+  max_side: 256
+  max_pixels: 65536
+  min_side: 16
+  batch_size: 1
+  device: cpu
+  amp_dtype: float32
+  storage_dtype: float16
+  content_scale: 1.0
+  normalize_residual: true
+  shard_rows: 2
+
+output_dir: data/smoke
