@@ -18,6 +18,7 @@ selection:
 download: {}
 dedup:
   workers: 16
+  chunksize: 32
   phash_distance: 6
   dhash_distance: 6
   require_both_hashes: true

@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import math
 from collections import defaultdict
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ProcessPoolExecutor
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
@@ -104,8 +104,9 @@ def deduplicate(config: dict[str, Any], destination: Path) -> dict[str, Any]:
     enriched: list[dict[str, Any]] = []
     invalid: list[dict[str, Any]] = []
     workers = int(config["dedup"].get("workers", 1))
-    with ThreadPoolExecutor(max_workers=workers) as executor:
-        for index, (valid, failed) in enumerate(executor.map(_enrich_row, rows), start=1):
+    with ProcessPoolExecutor(max_workers=workers) as executor:
+        results = executor.map(_enrich_row, rows, chunksize=int(config["dedup"].get("chunksize", 32)))
+        for index, (valid, failed) in enumerate(results, start=1):
             if valid is not None:
                 enriched.append(valid)
             if failed is not None:
