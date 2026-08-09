@@ -2,6 +2,7 @@ import torch
 
 from anima_style_data.tap_resampler import (
     _prototype_loss,
+    _training_rows_for_step,
     build_tap_resampler_model,
     select_tap_experiment_rows,
 )
@@ -63,3 +64,25 @@ def test_resampler_contract_and_prototype_loss():
     assert embedding.shape == (4, 8)
     assert torch.allclose(embedding.norm(dim=-1), torch.ones(4), atol=1e-5)
     assert torch.isfinite(_prototype_loss(embedding, 2, 2, 0.07))
+
+
+def test_training_episode_is_step_addressable():
+    artists = ["a", "b", "c"]
+    by_style = {
+        artist: [{"id": f"{artist}{index}"} for index in range(4)]
+        for artist in artists
+    }
+    kwargs = {
+        "step": 12,
+        "seed": 7,
+        "artists": artists,
+        "train_by_style": by_style,
+        "artists_per_batch": 2,
+        "images_per_artist": 3,
+    }
+
+    first = _training_rows_for_step(**kwargs)
+    second = _training_rows_for_step(**kwargs)
+
+    assert [row["id"] for row in first] == [row["id"] for row in second]
+    assert len(first) == 6

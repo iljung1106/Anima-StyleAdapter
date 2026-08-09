@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import math
 import random
+import time
 from collections import defaultdict
+from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
@@ -431,6 +433,28 @@ def _prototype_loss(embeddings, artists_per_batch: int, images_per_artist: int, 
     return F.cross_entropy((queries @ prototypes.T) / temperature, labels)
 
 
+def _training_rows_for_step(
+    *,
+    step: int,
+    seed: int,
+    artists: list[str],
+    train_by_style: dict[str, list[dict[str, Any]]],
+    artists_per_batch: int,
+    images_per_artist: int,
+) -> list[dict[str, Any]]:
+    """Build a deterministic episode without mutable sampler state.
+
+    Step-addressable episodes let the CPU prefetch queue run ahead without
+    changing checkpoint/resume behavior or the batches seen by other variants.
+    """
+    rng = random.Random((int(seed) << 32) ^ int(step))
+    selected_artists = rng.sample(artists, artists_per_batch)
+    rows = []
+    for artist in selected_artists:
+        rows.extend(rng.sample(train_by_style[artist], images_per_artist))
+    return rows
+
+
 def _reconstruction_loss(decoded, targets, mask, huber_weight: float):
     import torch
     import torch.nn.functional as F
@@ -596,7 +620,6 @@ def train_tap_resampler_variants(config: dict[str, Any], destination: Path) -> d
             weight_decay=float(training["weight_decay"]),
         )
         amp_dtype = torch.bfloat16
-        rng = random.Random(seed)
         artists = sorted(train_by_style)
         steps = int(training["steps"])
         artists_per_batch = int(training["artists_per_batch"])
@@ -607,72 +630,107 @@ def train_tap_resampler_variants(config: dict[str, Any], destination: Path) -> d
             state = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
             model.load_state_dict(state["model"])
             optimizer.load_state_dict(state["optimizer"])
-            rng.setstate(state["python_rng_state"])
             start_step = int(state["step"])
             print(f"resuming variant {name} from step {start_step}", flush=True)
         model.train()
         running = defaultdict(float)
-        for step in range(start_step, steps):
-            selected_artists = rng.sample(artists, artists_per_batch)
-            batch_rows = []
-            for artist in selected_artists:
-                batch_rows.extend(rng.sample(train_by_style[artist], images_per_artist))
-            features, targets, mask, shapes, global_feature = _load_feature_batch(
+        input_taps = [int(value) for value in variant["taps"]]
+        reconstruction_taps = [int(value) for value in cfg["reconstruction_taps"]]
+        prefetch_workers = int(training.get("prefetch_workers", 4))
+        prefetch_batches = max(prefetch_workers, int(training.get("prefetch_batches", 8)))
+
+        def load_step(step: int):
+            batch_rows = _training_rows_for_step(
+                step=step,
+                seed=seed,
+                artists=artists,
+                train_by_style=train_by_style,
+                artists_per_batch=artists_per_batch,
+                images_per_artist=images_per_artist,
+            )
+            return _load_feature_batch(
                 batch_rows,
                 feature_dir,
-                [int(value) for value in variant["taps"]],
-                [int(value) for value in cfg["reconstruction_taps"]],
+                input_taps,
+                reconstruction_taps,
                 global_kind,
             )
-            features = {key: value.to(device, non_blocking=True) for key, value in features.items()}
-            targets = {key: value.to(device, non_blocking=True) for key, value in targets.items()}
-            mask = mask.to(device, non_blocking=True)
-            if global_feature is not None:
-                global_feature = global_feature.to(device, non_blocking=True)
-            optimizer.zero_grad(set_to_none=True)
-            with torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=device.startswith("cuda")):
-                decoded, decoded_mask, embeddings = model(
-                    features, mask, shapes, global_feature
+
+        futures: dict[int, Future] = {}
+        next_submit = start_step
+        log_started = time.perf_counter()
+        with ThreadPoolExecutor(max_workers=prefetch_workers) as executor:
+            for step in range(start_step, steps):
+                while next_submit < steps and next_submit < step + prefetch_batches:
+                    futures[next_submit] = executor.submit(load_step, next_submit)
+                    next_submit += 1
+                wait_started = time.perf_counter()
+                features, targets, mask, shapes, global_feature = futures.pop(step).result()
+                running["data_wait"] += time.perf_counter() - wait_started
+                features = {
+                    key: value.to(device, non_blocking=True) for key, value in features.items()
+                }
+                targets = {
+                    key: value.to(device, non_blocking=True) for key, value in targets.items()
+                }
+                mask = mask.to(device, non_blocking=True)
+                if global_feature is not None:
+                    global_feature = global_feature.to(device, non_blocking=True)
+                optimizer.zero_grad(set_to_none=True)
+                with torch.autocast(
+                    device_type="cuda", dtype=amp_dtype, enabled=device.startswith("cuda")
+                ):
+                    decoded, decoded_mask, embeddings = model(
+                        features, mask, shapes, global_feature
+                    )
+                    rec_loss = _reconstruction_loss(
+                        decoded, targets, decoded_mask, float(training["huber_weight"])
+                    )
+                    proto_loss = _prototype_loss(
+                        embeddings,
+                        artists_per_batch,
+                        images_per_artist,
+                        float(training["temperature"]),
+                    )
+                    ramp = min(
+                        1.0,
+                        (step + 1)
+                        / max(1, int(steps * float(training["prototype_ramp"]))),
+                    )
+                    loss = rec_loss + ramp * float(training["prototype_weight"]) * proto_loss
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(
+                    model.parameters(), float(training["max_grad_norm"])
                 )
-                rec_loss = _reconstruction_loss(
-                    decoded, targets, decoded_mask, float(training["huber_weight"])
-                )
-                proto_loss = _prototype_loss(
-                    embeddings,
-                    artists_per_batch,
-                    images_per_artist,
-                    float(training["temperature"]),
-                )
-                ramp = min(1.0, (step + 1) / max(1, int(steps * float(training["prototype_ramp"]))))
-                loss = rec_loss + ramp * float(training["prototype_weight"]) * proto_loss
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), float(training["max_grad_norm"]))
-            optimizer.step()
-            running["loss"] += float(loss.detach())
-            running["reconstruction"] += float(rec_loss.detach())
-            running["prototype"] += float(proto_loss.detach())
-            if (step + 1) % int(training["log_every"]) == 0:
-                interval = int(training["log_every"])
-                print(
-                    f"variant={name} step={step + 1}/{steps} "
-                    f"loss={running['loss'] / interval:.4f} "
-                    f"rec={running['reconstruction'] / interval:.4f} "
-                    f"proto={running['prototype'] / interval:.4f}",
-                    flush=True,
-                )
-                running.clear()
-            if (step + 1) % int(training["checkpoint_every"]) == 0:
-                temporary = checkpoint_path.with_suffix(".tmp")
-                torch.save(
-                    {
-                        "step": step + 1,
-                        "model": model.state_dict(),
-                        "optimizer": optimizer.state_dict(),
-                        "python_rng_state": rng.getstate(),
-                    },
-                    temporary,
-                )
-                temporary.replace(checkpoint_path)
+                optimizer.step()
+                running["loss"] += float(loss.detach())
+                running["reconstruction"] += float(rec_loss.detach())
+                running["prototype"] += float(proto_loss.detach())
+                if (step + 1) % int(training["log_every"]) == 0:
+                    interval = int(training["log_every"])
+                    elapsed = time.perf_counter() - log_started
+                    print(
+                        f"variant={name} step={step + 1}/{steps} "
+                        f"loss={running['loss'] / interval:.4f} "
+                        f"rec={running['reconstruction'] / interval:.4f} "
+                        f"proto={running['prototype'] / interval:.4f} "
+                        f"step_s={elapsed / interval:.3f} "
+                        f"data_wait_s={running['data_wait'] / interval:.3f}",
+                        flush=True,
+                    )
+                    running.clear()
+                    log_started = time.perf_counter()
+                if (step + 1) % int(training["checkpoint_every"]) == 0:
+                    temporary = checkpoint_path.with_suffix(".tmp")
+                    torch.save(
+                        {
+                            "step": step + 1,
+                            "model": model.state_dict(),
+                            "optimizer": optimizer.state_dict(),
+                        },
+                        temporary,
+                    )
+                    temporary.replace(checkpoint_path)
 
         evaluation = _evaluate_model(model, val_rows, feature_dir, variant, cfg, device)
         result = {"name": name, "taps": variant["taps"], "global": global_kind, **evaluation}

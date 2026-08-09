@@ -116,6 +116,8 @@ tap_resampler_experiment:
     huber_weight: 0.10
     max_grad_norm: 1.0
     evaluation_batch_size: 8
+    prefetch_workers: 8
+    prefetch_batches: 16
     log_every: 20
     checkpoint_every: 100
     force: false
