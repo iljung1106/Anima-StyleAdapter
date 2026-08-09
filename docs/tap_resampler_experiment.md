@@ -21,6 +21,8 @@ Train 작가 중 1,000명에서 작가당 10장을 고정 표집하여, C-RADIO 
 2. 주요 후보에 block 24 native SigLIP CLS 추가
 3. native CLS가 유효한지 확인하기 위해 최종 SigLIP visual embedding과 비교
 
+Spatial validation에서 `[20,24]`가 최상위로 확인되어, 최종 global ablation은 동일한 `[20,24]` 입력에 native CLS와 final SigLIP visual을 각각 추가해 마무리한다. 이는 spatial 차이와 global 표현 차이를 혼동하지 않기 위한 통제 실험이다.
+
 선택 기준은 validation 작가의 prototype Top-1/MRR과 block별 reconstruction cosine의 Pareto 성능이다. 고정 학습 작가 classifier는 사용하지 않으며, 매 step 같은 작가의 이미지가 support/query 역할을 바꾸는 episodic prototype loss를 사용한다.
 
 ## 실행

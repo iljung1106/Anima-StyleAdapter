@@ -131,3 +131,5 @@ tap_resampler_experiment:
     - {name: l12_l24_native_siglip_l24, taps: [12, 24], global: native_24}
     - {name: l8_l16_l24_native_siglip_l24, taps: [8, 16, 24], global: native_24}
     - {name: l12_l24_siglip_visual, taps: [12, 24], global: siglip_visual}
+    - {name: l20_l24_native_siglip_l24, taps: [20, 24], global: native_24}
+    - {name: l20_l24_siglip_visual, taps: [20, 24], global: siglip_visual}
