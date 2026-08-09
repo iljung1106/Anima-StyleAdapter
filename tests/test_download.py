@@ -11,9 +11,17 @@ from anima_style_data.download import _run_downloads
 
 def test_parallel_download_and_cached_resume(tmp_path: Path) -> None:
     payloads = {f"/{index}": f"image-{index}".encode() for index in range(6)}
+    request_counts: dict[str, int] = {}
 
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self) -> None:
+            request_counts[self.path] = request_counts.get(self.path, 0) + 1
+            if self.path == "/0" and request_counts[self.path] == 1:
+                self.send_response(429)
+                self.send_header("cf-mitigated", "challenge")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
             payload = payloads[self.path]
             self.send_response(200)
             self.send_header("Content-Length", str(len(payload)))
@@ -43,6 +51,10 @@ def test_parallel_download_and_cached_resume(tmp_path: Path) -> None:
             "max_file_mb": 1,
             "user_agent": "test",
             "progress_every": 2,
+            "requests_per_second": 100,
+            "min_requests_per_second": 100,
+            "max_requests_per_second": 100,
+            "rate_limit_cooldown_seconds": 0.01,
         }
         images_dir = tmp_path / "images"
 
@@ -51,6 +63,7 @@ def test_parallel_download_and_cached_resume(tmp_path: Path) -> None:
 
         assert [item["download_status"] for item in first] == ["downloaded"] * 6
         assert [item["download_status"] for item in second] == ["cached"] * 6
+        assert request_counts["/0"] == 2
     finally:
         server.shutdown()
         thread.join()
