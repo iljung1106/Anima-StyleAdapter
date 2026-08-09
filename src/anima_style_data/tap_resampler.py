@@ -469,12 +469,20 @@ def _reconstruction_loss(decoded, targets, mask, huber_weight: float):
     return torch.stack(losses).mean()
 
 
-def _evaluate_model(model, rows, feature_dir, variant, cfg, device):
+def _evaluate_model(
+    model,
+    rows,
+    feature_dir,
+    variant,
+    cfg,
+    device,
+    *,
+    batch_size: int,
+):
     import torch
     import torch.nn.functional as F
 
     model.eval()
-    batch_size = int(cfg["evaluation_batch_size"])
     embeddings = []
     rec_sum = defaultdict(float)
     rec_batches = 0
@@ -732,7 +740,15 @@ def train_tap_resampler_variants(config: dict[str, Any], destination: Path) -> d
                     )
                     temporary.replace(checkpoint_path)
 
-        evaluation = _evaluate_model(model, val_rows, feature_dir, variant, cfg, device)
+        evaluation = _evaluate_model(
+            model,
+            val_rows,
+            feature_dir,
+            variant,
+            cfg,
+            device,
+            batch_size=int(training["evaluation_batch_size"]),
+        )
         result = {"name": name, "taps": variant["taps"], "global": global_kind, **evaluation}
         write_json(metrics_path, result)
         torch.save(
