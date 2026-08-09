@@ -13,6 +13,7 @@ from .cradio import extract_cradio_features
 from .dedup import deduplicate
 from .deepghs import download_deepghs_candidates
 from .download import download_candidates
+from .feature_probe import evaluate_probe_features, extract_probe_features, run_feature_probe
 from .metadata import select_candidates
 from .tagger import tag_images
 
@@ -42,6 +43,9 @@ def build_parser() -> argparse.ArgumentParser:
         ("tag", "Run the WD EVA02 tagger into resumable Parquet shards"),
         ("caption", "Build ordered Anima and content caption shards"),
         ("features", "Cache C-RADIO spatial and SigLIP2-g residual features"),
+        ("probe-extract", "Extract pooled C-RADIO layer candidates on a style subset"),
+        ("probe-evaluate", "Evaluate multi-reference artist retrieval for probe features"),
+        ("probe", "Extract and evaluate C-RADIO feature candidates"),
         ("prepare", "Run selection, download, and duplicate removal"),
         ("all", "Run every stage, including tagger and C-RADIO models"),
     ):
@@ -71,6 +75,12 @@ def main() -> None:
         _run(create_anima_captions, config, destination)
     elif args.command == "features":
         _run(extract_cradio_features, config, destination)
+    elif args.command == "probe-extract":
+        _run(extract_probe_features, config, destination)
+    elif args.command == "probe-evaluate":
+        _run(evaluate_probe_features, config, destination)
+    elif args.command == "probe":
+        _run(run_feature_probe, config, destination)
     elif args.command in {"prepare", "all"}:
         for stage in (select_candidates, download_candidates, deduplicate):
             _run(stage, config, destination)

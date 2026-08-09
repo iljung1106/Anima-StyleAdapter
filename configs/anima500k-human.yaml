@@ -61,3 +61,18 @@ cradio:
   content_scale: 1.0
   normalize_residual: true
   shard_rows: 128
+
+cradio_probe:
+  seed: 20260810
+  split: train
+  style_count: 64
+  images_per_style: 20
+  reference_counts: [1, 2, 4, 8]
+  layers: [4, 8, 12, 16, 20, 24, 26]
+  content_scales: [0.5, 1.0, 1.5]
+  batch_size: 4
+  max_open_buckets: 16
+  storage_dtype: float16
+  preprocess:
+    max_side: 512
+    max_pixels: 262144
