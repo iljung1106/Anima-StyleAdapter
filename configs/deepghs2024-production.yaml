@@ -11,7 +11,7 @@ selection:
   seed: 20260810
   artist_count: 5000
   images_per_artist: 30
-  candidate_multiplier: 2.0
+  candidate_multiplier: 1.0
   artist_pool_multiplier: 2.0
   per_artist_scan_cap: 1000
   date_windows_days: [730, 1095, 1460]
