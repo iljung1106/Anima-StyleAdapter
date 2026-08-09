@@ -5,7 +5,7 @@ import tarfile
 
 from PIL import Image
 
-from anima_style_data.anima500k import extract_anima500k_human
+from anima_style_data.anima500k import _extract_shard, extract_anima500k_human
 from anima_style_data.io import read_records
 
 
@@ -78,3 +78,20 @@ def test_synthetic_source_is_rejected(tmp_path):
         assert "synthetic" in str(error)
     else:
         raise AssertionError("synthetic source must not be accepted")
+
+
+def test_empty_human_shard_is_checkpointed(tmp_path):
+    destination = tmp_path / "data"
+    shard_dir = destination / "source" / "human"
+    shard_dir.mkdir(parents=True)
+    with tarfile.open(shard_dir / "human-w0-shard-empty.tar", "w"):
+        pass
+
+    manifest_dir = destination / "extract_manifests"
+    manifest_dir.mkdir()
+    shard = shard_dir / "human-w0-shard-empty.tar"
+    first = _extract_shard(shard, destination, manifest_dir)
+    second = _extract_shard(shard, destination, manifest_dir)
+
+    assert first == second == (None, 0, 0)
+    assert list(manifest_dir.glob("*.empty"))

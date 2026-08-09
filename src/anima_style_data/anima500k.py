@@ -52,11 +52,14 @@ def _sha256(data: bytes) -> str:
 
 def _extract_shard(
     shard: Path, destination: Path, manifest_dir: Path
-) -> tuple[Path, int, int]:
+) -> tuple[Path | None, int, int]:
     manifest_path = manifest_dir / f"{shard.stem}.parquet"
+    empty_marker = manifest_dir / f"{shard.stem}.empty"
     if manifest_path.exists():
         rows = read_records(manifest_path)
         return manifest_path, len(rows), 0
+    if empty_marker.exists():
+        return None, 0, 0
 
     rows: list[dict[str, Any]] = []
     written_bytes = 0
@@ -116,6 +119,12 @@ def _extract_shard(
                     "download_status": "extracted",
                 }
             )
+    if not rows:
+        # The source snapshot contains valid 10 KiB empty tar terminators.
+        # A marker makes these shards resumable without creating invalid empty
+        # Parquet files.
+        empty_marker.touch()
+        return None, 0, 0
     write_records(manifest_path, rows)
     return manifest_path, len(rows), written_bytes
 
@@ -141,7 +150,8 @@ def extract_anima500k_human(config: dict[str, Any], destination: Path) -> dict[s
         }
         for index, future in enumerate(as_completed(futures), start=1):
             manifest, count, added = future.result()
-            completed.append(manifest)
+            if manifest is not None:
+                completed.append(manifest)
             records += count
             written_bytes += added
             print(
