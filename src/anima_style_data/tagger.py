@@ -202,6 +202,8 @@ def tag_images(config: dict[str, Any], destination: Path) -> dict[str, Any]:
                 {
                     "id": int(image_id),
                     "artist": source["artist"],
+                    "style_id": source.get("style_id", source["artist"]),
+                    "split": source.get("split", "train"),
                     "local_path": source["local_path"],
                     "rating": labels.names[rating_index],
                     "rating_score": float(probs[rating_index]),

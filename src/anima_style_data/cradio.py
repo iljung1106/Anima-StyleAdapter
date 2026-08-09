@@ -276,6 +276,8 @@ def extract_cradio_features(config: dict[str, Any], destination: Path) -> dict[s
                 {
                     "id": image_id,
                     "artist": row["artist"],
+                    "style_id": row.get("style_id", row["artist"]),
+                    "split": row.get("split", "train"),
                     "local_path": row["local_path"],
                     "caption_config_hash": row["caption_config_hash"],
                     "content_caption_sha256": hashlib.sha256(

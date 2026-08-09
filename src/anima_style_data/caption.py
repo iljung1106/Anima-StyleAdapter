@@ -50,6 +50,8 @@ def build_anima_caption(row: dict[str, Any], cfg: dict[str, Any]) -> dict[str, A
     return {
         "id": int(row["id"]),
         "artist": row["artist"],
+        "style_id": row.get("style_id", row["artist"]),
+        "split": row.get("split", "train"),
         "local_path": row["local_path"],
         "rating_source": row.get("rating"),
         "rating_anima": rating,
