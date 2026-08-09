@@ -17,6 +17,7 @@ selection:
   candidate_multiplier: 1.6666667
 download: {}
 dedup:
+  workers: 16
   phash_distance: 6
   dhash_distance: 6
   require_both_hashes: true

@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import math
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
@@ -70,35 +71,47 @@ def _is_near_duplicate(
     return duplicate, p_distance, d_distance
 
 
+def _enrich_row(row: dict[str, Any]) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    path = Path(row["local_path"])
+    try:
+        with Image.open(path) as image:
+            image.load()
+            phash, dhash = perceptual_hashes(image)
+            width, height = image.size
+        return (
+            {
+                **row,
+                "decoded_width": width,
+                "decoded_height": height,
+                "phash": phash,
+                "dhash": dhash,
+                # The Anima500k extractor already verifies this digest against
+                # source JSON. Legacy manifests fall back to hashing the file.
+                "sha256": row.get("sha256") or _file_sha256(path),
+            },
+            None,
+        )
+    except Exception as exc:
+        return None, {**row, "dedup_status": "invalid", "dedup_reason": str(exc)}
+
+
 def deduplicate(config: dict[str, Any], destination: Path) -> dict[str, Any]:
     rows = [
         row
         for row in read_records(destination / "download_manifest.parquet")
         if row["download_status"] != "failed"
     ]
-    enriched = []
-    invalid = []
-    for index, row in enumerate(rows, start=1):
-        path = Path(row["local_path"])
-        try:
-            with Image.open(path) as image:
-                image.load()
-                phash, dhash = perceptual_hashes(image)
-                width, height = image.size
-            enriched.append(
-                {
-                    **row,
-                    "decoded_width": width,
-                    "decoded_height": height,
-                    "phash": phash,
-                    "dhash": dhash,
-                    "sha256": _file_sha256(path),
-                }
-            )
-        except Exception as exc:
-            invalid.append({**row, "dedup_status": "invalid", "dedup_reason": str(exc)})
-        if index % 500 == 0 or index == len(rows):
-            print(f"hashed {index}/{len(rows)} images", flush=True)
+    enriched: list[dict[str, Any]] = []
+    invalid: list[dict[str, Any]] = []
+    workers = int(config["dedup"].get("workers", 1))
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        for index, (valid, failed) in enumerate(executor.map(_enrich_row, rows), start=1):
+            if valid is not None:
+                enriched.append(valid)
+            if failed is not None:
+                invalid.append(failed)
+            if index % 1000 == 0 or index == len(rows):
+                print(f"hashed {index}/{len(rows)} images with {workers} workers", flush=True)
 
     final_rows: list[dict[str, Any]] = []
     audit_rows: list[dict[str, Any]] = list(invalid)
