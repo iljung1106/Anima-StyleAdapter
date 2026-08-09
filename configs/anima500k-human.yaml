@@ -1,0 +1,24 @@
+output_dir: data/anima500k-human
+
+anima500k:
+  repo_id: ij/anima-style-embedding-500k-full-face
+  revision: b8bf93dd0b1950576aa39e0467117b13812659dd
+  source: human
+  source_dir: source
+  download_workers: 16
+  extract_workers: 8
+
+# Kept for the common pipeline configuration contract. Selection is already
+# encoded in the source dataset; 50 candidates are retained before dedup.
+metadata: {}
+selection:
+  artists: 5000
+  images_per_artist: 30
+  candidate_multiplier: 1.6666667
+download: {}
+dedup:
+  phash_distance: 6
+  dhash_distance: 6
+  require_both_hashes: true
+tagger:
+  model_id: ashen-sensored/wd-eva02-tagger-2026-canary

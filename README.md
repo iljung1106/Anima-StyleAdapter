@@ -4,6 +4,8 @@ Danbooru 메타데이터에서 작가·이미지 후보를 고르고, 실제 파
 
 상세 연구 계획은 [docs/anima_style_adapter_training_plan.md](docs/anima_style_adapter_training_plan.md)에 있다.
 
+현재 1차 학습 데이터는 `ij/anima-style-embedding-500k-full-face`의 **human full 이미지**만 사용한다. `synthetic/`과 `.face.webp`는 다운로드·추출 대상에서 명시적으로 제외한다. 5,000개 style identity의 50장씩을 dedup 후보로 사용하고, 전역 exact duplicate와 동일 style identity 내부 near-duplicate를 제거한 뒤 작가당 30장을 본 학습 manifest에 넣는다.
+
 ## 설치
 
 Python 3.10 이상을 사용한다. 데이터 준비만 할 때와 GPU 태깅/C-RADIO 캐시까지 할 때를 나누어 설치할 수 있다.
@@ -28,6 +30,9 @@ anima-data --config configs/smoke.yaml prepare
 단계별 실행:
 
 ```bash
+anima-data --config configs/anima500k-human.yaml anima500k-download
+anima-data --config configs/anima500k-human.yaml anima500k-extract
+anima-data --config configs/anima500k-human.yaml dedup
 anima-data --config configs/production.yaml select
 anima-data --config configs/production.yaml download
 anima-data --config configs/production.yaml dedup

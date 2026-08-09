@@ -100,15 +100,45 @@ def deduplicate(config: dict[str, Any], destination: Path) -> dict[str, Any]:
         if index % 500 == 0 or index == len(rows):
             print(f"hashed {index}/{len(rows)} images", flush=True)
 
-    by_artist: dict[str, list[dict[str, Any]]] = defaultdict(list)
-    for row in enriched:
-        by_artist[row["artist"]].append(row)
-
     final_rows: list[dict[str, Any]] = []
     audit_rows: list[dict[str, Any]] = list(invalid)
     target = int(config["selection"]["images_per_artist"])
     shortfalls: dict[str, int] = {}
     cfg = config["dedup"]
+
+    # Exact encoded-image duplicates are removed globally. Prefer train over
+    # held-out splits so leakage is eliminated without unnecessarily shrinking
+    # the training corpus.
+    split_priority = {"train": 0, "validation": 1, "test": 2}
+    enriched.sort(
+        key=lambda row: (
+            split_priority.get(row.get("split", "train"), 3),
+            row.get("style_id", row["artist"]),
+            row["selection_rank"],
+        )
+    )
+    globally_unique: list[dict[str, Any]] = []
+    seen_sha256: dict[str, dict[str, Any]] = {}
+    for row in enriched:
+        duplicate_of = seen_sha256.get(row["sha256"])
+        if duplicate_of is not None:
+            audit_rows.append(
+                {
+                    **row,
+                    "dedup_status": "removed",
+                    "dedup_reason": "exact_sha256_global",
+                    "kept_id": duplicate_of["id"],
+                    "phash_distance": 0,
+                    "dhash_distance": 0,
+                }
+            )
+            continue
+        seen_sha256[row["sha256"]] = row
+        globally_unique.append(row)
+
+    by_artist: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for row in globally_unique:
+        by_artist[row.get("style_id", row["artist"])].append(row)
 
     for artist, artist_rows in sorted(by_artist.items()):
         artist_rows.sort(key=lambda row: (row["selection_rank"], -int(row["id"])))
@@ -173,12 +203,19 @@ def deduplicate(config: dict[str, Any], destination: Path) -> dict[str, Any]:
 
     if not final_rows:
         raise RuntimeError("No images survived decoding and duplicate removal")
-    final_rows.sort(key=lambda row: (row["artist_rank"], row["final_rank"]))
+    final_rows.sort(
+        key=lambda row: (
+            split_priority.get(row.get("split", "train"), 3),
+            row.get("style_id", row["artist"]),
+            row["final_rank"],
+        )
+    )
     write_records(destination / "dedup_manifest.parquet", audit_rows)
     write_records(destination / "final_manifest.parquet", final_rows)
     summary = {
         "decoded": len(enriched),
         "invalid": len(invalid),
+        "exact_duplicates_removed": len(enriched) - len(globally_unique),
         "final_images": len(final_rows),
         "artists_with_shortfall": len(shortfalls),
         "shortfalls": shortfalls,
