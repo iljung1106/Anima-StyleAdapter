@@ -478,6 +478,8 @@ def _evaluate_model(
     device,
     *,
     batch_size: int,
+    prefetch_workers: int,
+    prefetch_batches: int,
 ):
     import torch
     import torch.nn.functional as F
@@ -486,29 +488,54 @@ def _evaluate_model(
     embeddings = []
     rec_sum = defaultdict(float)
     rec_batches = 0
+    offsets = list(range(0, len(rows), batch_size))
+
+    def load_offset(offset: int):
+        batch_rows = rows[offset : offset + batch_size]
+        return batch_rows, _load_feature_batch(
+            batch_rows,
+            feature_dir,
+            variant["taps"],
+            cfg["reconstruction_taps"],
+            variant["global"],
+        )
+
+    futures: dict[int, Future] = {}
+    next_submit = 0
+    started = time.perf_counter()
     with torch.inference_mode():
-        for offset in range(0, len(rows), batch_size):
-            batch_rows = rows[offset : offset + batch_size]
-            features, targets, mask, shapes, global_feature = _load_feature_batch(
-                batch_rows,
-                feature_dir,
-                variant["taps"],
-                cfg["reconstruction_taps"],
-                variant["global"],
-            )
-            features = {key: value.to(device) for key, value in features.items()}
-            targets = {key: value.to(device) for key, value in targets.items()}
-            mask = mask.to(device)
-            if global_feature is not None:
-                global_feature = global_feature.to(device)
-            decoded, decoded_mask, embedding = model(features, mask, shapes, global_feature)
-            embeddings.append(embedding.cpu())
-            for layer, prediction in decoded.items():
-                similarity = F.cosine_similarity(
-                    prediction[decoded_mask].float(), targets[layer][decoded_mask].float(), dim=-1
-                ).mean()
-                rec_sum[int(layer)] += float(similarity)
-            rec_batches += 1
+        with ThreadPoolExecutor(max_workers=prefetch_workers) as executor:
+            for batch_index, _ in enumerate(offsets):
+                while next_submit < len(offsets) and next_submit < batch_index + prefetch_batches:
+                    futures[next_submit] = executor.submit(load_offset, offsets[next_submit])
+                    next_submit += 1
+                batch_rows, loaded = futures.pop(batch_index).result()
+                features, targets, mask, shapes, global_feature = loaded
+                features = {key: value.to(device) for key, value in features.items()}
+                targets = {key: value.to(device) for key, value in targets.items()}
+                mask = mask.to(device)
+                if global_feature is not None:
+                    global_feature = global_feature.to(device)
+                decoded, decoded_mask, embedding = model(
+                    features, mask, shapes, global_feature
+                )
+                embeddings.append(embedding.cpu())
+                for layer, prediction in decoded.items():
+                    similarity = F.cosine_similarity(
+                        prediction[decoded_mask].float(),
+                        targets[layer][decoded_mask].float(),
+                        dim=-1,
+                    ).mean()
+                    rec_sum[int(layer)] += float(similarity)
+                rec_batches += 1
+                if rec_batches % 25 == 0 or rec_batches == len(offsets):
+                    elapsed = time.perf_counter() - started
+                    print(
+                        f"evaluating variant={variant['name']} "
+                        f"batches={rec_batches}/{len(offsets)} "
+                        f"batch_s={elapsed / rec_batches:.3f}",
+                        flush=True,
+                    )
 
     values = torch.cat(embeddings)
     style_ids = [str(row.get("style_id", row["artist"])) for row in rows]
@@ -748,6 +775,8 @@ def train_tap_resampler_variants(config: dict[str, Any], destination: Path) -> d
             cfg,
             device,
             batch_size=int(training["evaluation_batch_size"]),
+            prefetch_workers=int(training.get("prefetch_workers", 4)),
+            prefetch_batches=int(training.get("prefetch_batches", 8)),
         )
         result = {"name": name, "taps": variant["taps"], "global": global_kind, **evaluation}
         write_json(metrics_path, result)
