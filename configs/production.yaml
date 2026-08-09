@@ -25,7 +25,8 @@ selection:
   exclude_banned: true
 
 download:
-  concurrency: 32
+  concurrency: 96
+  progress_every: 1000
   timeout_seconds: 60
   retries: 3
   max_file_mb: 80
