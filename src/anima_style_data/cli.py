@@ -16,6 +16,11 @@ from .download import download_candidates
 from .feature_probe import evaluate_probe_features, extract_probe_features, run_feature_probe
 from .metadata import select_candidates
 from .tagger import tag_images
+from .tap_resampler import (
+    extract_tap_features,
+    run_tap_resampler_experiment,
+    train_tap_resampler_variants,
+)
 
 
 Stage = Callable[[dict[str, Any], Path], dict[str, Any]]
@@ -46,6 +51,9 @@ def build_parser() -> argparse.ArgumentParser:
         ("probe-extract", "Extract pooled C-RADIO layer candidates on a style subset"),
         ("probe-evaluate", "Evaluate multi-reference artist retrieval for probe features"),
         ("probe", "Extract and evaluate C-RADIO feature candidates"),
+        ("tap-extract", "Cache spatial taps and SigLIP globals for the resampler experiment"),
+        ("tap-train", "Train and evaluate configured tap-resampler variants"),
+        ("tap-experiment", "Extract features, then train all tap-resampler variants"),
         ("prepare", "Run selection, download, and duplicate removal"),
         ("all", "Run every stage, including tagger and C-RADIO models"),
     ):
@@ -81,6 +89,12 @@ def main() -> None:
         _run(evaluate_probe_features, config, destination)
     elif args.command == "probe":
         _run(run_feature_probe, config, destination)
+    elif args.command == "tap-extract":
+        _run(extract_tap_features, config, destination)
+    elif args.command == "tap-train":
+        _run(train_tap_resampler_variants, config, destination)
+    elif args.command == "tap-experiment":
+        _run(run_tap_resampler_experiment, config, destination)
     elif args.command in {"prepare", "all"}:
         for stage in (select_candidates, download_candidates, deduplicate):
             _run(stage, config, destination)
