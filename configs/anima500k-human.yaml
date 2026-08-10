@@ -74,7 +74,7 @@ style_features:
   amp_dtype: bfloat16
   batch_size: 64
   shard_rows: 512
-  max_open_buckets: 64
+  max_open_buckets: 128
   reader_workers: 64
   decoder_workers: 32
   read_prefetch: 32768
