@@ -11,6 +11,8 @@ from anima_style_data.style_transfer import (
     ProductionStyleLoader,
     SharedLowRankStyleAdapter,
     SlotSetAggregator,
+    _archive_training_state,
+    _save_training_state,
     attach_style_adapter,
 )
 
@@ -98,3 +100,20 @@ def test_attach_patches_all_28_blocks_without_copying_adapter():
     assert anima.style_adapter is adapter
     assert [block.__dict__["_style_block_index"] for block in anima.blocks] == list(range(28))
     assert all(isinstance(block._forward, types.MethodType) for block in anima.blocks)
+
+
+def test_training_state_is_atomic_and_archivable(tmp_path):
+    model = nn.Linear(3, 2)
+    optimizer = torch.optim.AdamW(model.parameters())
+    loss = model(torch.ones(1, 3)).sum()
+    loss.backward()
+    optimizer.step()
+    current = tmp_path / "training_state.pt"
+    archive = tmp_path / "checkpoints" / "step-0000001.pt"
+    archive.parent.mkdir()
+    _save_training_state(current, 1, model, optimizer, {"name": "test"})
+    _archive_training_state(current, archive)
+    state = torch.load(archive, map_location="cpu", weights_only=False)
+    assert state["step"] == 1
+    assert state["config"] == {"name": "test"}
+    assert set(state["adapter"]) == set(model.state_dict())

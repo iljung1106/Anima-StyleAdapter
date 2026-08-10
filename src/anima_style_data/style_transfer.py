@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import json
+import gc
 import math
+import os
 import random
+import shutil
 import sys
 import threading
 import time
@@ -21,6 +24,7 @@ from einops import rearrange
 from safetensors import safe_open
 from safetensors.torch import load_file
 from torch import nn
+from PIL import Image, ImageDraw, ImageOps
 
 from .io import read_records, write_json
 from .tap_resampler import build_tap_resampler_model
@@ -531,6 +535,253 @@ def _resolve_anima_model(config: dict[str, Any], destination: Path, device: str)
     return model.to(device)
 
 
+def _parameter_grad_norm(parameters) -> float:
+    values = [value.grad.detach().float().norm() for value in parameters if value.grad is not None]
+    return float(torch.stack(values).norm()) if values else 0.0
+
+
+def _forward_flow_loss(
+    anima: nn.Module,
+    adapter: SharedLowRankStyleAdapter,
+    resampler: nn.Module,
+    batch: dict[str, Any],
+    device: str,
+    *,
+    generator: torch.Generator | None = None,
+) -> tuple[torch.Tensor, dict[str, Any]]:
+    references = _encode_reference_tokens(resampler, batch, device)
+    reference_mask = batch["reference_mask"].to(device, non_blocking=True)
+    latents = batch["latents"].to(device, non_blocking=True, dtype=torch.bfloat16)
+    conditioning = batch["conditioning"].to(device, non_blocking=True, dtype=torch.bfloat16)
+    with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=device.startswith("cuda")):
+        style_tokens = adapter.aggregate(references, reference_mask)
+        adapter.set_style_tokens(style_tokens)
+        noise = torch.randn(latents.shape, device=device, dtype=latents.dtype, generator=generator)
+        timesteps = torch.rand(latents.shape[0], device=device, dtype=torch.float32, generator=generator)
+        sigma = timesteps[:, None, None, None].to(latents.dtype)
+        noisy = (1 - sigma) * latents + sigma * noise
+        padding_mask = torch.zeros(
+            latents.shape[0], 1, latents.shape[-2], latents.shape[-1],
+            device=device, dtype=latents.dtype,
+        )
+        prediction = anima(
+            noisy.unsqueeze(2), timesteps.to(latents.dtype), context=conditioning,
+            padding_mask=padding_mask, target_input_ids=None,
+        ).squeeze(2)
+        loss = F.mse_loss(prediction.float(), (noise - latents).float())
+    return loss, {
+        "references": int(reference_mask.sum()),
+        "latent_shape": list(latents.shape),
+    }
+
+
+@torch.no_grad()
+def _validate_style_adapter(
+    anima: nn.Module,
+    adapter: SharedLowRankStyleAdapter,
+    resampler: nn.Module,
+    loader: ProductionStyleLoader,
+    device: str,
+    *,
+    batches: int,
+    seed: int,
+) -> dict[str, float]:
+    anima.eval()
+    adapter.eval()
+    losses = []
+    references = []
+    started = time.perf_counter()
+    try:
+        for index in range(batches):
+            batch = loader.load_step(index)
+            generator = torch.Generator(device=device).manual_seed(seed + index)
+            loss, details = _forward_flow_loss(
+                anima, adapter, resampler, batch, device, generator=generator
+            )
+            losses.append(float(loss))
+            references.append(details["references"])
+            adapter.clear_style_tokens()
+    finally:
+        adapter.clear_style_tokens()
+        anima.train()
+        adapter.train()
+    return {
+        "loss": sum(losses) / len(losses),
+        "batches": float(batches),
+        "mean_references": sum(references) / len(references),
+        "elapsed_s": time.perf_counter() - started,
+    }
+
+
+def _load_sampling_vae(config: dict[str, Any], destination: Path):
+    from huggingface_hub import hf_hub_download
+
+    cache_cfg = config["anima_cache"]
+    model_cfg = cache_cfg["models"]
+    path = hf_hub_download(
+        repo_id=str(model_cfg["repo_id"]), filename=str(model_cfg["vae_filename"]),
+        revision=str(model_cfg["revision"]), cache_dir=str(destination / "anima_model_cache"),
+    )
+    sd_scripts = Path(str(cache_cfg["sd_scripts_path"])).resolve()
+    if str(sd_scripts) not in sys.path:
+        sys.path.insert(0, str(sd_scripts))
+    from library import qwen_image_autoencoder_kl_2d
+
+    return qwen_image_autoencoder_kl_2d.load_vae(
+        path, device="cpu", disable_mmap=True
+    ).requires_grad_(False).eval()
+
+
+def _make_sample_sheet(
+    generated: Image.Image,
+    loader: ProductionStyleLoader,
+    batch: dict[str, Any],
+) -> Image.Image:
+    episode = batch["episodes"][0]
+    sources = [("target", episode.target_id)] + [
+        (f"ref {index + 1}", image_id)
+        for index, image_id in enumerate(episode.reference_ids[:4])
+    ]
+    thumb = 160
+    sheet = Image.new("RGB", (max(generated.width, thumb * len(sources)), generated.height + thumb + 28), "white")
+    sheet.paste(generated, ((sheet.width - generated.width) // 2, 0))
+    draw = ImageDraw.Draw(sheet)
+    for index, (label, image_id) in enumerate(sources):
+        path = Path(str(loader.style_by_id[image_id]["local_path"]))
+        with Image.open(path) as source:
+            tile = ImageOps.fit(source.convert("RGB"), (thumb, thumb), method=Image.Resampling.LANCZOS)
+        x = index * thumb
+        sheet.paste(tile, (x, generated.height + 28))
+        draw.text((x + 4, generated.height + 6), label, fill="black")
+    draw.text((4, 6), f"generated — {episode.style_id}", fill="white", stroke_width=2, stroke_fill="black")
+    return sheet
+
+
+@torch.no_grad()
+def _sample_style_adapter(
+    anima: nn.Module,
+    adapter: SharedLowRankStyleAdapter,
+    resampler: nn.Module,
+    loader: ProductionStyleLoader,
+    config: dict[str, Any],
+    destination: Path,
+    output: Path,
+    device: str,
+    step: int,
+    vae: nn.Module | None,
+) -> tuple[Path, nn.Module, float]:
+    sample_cfg = config["style_transfer"]["sampling"]
+    started = time.perf_counter()
+    python_rng = random.getstate()
+    torch_rng = torch.get_rng_state()
+    cuda_rng = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+    anima.eval()
+    adapter.eval()
+    batch = loader.load_step(int(sample_cfg.get("episode", 0)))
+    references = _encode_reference_tokens(resampler, batch, device)
+    reference_mask = batch["reference_mask"].to(device, non_blocking=True)
+    positive_style = adapter.aggregate(references, reference_mask)
+    positive_text = batch["conditioning"][:1].to(device, dtype=torch.bfloat16)
+    null_file = loader.text_root / "null_conditioning.safetensors"
+    null_text = load_file(null_file, device="cpu")["empty_prompt"]
+    if null_text.ndim == 2:
+        null_text = null_text.unsqueeze(0)
+    null_text = null_text.to(device, dtype=torch.bfloat16)
+    null_style = adapter.unconditional(1)
+    height = int(sample_cfg.get("height", 512))
+    width = int(sample_cfg.get("width", 512))
+    latent_h, latent_w = height // 8, width // 8
+    generator = torch.Generator(device="cpu").manual_seed(int(sample_cfg.get("seed", 20260811)))
+    x = torch.randn(1, 16, 1, latent_h, latent_w, generator=generator, dtype=torch.float32).to(
+        device=device, dtype=torch.bfloat16
+    )
+    steps = int(sample_cfg.get("steps", 20))
+    sigmas = torch.linspace(1.0, 0.0, steps + 1, device=device, dtype=torch.bfloat16)
+    shift = float(sample_cfg.get("flow_shift", 3.0))
+    sigmas = (sigmas * shift) / (1 + (shift - 1) * sigmas)
+    padding_mask = torch.zeros(1, 1, latent_h, latent_w, device=device, dtype=torch.bfloat16)
+    text_scale = float(sample_cfg.get("text_cfg", 4.0))
+    style_scale = float(sample_cfg.get("style_cfg", 1.0))
+
+    def predict(text: torch.Tensor, style: torch.Tensor, timestep: torch.Tensor):
+        adapter.set_style_tokens(style)
+        return anima(
+            x, timestep.expand(1), context=text, padding_mask=padding_mask,
+            target_input_ids=None,
+        ).float()
+
+    try:
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=device.startswith("cuda")):
+            for index in range(steps):
+                timestep = sigmas[index].to(torch.bfloat16)
+                base = predict(null_text, null_style, timestep)
+                text_only = predict(positive_text, null_style, timestep)
+                full = predict(positive_text, positive_style, timestep)
+                velocity = base + text_scale * (text_only - base) + style_scale * (full - text_only)
+                x = (x.float() + velocity * (sigmas[index + 1] - sigmas[index]).float()).to(torch.bfloat16)
+    finally:
+        adapter.clear_style_tokens()
+
+    if vae is None:
+        vae = _load_sampling_vae(config, destination)
+    vae.to(device=device, dtype=torch.bfloat16)
+    decoded = vae.decode_to_pixels(x).float()
+    vae.to("cpu")
+    pixels = decoded[0]
+    if pixels.ndim == 4:
+        pixels = pixels[:, 0]
+    pixels = ((pixels.clamp(-1, 1) + 1) * 127.5).byte().permute(1, 2, 0).cpu().numpy()
+    generated = Image.fromarray(pixels)
+    sample_dir = output / "samples"
+    sample_dir.mkdir(parents=True, exist_ok=True)
+    raw_path = sample_dir / f"step-{step:07d}.png"
+    sheet_path = sample_dir / f"step-{step:07d}-sheet.png"
+    generated.save(raw_path)
+    _make_sample_sheet(generated, loader, batch).save(sheet_path)
+    gc.collect()
+    if device.startswith("cuda"):
+        torch.cuda.empty_cache()
+    random.setstate(python_rng)
+    torch.set_rng_state(torch_rng)
+    if cuda_rng is not None:
+        torch.cuda.set_rng_state_all(cuda_rng)
+    anima.train()
+    adapter.train()
+    return sheet_path, vae, time.perf_counter() - started
+
+
+def _save_training_state(
+    path: Path,
+    step: int,
+    adapter: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    cfg: dict[str, Any],
+) -> None:
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    state = {
+        "step": step,
+        "adapter": adapter.state_dict(),
+        "optimizer": optimizer.state_dict(),
+        "config": cfg,
+        "python_rng": random.getstate(),
+        "torch_rng": torch.get_rng_state(),
+        "cuda_rng": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+    }
+    torch.save(state, temporary)
+    temporary.replace(path)
+
+
+def _archive_training_state(source: Path, destination: Path) -> None:
+    """Snapshot an immutable checkpoint without serializing optimizer state twice."""
+    temporary = destination.with_suffix(destination.suffix + ".tmp")
+    temporary.unlink(missing_ok=True)
+    try:
+        os.link(source, temporary)
+    except OSError:
+        shutil.copy2(source, temporary)
+    temporary.replace(destination)
+
+
 def train_style_adapter(config: dict[str, Any], destination: Path, *, steps_override: int | None = None) -> dict[str, Any]:
     cfg = config["style_transfer"]
     training = cfg["training"]
@@ -542,6 +793,9 @@ def train_style_adapter(config: dict[str, Any], destination: Path, *, steps_over
     torch.manual_seed(seed)
     torch.backends.cuda.matmul.allow_tf32 = bool(training.get("allow_tf32", True))
     loader = ProductionStyleLoader(destination, cfg["loader"])
+    validation_loader_cfg = {**cfg["loader"], "split": "validation", "batch_size": 1}
+    validation_loader_cfg["seed"] = seed ^ 0x51A7
+    validation_loader = ProductionStyleLoader(destination, validation_loader_cfg)
     resampler = load_per_reference_resampler(destination, cfg["resampler"], device)
     anima = _resolve_anima_model(config, destination, device)
     anima.requires_grad_(False).train()
@@ -560,63 +814,135 @@ def train_style_adapter(config: dict[str, Any], destination: Path, *, steps_over
     if steps_override is not None:
         output = output / f"smoke-{steps_override}-steps"
     output.mkdir(parents=True, exist_ok=True)
+    checkpoint_path = output / "training_state.pt"
+    checkpoint_dir = output / "checkpoints"
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    start_step = 0
+    resume = bool(training.get("resume", True)) and steps_override is None
+    if resume and checkpoint_path.exists():
+        state = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+        adapter.load_state_dict(state["adapter"])
+        optimizer.load_state_dict(state["optimizer"])
+        start_step = int(state["step"])
+        random.setstate(state["python_rng"])
+        torch.set_rng_state(state["torch_rng"])
+        if state.get("cuda_rng") is not None:
+            torch.cuda.set_rng_state_all(state["cuda_rng"])
+        print(f"resuming style training from step {start_step}", flush=True)
+    if start_step >= steps:
+        raise RuntimeError(f"Checkpoint is already at step {start_step}, requested steps={steps}")
+
+    wandb_run = None
+    wandb_cfg = dict(training.get("wandb", {}))
+    if bool(wandb_cfg.get("enabled", False)) and steps_override is None:
+        import wandb
+
+        wandb_run = wandb.init(
+            project=str(wandb_cfg.get("project", "anima-style-adapter")),
+            entity=wandb_cfg.get("entity"),
+            name=str(wandb_cfg.get("name", "anima-style-transfer")),
+            id=str(wandb_cfg.get("id", "anima-style-transfer-l18-l24")),
+            resume="allow",
+            config=cfg,
+        )
     metrics = []
     started = time.perf_counter()
-    iterator = loader.prefetch(
-        0, steps, workers=int(training.get("prefetch_workers", 2)),
+    if device.startswith("cuda"):
+        torch.cuda.reset_peak_memory_stats()
+    iterator = iter(loader.prefetch(
+        start_step, steps - start_step, workers=int(training.get("prefetch_workers", 2)),
         depth=int(training.get("prefetch_batches", 4)),
-    )
-    for step, batch in enumerate(iterator, start=1):
+    ))
+    checkpoint_every = int(training.get("checkpoint_every", 500))
+    validation_every = int(training.get("validation_every", 500))
+    validation_batches = int(training.get("validation_batches", 8))
+    sample_every = int(training.get("sample_every", 1000))
+    log_every = int(training.get("log_every", 10))
+    vae = None
+    for zero_based_step in range(start_step, steps):
+        wait_started = time.perf_counter()
+        batch = next(iterator)
+        data_wait = time.perf_counter() - wait_started
+        step = zero_based_step + 1
         data_ready = time.perf_counter()
-        references = _encode_reference_tokens(resampler, batch, device)
-        reference_mask = batch["reference_mask"].to(device, non_blocking=True)
-        latents = batch["latents"].to(device, non_blocking=True, dtype=torch.bfloat16)
-        conditioning = batch["conditioning"].to(device, non_blocking=True, dtype=torch.bfloat16)
         optimizer.zero_grad(set_to_none=True)
-        with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=device.startswith("cuda")):
-            style_tokens = adapter.aggregate(references, reference_mask)
-            adapter.set_style_tokens(style_tokens)
-            noise = torch.randn_like(latents)
-            timesteps = torch.rand(latents.shape[0], device=device, dtype=torch.float32)
-            sigma = timesteps[:, None, None, None].to(latents.dtype)
-            model_timesteps = timesteps.to(latents.dtype)
-            noisy = (1 - sigma) * latents + sigma * noise
-            padding_mask = torch.zeros(
-                latents.shape[0], 1, latents.shape[-2], latents.shape[-1],
-                device=device, dtype=latents.dtype,
-            )
-            prediction = anima(
-                noisy.unsqueeze(2), model_timesteps, context=conditioning,
-                padding_mask=padding_mask, target_input_ids=None,
-            ).squeeze(2)
-            target = noise - latents
-            loss = F.mse_loss(prediction.float(), target.float())
+        loss, details = _forward_flow_loss(anima, adapter, resampler, batch, device)
         loss.backward()
-        grad_norm = torch.nn.utils.clip_grad_norm_(parameters, float(training.get("max_grad_norm", 1.0)))
-        optimizer.step()
+        # Non-reentrant block checkpointing replays style attention during
+        # backward, so the active tokens must remain attached until this point.
         adapter.clear_style_tokens()
+        grad_norm = torch.nn.utils.clip_grad_norm_(parameters, float(training.get("max_grad_norm", 1.0)))
+        group_grads = {
+            "aggregator_grad": _parameter_grad_norm(adapter.aggregator.parameters()),
+            "shared_kv_grad": _parameter_grad_norm(
+                list(adapter.shared_k.parameters()) + list(adapter.shared_v.parameters())
+            ),
+            "gate_grad": _parameter_grad_norm(adapter.gate.parameters()),
+        }
+        optimizer.step()
         elapsed = time.perf_counter() - data_ready
         row = {
             "step": step, "loss": float(loss.detach()), "grad_norm": float(grad_norm),
-            "step_s": elapsed, "references": int(reference_mask.sum()),
-            "latent_shape": list(latents.shape),
+            "step_s": elapsed, "data_wait_s": data_wait,
+            "peak_vram_gib": torch.cuda.max_memory_allocated() / (1024**3) if device.startswith("cuda") else 0.0,
+            **details, **group_grads,
         }
         metrics.append(row)
-        print(
-            f"style step={step}/{steps} loss={row['loss']:.6f} grad={row['grad_norm']:.4f} "
-            f"refs={row['references']} shape={tuple(latents.shape)} step_s={elapsed:.2f}", flush=True,
-        )
+        metrics = metrics[-100:]
+        if step == start_step + 1 or step % log_every == 0 or step == steps:
+            print(
+                f"style step={step}/{steps} loss={row['loss']:.6f} grad={row['grad_norm']:.4f} "
+                f"refs={row['references']} shape={tuple(row['latent_shape'])} step_s={elapsed:.2f} "
+                f"data_wait_s={data_wait:.3f} peak_vram={row['peak_vram_gib']:.2f}GiB",
+                flush=True,
+            )
+            if wandb_run is not None:
+                wandb_run.log(
+                    {f"train/{key}": value for key, value in row.items() if key not in {"step", "latent_shape"}},
+                    step=step,
+                )
+        if validation_every and step % validation_every == 0:
+            validation = _validate_style_adapter(
+                anima, adapter, resampler, validation_loader, device,
+                batches=validation_batches, seed=seed ^ 0xA11CE,
+            )
+            print(
+                f"validation step={step} loss={validation['loss']:.6f} "
+                f"batches={validation_batches} elapsed_s={validation['elapsed_s']:.2f}",
+                flush=True,
+            )
+            if wandb_run is not None:
+                wandb_run.log({f"validation/{key}": value for key, value in validation.items()}, step=step)
+        if sample_every and step % sample_every == 0:
+            sheet_path, vae, sample_s = _sample_style_adapter(
+                anima, adapter, resampler, validation_loader, config, destination,
+                output, device, step, vae,
+            )
+            print(f"sample step={step} path={sheet_path} elapsed_s={sample_s:.2f}", flush=True)
+            if wandb_run is not None:
+                import wandb
+
+                wandb_run.log(
+                    {"sample/image": wandb.Image(str(sheet_path)), "sample/elapsed_s": sample_s},
+                    step=step,
+                )
+        if checkpoint_every and step % checkpoint_every == 0:
+            _save_training_state(checkpoint_path, step, adapter, optimizer, cfg)
+            _archive_training_state(
+                checkpoint_path, checkpoint_dir / f"step-{step:07d}.pt"
+            )
+
     checkpoint = output / "checkpoint.pt"
-    torch.save(
-        {"step": steps, "adapter": adapter.state_dict(), "optimizer": optimizer.state_dict(), "config": cfg},
-        checkpoint,
-    )
+    _save_training_state(checkpoint_path, steps, adapter, optimizer, cfg)
+    _archive_training_state(checkpoint_path, checkpoint)
     summary = {
         "steps": steps, "metrics": metrics, "elapsed_s": time.perf_counter() - started,
         "checkpoint": str(checkpoint.resolve()),
         "trainable_parameters": sum(value.numel() for value in parameters),
     }
     write_json(output / "summary.json", summary)
+    if wandb_run is not None:
+        wandb_run.finish()
     return summary
 
 

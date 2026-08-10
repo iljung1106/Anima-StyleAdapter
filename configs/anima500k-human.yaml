@@ -294,3 +294,23 @@ style_transfer:
     allow_tf32: true
     prefetch_workers: 2
     prefetch_batches: 4
+    log_every: 10
+    validation_every: 500
+    validation_batches: 8
+    checkpoint_every: 500
+    sample_every: 1000
+    resume: true
+    wandb:
+      enabled: true
+      project: anima-style-adapter
+      name: anima-style-transfer-l18-l24-siglip-l24
+      id: anima-style-transfer-l18-l24-siglip-l24-v1
+  sampling:
+    episode: 0
+    width: 512
+    height: 512
+    steps: 20
+    flow_shift: 3.0
+    seed: 20260811
+    text_cfg: 4.0
+    style_cfg: 1.0
