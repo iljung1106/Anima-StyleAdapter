@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import math
 import os
+import time
 from collections import defaultdict
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -177,6 +180,261 @@ def _caption_rows(destination: Path) -> list[dict[str, Any]]:
     for shard in shards:
         rows.extend(read_records(shard))
     return rows
+
+
+def _selected_style_feature_signature(
+    radio_cfg: dict[str, Any], feature_cfg: dict[str, Any]
+) -> str:
+    payload = {
+        "model_version": radio_cfg["model_version"],
+        "torchhub_ref": radio_cfg["torchhub_ref"],
+        "spatial_layers": sorted(int(value) for value in feature_cfg["spatial_layers"]),
+        "statistics_layers": sorted(
+            int(value) for value in feature_cfg.get("statistics_layers", [])
+        ),
+        "statistics": list(feature_cfg.get("statistics", ["mean", "std"])),
+        "storage_dtype": feature_cfg["storage_dtype"],
+        "preprocess": {
+            key: int(radio_cfg[key])
+            for key in ("patch_size", "min_side", "max_side", "max_pixels")
+        },
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _selected_style_tensors(
+    intermediate: list[Any],
+    layers: list[int],
+    spatial_layers: set[int],
+    statistics_layers: set[int],
+    storage_dtype: Any,
+) -> list[dict[str, Any]]:
+    """Collect the deliberately small, production-selected C-RADIO feature set."""
+    outputs: list[dict[str, Any]] = []
+    batch_size = int(intermediate[0].features.shape[0])
+    for item_index in range(batch_size):
+        tensors: dict[str, Any] = {}
+        for layer, output in zip(layers, intermediate):
+            spatial = output.features[item_index]
+            if layer in spatial_layers:
+                tensors[f"layer_{layer:02d}_spatial"] = spatial.detach().to(
+                    "cpu", dtype=storage_dtype
+                )
+            if layer in statistics_layers:
+                stable = spatial.detach().float()
+                tensors[f"layer_{layer:02d}_mean"] = stable.mean(dim=0).to(
+                    "cpu", dtype=storage_dtype
+                )
+                tensors[f"layer_{layer:02d}_std"] = stable.std(
+                    dim=0, correction=0
+                ).to("cpu", dtype=storage_dtype)
+        outputs.append(tensors)
+    return outputs
+
+
+def extract_selected_style_features(
+    config: dict[str, Any], destination: Path
+) -> dict[str, Any]:
+    """Cache L20/L24 spatial tokens and compact low-level style statistics."""
+    import torch
+    from safetensors.torch import save_file
+
+    feature_cfg = config["style_features"]
+    radio_cfg = {**config["cradio"], **feature_cfg.get("preprocess", {})}
+    spatial_layers = {int(value) for value in feature_cfg["spatial_layers"]}
+    statistics_layers = {
+        int(value) for value in feature_cfg.get("statistics_layers", [])
+    }
+    statistics = set(feature_cfg.get("statistics", ["mean", "std"]))
+    if statistics != {"mean", "std"}:
+        raise ValueError("style_features.statistics must contain exactly mean and std")
+    layers = sorted(spatial_layers | statistics_layers)
+    signature = _selected_style_feature_signature(radio_cfg, feature_cfg)
+
+    features_dir = destination / "style_features"
+    manifest_dir = features_dir / "manifests"
+    manifest_dir.mkdir(parents=True, exist_ok=True)
+    completed_rows: list[dict[str, Any]] = []
+    shard_numbers: list[int] = []
+    for path in sorted(manifest_dir.glob("part-*.parquet")):
+        shard_numbers.append(int(path.stem.split("-")[-1]))
+        part = read_records(path)
+        mismatched = [row for row in part if row.get("feature_signature") != signature]
+        if mismatched:
+            raise RuntimeError(
+                "Existing style feature shards use a different configuration; "
+                "choose a new output directory or move the old cache"
+            )
+        completed_rows.extend(part)
+    completed_ids = {int(row["id"]) for row in completed_rows}
+    # This cache is image-only. Read the post-dedup inventory directly so it
+    # neither consumes captions nor depends on the caption stage.
+    all_rows = read_records(destination / "final_manifest.parquet")
+    rows = [row for row in all_rows if int(row["id"]) not in completed_ids]
+    shard_index = max(shard_numbers) + 1 if shard_numbers else 0
+
+    if not rows:
+        total_bytes = sum(path.stat().st_size for path in features_dir.glob("*.safetensors"))
+        summary = {
+            "total": len(completed_rows),
+            "newly_encoded": 0,
+            "spatial_layers": sorted(spatial_layers),
+            "statistics_layers": sorted(statistics_layers),
+            "storage_bytes": total_bytes,
+            "feature_signature": signature,
+        }
+        write_json(features_dir / "summary.json", summary)
+        return summary
+
+    model, device = _load_cradio(radio_cfg, destination / "cradio_model_cache")
+    if min(layers) < 0 or max(layers) >= len(model.model.blocks):
+        raise ValueError(f"Feature layers must be in [0, {len(model.model.blocks) - 1}]")
+
+    batch_size = int(feature_cfg.get("batch_size", radio_cfg["batch_size"]))
+    shard_rows = int(feature_cfg.get("shard_rows", 128))
+    max_open_buckets = int(feature_cfg.get("max_open_buckets", 64))
+    preprocess_workers = int(feature_cfg.get("preprocess_workers", 8))
+    prefetch_images = max(
+        preprocess_workers, int(feature_cfg.get("prefetch_images", 64))
+    )
+    storage_dtype = _storage_dtype(feature_cfg["storage_dtype"])
+    amp_name = str(feature_cfg.get("amp_dtype", radio_cfg["amp_dtype"]))
+    amp_dtype = {
+        "float16": torch.float16,
+        "bfloat16": torch.bfloat16,
+        "float32": torch.float32,
+    }[amp_name]
+    amp_enabled = device.startswith("cuda") and amp_name != "float32"
+    buckets: dict[
+        tuple[int, int], list[tuple[dict[str, Any], torch.Tensor, PreprocessInfo]]
+    ] = defaultdict(list)
+    tensor_buffer: dict[str, torch.Tensor] = {}
+    record_buffer: list[dict[str, Any]] = []
+    output_rows = list(completed_rows)
+    newly_encoded = 0
+    started = time.monotonic()
+
+    def flush_shard() -> None:
+        nonlocal tensor_buffer, record_buffer, shard_index
+        if not record_buffer:
+            return
+        feature_path = features_dir / f"part-{shard_index:05d}.safetensors"
+        temporary = feature_path.with_suffix(feature_path.suffix + ".tmp")
+        save_file(
+            {key: value.contiguous() for key, value in tensor_buffer.items()}, temporary
+        )
+        temporary.replace(feature_path)
+        for record in record_buffer:
+            record["feature_shard"] = feature_path.name
+        write_records(manifest_dir / f"part-{shard_index:05d}.parquet", record_buffer)
+        output_rows.extend(record_buffer)
+        print(
+            f"wrote selected style feature shard {shard_index} "
+            f"({len(record_buffer)} images; total_new={newly_encoded})",
+            flush=True,
+        )
+        tensor_buffer = {}
+        record_buffer = []
+        shard_index += 1
+
+    def run_batch(items: list[tuple[dict[str, Any], torch.Tensor, PreprocessInfo]]) -> None:
+        nonlocal newly_encoded
+        images = torch.stack([item[1] for item in items]).to(device, non_blocking=True)
+        with torch.inference_mode(), torch.autocast(
+            device_type="cuda", dtype=amp_dtype, enabled=amp_enabled
+        ):
+            _, intermediate = model.forward_intermediates(
+                images,
+                indices=layers,
+                return_prefix_tokens=True,
+                norm=True,
+                output_fmt="NLC",
+                aggregation="sparse",
+            )
+        selected = _selected_style_tensors(
+            intermediate, layers, spatial_layers, statistics_layers, storage_dtype
+        )
+        for (row, _, info), tensors in zip(items, selected):
+            image_id = int(row["id"])
+            for name, tensor in tensors.items():
+                tensor_buffer[f"{image_id}.{name}"] = tensor
+            record_buffer.append(
+                {
+                    "id": image_id,
+                    "artist": row["artist"],
+                    "style_id": row.get("style_id", row["artist"]),
+                    "split": row.get("split", "train"),
+                    "local_path": row["local_path"],
+                    "target_height": info.target_height,
+                    "target_width": info.target_width,
+                    "spatial_tokens": (info.target_height // 16)
+                    * (info.target_width // 16),
+                    "spatial_dim": int(next(iter(tensors.values())).shape[-1]),
+                    "storage_dtype": feature_cfg["storage_dtype"],
+                    "feature_signature": signature,
+                    "model_version": radio_cfg["model_version"],
+                    "torchhub_ref": radio_cfg["torchhub_ref"],
+                }
+            )
+            newly_encoded += 1
+        if len(record_buffer) >= shard_rows:
+            flush_shard()
+
+    def flush_bucket(key: tuple[int, int]) -> None:
+        items = buckets.pop(key)
+        for offset in range(0, len(items), batch_size):
+            run_batch(items[offset : offset + batch_size])
+
+    def load_image(row: dict[str, Any]):
+        with Image.open(row["local_path"]) as image:
+            array, info = preprocess_cradio_image(image, radio_cfg)
+        return row, torch.from_numpy(array), info
+
+    with ThreadPoolExecutor(max_workers=preprocess_workers) as executor:
+        pending: dict[int, Future[Any]] = {}
+        next_submit = 0
+        for index in range(len(rows)):
+            while next_submit < len(rows) and next_submit < index + prefetch_images:
+                pending[next_submit] = executor.submit(load_image, rows[next_submit])
+                next_submit += 1
+            row, tensor, info = pending.pop(index).result()
+            key = (info.target_height, info.target_width)
+            buckets[key].append((row, tensor, info))
+            if len(buckets[key]) >= batch_size:
+                flush_bucket(key)
+            elif len(buckets) > max_open_buckets:
+                fullest = max(buckets, key=lambda bucket: len(buckets[bucket]))
+                flush_bucket(fullest)
+            if (index + 1) % 1000 == 0:
+                elapsed = time.monotonic() - started
+                print(
+                    f"prepared selected style images {index + 1}/{len(rows)} "
+                    f"({(index + 1) / elapsed:.2f} images/s)",
+                    flush=True,
+                )
+
+    for key in list(buckets):
+        flush_bucket(key)
+    flush_shard()
+    output_rows.sort(key=lambda row: int(row["id"]))
+    write_records(features_dir / "manifest.parquet", output_rows)
+    total_bytes = sum(path.stat().st_size for path in features_dir.glob("*.safetensors"))
+    summary = {
+        "total": len(output_rows),
+        "previously_encoded": len(completed_rows),
+        "newly_encoded": newly_encoded,
+        "spatial_layers": sorted(spatial_layers),
+        "statistics_layers": sorted(statistics_layers),
+        "statistics": sorted(statistics),
+        "storage_dtype": feature_cfg["storage_dtype"],
+        "storage_bytes": total_bytes,
+        "average_bytes_per_image": total_bytes / len(output_rows),
+        "feature_signature": signature,
+        "manifest": str((features_dir / "manifest.parquet").resolve()),
+    }
+    write_json(features_dir / "summary.json", summary)
+    return summary
 
 
 def extract_cradio_features(config: dict[str, Any], destination: Path) -> dict[str, Any]:

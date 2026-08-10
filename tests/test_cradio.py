@@ -3,6 +3,7 @@ import torch
 from PIL import Image
 
 from anima_style_data.cradio import (
+    _selected_style_tensors,
     build_style_feature_combiner,
     compute_cradio_size,
     content_subtracted_summary,
@@ -48,3 +49,37 @@ def test_content_subtraction_and_trainable_combiner_shapes():
     combiner = build_style_feature_combiner(6, 4, 8)
     combined = combiner(torch.randn(2, 12, 6), torch.randn(2, 4))
     assert combined.shape == (2, 13, 8)
+
+
+def test_selected_style_tensors_keep_spatial_and_population_statistics():
+    class Output:
+        def __init__(self, features):
+            self.features = features
+
+    layer_8 = torch.arange(2 * 3 * 4, dtype=torch.float32).reshape(2, 3, 4)
+    layer_20 = layer_8 + 100
+    layer_24 = layer_8 + 200
+    selected = _selected_style_tensors(
+        [Output(layer_8), Output(layer_20), Output(layer_24)],
+        [8, 20, 24],
+        {20, 24},
+        {8},
+        torch.float16,
+    )
+
+    assert set(selected[0]) == {
+        "layer_08_mean",
+        "layer_08_std",
+        "layer_20_spatial",
+        "layer_24_spatial",
+    }
+    assert selected[0]["layer_20_spatial"].shape == (3, 4)
+    torch.testing.assert_close(
+        selected[0]["layer_08_mean"].float(), layer_8[0].mean(dim=0)
+    )
+    torch.testing.assert_close(
+        selected[0]["layer_08_std"].float(),
+        layer_8[0].std(dim=0, correction=0),
+        atol=1e-3,
+        rtol=1e-3,
+    )

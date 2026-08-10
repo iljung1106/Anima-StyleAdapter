@@ -51,6 +51,13 @@ Prefetch episode는 `(seed, step)`으로 직접 결정되므로 queue가 먼저 
 
 ## 다음 단계
 
-전체 데이터 특징 캐시는 C-RADIO block 20과 24 spatial token만 FP16/BF16으로 생성한다. 첫 공통 style encoder에는 SigLIP CLS와 final visual embedding을 넣지 않는다. 이 결정은 현재 pilot의 작가 prototype·feature reconstruction 목적에 대한 것이며, 이후 실제 Anima 생성 평가에서 global 색채나 구도 정보 부족이 관찰될 때만 SigLIP 계열을 별도 ablation으로 다시 검토한다.
+전체 데이터 특징 캐시는 C-RADIO block 20과 24 spatial token을 FP16으로 생성하고, 저수준 선·색·질감 정보에 대한 저비용 보험으로 block 8 spatial token의 채널별 mean/std도 함께 저장한다. L8의 전체 spatial map, SigLIP CLS와 final visual embedding은 저장하지 않는다. 이 결정은 현재 pilot의 작가 prototype·feature reconstruction 목적에 대한 것이며, 이후 실제 Anima 생성 평가에서 global 색채나 구도 정보 부족이 관찰될 때만 SigLIP 계열을 별도 ablation으로 다시 검토한다.
+
+전체 dedup 매니페스트에 대한 재개 가능한 추출 명령은 다음과 같다. 캡션이나 태그는 이 단계의 입력으로 사용하지 않는다.
+
+```bash
+HF_HOME=/workspace/.cache/huggingface \
+  .venv/bin/anima-data --config configs/anima500k-human.yaml style-extract
+```
 
 이번 결과는 단일 seed와 작가당 10장인 pilot이다. 따라서 정확한 절대 성능보다 후보 간 큰 차이와 비용 방향을 선택 근거로 사용한다.

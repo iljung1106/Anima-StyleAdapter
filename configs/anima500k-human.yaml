@@ -64,6 +64,23 @@ cradio:
   normalize_residual: true
   shard_rows: 128
 
+# Production cache selected by the 1,000-artist tap-resampler pilot. Keep the
+# late spatial maps intact and retain only cheap low-level channel statistics.
+style_features:
+  spatial_layers: [20, 24]
+  statistics_layers: [8]
+  statistics: [mean, std]
+  storage_dtype: float16
+  amp_dtype: bfloat16
+  batch_size: 4
+  shard_rows: 128
+  max_open_buckets: 64
+  preprocess_workers: 8
+  prefetch_images: 64
+  preprocess:
+    max_side: 512
+    max_pixels: 262144
+
 cradio_probe:
   seed: 20260810
   split: train

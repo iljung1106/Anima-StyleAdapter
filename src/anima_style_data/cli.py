@@ -9,7 +9,7 @@ from typing import Any
 from .anima500k import download_anima500k_human, extract_anima500k_human
 from .caption import create_anima_captions
 from .config import load_config, output_dir
-from .cradio import extract_cradio_features
+from .cradio import extract_cradio_features, extract_selected_style_features
 from .dedup import deduplicate
 from .deepghs import download_deepghs_candidates
 from .download import download_candidates
@@ -49,6 +49,7 @@ def build_parser() -> argparse.ArgumentParser:
         ("tag", "Run the WD EVA02 tagger into resumable Parquet shards"),
         ("caption", "Build ordered Anima and content caption shards"),
         ("features", "Cache C-RADIO spatial and SigLIP2-g residual features"),
+        ("style-extract", "Cache selected production C-RADIO style features"),
         ("probe-extract", "Extract pooled C-RADIO layer candidates on a style subset"),
         ("probe-evaluate", "Evaluate multi-reference artist retrieval for probe features"),
         ("probe", "Extract and evaluate C-RADIO feature candidates"),
@@ -85,6 +86,8 @@ def main() -> None:
         _run(create_anima_captions, config, destination)
     elif args.command == "features":
         _run(extract_cradio_features, config, destination)
+    elif args.command == "style-extract":
+        _run(extract_selected_style_features, config, destination)
     elif args.command == "probe-extract":
         _run(extract_probe_features, config, destination)
     elif args.command == "probe-evaluate":
