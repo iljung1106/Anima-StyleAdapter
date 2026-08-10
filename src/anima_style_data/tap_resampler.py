@@ -71,6 +71,104 @@ def _experiment_dir(destination: Path, cfg: dict[str, Any]) -> Path:
     return path
 
 
+def _materialize_local_feature_cache(
+    rows: list[dict[str, Any]],
+    source_dir: Path,
+    local_dir: Path,
+    feature_cfg: dict[str, Any],
+    variants: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Repack the selected pilot tensors once so training avoids random NFS reads."""
+    from safetensors import safe_open
+    from safetensors.torch import save_file
+
+    manifest_dir = local_dir / "manifests"
+    manifest_dir.mkdir(parents=True, exist_ok=True)
+    completed_rows: list[dict[str, Any]] = []
+    shard_numbers: list[int] = []
+    for path in sorted(manifest_dir.glob("part-*.parquet")):
+        shard_numbers.append(int(path.stem.split("-")[-1]))
+        completed_rows.extend(read_records(path))
+    completed_ids = {int(row["id"]) for row in completed_rows}
+    selected_ids = {int(row["id"]) for row in rows}
+    if completed_ids - selected_ids:
+        raise RuntimeError(
+            f"Local feature cache contains {len(completed_ids - selected_ids)} stale images: "
+            f"{local_dir}"
+        )
+
+    layers = sorted(int(layer) for layer in feature_cfg["layers"])
+    native_globals = sorted(
+        {
+            int(str(variant["global"]).rsplit("_", 1)[-1])
+            for variant in variants
+            if str(variant.get("global", "none")).startswith("native_")
+        }
+    )
+    needs_visual = any(
+        str(variant.get("global", "none")) == "siglip_visual" for variant in variants
+    )
+    tensor_suffixes = [f"layer_{layer:02d}_spatial" for layer in layers]
+    tensor_suffixes.extend(f"layer_{layer:02d}_siglip_cls" for layer in native_globals)
+    if needs_visual:
+        tensor_suffixes.append("siglip_visual")
+
+    remaining = [row for row in rows if int(row["id"]) not in completed_ids]
+    grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for row in remaining:
+        grouped[str(row["feature_shard"])].append(row)
+    shard_rows = int(feature_cfg.get("local_shard_rows", 512))
+    shard_index = max(shard_numbers) + 1 if shard_numbers else 0
+    tensor_buffer: dict[str, Any] = {}
+    record_buffer: list[dict[str, Any]] = []
+
+    def flush() -> None:
+        nonlocal tensor_buffer, record_buffer, shard_index
+        if not record_buffer:
+            return
+        feature_path = local_dir / f"part-{shard_index:05d}.safetensors"
+        temporary = feature_path.with_suffix(feature_path.suffix + ".tmp")
+        save_file(tensor_buffer, temporary)
+        temporary.replace(feature_path)
+        for record in record_buffer:
+            record["feature_shard"] = feature_path.name
+        write_records(manifest_dir / f"part-{shard_index:05d}.parquet", record_buffer)
+        completed_rows.extend(record_buffer)
+        print(
+            f"materialized local feature shard {shard_index} "
+            f"({len(record_buffer)} images)",
+            flush=True,
+        )
+        tensor_buffer = {}
+        record_buffer = []
+        shard_index += 1
+
+    for source_shard, shard_rows_ in sorted(grouped.items()):
+        with safe_open(source_dir / source_shard, framework="pt", device="cpu") as handle:
+            for row in shard_rows_:
+                image_id = int(row["id"])
+                for suffix in tensor_suffixes:
+                    key = f"{image_id}.{suffix}"
+                    tensor_buffer[key] = handle.get_tensor(key).clone()
+                record_buffer.append(dict(row))
+                if len(record_buffer) >= shard_rows:
+                    flush()
+    flush()
+    completed_rows.sort(key=lambda row: int(row["experiment_artist_index"]) * 100 + int(row["experiment_sample_rank"]))
+    write_records(local_dir / "manifest.parquet", completed_rows)
+    write_json(
+        local_dir / "summary.json",
+        {
+            "images": len(completed_rows),
+            "layers": layers,
+            "native_global_layers": native_globals,
+            "source_directory": str(source_dir),
+            "storage_bytes": sum(path.stat().st_size for path in local_dir.glob("*.safetensors")),
+        },
+    )
+    return completed_rows
+
+
 def extract_tap_features(config: dict[str, Any], destination: Path) -> dict[str, Any]:
     import torch
     import torch.nn.functional as F
@@ -125,6 +223,15 @@ def extract_tap_features(config: dict[str, Any], destination: Path) -> dict[str,
             }
             for row in rows
         ]
+        local_cache_directory = feature_cfg.get("local_cache_directory")
+        if local_cache_directory:
+            output_rows = _materialize_local_feature_cache(
+                output_rows,
+                source_dir,
+                Path(str(local_cache_directory)),
+                feature_cfg,
+                list(cfg["variants"]),
+            )
         manifest_path = feature_dir / "manifest.parquet"
         write_records(manifest_path, output_rows)
         summary = {
@@ -132,6 +239,9 @@ def extract_tap_features(config: dict[str, Any], destination: Path) -> dict[str,
             "images": len(output_rows),
             "layers": sorted(int(layer) for layer in feature_cfg["layers"]),
             "source_directory": str(source_directory),
+            "local_cache_directory": (
+                str(local_cache_directory) if local_cache_directory else None
+            ),
             "storage_bytes": 0,
             "manifest": str(manifest_path.resolve()),
         }
@@ -267,6 +377,9 @@ def extract_tap_features(config: dict[str, Any], destination: Path) -> dict[str,
 def _feature_storage_dir(
     destination: Path, root: Path, feature_cfg: dict[str, Any]
 ) -> Path:
+    local_cache_directory = feature_cfg.get("local_cache_directory")
+    if local_cache_directory:
+        return Path(str(local_cache_directory))
     source_directory = feature_cfg.get("source_directory")
     return destination / str(source_directory) if source_directory else root / "features"
 
@@ -469,21 +582,25 @@ def _load_feature_batch(
             for row in shard_rows:
                 image_id = int(row["id"])
                 loaded[image_id] = {
-                    layer: handle.get_tensor(f"{image_id}.layer_{layer:02d}_spatial").float()
+                    layer: handle.get_tensor(f"{image_id}.layer_{layer:02d}_spatial")
                     for layer in needed
                 }
                 if global_kind.startswith("native_"):
                     layer = int(global_kind.rsplit("_", 1)[-1])
                     globals_[image_id] = handle.get_tensor(
                         f"{image_id}.layer_{layer:02d}_siglip_cls"
-                    ).float()
+                    )
                 elif global_kind == "siglip_visual":
-                    globals_[image_id] = handle.get_tensor(f"{image_id}.siglip_visual").float()
+                    globals_[image_id] = handle.get_tensor(f"{image_id}.siglip_visual")
 
     max_tokens = max(int(row["spatial_tokens"]) for row in rows)
     mask = torch.zeros((len(rows), max_tokens), dtype=torch.bool)
+    feature_dtype = loaded[int(rows[0]["id"])][needed[0]].dtype
     features = {
-        layer: torch.zeros((len(rows), max_tokens, int(rows[0]["spatial_dim"])))
+        layer: torch.zeros(
+            (len(rows), max_tokens, int(rows[0]["spatial_dim"])),
+            dtype=feature_dtype,
+        )
         for layer in needed
     }
     targets = {layer: features[layer] for layer in reconstruction_taps}
@@ -503,6 +620,91 @@ def _load_feature_batch(
         [(int(row["target_height"]), int(row["target_width"])) for row in rows],
         global_batch,
     )
+
+
+class _PinnedCudaBatchPipeline:
+    """Two reusable pinned host slots with an independent CUDA transfer stream."""
+
+    def __init__(self, device: str):
+        import torch
+
+        self.device = device
+        self.stream = torch.cuda.Stream(device=device)
+        self.slots: list[dict[str, Any]] = [
+            {"buffers": {}, "event": None},
+            {"buffers": {}, "event": None},
+        ]
+
+    @staticmethod
+    def _view(buffer, shape: tuple[int, ...]):
+        return buffer[tuple(slice(0, size) for size in shape)]
+
+    def _copy_to_slot(self, slot: dict[str, Any], name: str, value):
+        import torch
+
+        shape = tuple(value.shape)
+        buffer = slot["buffers"].get(name)
+        if (
+            buffer is None
+            or buffer.dtype != value.dtype
+            or buffer.ndim != value.ndim
+            or any(current < required for current, required in zip(buffer.shape, shape))
+        ):
+            buffer = torch.empty(shape, dtype=value.dtype, pin_memory=True)
+            slot["buffers"][name] = buffer
+        view = self._view(buffer, shape)
+        view.copy_(value)
+        return view
+
+    def stage(self, loaded, slot_index: int):
+        import torch
+
+        features, targets, mask, shapes, global_feature = loaded
+        slot = self.slots[slot_index]
+        if slot["event"] is not None:
+            # The slot is reused two iterations later. Ensure its previous H2D
+            # copy no longer reads the pinned memory before overwriting it.
+            slot["event"].synchronize()
+        unique = {**targets, **features}
+        host_features = {
+            layer: self._copy_to_slot(slot, f"layer_{layer}", value)
+            for layer, value in unique.items()
+        }
+        host_mask = self._copy_to_slot(slot, "mask", mask)
+        host_global = (
+            self._copy_to_slot(slot, "global", global_feature)
+            if global_feature is not None
+            else None
+        )
+        with torch.cuda.stream(self.stream):
+            device_features = {
+                layer: value.to(self.device, non_blocking=True)
+                for layer, value in host_features.items()
+            }
+            device_mask = host_mask.to(self.device, non_blocking=True)
+            device_global = (
+                host_global.to(self.device, non_blocking=True)
+                if host_global is not None
+                else None
+            )
+            event = torch.cuda.Event()
+            event.record(self.stream)
+        slot["event"] = event
+        return {
+            "event": event,
+            "features": {layer: device_features[layer] for layer in features},
+            "targets": {layer: device_features[layer] for layer in targets},
+            "mask": device_mask,
+            "shapes": shapes,
+            "global": device_global,
+            "padding_efficiency": float(mask.sum().item() / mask.numel()),
+        }
+
+    @staticmethod
+    def wait(batch) -> None:
+        import torch
+
+        torch.cuda.current_stream().wait_event(batch["event"])
 
 
 def _prototype_loss(embeddings, artists_per_batch: int, images_per_artist: int, temperature: float):
@@ -559,6 +761,7 @@ def _training_rows_for_step(
     train_by_style: dict[str, list[dict[str, Any]]],
     artists_per_batch: int,
     images_per_artist: int,
+    token_bucket_centers: list[int] | None = None,
 ) -> list[dict[str, Any]]:
     """Build a deterministic episode without mutable sampler state.
 
@@ -566,11 +769,37 @@ def _training_rows_for_step(
     changing checkpoint/resume behavior or the batches seen by other variants.
     """
     rng = random.Random((int(seed) << 32) ^ int(step))
+    target_tokens = (
+        rng.choice(token_bucket_centers) if token_bucket_centers else None
+    )
     selected_artists = rng.sample(artists, artists_per_batch)
     rows = []
     for artist in selected_artists:
-        rows.extend(rng.sample(train_by_style[artist], images_per_artist))
+        candidates = train_by_style[artist]
+        if target_tokens is not None:
+            candidates = sorted(
+                candidates,
+                key=lambda row: (
+                    abs(int(row["spatial_tokens"]) - target_tokens),
+                    str(row["id"]),
+                ),
+            )[:images_per_artist]
+        rows.extend(rng.sample(candidates, images_per_artist))
     return rows
+
+
+def _token_bucket_centers(rows: list[dict[str, Any]], bucket_count: int) -> list[int]:
+    values = sorted(int(row["spatial_tokens"]) for row in rows)
+    if not values or bucket_count <= 0:
+        return []
+    if bucket_count == 1:
+        return [values[len(values) // 2]]
+    return sorted(
+        {
+            values[round(index * (len(values) - 1) / (bucket_count - 1))]
+            for index in range(bucket_count)
+        }
+    )
 
 
 def _reconstruction_loss(decoded, targets, mask, huber_weight: float):
@@ -774,6 +1003,7 @@ def train_tap_resampler_variants(config: dict[str, Any], destination: Path) -> d
             model.parameters(),
             lr=float(training["learning_rate"]),
             weight_decay=float(training["weight_decay"]),
+            fused=bool(training.get("fused_adamw", device.startswith("cuda"))),
         )
         amp_dtype = torch.bfloat16
         artists = sorted(train_by_style)
@@ -794,6 +1024,28 @@ def train_tap_resampler_variants(config: dict[str, Any], destination: Path) -> d
         reconstruction_taps = [int(value) for value in cfg["reconstruction_taps"]]
         prefetch_workers = int(training.get("prefetch_workers", 4))
         prefetch_batches = max(prefetch_workers, int(training.get("prefetch_batches", 8)))
+        bucket_centers = _token_bucket_centers(
+            [row for values in train_by_style.values() for row in values],
+            int(training.get("token_buckets", 0)),
+        )
+        wandb_run = None
+        wandb_cfg = dict(training.get("wandb", {}))
+        if bool(wandb_cfg.get("enabled", False)):
+            import wandb
+
+            wandb_run = wandb.init(
+                project=str(wandb_cfg.get("project", "anima-style-adapter")),
+                entity=wandb_cfg.get("entity"),
+                name=str(wandb_cfg.get("name", name)),
+                id=str(wandb_cfg.get("id", f"per-reference-{name}")),
+                resume="allow",
+                config={
+                    "variant": dict(variant),
+                    "training": dict(training),
+                    "artist_count": len(train_by_style),
+                    "token_bucket_centers": bucket_centers,
+                },
+            )
 
         def load_step(step: int):
             batch_rows = _training_rows_for_step(
@@ -803,6 +1055,7 @@ def train_tap_resampler_variants(config: dict[str, Any], destination: Path) -> d
                 train_by_style=train_by_style,
                 artists_per_batch=artists_per_batch,
                 images_per_artist=images_per_artist,
+                token_bucket_centers=bucket_centers,
             )
             return _load_feature_batch(
                 batch_rows,
@@ -815,23 +1068,26 @@ def train_tap_resampler_variants(config: dict[str, Any], destination: Path) -> d
         futures: dict[int, Future] = {}
         next_submit = start_step
         log_started = time.perf_counter()
+        transfer = _PinnedCudaBatchPipeline(device)
+
+        def submit_window(executor, anchor: int) -> None:
+            nonlocal next_submit
+            while next_submit < steps and next_submit < anchor + prefetch_batches:
+                futures[next_submit] = executor.submit(load_step, next_submit)
+                next_submit += 1
+
         with ThreadPoolExecutor(max_workers=prefetch_workers) as executor:
+            submit_window(executor, start_step)
+            wait_started = time.perf_counter()
+            current = transfer.stage(futures.pop(start_step).result(), 0)
+            running["data_wait"] += time.perf_counter() - wait_started
             for step in range(start_step, steps):
-                while next_submit < steps and next_submit < step + prefetch_batches:
-                    futures[next_submit] = executor.submit(load_step, next_submit)
-                    next_submit += 1
-                wait_started = time.perf_counter()
-                features, targets, mask, shapes, global_feature = futures.pop(step).result()
-                running["data_wait"] += time.perf_counter() - wait_started
-                features = {
-                    key: value.to(device, non_blocking=True) for key, value in features.items()
-                }
-                targets = {
-                    key: value.to(device, non_blocking=True) for key, value in targets.items()
-                }
-                mask = mask.to(device, non_blocking=True)
-                if global_feature is not None:
-                    global_feature = global_feature.to(device, non_blocking=True)
+                transfer.wait(current)
+                features = current["features"]
+                targets = current["targets"]
+                mask = current["mask"]
+                shapes = current["shapes"]
+                global_feature = current["global"]
                 optimizer.zero_grad(set_to_none=True)
                 with torch.autocast(
                     device_type="cuda", dtype=amp_dtype, enabled=device.startswith("cuda")
@@ -869,27 +1125,46 @@ def train_tap_resampler_variants(config: dict[str, Any], destination: Path) -> d
                         * pooled_proto_loss
                     )
                 loss.backward()
-                torch.nn.utils.clip_grad_norm_(
+                grad_norm = torch.nn.utils.clip_grad_norm_(
                     model.parameters(), float(training["max_grad_norm"])
                 )
                 optimizer.step()
-                running["loss"] += float(loss.detach())
-                running["reconstruction"] += float(rec_loss.detach())
-                running["prototype"] += float(proto_loss.detach())
-                running["pooled_prototype"] += float(pooled_proto_loss.detach())
+                # Keep scalar accumulators on GPU and synchronize only at the
+                # logging interval, not once for every training step.
+                running["loss"] += loss.detach()
+                running["reconstruction"] += rec_loss.detach()
+                running["prototype"] += proto_loss.detach()
+                running["pooled_prototype"] += pooled_proto_loss.detach()
+                running["grad_norm"] += grad_norm.detach()
+                running["padding_efficiency"] += float(current["padding_efficiency"])
                 if (step + 1) % int(training["log_every"]) == 0:
                     interval = int(training["log_every"])
                     elapsed = time.perf_counter() - log_started
+                    log_values = {
+                        "train/loss": float(running["loss"] / interval),
+                        "train/reconstruction": float(running["reconstruction"] / interval),
+                        "train/slot_prototype": float(running["prototype"] / interval),
+                        "train/pooled_prototype": float(running["pooled_prototype"] / interval),
+                        "train/grad_norm": float(running["grad_norm"] / interval),
+                        "train/prototype_ramp": ramp,
+                        "perf/step_s": elapsed / interval,
+                        "perf/data_wait_s": running["data_wait"] / interval,
+                        "perf/padding_efficiency": running["padding_efficiency"] / interval,
+                        "train/learning_rate": optimizer.param_groups[0]["lr"],
+                    }
                     print(
                         f"variant={name} step={step + 1}/{steps} "
-                        f"loss={running['loss'] / interval:.4f} "
-                        f"rec={running['reconstruction'] / interval:.4f} "
-                        f"proto={running['prototype'] / interval:.4f} "
-                        f"pooled_proto={running['pooled_prototype'] / interval:.4f} "
-                        f"step_s={elapsed / interval:.3f} "
-                        f"data_wait_s={running['data_wait'] / interval:.3f}",
+                        f"loss={log_values['train/loss']:.4f} "
+                        f"rec={log_values['train/reconstruction']:.4f} "
+                        f"proto={log_values['train/slot_prototype']:.4f} "
+                        f"pooled_proto={log_values['train/pooled_prototype']:.4f} "
+                        f"padding={log_values['perf/padding_efficiency']:.3f} "
+                        f"step_s={log_values['perf/step_s']:.3f} "
+                        f"data_wait_s={log_values['perf/data_wait_s']:.3f}",
                         flush=True,
                     )
+                    if wandb_run is not None:
+                        wandb_run.log(log_values, step=step + 1)
                     running.clear()
                     log_started = time.perf_counter()
                 if (step + 1) % int(training["checkpoint_every"]) == 0:
@@ -903,6 +1178,16 @@ def train_tap_resampler_variants(config: dict[str, Any], destination: Path) -> d
                         temporary,
                     )
                     temporary.replace(checkpoint_path)
+                next_batch = None
+                if step + 1 < steps:
+                    submit_window(executor, step + 1)
+                    wait_started = time.perf_counter()
+                    next_batch = transfer.stage(
+                        futures.pop(step + 1).result(),
+                        (step - start_step + 1) % 2,
+                    )
+                    running["data_wait"] += time.perf_counter() - wait_started
+                current = next_batch
 
         evaluation = _evaluate_model(
             model,
@@ -916,6 +1201,23 @@ def train_tap_resampler_variants(config: dict[str, Any], destination: Path) -> d
             prefetch_batches=int(training.get("prefetch_batches", 8)),
         )
         result = {"name": name, "taps": variant["taps"], "global": global_kind, **evaluation}
+        if wandb_run is not None:
+            validation_log = {
+                "validation/mean_top1": result["mean_top1"],
+                **{
+                    f"validation/top1_{row['references']}ref": row["top1"]
+                    for row in result["prototype"]
+                },
+                **{
+                    f"validation/mrr_{row['references']}ref": row["mrr"]
+                    for row in result["prototype"]
+                },
+                **{
+                    f"validation/reconstruction_l{layer}": value
+                    for layer, value in result["reconstruction_cosine"].items()
+                },
+            }
+            wandb_run.log(validation_log, step=steps)
         write_json(metrics_path, result)
         torch.save(
             {"model": model.state_dict(), "variant": variant, "training": training},
@@ -924,6 +1226,8 @@ def train_tap_resampler_variants(config: dict[str, Any], destination: Path) -> d
         checkpoint_path.unlink(missing_ok=True)
         results.append(result)
         print(f"completed variant {name}: mean_top1={result['mean_top1']:.4f}", flush=True)
+        if wandb_run is not None:
+            wandb_run.finish()
 
     results.sort(key=lambda row: row["mean_top1"], reverse=True)
     summary = {"variants": results}
@@ -1018,6 +1322,36 @@ def evaluate_selected_tap_variant(
         "meta_test_images": len(test_rows),
     }
     write_json(root / "final_test.json", result)
+    wandb_cfg = dict(training.get("wandb", {}))
+    if bool(wandb_cfg.get("enabled", False)):
+        import wandb
+
+        run = wandb.init(
+            project=str(wandb_cfg.get("project", "anima-style-adapter")),
+            entity=wandb_cfg.get("entity"),
+            name=str(wandb_cfg.get("name", selected_name)),
+            id=str(wandb_cfg.get("id", f"per-reference-{selected_name}")),
+            resume="allow",
+        )
+        run.log(
+            {
+                "test/mean_top1": test_metrics["mean_top1"],
+                **{
+                    f"test/top1_{row['references']}ref": row["top1"]
+                    for row in test_metrics["prototype"]
+                },
+                **{
+                    f"test/mrr_{row['references']}ref": row["mrr"]
+                    for row in test_metrics["prototype"]
+                },
+                **{
+                    f"test/reconstruction_l{layer}": value
+                    for layer, value in test_metrics["reconstruction_cosine"].items()
+                },
+            },
+            step=int(training["steps"]) + 1,
+        )
+        run.finish()
     return result
 
 

@@ -159,6 +159,8 @@ tap_resampler_experiment:
   reference_counts: [1, 2, 4, 8]
   features:
     source_directory: style_features_l18_l24_siglip_l24
+    local_cache_directory: /tmp/anima-style-resampler-l18-l24-siglip-l24
+    local_shard_rows: 512
     layers: [18, 24]
     storage_dtype: float16
     batch_size: 4
@@ -191,8 +193,15 @@ tap_resampler_experiment:
     evaluation_batch_size: 8
     prefetch_workers: 8
     prefetch_batches: 16
+    token_buckets: 8
+    fused_adamw: true
+    wandb:
+      enabled: true
+      project: anima-style-adapter
+      name: per-reference-l18-l24-siglip-l24
+      id: per-reference-l18-l24-siglip-l24-v1
     log_every: 20
-    checkpoint_every: 100
+    checkpoint_every: 500
     force: false
   variants:
     - {name: l18_l24_native_siglip_l24, taps: [18, 24], global: native_24}

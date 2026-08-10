@@ -1,6 +1,7 @@
 import torch
 
 from anima_style_data.tap_resampler import (
+    _load_feature_batch,
     _prototype_loss,
     _training_rows_for_step,
     build_tap_resampler_model,
@@ -117,3 +118,61 @@ def test_training_episode_is_step_addressable():
 
     assert [row["id"] for row in first] == [row["id"] for row in second]
     assert len(first) == 6
+
+
+def test_feature_loader_keeps_cached_fp16(tmp_path):
+    from safetensors.torch import save_file
+
+    save_file(
+        {
+            "1.layer_18_spatial": torch.randn(3, 12).half(),
+            "1.layer_24_spatial": torch.randn(3, 12).half(),
+            "1.layer_24_siglip_cls": torch.randn(12).half(),
+            "2.layer_18_spatial": torch.randn(2, 12).half(),
+            "2.layer_24_spatial": torch.randn(2, 12).half(),
+            "2.layer_24_siglip_cls": torch.randn(12).half(),
+        },
+        tmp_path / "part.safetensors",
+    )
+    rows = [
+        {
+            "id": image_id,
+            "feature_shard": "part.safetensors",
+            "spatial_tokens": tokens,
+            "spatial_dim": 12,
+            "target_height": 16,
+            "target_width": tokens * 16,
+        }
+        for image_id, tokens in ((1, 3), (2, 2))
+    ]
+
+    features, targets, mask, _, global_feature = _load_feature_batch(
+        rows, tmp_path, [18, 24], [18, 24], "native_24"
+    )
+
+    assert features[18].dtype == features[24].dtype == torch.float16
+    assert targets[18].data_ptr() == features[18].data_ptr()
+    assert global_feature.dtype == torch.float16
+    assert mask.sum().item() == 5
+
+
+def test_token_bucket_episode_prefers_similar_sizes():
+    artists = ["a", "b"]
+    by_style = {
+        artist: [
+            {"id": f"{artist}{index}", "spatial_tokens": 100 if index < 4 else 1000}
+            for index in range(6)
+        ]
+        for artist in artists
+    }
+    rows = _training_rows_for_step(
+        step=3,
+        seed=7,
+        artists=artists,
+        train_by_style=by_style,
+        artists_per_batch=2,
+        images_per_artist=4,
+        token_bucket_centers=[100],
+    )
+
+    assert {row["spatial_tokens"] for row in rows} == {100}
