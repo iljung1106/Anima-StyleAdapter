@@ -1,6 +1,7 @@
 import torch
 
 from anima_style_data.tap_resampler import (
+    _PinnedCudaBatchPipeline,
     _load_feature_batch,
     _prototype_loss,
     _training_rows_for_step,
@@ -176,3 +177,28 @@ def test_token_bucket_episode_prefers_similar_sizes():
     )
 
     assert {row["spatial_tokens"] for row in rows} == {100}
+
+
+@torch.no_grad()
+def test_pinned_cuda_pipeline_preserves_fp16_and_target_aliases():
+    if not torch.cuda.is_available():
+        return
+    pipeline = _PinnedCudaBatchPipeline("cuda")
+    layer_18 = torch.randn(2, 5, 12).half()
+    layer_24 = torch.randn(2, 5, 12).half()
+    loaded = (
+        {18: layer_18, 24: layer_24},
+        {18: layer_18, 24: layer_24},
+        torch.ones(2, 5, dtype=torch.bool),
+        [(16, 80), (16, 80)],
+        torch.randn(2, 12).half(),
+    )
+
+    batch = pipeline.stage(loaded, 0)
+    pipeline.wait(batch)
+    torch.cuda.synchronize()
+
+    assert batch["features"][18].dtype == torch.float16
+    assert batch["targets"][18].data_ptr() == batch["features"][18].data_ptr()
+    assert batch["global"].dtype == torch.float16
+    assert batch["padding_efficiency"] == 1.0
