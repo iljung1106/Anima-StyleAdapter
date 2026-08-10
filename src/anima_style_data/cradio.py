@@ -6,6 +6,7 @@ import math
 import os
 import time
 from collections import defaultdict
+from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
@@ -298,6 +299,10 @@ def extract_selected_style_features(
     prefetch_images = max(
         preprocess_workers, int(feature_cfg.get("prefetch_images", 64))
     )
+    writer_workers = int(feature_cfg.get("writer_workers", 2))
+    pending_writes_limit = max(
+        writer_workers, int(feature_cfg.get("pending_writes", writer_workers * 2))
+    )
     storage_dtype = _storage_dtype(feature_cfg["storage_dtype"])
     amp_name = str(feature_cfg.get("amp_dtype", radio_cfg["amp_dtype"]))
     amp_dtype = {
@@ -314,29 +319,55 @@ def extract_selected_style_features(
     output_rows = list(completed_rows)
     newly_encoded = 0
     started = time.monotonic()
+    write_executor = ThreadPoolExecutor(max_workers=writer_workers)
+    pending_writes: deque[Future[list[dict[str, Any]]]] = deque()
+
+    def write_shard(
+        feature_path: Path,
+        manifest_path: Path,
+        tensors: dict[str, torch.Tensor],
+        records: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        temporary = feature_path.with_suffix(feature_path.suffix + ".tmp")
+        save_file(
+            {key: value.contiguous() for key, value in tensors.items()}, temporary
+        )
+        temporary.replace(feature_path)
+        for record in records:
+            record["feature_shard"] = feature_path.name
+        write_records(manifest_path, records)
+        print(
+            f"wrote selected style feature shard {feature_path.stem.split('-')[-1]} "
+            f"({len(records)} images)",
+            flush=True,
+        )
+        return records
+
+    def collect_write(*, block: bool) -> None:
+        if block and pending_writes:
+            output_rows.extend(pending_writes.popleft().result())
+        while pending_writes and pending_writes[0].done():
+            output_rows.extend(pending_writes.popleft().result())
 
     def flush_shard() -> None:
         nonlocal tensor_buffer, record_buffer, shard_index
         if not record_buffer:
             return
         feature_path = features_dir / f"part-{shard_index:05d}.safetensors"
-        temporary = feature_path.with_suffix(feature_path.suffix + ".tmp")
-        save_file(
-            {key: value.contiguous() for key, value in tensor_buffer.items()}, temporary
-        )
-        temporary.replace(feature_path)
-        for record in record_buffer:
-            record["feature_shard"] = feature_path.name
-        write_records(manifest_dir / f"part-{shard_index:05d}.parquet", record_buffer)
-        output_rows.extend(record_buffer)
-        print(
-            f"wrote selected style feature shard {shard_index} "
-            f"({len(record_buffer)} images; total_new={newly_encoded})",
-            flush=True,
+        manifest_path = manifest_dir / f"part-{shard_index:05d}.parquet"
+        pending_writes.append(
+            write_executor.submit(
+                write_shard,
+                feature_path,
+                manifest_path,
+                tensor_buffer,
+                record_buffer,
+            )
         )
         tensor_buffer = {}
         record_buffer = []
         shard_index += 1
+        collect_write(block=len(pending_writes) >= pending_writes_limit)
 
     def run_batch(items: list[tuple[dict[str, Any], torch.Tensor, PreprocessInfo]]) -> None:
         nonlocal newly_encoded
@@ -417,6 +448,9 @@ def extract_selected_style_features(
     for key in list(buckets):
         flush_bucket(key)
     flush_shard()
+    while pending_writes:
+        collect_write(block=True)
+    write_executor.shutdown(wait=True)
     output_rows.sort(key=lambda row: int(row["id"]))
     write_records(features_dir / "manifest.parquet", output_rows)
     total_bytes = sum(path.stat().st_size for path in features_dir.glob("*.safetensors"))
