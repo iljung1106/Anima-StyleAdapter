@@ -393,6 +393,16 @@ def _style_block_forward(
         x = x.float()
     if extra_per_block_pos_emb is not None:
         x = x + extra_per_block_pos_emb
+    # The standalone runner supplies normalized diffusion timesteps as FP32.
+    # Under non-reentrant checkpoint replay PyTorch does not guarantee that the
+    # surrounding autocast has already converted the timestep embedding. Match
+    # the frozen AdaLN-LoRA weights explicitly, as the upstream block contract
+    # does for its activation path.
+    modulation = block.adaln_modulation_self_attn[-1]
+    modulation_dtype = modulation.weight.dtype
+    emb = emb.to(dtype=modulation_dtype)
+    if adaln_lora_B_T_3D is not None:
+        adaln_lora_B_T_3D = adaln_lora_B_T_3D.to(dtype=modulation_dtype)
     with torch.autocast(device_type=x.device.type, dtype=torch.float32, enabled=use_fp32):
         if block.use_adaln_lora:
             self_mod = block.adaln_modulation_self_attn(emb) + adaln_lora_B_T_3D
