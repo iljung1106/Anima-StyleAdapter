@@ -863,9 +863,14 @@ def _evaluate_model(
                 mask = mask.to(device)
                 if global_feature is not None:
                     global_feature = global_feature.to(device)
-                decoded, decoded_mask, representation = model(
-                    features, mask, shapes, global_feature
-                )
+                with torch.autocast(
+                    device_type="cuda",
+                    dtype=torch.bfloat16,
+                    enabled=device.startswith("cuda"),
+                ):
+                    decoded, decoded_mask, representation = model(
+                        features, mask, shapes, global_feature
+                    )
                 embeddings.append(_evaluation_descriptor(representation).cpu())
                 for layer, prediction in decoded.items():
                     similarity = F.cosine_similarity(
@@ -1077,10 +1082,11 @@ def train_tap_resampler_variants(config: dict[str, Any], destination: Path) -> d
                 next_submit += 1
 
         with ThreadPoolExecutor(max_workers=prefetch_workers) as executor:
-            submit_window(executor, start_step)
-            wait_started = time.perf_counter()
-            current = transfer.stage(futures.pop(start_step).result(), 0)
-            running["data_wait"] += time.perf_counter() - wait_started
+            if start_step < steps:
+                submit_window(executor, start_step)
+                wait_started = time.perf_counter()
+                current = transfer.stage(futures.pop(start_step).result(), 0)
+                running["data_wait"] += time.perf_counter() - wait_started
             for step in range(start_step, steps):
                 transfer.wait(current)
                 features = current["features"]
