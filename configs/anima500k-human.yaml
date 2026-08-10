@@ -314,3 +314,7 @@ style_transfer:
     seed: 20260811
     text_cfg: 4.0
     style_cfg: 1.0
+  benchmark:
+    batch_sizes: [4, 8, 16]
+    steps: 8
+    warmup_steps: 2

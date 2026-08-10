@@ -962,3 +962,59 @@ def smoke_test_style_adapter(config: dict[str, Any], destination: Path) -> dict[
     training["sample_every"] = 1
     smoke_config["style_transfer"]["sampling"]["steps"] = 2
     return train_style_adapter(smoke_config, destination, steps_override=2)
+
+
+def benchmark_style_batches(config: dict[str, Any], destination: Path) -> dict[str, Any]:
+    """Measure end-to-end training throughput without validation/sample overhead."""
+    benchmark_cfg = config["style_transfer"].get("benchmark", {})
+    batch_sizes = [int(value) for value in benchmark_cfg.get("batch_sizes", [4, 8, 16])]
+    steps = int(benchmark_cfg.get("steps", 8))
+    warmup = int(benchmark_cfg.get("warmup_steps", 2))
+    if warmup >= steps:
+        raise ValueError("style_transfer.benchmark.warmup_steps must be smaller than steps")
+    results = []
+    benchmark_root = destination / "style_transfer_benchmarks"
+    benchmark_root.mkdir(parents=True, exist_ok=True)
+    for batch_size in batch_sizes:
+        candidate = copy.deepcopy(config)
+        style_cfg = candidate["style_transfer"]
+        style_cfg["output_directory"] = f"style_transfer_benchmarks/batch-{batch_size}"
+        style_cfg["loader"]["batch_size"] = batch_size
+        training = style_cfg["training"]
+        training.update(
+            {
+                "validation_every": 0,
+                "checkpoint_every": 0,
+                "sample_every": 0,
+                "log_every": 1,
+                "resume": False,
+            }
+        )
+        training.setdefault("wandb", {})["enabled"] = False
+        try:
+            summary = train_style_adapter(candidate, destination, steps_override=steps)
+            measured = summary["metrics"][warmup:]
+            mean_compute = sum(row["step_s"] for row in measured) / len(measured)
+            mean_wait = sum(row["data_wait_s"] for row in measured) / len(measured)
+            wall_step = mean_compute + mean_wait
+            result = {
+                "batch_size": batch_size,
+                "status": "ok",
+                "measured_steps": len(measured),
+                "mean_compute_s": mean_compute,
+                "mean_data_wait_s": mean_wait,
+                "mean_wall_step_s": wall_step,
+                "target_images_s": batch_size / wall_step,
+                "mean_reference_images": sum(row["references"] for row in measured) / len(measured),
+                "peak_vram_gib": max(row["peak_vram_gib"] for row in summary["metrics"]),
+            }
+        except torch.cuda.OutOfMemoryError as error:
+            result = {"batch_size": batch_size, "status": "oom", "error": str(error)}
+        results.append(result)
+        print(f"batch benchmark: {json.dumps(result, ensure_ascii=False)}", flush=True)
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    output = {"steps": steps, "warmup_steps": warmup, "results": results}
+    write_json(benchmark_root / "batch_benchmark.json", output)
+    return output
