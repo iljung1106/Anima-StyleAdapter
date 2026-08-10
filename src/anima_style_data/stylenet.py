@@ -12,7 +12,12 @@ from typing import Any
 
 from PIL import Image, ImageStat
 
-from .cradio import _load_cradio, _storage_dtype, preprocess_cradio_image
+from .cradio import (
+    _load_cradio,
+    _storage_dtype,
+    compute_cradio_size,
+    preprocess_cradio_image,
+)
 from .io import read_records, write_json, write_records
 
 
@@ -166,6 +171,19 @@ def extract_stylenet_layer_features(
         if row["controlled_group_valid"]
     ]
     radio_cfg = {**config["cradio"], **cfg.get("preprocess", {})}
+    rows.sort(
+        key=lambda row: (
+            compute_cradio_size(
+                int(row["height"]),
+                int(row["width"]),
+                max_side=int(radio_cfg["max_side"]),
+                max_pixels=int(radio_cfg["max_pixels"]),
+                step=int(radio_cfg["patch_size"]),
+                min_side=int(radio_cfg["min_side"]),
+            )[2:],
+            int(row["id"]),
+        )
+    )
     model, device = _load_cradio(radio_cfg, destination / "cradio_model_cache")
     layers = [int(layer) for layer in cfg["layers"]]
     if min(layers) < 0 or max(layers) >= len(model.model.blocks):
