@@ -1003,6 +1003,45 @@ def train_style_adapter(config: dict[str, Any], destination: Path, *, steps_over
     sample_every = int(training.get("sample_every", 1000))
     log_every = int(training.get("log_every", 10))
     vae = None
+    if start_step == 0 and steps_override is None:
+        baseline = _validate_style_adapter(
+            anima,
+            adapter,
+            resampler,
+            validation_loader,
+            device,
+            batches=validation_batches,
+            seed=seed ^ 0xA11CE,
+        )
+        print(
+            f"validation step=0 loss={baseline['loss']:.6f} "
+            f"batches={validation_batches} elapsed_s={baseline['elapsed_s']:.2f}",
+            flush=True,
+        )
+        sheet_path, vae, sample_s = _sample_style_adapter(
+            anima,
+            adapter,
+            resampler,
+            validation_loader,
+            config,
+            destination,
+            output,
+            device,
+            0,
+            vae,
+        )
+        print(f"sample step=0 path={sheet_path} elapsed_s={sample_s:.2f}", flush=True)
+        if wandb_run is not None:
+            import wandb
+
+            wandb_run.log(
+                {
+                    **{f"validation/{key}": value for key, value in baseline.items()},
+                    "sample/image": wandb.Image(str(sheet_path)),
+                    "sample/elapsed_s": sample_s,
+                },
+                step=0,
+            )
     for zero_based_step in range(start_step, steps):
         wait_started = time.perf_counter()
         batch = next(iterator)
