@@ -667,6 +667,8 @@ def _make_sample_sheet(
     generated: Image.Image,
     loader: ProductionStyleLoader,
     batch: dict[str, Any],
+    *,
+    base_generated: Image.Image | None = None,
 ) -> Image.Image:
     episode = batch["episodes"][0]
     sources = [("target", episode.target_id)] + [
@@ -674,8 +676,17 @@ def _make_sample_sheet(
         for index, image_id in enumerate(episode.reference_ids[:4])
     ]
     thumb = 160
-    sheet = Image.new("RGB", (max(generated.width, thumb * len(sources)), generated.height + thumb + 28), "white")
-    sheet.paste(generated, ((sheet.width - generated.width) // 2, 0))
+    generated_width = generated.width + (base_generated.width if base_generated is not None else 0)
+    sheet = Image.new(
+        "RGB",
+        (max(generated_width, thumb * len(sources)), generated.height + thumb + 28),
+        "white",
+    )
+    if base_generated is None:
+        sheet.paste(generated, ((sheet.width - generated.width) // 2, 0))
+    else:
+        sheet.paste(base_generated, (0, 0))
+        sheet.paste(generated, (base_generated.width, 0))
     draw = ImageDraw.Draw(sheet)
     for index, (label, image_id) in enumerate(sources):
         path = Path(str(loader.style_by_id[image_id]["local_path"]))
@@ -684,7 +695,17 @@ def _make_sample_sheet(
         x = index * thumb
         sheet.paste(tile, (x, generated.height + 28))
         draw.text((x + 4, generated.height + 6), label, fill="black")
-    draw.text((4, 6), f"generated — {episode.style_id}", fill="white", stroke_width=2, stroke_fill="black")
+    if base_generated is None:
+        draw.text((4, 6), f"generated — {episode.style_id}", fill="white", stroke_width=2, stroke_fill="black")
+    else:
+        draw.text((4, 6), "frozen Anima (adapter bypassed)", fill="white", stroke_width=2, stroke_fill="black")
+        draw.text(
+            (base_generated.width + 4, 6),
+            f"styled — {episode.style_id}",
+            fill="white",
+            stroke_width=2,
+            stroke_fill="black",
+        )
     return sheet
 
 
@@ -724,7 +745,7 @@ def _sample_style_adapter(
     width = int(sample_cfg.get("width", 512))
     latent_h, latent_w = height // 8, width // 8
     generator = torch.Generator(device="cpu").manual_seed(int(sample_cfg.get("seed", 20260811)))
-    x = torch.randn(1, 16, 1, latent_h, latent_w, generator=generator, dtype=torch.float32).to(
+    initial_noise = torch.randn(1, 16, 1, latent_h, latent_w, generator=generator, dtype=torch.float32).to(
         device=device, dtype=torch.bfloat16
     )
     steps = int(sample_cfg.get("steps", 20))
@@ -735,41 +756,73 @@ def _sample_style_adapter(
     text_scale = float(sample_cfg.get("text_cfg", 4.0))
     style_scale = float(sample_cfg.get("style_cfg", 1.0))
 
-    def predict(text: torch.Tensor, style: torch.Tensor, timestep: torch.Tensor):
-        adapter.set_style_tokens(style)
+    def predict(x: torch.Tensor, text: torch.Tensor, style: torch.Tensor | None, timestep: torch.Tensor):
+        if style is None:
+            adapter.clear_style_tokens()
+        else:
+            adapter.set_style_tokens(style)
         return anima(
             x, timestep.expand(1), context=text, padding_mask=padding_mask,
             target_input_ids=None,
         ).float()
 
+    def denoise(*, with_style: bool) -> torch.Tensor:
+        x = initial_noise.clone()
+        for index in range(steps):
+            timestep = sigmas[index].to(torch.bfloat16)
+            if with_style:
+                base = predict(x, null_text, null_style, timestep)
+                text_only = predict(x, positive_text, null_style, timestep)
+                full = predict(x, positive_text, positive_style, timestep)
+                velocity = base + text_scale * (text_only - base) + style_scale * (full - text_only)
+            else:
+                # This control bypasses the adapter completely and must remain
+                # a valid frozen-Anima sample for every learned checkpoint.
+                base = predict(x, null_text, None, timestep)
+                text_only = predict(x, positive_text, None, timestep)
+                velocity = base + text_scale * (text_only - base)
+            x = (x.float() + velocity * (sigmas[index + 1] - sigmas[index]).float()).to(torch.bfloat16)
+            if not torch.isfinite(x).all():
+                mode = "styled" if with_style else "base"
+                raise FloatingPointError(f"Non-finite {mode} latent at sampling step {index + 1}")
+        return x
+
     try:
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=device.startswith("cuda")):
-            for index in range(steps):
-                timestep = sigmas[index].to(torch.bfloat16)
-                base = predict(null_text, null_style, timestep)
-                text_only = predict(positive_text, null_style, timestep)
-                full = predict(positive_text, positive_style, timestep)
-                velocity = base + text_scale * (text_only - base) + style_scale * (full - text_only)
-                x = (x.float() + velocity * (sigmas[index + 1] - sigmas[index]).float()).to(torch.bfloat16)
+            base_x = denoise(with_style=False)
+            styled_x = denoise(with_style=True)
     finally:
         adapter.clear_style_tokens()
 
     if vae is None:
         vae = _load_sampling_vae(config, destination)
     vae.to(device=device, dtype=torch.bfloat16)
-    decoded = vae.decode_to_pixels(x).float()
+    decoded = vae.decode_to_pixels(torch.cat((base_x, styled_x), dim=0)).float()
     vae.to("cpu")
-    pixels = decoded[0]
-    if pixels.ndim == 4:
-        pixels = pixels[:, 0]
-    pixels = ((pixels.clamp(-1, 1) + 1) * 127.5).byte().permute(1, 2, 0).cpu().numpy()
-    generated = Image.fromarray(pixels)
+
+    def to_image(value: torch.Tensor) -> Image.Image:
+        if value.ndim == 4:
+            value = value[:, 0]
+        pixels = ((value.clamp(-1, 1) + 1) * 127.5).byte().permute(1, 2, 0).cpu().numpy()
+        return Image.fromarray(pixels)
+
+    base_generated = to_image(decoded[0])
+    generated = to_image(decoded[1])
     sample_dir = output / "samples"
     sample_dir.mkdir(parents=True, exist_ok=True)
     raw_path = sample_dir / f"step-{step:07d}.png"
     sheet_path = sample_dir / f"step-{step:07d}-sheet.png"
     generated.save(raw_path)
-    _make_sample_sheet(generated, loader, batch).save(sheet_path)
+    base_generated.save(sample_dir / f"step-{step:07d}-base.png")
+    _make_sample_sheet(generated, loader, batch, base_generated=base_generated).save(sheet_path)
+    print(
+        f"sample latent stats step={step} "
+        f"base_mean={base_x.float().mean().item():.5f} base_std={base_x.float().std().item():.5f} "
+        f"base_absmax={base_x.float().abs().max().item():.5f} "
+        f"style_mean={styled_x.float().mean().item():.5f} style_std={styled_x.float().std().item():.5f} "
+        f"style_absmax={styled_x.float().abs().max().item():.5f}",
+        flush=True,
+    )
     gc.collect()
     if device.startswith("cuda"):
         torch.cuda.empty_cache()
@@ -780,6 +833,28 @@ def _sample_style_adapter(
     anima.train()
     adapter.train()
     return sheet_path, vae, time.perf_counter() - started
+
+
+def sample_style_checkpoint(config: dict[str, Any], destination: Path) -> dict[str, Any]:
+    """Render a frozen-base control and styled sample from the resumable checkpoint."""
+    cfg = config["style_transfer"]
+    device = str(cfg["training"].get("device", "cuda"))
+    loader_cfg = {**cfg["loader"], "split": "validation", "batch_size": 1}
+    loader_cfg["seed"] = int(cfg.get("seed", 20260811)) ^ 0x51A7
+    loader = ProductionStyleLoader(destination, loader_cfg)
+    resampler = load_per_reference_resampler(destination, cfg["resampler"], device)
+    anima = _resolve_anima_model(config, destination, device).requires_grad_(False).eval()
+    adapter = SharedLowRankStyleAdapter(**cfg["adapter"]).to(device, dtype=torch.bfloat16)
+    attach_style_adapter(anima, adapter)
+    output = destination / str(cfg.get("output_directory", "style_transfer_training"))
+    checkpoint_path = output / "training_state.pt"
+    state = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    adapter.load_state_dict(state["adapter"])
+    step = int(state["step"])
+    sheet, _, elapsed = _sample_style_adapter(
+        anima, adapter, resampler, loader, config, destination, output, device, step, None
+    )
+    return {"step": step, "sheet": str(sheet), "elapsed_s": elapsed}
 
 
 def _save_training_state(
