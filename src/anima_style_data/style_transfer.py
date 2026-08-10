@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import json
 import gc
 import math
@@ -947,4 +948,11 @@ def train_style_adapter(config: dict[str, Any], destination: Path, *, steps_over
 
 
 def smoke_test_style_adapter(config: dict[str, Any], destination: Path) -> dict[str, Any]:
-    return train_style_adapter(config, destination, steps_override=2)
+    smoke_config = copy.deepcopy(config)
+    training = smoke_config["style_transfer"]["training"]
+    training["validation_every"] = 1
+    training["validation_batches"] = 1
+    training["checkpoint_every"] = 1
+    training["sample_every"] = 1
+    smoke_config["style_transfer"]["sampling"]["steps"] = 2
+    return train_style_adapter(smoke_config, destination, steps_override=2)
