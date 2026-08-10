@@ -816,6 +816,95 @@ def _reconstruction_loss(decoded, targets, mask, huber_weight: float):
     return torch.stack(losses).mean()
 
 
+def _evaluate_fixed_episodes(
+    model,
+    val_by_style,
+    feature_dir,
+    variant,
+    cfg,
+    training,
+    device,
+    *,
+    episodes: int,
+    seed: int,
+):
+    """Measure comparable validation losses on fixed unseen-artist episodes."""
+    import torch
+
+    artists = sorted(val_by_style)
+    artists_per_batch = int(training["artists_per_batch"])
+    images_per_artist = int(training["images_per_artist"])
+    bucket_centers = _token_bucket_centers(
+        [row for values in val_by_style.values() for row in values],
+        int(training.get("token_buckets", 0)),
+    )
+    totals = defaultdict(float)
+    was_training = model.training
+    model.eval()
+    with torch.inference_mode():
+        for episode in range(episodes):
+            rows = _training_rows_for_step(
+                step=episode,
+                seed=seed,
+                artists=artists,
+                train_by_style=val_by_style,
+                artists_per_batch=artists_per_batch,
+                images_per_artist=images_per_artist,
+                token_bucket_centers=bucket_centers,
+            )
+            features, targets, mask, shapes, global_feature = _load_feature_batch(
+                rows,
+                feature_dir,
+                [int(value) for value in variant["taps"]],
+                [int(value) for value in cfg["reconstruction_taps"]],
+                str(variant.get("global", "none")),
+            )
+            unique = {**targets, **features}
+            device_features = {layer: value.to(device) for layer, value in unique.items()}
+            features = {layer: device_features[layer] for layer in features}
+            targets = {layer: device_features[layer] for layer in targets}
+            mask = mask.to(device)
+            if global_feature is not None:
+                global_feature = global_feature.to(device)
+            with torch.autocast(
+                device_type="cuda",
+                dtype=torch.bfloat16,
+                enabled=device.startswith("cuda"),
+            ):
+                decoded, decoded_mask, representation = model(
+                    features, mask, shapes, global_feature
+                )
+                rec = _reconstruction_loss(
+                    decoded, targets, decoded_mask, float(training["huber_weight"])
+                )
+                slot = _prototype_loss(
+                    representation,
+                    artists_per_batch,
+                    images_per_artist,
+                    float(training["temperature"]),
+                )
+                pooled = (
+                    _pooled_token_prototype_loss(
+                        representation,
+                        artists_per_batch,
+                        images_per_artist,
+                        float(training["temperature"]),
+                    )
+                    if representation.ndim == 3
+                    else representation.new_zeros(())
+                )
+                total = rec + float(training["prototype_weight"]) * slot + float(
+                    training.get("pooled_prototype_weight", 0.0)
+                ) * pooled
+            totals["total"] += float(total)
+            totals["reconstruction"] += float(rec)
+            totals["slot_prototype"] += float(slot)
+            totals["pooled_prototype"] += float(pooled)
+    if was_training:
+        model.train()
+    return {key: value / episodes for key, value in totals.items()}
+
+
 def _evaluate_model(
     model,
     rows,
@@ -958,6 +1047,9 @@ def train_tap_resampler_variants(config: dict[str, Any], destination: Path) -> d
             int(row["experiment_sample_rank"]),
         )
     )
+    val_by_style: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for row in val_rows:
+        val_by_style[str(row.get("style_id", row["artist"]))].append(row)
 
     device = str(training.get("device", "cuda"))
     if device.startswith("cuda") and not torch.cuda.is_available():
@@ -1016,6 +1108,20 @@ def train_tap_resampler_variants(config: dict[str, Any], destination: Path) -> d
         artists_per_batch = int(training["artists_per_batch"])
         images_per_artist = int(training["images_per_artist"])
         checkpoint_path = run_dir / "training_state.pt"
+        checkpoint_dir = run_dir / "checkpoints"
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        validation_history_path = run_dir / "validation_history.json"
+        validation_history = (
+            json.loads(validation_history_path.read_text(encoding="utf-8"))
+            if validation_history_path.exists()
+            else []
+        )
+        best_validation_path = run_dir / "best_validation.json"
+        best_validation = (
+            json.loads(best_validation_path.read_text(encoding="utf-8"))
+            if best_validation_path.exists()
+            else None
+        )
         start_step = 0
         if checkpoint_path.exists():
             state = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
@@ -1184,6 +1290,87 @@ def train_tap_resampler_variants(config: dict[str, Any], destination: Path) -> d
                         temporary,
                     )
                     temporary.replace(checkpoint_path)
+                completed_step = step + 1
+                validation_every = int(training.get("validation_every", 0))
+                full_validation_every = int(training.get("full_validation_every", 0))
+                if validation_every and completed_step % validation_every == 0:
+                    fixed = _evaluate_fixed_episodes(
+                        model,
+                        val_by_style,
+                        feature_dir,
+                        variant,
+                        cfg,
+                        training,
+                        device,
+                        episodes=int(training.get("validation_episodes", 16)),
+                        seed=seed ^ 0x5A17,
+                    )
+                    row = {"step": completed_step, "kind": "fixed_episodes", **fixed}
+                    validation_history.append(row)
+                    write_json(validation_history_path, validation_history)
+                    print(
+                        f"validation step={completed_step} "
+                        f"loss={fixed['total']:.4f} rec={fixed['reconstruction']:.4f} "
+                        f"proto={fixed['slot_prototype']:.4f}",
+                        flush=True,
+                    )
+                    if wandb_run is not None:
+                        wandb_run.log(
+                            {f"validation_loss/{key}": value for key, value in fixed.items()},
+                            step=completed_step,
+                        )
+                if full_validation_every and completed_step % full_validation_every == 0:
+                    retrieval = _evaluate_model(
+                        model,
+                        val_rows,
+                        feature_dir,
+                        variant,
+                        cfg,
+                        device,
+                        batch_size=int(training["evaluation_batch_size"]),
+                        prefetch_workers=int(training.get("prefetch_workers", 4)),
+                        prefetch_batches=int(training.get("prefetch_batches", 8)),
+                    )
+                    model.train()
+                    row = {"step": completed_step, "kind": "full_retrieval", **retrieval}
+                    validation_history.append(row)
+                    write_json(validation_history_path, validation_history)
+                    step_checkpoint = checkpoint_dir / f"step-{completed_step:05d}.pt"
+                    torch.save(
+                        {
+                            "model": model.state_dict(),
+                            "variant": variant,
+                            "training": training,
+                            "step": completed_step,
+                            "validation": retrieval,
+                        },
+                        step_checkpoint,
+                    )
+                    if (
+                        best_validation is None
+                        or retrieval["mean_top1"] > best_validation["mean_top1"]
+                    ):
+                        best_validation = {
+                            "step": completed_step,
+                            "mean_top1": retrieval["mean_top1"],
+                            "checkpoint": str(step_checkpoint),
+                        }
+                        write_json(best_validation_path, best_validation)
+                    if wandb_run is not None:
+                        wandb_run.log(
+                            {
+                                "validation_curve/mean_top1": retrieval["mean_top1"],
+                                **{
+                                    f"validation_curve/top1_{item['references']}ref": item["top1"]
+                                    for item in retrieval["prototype"]
+                                },
+                                **{
+                                    f"validation_curve/reconstruction_l{layer}": value
+                                    for layer, value in retrieval["reconstruction_cosine"].items()
+                                },
+                            },
+                            step=completed_step,
+                        )
                 next_batch = None
                 if step + 1 < steps:
                     submit_window(executor, step + 1)
@@ -1195,6 +1382,14 @@ def train_tap_resampler_variants(config: dict[str, Any], destination: Path) -> d
                     running["data_wait"] += time.perf_counter() - wait_started
                 current = next_batch
 
+        selected_step = steps
+        if best_validation is not None:
+            best_checkpoint = torch.load(
+                best_validation["checkpoint"], map_location="cpu", weights_only=False
+            )
+            model.load_state_dict(best_checkpoint["model"])
+            selected_step = int(best_validation["step"])
+            model.to(device)
         evaluation = _evaluate_model(
             model,
             val_rows,
@@ -1206,7 +1401,13 @@ def train_tap_resampler_variants(config: dict[str, Any], destination: Path) -> d
             prefetch_workers=int(training.get("prefetch_workers", 4)),
             prefetch_batches=int(training.get("prefetch_batches", 8)),
         )
-        result = {"name": name, "taps": variant["taps"], "global": global_kind, **evaluation}
+        result = {
+            "name": name,
+            "taps": variant["taps"],
+            "global": global_kind,
+            "selected_step": selected_step,
+            **evaluation,
+        }
         if wandb_run is not None:
             validation_log = {
                 "validation/mean_top1": result["mean_top1"],
@@ -1226,7 +1427,12 @@ def train_tap_resampler_variants(config: dict[str, Any], destination: Path) -> d
             wandb_run.log(validation_log, step=steps)
         write_json(metrics_path, result)
         torch.save(
-            {"model": model.state_dict(), "variant": variant, "training": training},
+            {
+                "model": model.state_dict(),
+                "variant": variant,
+                "training": training,
+                "selected_step": selected_step,
+            },
             run_dir / "checkpoint.pt",
         )
         checkpoint_path.unlink(missing_ok=True)

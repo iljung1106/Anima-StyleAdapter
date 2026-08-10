@@ -147,7 +147,7 @@ cradio_probe:
     max_pixels: 262144
 
 tap_resampler_experiment:
-  output_directory: per_reference_resampler_l18_l24_siglip_l24
+  output_directory: per_reference_resampler_l18_l24_siglip_l24_8k_val
   seed: 20260810
   selected_variant: l18_l24_native_siglip_l24
   source_split: train
@@ -181,7 +181,7 @@ tap_resampler_experiment:
     direct_style_tokens: true
     artists_per_batch: 8
     images_per_artist: 4
-    steps: 5000
+    steps: 8000
     learning_rate: 0.0002
     weight_decay: 0.01
     prototype_weight: 0.25
@@ -191,6 +191,9 @@ tap_resampler_experiment:
     huber_weight: 0.10
     max_grad_norm: 1.0
     evaluation_batch_size: 8
+    validation_every: 250
+    validation_episodes: 16
+    full_validation_every: 500
     prefetch_workers: 8
     prefetch_batches: 16
     token_buckets: 8
@@ -198,8 +201,8 @@ tap_resampler_experiment:
     wandb:
       enabled: true
       project: anima-style-adapter
-      name: per-reference-l18-l24-siglip-l24
-      id: per-reference-l18-l24-siglip-l24-v1
+      name: per-reference-l18-l24-siglip-l24-8k-val
+      id: per-reference-l18-l24-siglip-l24-8k-val-v2
     log_every: 20
     checkpoint_every: 500
     force: false
