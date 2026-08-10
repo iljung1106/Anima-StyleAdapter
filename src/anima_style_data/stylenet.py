@@ -162,7 +162,7 @@ def extract_stylenet_layer_features(
     config: dict[str, Any], destination: Path
 ) -> dict[str, Any]:
     import torch
-    from safetensors.torch import save_file
+    from safetensors.torch import load_file, save_file
 
     cfg = config["stylenet_benchmark"]
     root = _benchmark_dir(config, destination)
@@ -184,8 +184,42 @@ def extract_stylenet_layer_features(
             int(row["id"]),
         )
     )
+    requested_layers = [int(layer) for layer in cfg["layers"]]
+    keep_spatial_stats = bool(cfg.get("extract_spatial_stats", True))
+    required_kinds = ["summary", "spatial_mean"]
+    if keep_spatial_stats:
+        required_kinds.append("spatial_stats")
+    feature_dir = root / "pooled_features"
+    feature_dir.mkdir(parents=True, exist_ok=True)
+    feature_path = feature_dir / "features.safetensors"
+    manifest_path = feature_dir / "manifest.parquet"
+    features: dict[str, torch.Tensor] = (
+        dict(load_file(feature_path)) if feature_path.exists() else {}
+    )
+    if manifest_path.exists():
+        existing_rows = read_records(manifest_path)
+        expected_ids = [int(row["id"]) for row in rows]
+        existing_ids = [int(row["id"]) for row in existing_rows]
+        if existing_ids != expected_ids:
+            raise RuntimeError("Existing StyleNet feature order does not match the manifest")
+    layers = [
+        layer
+        for layer in requested_layers
+        if any(f"layer_{layer:02d}_{kind}" not in features for kind in required_kinds)
+    ]
+    if not layers:
+        summary = {
+            "images": len(rows),
+            "layers": requested_layers,
+            "added_layers": [],
+            "representations": {
+                name: list(value.shape) for name, value in features.items()
+            },
+        }
+        write_json(feature_dir / "extract_summary.json", summary)
+        return summary
+
     model, device = _load_cradio(radio_cfg, destination / "cradio_model_cache")
-    layers = [int(layer) for layer in cfg["layers"]]
     if min(layers) < 0 or max(layers) >= len(model.model.blocks):
         raise ValueError(f"StyleNet layers must be in [0, {len(model.model.blocks) - 1}]")
     batch_size = int(cfg.get("batch_size", 32))
@@ -196,7 +230,6 @@ def extract_stylenet_layer_features(
     amp_dtype = {"float16": torch.float16, "bfloat16": torch.bfloat16}[
         cfg.get("amp_dtype", radio_cfg["amp_dtype"])
     ]
-    features: dict[str, torch.Tensor] = {}
     buckets: dict[tuple[int, int], list[tuple[int, torch.Tensor]]] = defaultdict(list)
     started = time.monotonic()
     encoded = 0
@@ -239,11 +272,12 @@ def extract_stylenet_layer_features(
             spatial = output.features.float()
             put(f"layer_{layer:02d}_summary", indices, output.summary.float())
             put(f"layer_{layer:02d}_spatial_mean", indices, spatial.mean(dim=1))
-            put(
-                f"layer_{layer:02d}_spatial_stats",
-                indices,
-                torch.cat((spatial.mean(dim=1), spatial.std(dim=1)), dim=-1),
-            )
+            if keep_spatial_stats:
+                put(
+                    f"layer_{layer:02d}_spatial_stats",
+                    indices,
+                    torch.cat((spatial.mean(dim=1), spatial.std(dim=1)), dim=-1),
+                )
         encoded += len(items)
         batches += 1
         if encoded // 1000 != (encoded - len(items)) // 1000:
@@ -293,17 +327,18 @@ def extract_stylenet_layer_features(
     for key in list(buckets):
         flush(key)
 
-    feature_dir = root / "pooled_features"
-    feature_dir.mkdir(parents=True, exist_ok=True)
+    temporary = feature_dir / "features.next.safetensors"
     save_file(
         {name: value.contiguous() for name, value in features.items()},
-        feature_dir / "features.safetensors",
+        temporary,
     )
+    temporary.replace(feature_path)
     feature_rows = [{**row, "feature_index": index} for index, row in enumerate(rows)]
-    write_records(feature_dir / "manifest.parquet", feature_rows)
+    write_records(manifest_path, feature_rows)
     summary = {
         "images": len(rows),
-        "layers": layers,
+        "layers": requested_layers,
+        "added_layers": layers,
         "elapsed_s": time.monotonic() - started,
         "decoder_workers": decoder_workers,
         "decode_prefetch": decode_prefetch,
@@ -321,6 +356,7 @@ def controlled_style_ranking(
     reference_count: int,
     *,
     normalized: bool = False,
+    return_correct: bool = False,
 ):
     import torch
     import torch.nn.functional as F
@@ -370,6 +406,7 @@ def controlled_style_ranking(
     correct = 0
     reciprocal_rank_sum = 0.0
     margin_sum = 0.0
+    correct_chunks = []
     chunk_size = 4096
     for offset in range(0, len(candidate_indices), chunk_size):
         stop = min(offset + chunk_size, len(candidate_indices))
@@ -390,17 +427,23 @@ def controlled_style_ranking(
         ranks = 1 + (scores > positive_scores[:, None]).sum(dim=1)
         scores[row_index, positive_index] = -torch.inf
         margins = positive_scores - scores.max(dim=1).values
-        correct += int((ranks == 1).sum())
+        chunk_correct = ranks == 1
+        correct += int(chunk_correct.sum())
+        if return_correct:
+            correct_chunks.append(chunk_correct.to("cpu"))
         reciprocal_rank_sum += float((1.0 / ranks.float()).sum())
         margin_sum += float(margins.sum())
     query_count = len(candidate_indices)
-    return {
+    metrics = {
         "references": int(reference_count),
         "queries": query_count,
         "top1": correct / query_count,
         "mrr": reciprocal_rank_sum / query_count,
         "margin": margin_sum / query_count,
     }
+    if return_correct:
+        return metrics, torch.cat(correct_chunks)
+    return metrics
 
 
 def evaluate_stylenet_layer_features(
@@ -433,6 +476,20 @@ def evaluate_stylenet_layer_features(
             dim=-1,
         )
 
+    pairwise_layers = [int(layer) for layer in cfg.get("pairwise_layers", [])]
+    pair_names = []
+    for first_index, first in enumerate(pairwise_layers):
+        for second in pairwise_layers[first_index + 1 :]:
+            spatial_name = f"pair_l{first:02d}_l{second:02d}_spatial_mean"
+            summary_name = f"pair_l{first:02d}_l{second:02d}_summary"
+            representations[spatial_name] = normalized_concat(
+                [f"layer_{first:02d}_spatial_mean", f"layer_{second:02d}_spatial_mean"]
+            )
+            representations[summary_name] = normalized_concat(
+                [f"layer_{first:02d}_summary", f"layer_{second:02d}_summary"]
+            )
+            pair_names.append((first, second, spatial_name, summary_name))
+
     for combo in cfg.get("combinations", []):
         names = [str(name) for name in combo["representations"]]
         representations[str(combo["name"])] = normalized_concat(names)
@@ -442,12 +499,29 @@ def evaluate_stylenet_layer_features(
     if device.startswith("cuda") and not torch.cuda.is_available():
         raise RuntimeError("CUDA was requested for StyleNet evaluation but is unavailable")
     ranking = []
+    decision_names = {
+        f"layer_{layer:02d}_{kind}"
+        for layer in pairwise_layers
+        for kind in ("spatial_mean", "summary")
+    }
+    decisions = {}
     for name, values in representations.items():
         values = F.normalize(values.to(device=device, dtype=torch.float32), dim=-1)
-        metrics = [
-            controlled_style_ranking(values, rows, count, normalized=True)
-            for count in reference_counts
-        ]
+        metrics = []
+        for count in reference_counts:
+            result = controlled_style_ranking(
+                values,
+                rows,
+                count,
+                normalized=True,
+                return_correct=name in decision_names,
+            )
+            if name in decision_names:
+                metric, correct = result
+                decisions[(name, count)] = correct
+            else:
+                metric = result
+            metrics.append(metric)
         ranking.append(
             {
                 "representation": name,
@@ -459,12 +533,76 @@ def evaluate_stylenet_layer_features(
             }
         )
     ranking.sort(key=lambda row: (row["mean_top1"], row["mean_mrr"]), reverse=True)
+    ranking_by_name = {row["representation"]: row for row in ranking}
+
+    centered_spatial = {}
+    spatial_self_hsic = {}
+    for layer in pairwise_layers:
+        values = tensors[f"layer_{layer:02d}_spatial_mean"].to(
+            device=device, dtype=torch.float32
+        )
+        values = values - values.mean(dim=0, keepdim=True)
+        gram = values.T @ values
+        centered_spatial[layer] = values
+        spatial_self_hsic[layer] = gram.square().sum()
+
+    pair_analysis = []
+    for first, second, spatial_name, summary_name in pair_names:
+        cross = centered_spatial[first].T @ centered_spatial[second]
+        cka = cross.square().sum() / torch.sqrt(
+            spatial_self_hsic[first] * spatial_self_hsic[second]
+        )
+        oracle_values = []
+        error_jaccard_values = []
+        disagreement_values = []
+        for count in reference_counts:
+            first_correct = decisions[(f"layer_{first:02d}_spatial_mean", count)]
+            second_correct = decisions[(f"layer_{second:02d}_spatial_mean", count)]
+            first_error = ~first_correct
+            second_error = ~second_correct
+            oracle_values.append(float((first_correct | second_correct).float().mean()))
+            error_union = first_error | second_error
+            error_jaccard_values.append(
+                float((first_error & second_error).sum() / error_union.sum())
+            )
+            disagreement_values.append(float((first_correct != second_correct).float().mean()))
+        spatial_pair = ranking_by_name[spatial_name]
+        summary_pair = ranking_by_name[summary_name]
+        best_spatial_single = max(
+            ranking_by_name[f"layer_{first:02d}_spatial_mean"]["mean_top1"],
+            ranking_by_name[f"layer_{second:02d}_spatial_mean"]["mean_top1"],
+        )
+        best_summary_single = max(
+            ranking_by_name[f"layer_{first:02d}_summary"]["mean_top1"],
+            ranking_by_name[f"layer_{second:02d}_summary"]["mean_top1"],
+        )
+        pair_analysis.append(
+            {
+                "layers": [first, second],
+                "spatial_mean_cka": float(cka),
+                "spatial_pair_mean_top1": spatial_pair["mean_top1"],
+                "spatial_gain_over_best_single": spatial_pair["mean_top1"]
+                - best_spatial_single,
+                "summary_pair_mean_top1": summary_pair["mean_top1"],
+                "summary_gain_over_best_single": summary_pair["mean_top1"]
+                - best_summary_single,
+                "spatial_oracle_mean_top1": sum(oracle_values) / len(oracle_values),
+                "spatial_error_jaccard": sum(error_jaccard_values)
+                / len(error_jaccard_values),
+                "spatial_correctness_disagreement": sum(disagreement_values)
+                / len(disagreement_values),
+            }
+        )
+    pair_analysis.sort(
+        key=lambda row: row["spatial_pair_mean_top1"], reverse=True
+    )
     summary = {
         "protocol": "Within each character-controlled group, rank the target artist original against three different-artist images using references from other groups.",
         "images": len(rows),
         "groups": len({row["group_key"] for row in rows}),
         "reference_counts": reference_counts,
         "ranking": ranking,
+        "pair_analysis": pair_analysis,
     }
     write_json(root / "evaluation.json", summary)
     return summary

@@ -95,7 +95,9 @@ stylenet_benchmark:
   download_workers: 16
   min_side: 64
   min_image_std: 2.0
-  layers: [4, 8, 12, 16, 20, 24, 26]
+  layers: [4, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26]
+  pairwise_layers: [8, 10, 12, 14, 16, 18, 20, 22, 24]
+  extract_spatial_stats: false
   reference_counts: [1, 2, 4, 8]
   evaluation_device: cuda
   storage_dtype: float16
