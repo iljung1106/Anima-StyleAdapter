@@ -7,6 +7,11 @@ from pathlib import Path
 from typing import Any
 
 from .anima500k import download_anima500k_human, extract_anima500k_human
+from .anima_cache import (
+    cache_all_anima_inputs,
+    cache_anima_text_conditions,
+    cache_anima_vae_latents,
+)
 from .caption import create_anima_captions
 from .config import load_config, output_dir
 from .cradio import extract_cradio_features, extract_selected_style_features
@@ -67,6 +72,9 @@ def build_parser() -> argparse.ArgumentParser:
         ("stylenet-extract", "Extract pooled C-RADIO layer features on StyleNet"),
         ("stylenet-evaluate", "Evaluate controlled StyleNet style ranking"),
         ("stylenet-benchmark", "Prepare, extract, and evaluate StyleNet layers"),
+        ("anima-text-cache", "Cache packed post-LLM Anima text conditioning"),
+        ("anima-latent-cache", "Cache packed Qwen-Image VAE latents"),
+        ("anima-cache", "Cache all frozen Anima training inputs"),
         ("prepare", "Run selection, download, and duplicate removal"),
         ("all", "Run every stage, including tagger and C-RADIO models"),
     ):
@@ -120,6 +128,12 @@ def main() -> None:
         _run(evaluate_stylenet_layer_features, config, destination)
     elif args.command == "stylenet-benchmark":
         _run(run_stylenet_layer_benchmark, config, destination)
+    elif args.command == "anima-text-cache":
+        _run(cache_anima_text_conditions, config, destination)
+    elif args.command == "anima-latent-cache":
+        _run(cache_anima_vae_latents, config, destination)
+    elif args.command == "anima-cache":
+        _run(cache_all_anima_inputs, config, destination)
     elif args.command in {"prepare", "all"}:
         for stage in (select_candidates, download_candidates, deduplicate):
             _run(stage, config, destination)

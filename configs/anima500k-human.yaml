@@ -47,6 +47,50 @@ caption:
   include_characters: true
   include_general: true
 
+# Frozen input caches for the full style-transfer training stage. The runtime
+# imports the exact Anima implementation from a pinned sd-scripts checkout.
+anima_cache:
+  sd_scripts_path: /workspace/sd-scripts
+  sd_scripts_revision: 37a1cbbc5725ed2a3575506e7bd2001c9908ac92
+  models:
+    repo_id: circlestone-labs/Anima
+    revision: main
+    qwen3_filename: split_files/text_encoders/qwen_3_06b_base.safetensors
+    dit_filename: split_files/diffusion_models/anima-base-v1.0.safetensors
+    vae_filename: split_files/vae/qwen_image_vae.safetensors
+  text:
+    output_directory: anima_text_cache_post_llm
+    device: cuda
+    batch_size: 64
+    shard_rows: 512
+    writer_workers: 2
+    pending_writes: 4
+    qwen_max_length: 512
+    t5_max_length: 512
+    variants: 2
+    general_tag_dropout: 0.15
+    variant_seed: 20260811
+    allow_tf32: true
+  latents:
+    output_directory: anima_latent_cache_qwen_2d
+    device: cuda
+    batch_size: 4
+    shard_rows: 512
+    reader_workers: 32
+    decoder_workers: 16
+    read_prefetch: 4096
+    decode_prefetch: 512
+    writer_workers: 4
+    pending_writes: 8
+    pinned_buffers: 2
+    preprocess:
+      max_side: 1536
+      max_pixels: 1048576
+      min_side: 256
+      bucket_step: 64
+      allow_upscale: false
+      upscale_below_min: true
+
 cradio:
   torchhub_repo: NVlabs/RADIO
   torchhub_ref: c0f37017930e9dda53f93424cf4bf39fc51f287e
