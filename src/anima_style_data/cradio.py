@@ -249,27 +249,29 @@ def _selected_style_tensors(
     statistics_layers: set[int],
     storage_dtype: Any,
 ) -> list[dict[str, Any]]:
-    """Collect the deliberately small, production-selected C-RADIO feature set."""
-    outputs: list[dict[str, Any]] = []
-    batch_size = int(intermediate[0].features.shape[0])
-    for item_index in range(batch_size):
-        tensors: dict[str, Any] = {}
-        for layer, output in zip(layers, intermediate):
-            spatial = output.features[item_index]
-            if layer in spatial_layers:
-                tensors[f"layer_{layer:02d}_spatial"] = spatial.detach().to(
-                    "cpu", dtype=storage_dtype
-                )
-            if layer in statistics_layers:
-                stable = spatial.detach().float()
-                tensors[f"layer_{layer:02d}_mean"] = stable.mean(dim=0).to(
-                    "cpu", dtype=storage_dtype
-                )
-                tensors[f"layer_{layer:02d}_std"] = stable.std(
-                    dim=0, correction=0
-                ).to("cpu", dtype=storage_dtype)
-        outputs.append(tensors)
-    return outputs
+    """Collect production features with one reduction/transfer per layer batch."""
+    batched: dict[str, Any] = {}
+    for layer, output in zip(layers, intermediate):
+        spatial = output.features if hasattr(output, "features") else output
+        spatial = spatial.detach()
+        if layer in spatial_layers:
+            batched[f"layer_{layer:02d}_spatial"] = spatial.to(
+                "cpu", dtype=storage_dtype
+            )
+        if layer in statistics_layers:
+            stable = spatial.float()
+            batched[f"layer_{layer:02d}_mean"] = stable.mean(dim=1).to(
+                "cpu", dtype=storage_dtype
+            )
+            batched[f"layer_{layer:02d}_std"] = stable.std(
+                dim=1, correction=0
+            ).to("cpu", dtype=storage_dtype)
+
+    batch_size = int(next(iter(batched.values())).shape[0])
+    return [
+        {name: values[item_index] for name, values in batched.items()}
+        for item_index in range(batch_size)
+    ]
 
 
 def extract_selected_style_features(
@@ -439,22 +441,31 @@ def extract_selected_style_features(
 
     def run_batch(items: list[tuple[dict[str, Any], torch.Tensor, PreprocessInfo]]) -> None:
         nonlocal newly_encoded
-        host_images = torch.stack([item[1] for item in items])
+        image_tensors = [item[1] for item in items]
         pin_started = time.monotonic()
         if device.startswith("cuda"):
-            host_images = host_images.pin_memory()
+            host_images = torch.empty(
+                (len(image_tensors), *image_tensors[0].shape),
+                dtype=image_tensors[0].dtype,
+                pin_memory=True,
+            )
+            torch.stack(image_tensors, out=host_images)
+        else:
+            host_images = torch.stack(image_tensors)
         timing["pin_s"] += time.monotonic() - pin_started
         gpu_started = time.monotonic()
         images = host_images.to(device, non_blocking=device.startswith("cuda"))
         with torch.inference_mode(), torch.autocast(
             device_type="cuda", dtype=amp_dtype, enabled=amp_enabled
         ):
-            _, intermediate = model.forward_intermediates(
+            intermediate = model.forward_intermediates(
                 images,
                 indices=layers,
-                return_prefix_tokens=True,
+                return_prefix_tokens=False,
                 norm=True,
+                stop_early=True,
                 output_fmt="NLC",
+                intermediates_only=True,
                 aggregation="sparse",
             )
         selected = _selected_style_tensors(
