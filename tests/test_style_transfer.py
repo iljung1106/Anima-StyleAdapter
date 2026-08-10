@@ -12,9 +12,21 @@ from anima_style_data.style_transfer import (
     SharedLowRankStyleAdapter,
     SlotSetAggregator,
     _archive_training_state,
+    _pad_text_conditions,
     _save_training_state,
     attach_style_adapter,
 )
+
+
+def test_text_conditions_restore_animas_fixed_zero_padding():
+    first = torch.randn(3, 8)
+    second = torch.randn(5, 8)
+    padded = _pad_text_conditions([first, second], 7)
+    assert padded.shape == (2, 7, 8)
+    torch.testing.assert_close(padded[0, :3], first)
+    torch.testing.assert_close(padded[1, :5], second)
+    assert torch.count_nonzero(padded[0, 3:]) == 0
+    assert torch.count_nonzero(padded[1, 5:]) == 0
 
 
 def test_slot_set_aggregator_is_reference_order_invariant():

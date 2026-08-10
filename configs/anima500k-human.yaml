@@ -269,6 +269,9 @@ style_transfer:
     batch_size: 16
     min_references: 1
     max_references: 8
+    # Anima cross-attention was trained with 512 post-LLM tokens, including
+    # trailing zeros; it has no text padding mask, so runtime must restore them.
+    text_conditioning_length: 512
     text_lru_shards: 2
     latent_lru_shards: 2
   resampler:

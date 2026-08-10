@@ -60,6 +60,25 @@ class _TensorShardCache:
             return tensors
 
 
+def _pad_text_conditions(
+    conditions: list[torch.Tensor], conditioning_length: int
+) -> torch.Tensor:
+    if any(value.shape[0] > conditioning_length for value in conditions):
+        longest = max(value.shape[0] for value in conditions)
+        raise ValueError(
+            f"Cached text condition length {longest} exceeds configured length {conditioning_length}"
+        )
+    batch = torch.zeros(
+        len(conditions),
+        conditioning_length,
+        conditions[0].shape[-1],
+        dtype=conditions[0].dtype,
+    )
+    for index, value in enumerate(conditions):
+        batch[index, : value.shape[0]] = value
+    return batch
+
+
 class ProductionStyleLoader:
     """Deterministic same-style target/reference episodes over frozen caches.
 
@@ -77,6 +96,11 @@ class ProductionStyleLoader:
         self.min_references = int(cfg.get("min_references", 1))
         self.max_references = int(cfg.get("max_references", 8))
         self.split = str(cfg.get("split", "train"))
+        # Anima was trained with fixed 512-token post-LLM conditioning. Its
+        # cross-attention does not receive a text padding mask, so the trailing
+        # zero embeddings are part of the learned softmax normalization and
+        # must not be trimmed at runtime.
+        self.text_conditioning_length = int(cfg.get("text_conditioning_length", 512))
 
         style_root = destination / str(cfg["style_cache"])
         text_root = destination / str(cfg["text_cache"])
@@ -181,12 +205,7 @@ class ProductionStyleLoader:
             shard = self.text_shards.get(str(row["cache_shard"]))
             start = int(row["token_offset"])
             conditions.append(shard["conditioning"][start : start + int(row["token_length"])])
-        max_text = max(value.shape[0] for value in conditions)
-        condition_batch = torch.zeros(
-            len(conditions), max_text, conditions[0].shape[-1], dtype=conditions[0].dtype
-        )
-        for index, value in enumerate(conditions):
-            condition_batch[index, : value.shape[0]] = value
+        condition_batch = _pad_text_conditions(conditions, self.text_conditioning_length)
 
         flat_references = [image_id for item in episodes for image_id in item.reference_ids]
         max_refs = max(len(item.reference_ids) for item in episodes)
@@ -739,6 +758,9 @@ def _sample_style_adapter(
     null_text = load_file(null_file, device="cpu")["empty_prompt"]
     if null_text.ndim == 2:
         null_text = null_text.unsqueeze(0)
+    null_text = _pad_text_conditions(
+        [null_text[0]], loader.text_conditioning_length
+    )
     null_text = null_text.to(device, dtype=torch.bfloat16)
     null_style = adapter.unconditional(1)
     height = int(sample_cfg.get("height", 512))
