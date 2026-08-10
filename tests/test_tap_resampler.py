@@ -66,6 +66,37 @@ def test_resampler_contract_and_prototype_loss():
     assert torch.isfinite(_prototype_loss(embedding, 2, 2, 0.07))
 
 
+def test_concat_resampler_returns_direct_style_tokens():
+    model = build_tap_resampler_model(
+        taps=[18, 24],
+        reconstruction_taps=[18, 24],
+        spatial_dim=12,
+        global_kind="native_24",
+        global_dim=12,
+        model_dim=24,
+        latent_tokens=4,
+        heads=4,
+        resampler_layers=1,
+        decoder_layers=1,
+        style_dim=24,
+        spatial_fusion="concat_mlp",
+        direct_style_tokens=True,
+    )
+    features = {18: torch.randn(4, 6, 12), 24: torch.randn(4, 6, 12)}
+    mask = torch.ones(4, 6, dtype=torch.bool)
+    decoded, decoded_mask, style_tokens = model(
+        features,
+        mask,
+        [(32, 48)] * 4,
+        torch.randn(4, 12),
+    )
+
+    assert decoded[18].shape == decoded[24].shape == (4, 6, 12)
+    assert torch.equal(decoded_mask, mask)
+    assert style_tokens.shape == (4, 4, 24)
+    assert torch.isfinite(_prototype_loss(style_tokens, 2, 2, 0.07))
+
+
 def test_training_episode_is_step_addressable():
     artists = ["a", "b", "c"]
     by_style = {

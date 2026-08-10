@@ -231,6 +231,9 @@ def _selected_style_feature_signature(
         "statistics_layers": sorted(
             int(value) for value in feature_cfg.get("statistics_layers", [])
         ),
+        "summary_layers": sorted(
+            int(value) for value in feature_cfg.get("summary_layers", [])
+        ),
         "statistics": list(feature_cfg.get("statistics", ["mean", "std"])),
         "storage_dtype": feature_cfg["storage_dtype"],
         "preprocess": {
@@ -247,6 +250,7 @@ def _selected_style_tensors(
     layers: list[int],
     spatial_layers: set[int],
     statistics_layers: set[int],
+    summary_layers: set[int],
     storage_dtype: Any,
 ) -> list[dict[str, Any]]:
     """Collect production features with one reduction/transfer per layer batch."""
@@ -266,6 +270,17 @@ def _selected_style_tensors(
             batched[f"layer_{layer:02d}_std"] = stable.std(
                 dim=1, correction=0
             ).to("cpu", dtype=storage_dtype)
+        if layer in summary_layers:
+            if not hasattr(output, "summary"):
+                raise RuntimeError(
+                    f"C-RADIO layer {layer} did not return prefix/summary tokens"
+                )
+            # C-RADIO summary concatenates teacher slots. The first backbone-width
+            # slice is the internal SigLIP2-g teacher CLS representation.
+            siglip_cls = output.summary.detach()[..., : spatial.shape[-1]]
+            batched[f"layer_{layer:02d}_siglip_cls"] = siglip_cls.to(
+                "cpu", dtype=storage_dtype
+            )
 
     batch_size = int(next(iter(batched.values())).shape[0])
     return [
@@ -277,7 +292,7 @@ def _selected_style_tensors(
 def extract_selected_style_features(
     config: dict[str, Any], destination: Path
 ) -> dict[str, Any]:
-    """Cache L20/L24 spatial tokens and compact low-level style statistics."""
+    """Cache the configured production spatial and teacher-summary features."""
     import torch
     from safetensors.torch import save_file
 
@@ -287,13 +302,14 @@ def extract_selected_style_features(
     statistics_layers = {
         int(value) for value in feature_cfg.get("statistics_layers", [])
     }
+    summary_layers = {int(value) for value in feature_cfg.get("summary_layers", [])}
     statistics = set(feature_cfg.get("statistics", ["mean", "std"]))
     if statistics != {"mean", "std"}:
         raise ValueError("style_features.statistics must contain exactly mean and std")
-    layers = sorted(spatial_layers | statistics_layers)
+    layers = sorted(spatial_layers | statistics_layers | summary_layers)
     signature = _selected_style_feature_signature(radio_cfg, feature_cfg)
 
-    features_dir = destination / "style_features"
+    features_dir = destination / str(feature_cfg.get("output_directory", "style_features"))
     manifest_dir = features_dir / "manifests"
     manifest_dir.mkdir(parents=True, exist_ok=True)
     completed_rows: list[dict[str, Any]] = []
@@ -322,6 +338,7 @@ def extract_selected_style_features(
             "newly_encoded": 0,
             "spatial_layers": sorted(spatial_layers),
             "statistics_layers": sorted(statistics_layers),
+            "summary_layers": sorted(summary_layers),
             "storage_bytes": total_bytes,
             "feature_signature": signature,
         }
@@ -461,7 +478,7 @@ def extract_selected_style_features(
             intermediate = model.forward_intermediates(
                 images,
                 indices=layers,
-                return_prefix_tokens=False,
+                return_prefix_tokens=bool(summary_layers),
                 norm=True,
                 stop_early=True,
                 output_fmt="NLC",
@@ -469,7 +486,12 @@ def extract_selected_style_features(
                 aggregation="sparse",
             )
         selected = _selected_style_tensors(
-            intermediate, layers, spatial_layers, statistics_layers, storage_dtype
+            intermediate,
+            layers,
+            spatial_layers,
+            statistics_layers,
+            summary_layers,
+            storage_dtype,
         )
         if device.startswith("cuda"):
             torch.cuda.synchronize()
@@ -617,6 +639,7 @@ def extract_selected_style_features(
         "newly_encoded": newly_encoded,
         "spatial_layers": sorted(spatial_layers),
         "statistics_layers": sorted(statistics_layers),
+        "summary_layers": sorted(summary_layers),
         "statistics": sorted(statistics),
         "storage_dtype": feature_cfg["storage_dtype"],
         "storage_bytes": total_bytes,

@@ -85,4 +85,4 @@ reference 수별로도 L18 spatial은 51.99/55.13/58.56/60.32%, L18+L24는 51.60
 2. L18+L24 spatial: dense sweep이 제시한 주 후보
 3. L20+L24 spatial: 현재 production 기준선
 
-spatial pair를 먼저 확정한 후, 승자에 L24 SigLIP CLS를 통합하는 구조를 별도로 검증한다. prototype loss는 보조 projection만이 아니라 실제 출력 style token에도 적용하고, reconstruction과 held-out-artist 성능의 Pareto로 선택한다.
+최종 입력 후보는 **L18+L24 full spatial + L24 SigLIP CLS**로 확정했다. 전체 human 데이터에 이 세 특징을 production cache로 만들고, `16×768` 직접 style token에 prototype loss를 적용하는 per-reference Resampler를 학습한다. reconstruction과 held-out-artist 성능을 함께 기록하며, L20+L24의 기존 pilot 결과는 기준선으로 보존한다.

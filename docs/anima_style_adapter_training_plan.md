@@ -265,6 +265,19 @@ Decoder는 이 표현 학습의 보조 장치이므로 최종 Style Transfer 추
 
 각 reference는 공유된 per-reference Resampler를 거쳐 `N×D` style token을 만든다. 1~8장분의 token은 순서에 무관한 작은 Set Aggregator가 받아 고정된 수의 최종 style token으로 합친다. 28개의 독립 aggregator를 두지 않고 하나의 aggregator를 공유한다.
 
+확정한 per-reference 입력은 **C-RADIO L18 spatial + L24 spatial + L24 내부 SigLIP teacher CLS**다. L18/L24의 같은 위치 spatial token을 각각 정규화한 뒤 채널 방향으로 결합하고 2-layer MLP로 768차원에 투영한다. L24 SigLIP CLS는 별도 768차원 global context token으로 투영해 spatial context 앞에 추가한다. 16개의 learned query와 4-layer cross/self-attention Resampler가 reference마다 `16×768` style token을 출력한다. 보조 256차원 projection에만 작가 loss를 걸지 않고, 대응하는 16개 출력 slot 자체에 slot-wise prototype loss를 적용한다. 2-layer reconstruction decoder는 L18/L24 spatial 특징을 복원하며 추론에서는 제거한다.
+
+Set Aggregator는 입력 `B×R×16×768`에서 같은 번호의 slot끼리 reference 방향 attention을 먼저 수행한다. masked mean을 residual 기준으로 삼고 attention branch에는 `1e-3` LayerScale을 사용해 1-reference에서 원래 출력에 가깝게 시작한다. 이후 2-layer, 12-head Pre-LN slot Transformer로 16개 slot 사이를 정제하고 reference 수와 무관한 `16×768`을 출력한다. Reference 순서 embedding은 사용하지 않는다. 전체 style dropout에서는 같은 형상의 learned null token을 사용한다.
+
+초기 고정값은 다음과 같다.
+
+- per-reference/final style tokens: 16
+- token width: 768
+- Resampler heads: 12, encoder 4 layers, training-only decoder 2 layers
+- Set Aggregator: reference-slot attention 1 layer + slot Transformer 2 layers
+- 개별 slot prototype loss + 약한 pooled prototype loss
+- Anima K/V shared full-rank base + block별 rank-16 delta
+
 Anima 28-block 모델은 hidden dimension 2,048, 16-head 구조이며 각 block이 AdaLN으로 조절되는 self-attention, text cross-attention, MLP를 순서대로 수행한다. Style 조건은 text token과 같은 softmax에 단순 연결하지 않고 별도의 decoupled style-attention branch로 추가한다. Style branch는 기존 text cross-attention에 들어가는 정규화된 image hidden state와 block별 `Q` projection을 재사용하고 style K/V만 새로 만든다. 1차 구현에서는 기존 output projection도 재사용하며, 별도 style Q 또는 Q-LoRA는 이 구조의 한계가 실제 생성 평가에서 확인될 때만 검토한다.
 
 Style attention은 text cross-attention 직후, MLP 이전에 삽입한다. 따라서 text와 style은 서로 다른 softmax로 조건을 읽되, 두 residual이 합쳐진 hidden state를 같은 block의 MLP가 처리한다. Text token과 style token을 한 attention의 K/V로 concatenate하지 않는다.
@@ -307,6 +320,8 @@ Text와 style의 강도는 다음 세 prediction으로 분리한다.
 C-RADIO는 전 단계에서 동결한다. 공동학습 중 reconstruction decoder 비용이 크면 decoder는 제외하고 prototype 및 anchor loss만 유지할 수 있다.
 
 ## 12. 캐시와 산출물
+
+최종 feature contract가 정해졌으므로 pilot 10,000장만 별도 캐싱하지 않는다. 전체 human manifest 149,877장에 대해 `style_features_l18_l24_siglip_l24` cache를 생성한다. 각 shard에는 L18/L24 full spatial FP16과 L24 SigLIP teacher CLS FP16을 함께 저장한다. Per-reference Resampler 사전학습은 이 전체 cache의 manifest에서 artist-disjoint 1,000명×10장 subset만 선택해 사용하며, 이후 더 큰 사전학습 및 Anima adapter 학습도 같은 cache를 재사용한다. 기존 L20/L24/L8-stat cache는 이전 실험 재현을 위해 삭제하거나 덮어쓰지 않는다.
 
 각 단계는 다시 실행할 수 있고 중간 결과만 교체할 수 있도록 sharded Parquet 또는 유사한 columnar manifest로 저장한다.
 

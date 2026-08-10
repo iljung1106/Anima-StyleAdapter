@@ -84,6 +84,7 @@ def test_batched_selected_style_tensors_match_per_image_reference_bitwise():
         [8, 20, 24],
         {20, 24},
         {8},
+        set(),
         torch.float16,
     )
 
@@ -105,3 +106,20 @@ def test_batched_selected_style_tensors_match_per_image_reference_bitwise():
         }
         for name, value in expected.items():
             assert torch.equal(tensors[name], value), name
+
+
+def test_selected_style_tensors_extract_siglip_teacher_cls():
+    from types import SimpleNamespace
+
+    spatial = torch.randn(2, 7, 12)
+    summary = torch.randn(2, 24)
+    selected = _selected_style_tensors(
+        [SimpleNamespace(features=spatial, summary=summary)],
+        [24],
+        {24},
+        set(),
+        {24},
+        torch.float16,
+    )
+
+    assert torch.equal(selected[0]["layer_24_siglip_cls"], summary[0, :12].half())
