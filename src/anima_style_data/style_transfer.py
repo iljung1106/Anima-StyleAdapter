@@ -681,7 +681,8 @@ def _sample_style_adapter(
     batch = loader.load_step(int(sample_cfg.get("episode", 0)))
     references = _encode_reference_tokens(resampler, batch, device)
     reference_mask = batch["reference_mask"].to(device, non_blocking=True)
-    positive_style = adapter.aggregate(references, reference_mask)
+    with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=device.startswith("cuda")):
+        positive_style = adapter.aggregate(references, reference_mask)
     positive_text = batch["conditioning"][:1].to(device, dtype=torch.bfloat16)
     null_file = loader.text_root / "null_conditioning.safetensors"
     null_text = load_file(null_file, device="cpu")["empty_prompt"]
