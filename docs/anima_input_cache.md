@@ -20,7 +20,7 @@ Anima의 실제 text 경로는 `Qwen3-0.6B hidden state → 6-layer LLM Adapter 
 
 공식 Qwen-Image weight를 sd-scripts의 image-only 2D VAE 구현으로 변환하여 사용한다. Posterior mean과 공식 latent mean/std normalization을 적용한 16-channel FP16 latent를 저장한다.
 
-- 원본 비율을 유지하며 1MP와 long side 1,536 이하로만 축소
+- 원본 비율을 유지하며 1MP와 보통 long side 1,536 이하로만 축소
 - 64px bucket 정렬 후 center crop
 - 일반 이미지는 확대하지 않음
 - 짧은 변이 256px 미만인 12장만 최소 bucket까지 확대
@@ -54,6 +54,20 @@ HF_HOME=/workspace/.cache/huggingface \
 H100 SXM 실측에서 text batch 64는 16.64 items/s였고 128로 키워도 16.58 items/s로 개선되지 않았다. VAE batch 8은 29.08 images/s였고 16은 28.89 images/s였다. 따라서 production 기본값은 text 64, VAE 8로 고정한다.
 
 VAE activation memory는 해상도에 따라 증가한다. 최대 batch 8에 더해 batch당 target pixel budget을 4,194,304로 제한하여 512²에서는 8, 704×768에서는 7, 1024²에서는 4로 자동 조절한다. 이 제한은 H100 80GB에서 후반 고해상도 bucket의 OOM을 막기 위한 것이다.
+
+최소 짧은 변 rescue가 우선되므로 극단적으로 긴 소형 이미지 한 장은 256×1728 bucket이 되었다. 총 pixel은 1MP 이내이고 Anima latent grid 허용 범위 안이다. 이 예외를 없애려면 해당 이미지를 제외하거나 cache contract version을 올려 전처리를 다시 해야 하므로 현재 v1 cache에서는 보존한다.
+
+## Production 결과
+
+Anima model revision `f7382c4bf9d7ffe4ceea593a0adbb470c56dd79b`, sd-scripts revision `37a1cbbc5725ed2a3575506e7bd2001c9908ac92`로 전체 149,877장을 캐시했다.
+
+| Cache | Items | Shards | Bytes |
+|---|---:|---:|---:|
+| Post-LLM text, 2 variants | 299,754 | 586 | 71,996,252,636 |
+| Qwen-Image VAE latent | 149,877 | 435 | 51,764,525,856 |
+| 합계 | 449,631 | 1,021 | 123,760,778,492 |
+
+Text 최초 실행은 전체 평균 714 items/s였다. VAE는 pixel-budget 수정 전 완료된 25,648장을 재사용하고 나머지 124,229장을 47.17 images/s로 처리했다. `anima-cache-validate`는 global/part manifest 개수와 중복, 첫·중간·마지막 shard의 ID·variant·offset, FP16 dtype, finite 값과 16-channel latent contract를 확인해 `valid: true`를 기록했다.
 
 ## 본학습 loader 계약
 
