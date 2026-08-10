@@ -808,6 +808,8 @@ def _sample_style_adapter(
         vae = _load_sampling_vae(config, destination)
     vae.to(device=device, dtype=torch.bfloat16)
     decoded = vae.decode_to_pixels(torch.cat((base_x, styled_x), dim=0)).float()
+    target_x = batch["latents"][:1].to(device=device, dtype=torch.bfloat16).unsqueeze(2)
+    target_decoded = vae.decode_to_pixels(target_x).float()
     vae.to("cpu")
 
     def to_image(value: torch.Tensor) -> Image.Image:
@@ -824,13 +826,16 @@ def _sample_style_adapter(
     sheet_path = sample_dir / f"step-{step:07d}-sheet.png"
     generated.save(raw_path)
     base_generated.save(sample_dir / f"step-{step:07d}-base.png")
+    to_image(target_decoded[0]).save(sample_dir / f"step-{step:07d}-cached-target.png")
     _make_sample_sheet(generated, loader, batch, base_generated=base_generated).save(sheet_path)
     print(
         f"sample latent stats step={step} "
         f"base_mean={base_x.float().mean().item():.5f} base_std={base_x.float().std().item():.5f} "
         f"base_absmax={base_x.float().abs().max().item():.5f} "
         f"style_mean={styled_x.float().mean().item():.5f} style_std={styled_x.float().std().item():.5f} "
-        f"style_absmax={styled_x.float().abs().max().item():.5f}",
+        f"style_absmax={styled_x.float().abs().max().item():.5f} "
+        f"target_mean={target_x.float().mean().item():.5f} target_std={target_x.float().std().item():.5f} "
+        f"target_absmax={target_x.float().abs().max().item():.5f}",
         flush=True,
     )
     gc.collect()
