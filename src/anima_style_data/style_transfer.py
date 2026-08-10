@@ -120,12 +120,17 @@ class ProductionStyleLoader:
         if not self.by_style or not self.buckets:
             raise RuntimeError("No eligible same-style episodes exist in the cache intersection")
         self.bucket_keys = sorted(self.buckets)
+        self.bucket_weights = [len(self.buckets[key]) for key in self.bucket_keys]
         self.text_shards = _TensorShardCache(text_root, int(cfg.get("text_lru_shards", 2)))
         self.latent_shards = _TensorShardCache(latent_root, int(cfg.get("latent_lru_shards", 2)))
 
     def episodes_for_step(self, step: int) -> list[StyleEpisode]:
         rng = random.Random(self.seed + step * 1_000_003)
-        shape = self.bucket_keys[step % len(self.bucket_keys)]
+        # Sampling bucket names uniformly would drastically overrepresent rare
+        # extreme aspect ratios. Weight by eligible target count so each image
+        # retains approximately equal target probability while batches remain
+        # exact-shape.
+        shape = rng.choices(self.bucket_keys, weights=self.bucket_weights, k=1)[0]
         candidates = self.buckets[shape]
         chosen: list[int] = []
         attempts = 0

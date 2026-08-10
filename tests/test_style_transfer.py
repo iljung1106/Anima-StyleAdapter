@@ -35,6 +35,7 @@ def test_episode_sampler_never_uses_target_as_reference():
     loader.min_references = 1
     loader.max_references = 3
     loader.bucket_keys = [(32, 32)]
+    loader.bucket_weights = [4]
     loader.buckets = {(32, 32): [10, 11, 12, 13]}
     loader.style_by_id = {
         image_id: {"artist": "artist", "style_id": "style"}
