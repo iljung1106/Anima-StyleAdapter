@@ -521,10 +521,14 @@ def _resolve_anima_model(config: dict[str, Any], destination: Path, device: str)
         sys.path.insert(0, str(sd_scripts))
     from library import anima_utils
 
-    return anima_utils.load_anima_model(
+    model = anima_utils.load_anima_model(
         device=device, dit_path=dit_path, attn_mode="torch", split_attn=False,
         loading_device=device, dit_weight_dtype=torch.bfloat16,
     )
+    # load_anima_model places checkpoint tensors directly, while accelerator in
+    # the upstream trainer performs the final move that also covers RoPE and
+    # other non-checkpoint buffers. This standalone runner must do that step.
+    return model.to(device)
 
 
 def train_style_adapter(config: dict[str, Any], destination: Path, *, steps_override: int | None = None) -> dict[str, Any]:
