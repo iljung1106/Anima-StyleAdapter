@@ -72,7 +72,7 @@ style_features:
   statistics: [mean, std]
   storage_dtype: float16
   amp_dtype: bfloat16
-  batch_size: 32
+  batch_size: 64
   shard_rows: 512
   max_open_buckets: 64
   reader_workers: 64
