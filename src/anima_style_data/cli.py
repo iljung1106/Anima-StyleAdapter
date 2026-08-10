@@ -77,6 +77,8 @@ def build_parser() -> argparse.ArgumentParser:
         ("anima-latent-cache", "Cache packed Qwen-Image VAE latents"),
         ("anima-cache", "Cache all frozen Anima training inputs"),
         ("anima-cache-validate", "Validate packed Anima cache manifests and tensors"),
+        ("style-train", "Train the multi-reference Anima style adapter"),
+        ("style-smoke", "Run two real Anima style-adapter training steps"),
         ("prepare", "Run selection, download, and duplicate removal"),
         ("all", "Run every stage, including tagger and C-RADIO models"),
     ):
@@ -138,6 +140,12 @@ def main() -> None:
         _run(cache_all_anima_inputs, config, destination)
     elif args.command == "anima-cache-validate":
         _run(validate_anima_caches, config, destination)
+    elif args.command in {"style-train", "style-smoke"}:
+        # Keep torch/sd-scripts optional for metadata-only commands.
+        from .style_transfer import smoke_test_style_adapter, train_style_adapter
+
+        stage = smoke_test_style_adapter if args.command == "style-smoke" else train_style_adapter
+        _run(stage, config, destination)
     elif args.command in {"prepare", "all"}:
         for stage in (select_candidates, download_candidates, deduplicate):
             _run(stage, config, destination)

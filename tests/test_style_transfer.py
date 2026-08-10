@@ -1,0 +1,100 @@
+from __future__ import annotations
+
+import types
+
+import pytest
+
+torch = pytest.importorskip("torch")
+from torch import nn
+
+from anima_style_data.style_transfer import (
+    ProductionStyleLoader,
+    SharedLowRankStyleAdapter,
+    SlotSetAggregator,
+    attach_style_adapter,
+)
+
+
+def test_slot_set_aggregator_is_reference_order_invariant():
+    torch.manual_seed(7)
+    model = SlotSetAggregator(slots=3, dim=12, heads=3, layers=2).eval()
+    values = torch.randn(2, 4, 3, 12)
+    mask = torch.tensor([[True, True, True, False], [True, True, True, True]])
+    permutation = torch.tensor([2, 0, 3, 1])
+    first = model(values, mask)
+    second = model(values[:, permutation], mask[:, permutation])
+    torch.testing.assert_close(first, second, atol=2e-6, rtol=2e-6)
+
+
+def test_episode_sampler_never_uses_target_as_reference():
+    loader = ProductionStyleLoader.__new__(ProductionStyleLoader)
+    loader.seed = 41
+    loader.batch_size = 1
+    loader.min_references = 1
+    loader.max_references = 3
+    loader.bucket_keys = [(32, 32)]
+    loader.buckets = {(32, 32): [10, 11, 12, 13]}
+    loader.style_by_id = {
+        image_id: {"artist": "artist", "style_id": "style"}
+        for image_id in (10, 11, 12, 13)
+    }
+    loader.by_style = {"style": [10, 11, 12, 13]}
+    loader.text_variants = {image_id: [0, 1] for image_id in (10, 11, 12, 13)}
+    for step in range(12):
+        episode = loader.episodes_for_step(step)[0]
+        assert episode.target_id not in episode.reference_ids
+        assert 1 <= len(episode.reference_ids) <= 3
+        assert len(set(episode.reference_ids)) == len(episode.reference_ids)
+
+
+class _FakeCrossAttention(nn.Module):
+    def __init__(self, hidden: int):
+        super().__init__()
+        self.q_proj = nn.Linear(hidden, hidden, bias=False)
+        self.q_norm = nn.Identity()
+        self.k_norm = nn.Identity()
+        self.output_proj = nn.Linear(hidden, hidden, bias=False)
+        self.output_dropout = nn.Identity()
+
+
+def test_style_attention_reuses_frozen_q_and_updates_gate():
+    torch.manual_seed(3)
+    adapter = SharedLowRankStyleAdapter(
+        style_dim=8, slots=2, hidden_dim=16, heads=4, blocks=28, rank=2,
+        aggregator_heads=2, aggregator_layers=1, style_dropout=0.0, gate_dim=4,
+    )
+    cross = _FakeCrossAttention(16)
+    cross.requires_grad_(False)
+    adapter.set_style_tokens(torch.randn(2, 2, 8))
+    query = torch.randn(2, 5, 16)
+    timestep = torch.randn(2, 1, 16)
+
+    # Zero-init gate makes attachment exactly neutral before training.
+    initial = adapter.attend(0, query, timestep, cross)
+    assert torch.count_nonzero(initial) == 0
+    adapter.gate[-1].bias.data[0] = 0.1
+    output = adapter.attend(0, query, timestep, cross)
+    assert output.shape == query.shape
+    output.square().mean().backward()
+    assert adapter.shared_k.weight.grad is not None
+    assert cross.q_proj.weight.grad is None
+
+
+def test_attach_patches_all_28_blocks_without_copying_adapter():
+    class Block(nn.Module):
+        def __init__(self):
+            super().__init__()
+
+        def _forward(self):
+            return None
+
+    anima = nn.Module()
+    anima.blocks = nn.ModuleList([Block() for _ in range(28)])
+    adapter = SharedLowRankStyleAdapter(
+        style_dim=8, slots=2, hidden_dim=16, heads=4, blocks=28, rank=2,
+        aggregator_heads=2, aggregator_layers=1, gate_dim=4,
+    )
+    attach_style_adapter(anima, adapter)
+    assert anima.style_adapter is adapter
+    assert [block.__dict__["_style_block_index"] for block in anima.blocks] == list(range(28))
+    assert all(isinstance(block._forward, types.MethodType) for block in anima.blocks)

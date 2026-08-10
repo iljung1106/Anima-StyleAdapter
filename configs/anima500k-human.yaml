@@ -253,3 +253,44 @@ tap_resampler_experiment:
     force: false
   variants:
     - {name: l18_l24_native_siglip_l24, taps: [18, 24], global: native_24}
+
+# Frozen Anima + frozen per-reference Resampler training. The loader intersects
+# the three production caches, rotates target/reference roles within each style,
+# and batches targets by exact latent shape. `style-smoke` forces two steps and
+# writes to a separate smoke directory; `style-train` uses `training.steps`.
+style_transfer:
+  output_directory: style_transfer_l18_l24_siglip_l24
+  seed: 20260811
+  loader:
+    style_cache: style_features_l18_l24_siglip_l24
+    text_cache: anima_text_cache_post_llm
+    latent_cache: anima_latent_cache_qwen_2d
+    split: train
+    batch_size: 1
+    min_references: 1
+    max_references: 8
+    text_lru_shards: 2
+    latent_lru_shards: 2
+  resampler:
+    checkpoint: per_reference_resampler_l18_l24_siglip_l24_8k_val/runs/l18_l24_native_siglip_l24/checkpoint.pt
+  adapter:
+    style_dim: 768
+    slots: 16
+    hidden_dim: 2048
+    heads: 16
+    blocks: 28
+    rank: 16
+    aggregator_heads: 12
+    aggregator_layers: 2
+    style_dropout: 0.12
+    gate_dim: 256
+  training:
+    device: cuda
+    steps: 100000
+    learning_rate: 0.0001
+    weight_decay: 0.01
+    max_grad_norm: 1.0
+    gradient_checkpointing: true
+    allow_tf32: true
+    prefetch_workers: 2
+    prefetch_batches: 4
