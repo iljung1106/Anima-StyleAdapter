@@ -16,6 +16,12 @@ from .download import download_candidates
 from .feature_probe import evaluate_probe_features, extract_probe_features, run_feature_probe
 from .metadata import select_candidates
 from .tagger import tag_images
+from .stylenet import (
+    evaluate_stylenet_layer_features,
+    extract_stylenet_layer_features,
+    prepare_stylenet,
+    run_stylenet_layer_benchmark,
+)
 from .tap_resampler import (
     evaluate_selected_tap_variant,
     extract_tap_features,
@@ -57,6 +63,10 @@ def build_parser() -> argparse.ArgumentParser:
         ("tap-train", "Train and evaluate configured tap-resampler variants"),
         ("tap-test", "Evaluate the validation-selected tap variant on meta-test artists"),
         ("tap-experiment", "Extract features, then train all tap-resampler variants"),
+        ("stylenet-prepare", "Download and index the controlled StyleNet benchmark"),
+        ("stylenet-extract", "Extract pooled C-RADIO layer features on StyleNet"),
+        ("stylenet-evaluate", "Evaluate controlled StyleNet style ranking"),
+        ("stylenet-benchmark", "Prepare, extract, and evaluate StyleNet layers"),
         ("prepare", "Run selection, download, and duplicate removal"),
         ("all", "Run every stage, including tagger and C-RADIO models"),
     ):
@@ -102,6 +112,14 @@ def main() -> None:
         _run(evaluate_selected_tap_variant, config, destination)
     elif args.command == "tap-experiment":
         _run(run_tap_resampler_experiment, config, destination)
+    elif args.command == "stylenet-prepare":
+        _run(prepare_stylenet, config, destination)
+    elif args.command == "stylenet-extract":
+        _run(extract_stylenet_layer_features, config, destination)
+    elif args.command == "stylenet-evaluate":
+        _run(evaluate_stylenet_layer_features, config, destination)
+    elif args.command == "stylenet-benchmark":
+        _run(run_stylenet_layer_benchmark, config, destination)
     elif args.command in {"prepare", "all"}:
         for stage in (select_candidates, download_candidates, deduplicate):
             _run(stage, config, destination)

@@ -125,3 +125,5 @@ pytest
 ```
 
 테스트는 날짜 창·결정적 표집, perceptual hash, 태거 전처리 계약처럼 대량 실행 실패 위험이 큰 부분에 집중한다.
+외부 StyleNet controlled layer benchmark의 protocol과 실행법은
+[`docs/stylenet_layer_benchmark.md`](docs/stylenet_layer_benchmark.md)에 기록되어 있다.

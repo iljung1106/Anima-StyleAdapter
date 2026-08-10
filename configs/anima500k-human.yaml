@@ -86,6 +86,32 @@ style_features:
     max_side: 512
     max_pixels: 262144
 
+# External controlled benchmark. Each group contains one image from the shard
+# artist and three images of the same character(s) from different artists.
+stylenet_benchmark:
+  repo_id: Shio-Koube/stylenet
+  revision: 4bb6753c7c3c236495b8899552572b97e7ebb081
+  directory: stylenet_benchmark
+  download_workers: 16
+  min_side: 64
+  min_image_std: 2.0
+  layers: [4, 8, 12, 16, 20, 24, 26]
+  reference_counts: [1, 2, 4, 8]
+  storage_dtype: float16
+  amp_dtype: bfloat16
+  batch_size: 64
+  max_open_buckets: 64
+  preprocess:
+    max_side: 512
+    max_pixels: 262144
+  combinations:
+    - name: combo_l20_l24_spatial_mean
+      representations: [layer_20_spatial_mean, layer_24_spatial_mean]
+    - name: combo_l20_l24_spatial_stats
+      representations: [layer_20_spatial_stats, layer_24_spatial_stats]
+    - name: combo_l8_l20_l24_spatial_stats
+      representations: [layer_08_spatial_stats, layer_20_spatial_stats, layer_24_spatial_stats]
+
 cradio_probe:
   seed: 20260810
   split: train

@@ -257,9 +257,54 @@ Resampler는 1~8개의 reference 이미지가 들어올 수 있도록 set 입력
 
 Resampler의 표현과 규모가 정해진 뒤 Anima의 28개 block 각각에 Style Adapter용 K/V projection을 추가한다. 이 단계의 기본 학습 샘플은 같은 작가의 reference 1~8장, target의 content prompt, target 이미지로 구성한다.
 
-초기에는 reference 집합에 target 이미지를 포함하는 비율을 높여 어떤 시각 특징을 이용해야 하는지 빠르게 학습한다. 이후 target과 겹치지 않는 reference만 사용하는 비율을 점진적으로 증가시킨다. 정확한 ramp schedule과 self-reference 비율은 Resampler 검증 뒤 결정한다.
+정확한 target 이미지를 reference로 장기간 사용하는 것은 내용·구도 복사 shortcut을 만들 수 있다. 따라서 self-reference는 필요할 경우 초반 5% 이내의 짧은 warm-up에서만 강한 augmentation과 함께 사용하고, 전체 학습의 10% 이전에 제거한다. 이후에는 매 episode 안에서 reference와 target을 분리하되, train pool의 이미지들은 episode마다 두 역할을 번갈아 맡을 수 있다.
 
 Decoder는 이 표현 학습의 보조 장치이므로 최종 Style Transfer 추론 경로에는 포함하지 않는다.
+
+### 11.1 Multi-reference와 block별 Style K/V
+
+각 reference는 공유된 per-reference Resampler를 거쳐 `N×D` style token을 만든다. 1~8장분의 token은 순서에 무관한 작은 Set Aggregator가 받아 고정된 수의 최종 style token으로 합친다. 28개의 독립 aggregator를 두지 않고 하나의 aggregator를 공유한다.
+
+Anima 28-block 모델은 hidden dimension 2,048, 16-head 구조이며 각 block이 AdaLN으로 조절되는 self-attention, text cross-attention, MLP를 순서대로 수행한다. Style 조건은 text token과 같은 softmax에 단순 연결하지 않고 별도의 decoupled style-attention branch로 추가한다. Style branch는 기존 text cross-attention에 들어가는 정규화된 image hidden state와 block별 `Q` projection을 재사용하고 style K/V만 새로 만든다. 1차 구현에서는 기존 output projection도 재사용하며, 별도 style Q 또는 Q-LoRA는 이 구조의 한계가 실제 생성 평가에서 확인될 때만 검토한다.
+
+Style attention은 text cross-attention 직후, MLP 이전에 삽입한다. 따라서 text와 style은 서로 다른 softmax로 조건을 읽되, 두 residual이 합쳐진 hidden state를 같은 block의 MLP가 처리한다. Text token과 style token을 한 attention의 K/V로 concatenate하지 않는다.
+
+`x_text = x + A_text(Q(x), K_text, V_text)`
+
+`x_style = x_text + strength * g_b(t) * A_style(Q(x), K_style, V_style)`
+
+`x_out = x_style + MLP(x_style)`
+
+Style K/V projection은 모든 block이 공유하는 full-rank base와 block별 low-rank delta로 구성한다.
+
+`W_b = W_shared + A_b B_b`
+
+초기 후보 rank는 16과 32이다. Style gate는 Anima timestep embedding을 받는 작은 shared MLP가 28개의 block별 scalar를 출력하는 구조를 1차 기준으로 삼는다. 마지막 projection만 0으로 초기화하여 학습 시작 시 원본 Anima와 같은 출력을 보장하고, 두 개의 0-init 인자를 곱해 gradient가 막히는 구조는 사용하지 않는다. Channel별 gate는 scalar gate의 한계가 확인될 때만 low-rank 형태로 검토한다.
+
+사용자 `strength`는 style token이나 K/V 입력이 아니라 style-attention residual에 곱한다. 입력 token을 스케일하면 K 크기와 softmax 분포까지 비선형적으로 변하므로 피한다.
+
+### 11.2 Null token, style dropout과 Style CFG
+
+Set Aggregator의 최종 출력과 같은 형상 `M×D`의 전역 learned null token을 둔다. 이는 reference가 없는 상태를 나타내며 zero tensor나 회색 이미지 encoding을 기본 null 표현으로 사용하지 않는다. 학습 episode의 10~15%에서는 전체 reference set을 null token으로 교체하여 style branch가 있거나 없는 두 경로를 모두 학습한다. 별도의 reference별 dropout과 reference-count dropout으로 1/2/4/8장 조건도 함께 견고하게 만든다.
+
+Text와 style의 강도는 다음 세 prediction으로 분리한다.
+
+`v = v_uncond + s_text * (v_text - v_uncond) + s_style * (v_text_style - v_text)`
+
+- `v_uncond`: text와 style 모두 unconditional
+- `v_text`: text만 사용하고 style은 null
+- `v_text_style`: text와 실제 style을 모두 사용
+
+이를 통해 prompt CFG와 Style CFG를 독립적으로 조절한다. 구현 시 세 condition을 batch로 묶을지 별도 pass로 실행할지는 VRAM과 처리속도를 측정해 정한다. Adapter를 완전히 끄는 경로에서는 style gate를 명시적으로 0으로 만들어 원본 Anima 동작을 보장한다.
+
+### 11.3 동결 및 공동학습 순서
+
+1. C-RADIO를 계속 동결하고 per-reference Resampler를 reconstruction과 직접적인 slot-wise artist prototype loss로 사전학습한다.
+2. Style Adapter 연결 초기 5~10% 구간에는 Resampler와 Anima를 동결하고 Set Aggregator, shared K/V base, block별 low-rank delta와 style gate만 학습한다.
+3. Style branch가 안정화되면 Resampler 상위 1~2층만 Adapter 학습률의 5~10%로 해제한다. 이때 prototype loss와 사전학습 출력에 대한 anchor loss를 유지하여 style 공간의 붕괴와 content leakage를 억제한다.
+4. 검증 성능 향상이 없으면 Resampler를 다시 동결한다. Anima 본체는 기본적으로 동결하며, Adapter만으로 한계가 확인될 때에만 기존 cross-attention Q/output projection에 작은 LoRA를 검토한다.
+
+C-RADIO는 전 단계에서 동결한다. 공동학습 중 reconstruction decoder 비용이 크면 decoder는 제외하고 prototype 및 anchor loss만 유지할 수 있다.
 
 ## 12. 캐시와 산출물
 
@@ -312,7 +357,7 @@ Resampler 구조 확정 전에는 다음 결과가 필요하다.
 - content subtraction 계수
 - Resampler 차원, token 수, layer 수와 decoder 구조
 - loss 가중치와 multi-reference 구성 비율
-- Anima K/V 차원, block별 공유 여부와 학습 schedule
+- block별 low-rank delta의 rank(16/32), Resampler 해제 시점과 독립 Style CFG 실행 방식
 
 ## 15. 참고 자료
 
@@ -320,3 +365,6 @@ Resampler 구조 확정 전에는 다음 결과가 필요하다.
 - [ashen-sensored/wd-eva02-tagger-2026-canary Space](https://huggingface.co/spaces/ashen-sensored/wd-eva02-tagger-2026-canary)
 - [nvidia/C-RADIOv4-SO400M model card](https://huggingface.co/nvidia/C-RADIOv4-SO400M)
 - [NVlabs/RADIO official repository](https://github.com/NVlabs/RADIO)
+- [ComfyUI Anima implementation](https://github.com/Comfy-Org/ComfyUI/blob/master/comfy/ldm/anima/model.py)
+- [ComfyUI Cosmos Predict2 attention implementation](https://github.com/Comfy-Org/ComfyUI/blob/master/comfy/ldm/cosmos/predict2.py)
+- [LuciferTC9527/ComfyUI-Anima_IP-Adapter](https://github.com/LuciferTC9527/ComfyUI-Anima_IP-Adapter)
