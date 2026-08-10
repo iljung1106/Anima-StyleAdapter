@@ -327,6 +327,8 @@ Pilot의 반복 학습에서는 전체 NFS shard를 무작위로 다시 읽지 �
 
 학습은 W&B project `anima-style-adapter`의 고정 resume ID로 기록한다. 20 step마다 reconstruction, slot/pooled prototype, total loss, prototype ramp, gradient norm, learning rate, step/data-wait 시간과 padding efficiency를 기록하고, validation/meta-test의 1/2/4/8-reference Top-1·MRR 및 tap별 reconstruction cosine을 남긴다. 반복 checkpoint는 W&B에 업로드하지 않고 500 step마다 workspace에 원자적으로 저장한다.
 
+완료된 1,000-artist pilot 결과는 [per_reference_resampler_results.md](per_reference_resampler_results.md)에 기록한다.
+
 각 단계는 다시 실행할 수 있고 중간 결과만 교체할 수 있도록 sharded Parquet 또는 유사한 columnar manifest로 저장한다.
 
 | 산출물 | 핵심 내용 |
