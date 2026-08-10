@@ -272,7 +272,14 @@ class SetAggregatorLayer(nn.Module):
 class SlotSetAggregator(nn.Module):
     """Order-invariant attention over references, aligned independently per slot."""
 
-    def __init__(self, slots: int = 16, dim: int = 768, heads: int = 12, layers: int = 2):
+    def __init__(
+        self,
+        slots: int = 16,
+        dim: int = 768,
+        heads: int = 12,
+        layers: int = 2,
+        slot_mixer_layers: int = 1,
+    ):
         super().__init__()
         self.slots = slots
         self.dim = dim
@@ -284,6 +291,13 @@ class SlotSetAggregator(nn.Module):
         self.pool = nn.MultiheadAttention(dim, heads, batch_first=True)
         self.out_norm = nn.LayerNorm(dim)
         self.out_ff = nn.Sequential(nn.Linear(dim, dim * 4), nn.GELU(), nn.Linear(dim * 4, dim))
+        # Reference aggregation above is deliberately slot-aligned. Once each
+        # slot has been pooled, a small Transformer lets the final style set
+        # exchange information across slots without introducing reference-order
+        # dependence.
+        self.slot_mixers = nn.ModuleList(
+            [SetAggregatorLayer(dim, heads) for _ in range(slot_mixer_layers)]
+        )
 
     def forward(self, references: torch.Tensor, reference_mask: torch.Tensor) -> torch.Tensor:
         if references.ndim != 4:
@@ -302,7 +316,11 @@ class SlotSetAggregator(nn.Module):
             key_padding_mask=padding, need_weights=False,
         )[0]
         pooled = pooled + self.out_ff(self.out_norm(pooled))
-        return pooled.reshape(batch, slots, dim)
+        pooled = pooled.reshape(batch, slots, dim)
+        slot_padding = torch.zeros(batch, slots, dtype=torch.bool, device=pooled.device)
+        for mixer in self.slot_mixers:
+            pooled = mixer(pooled, slot_padding)
+        return pooled
 
 
 class SharedLowRankStyleAdapter(nn.Module):
@@ -319,6 +337,7 @@ class SharedLowRankStyleAdapter(nn.Module):
         rank: int = 16,
         aggregator_heads: int = 12,
         aggregator_layers: int = 2,
+        aggregator_slot_mixer_layers: int = 1,
         style_dropout: float = 0.12,
         gate_dim: int = 256,
     ):
@@ -330,7 +349,13 @@ class SharedLowRankStyleAdapter(nn.Module):
         self.head_dim = hidden_dim // heads
         self.blocks = blocks
         self.style_dropout = style_dropout
-        self.aggregator = SlotSetAggregator(slots, style_dim, aggregator_heads, aggregator_layers)
+        self.aggregator = SlotSetAggregator(
+            slots,
+            style_dim,
+            aggregator_heads,
+            aggregator_layers,
+            aggregator_slot_mixer_layers,
+        )
         self.null_tokens = nn.Parameter(torch.empty(1, slots, style_dim))
         nn.init.normal_(self.null_tokens, std=0.02)
         self.shared_k = nn.Linear(style_dim, hidden_dim, bias=False)

@@ -28,6 +28,21 @@ def test_slot_set_aggregator_is_reference_order_invariant():
     torch.testing.assert_close(first, second, atol=2e-6, rtol=2e-6)
 
 
+def test_cross_slot_mixer_couples_pooled_slots():
+    torch.manual_seed(11)
+    model = SlotSetAggregator(
+        slots=3, dim=12, heads=3, layers=1, slot_mixer_layers=1
+    ).eval()
+    values = torch.randn(1, 2, 3, 12)
+    mask = torch.ones(1, 2, dtype=torch.bool)
+    first = model(values, mask)
+    changed = values.clone()
+    changed[:, :, 1] *= -1.0
+    second = model(changed, mask)
+    # Changing slot 1 affects slot 0 only through the post-pooling slot mixer.
+    assert not torch.allclose(first[:, 0], second[:, 0])
+
+
 def test_episode_sampler_never_uses_target_as_reference():
     loader = ProductionStyleLoader.__new__(ProductionStyleLoader)
     loader.seed = 41
