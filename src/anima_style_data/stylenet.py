@@ -335,20 +335,19 @@ def controlled_style_ranking(
     for artist_rows in originals.values():
         artist_rows.sort(key=lambda row: (int(row["group_index"]), int(row["id"])))
 
-    correct = 0
-    reciprocal_rank_sum = 0.0
-    margin_sum = 0.0
-    query_count = 0
+    reference_indices = []
+    candidate_indices = []
+    positive_indices = []
+    query_artist_indices = []
     for artist, artist_rows in originals.items():
         if len(artist_rows) <= reference_count:
             continue
         references = artist_rows[:reference_count]
-        prototype = F.normalize(
-            values[[int(row["feature_index"]) for row in references]].mean(dim=0), dim=0
+        artist_index = len(reference_indices)
+        reference_indices.append(
+            [int(row["feature_index"]) for row in references]
         )
         reference_groups = {row["group_key"] for row in references}
-        candidate_indices = []
-        positive_indices = []
         for positive in artist_rows[reference_count:]:
             if positive["group_key"] in reference_groups:
                 continue
@@ -361,23 +360,40 @@ def controlled_style_ranking(
             positive_indices.append(
                 next(index for index, row in enumerate(candidates) if row["is_original"])
             )
-        if not candidate_indices:
-            continue
-        candidate_index = torch.tensor(candidate_indices, dtype=torch.long)
-        positive_index = torch.tensor(positive_indices, dtype=torch.long)
-        scores = values[candidate_index] @ prototype
-        row_index = torch.arange(scores.shape[0])
+            query_artist_indices.append(artist_index)
+    if not candidate_indices:
+        raise RuntimeError(f"No controlled StyleNet queries for {reference_count} references")
+
+    device = values.device
+    reference_index = torch.tensor(reference_indices, dtype=torch.long, device=device)
+    prototypes = F.normalize(values[reference_index].mean(dim=1), dim=-1)
+    correct = 0
+    reciprocal_rank_sum = 0.0
+    margin_sum = 0.0
+    chunk_size = 4096
+    for offset in range(0, len(candidate_indices), chunk_size):
+        stop = min(offset + chunk_size, len(candidate_indices))
+        candidate_index = torch.tensor(
+            candidate_indices[offset:stop], dtype=torch.long, device=device
+        )
+        positive_index = torch.tensor(
+            positive_indices[offset:stop], dtype=torch.long, device=device
+        )
+        query_artist_index = torch.tensor(
+            query_artist_indices[offset:stop], dtype=torch.long, device=device
+        )
+        scores = (
+            values[candidate_index] * prototypes[query_artist_index, None, :]
+        ).sum(dim=-1)
+        row_index = torch.arange(scores.shape[0], device=device)
         positive_scores = scores[row_index, positive_index]
         ranks = 1 + (scores > positive_scores[:, None]).sum(dim=1)
-        negative_scores = scores.clone()
-        negative_scores[row_index, positive_index] = -torch.inf
-        margins = positive_scores - negative_scores.max(dim=1).values
+        scores[row_index, positive_index] = -torch.inf
+        margins = positive_scores - scores.max(dim=1).values
         correct += int((ranks == 1).sum())
         reciprocal_rank_sum += float((1.0 / ranks.float()).sum())
         margin_sum += float(margins.sum())
-        query_count += int(ranks.numel())
-    if not query_count:
-        raise RuntimeError(f"No controlled StyleNet queries for {reference_count} references")
+    query_count = len(candidate_indices)
     return {
         "references": int(reference_count),
         "queries": query_count,
@@ -408,9 +424,12 @@ def evaluate_stylenet_layer_features(
         representations[str(combo["name"])] = normalized_concat(names)
 
     reference_counts = [int(value) for value in cfg["reference_counts"]]
+    device = str(cfg.get("evaluation_device", config["cradio"]["device"]))
+    if device.startswith("cuda") and not torch.cuda.is_available():
+        raise RuntimeError("CUDA was requested for StyleNet evaluation but is unavailable")
     ranking = []
     for name, values in representations.items():
-        values = F.normalize(values.float(), dim=-1)
+        values = F.normalize(values.to(device=device, dtype=torch.float32), dim=-1)
         metrics = [
             controlled_style_ranking(values, rows, count, normalized=True)
             for count in reference_counts

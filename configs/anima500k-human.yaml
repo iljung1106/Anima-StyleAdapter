@@ -97,6 +97,7 @@ stylenet_benchmark:
   min_image_std: 2.0
   layers: [4, 8, 12, 16, 20, 24, 26]
   reference_counts: [1, 2, 4, 8]
+  evaluation_device: cuda
   storage_dtype: float16
   amp_dtype: bfloat16
   batch_size: 64
