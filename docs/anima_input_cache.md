@@ -49,6 +49,8 @@ HF_HOME=/workspace/.cache/huggingface \
 
 `anima-cache`는 두 단계를 순차 실행한다. 각 단계는 `manifests/part-*.parquet`을 기준으로 완료 shard를 재사용하므로 중단 후 같은 명령으로 resume할 수 있다. 기존 cache와 model/config signature가 다르면 덮어쓰지 않고 오류를 낸다.
 
+H100 SXM 실측에서 text batch 64는 16.64 items/s였고 128로 키워도 16.58 items/s로 개선되지 않았다. VAE batch 8은 29.08 images/s였고 16은 28.89 images/s였다. 따라서 production 기본값은 text 64, VAE 8로 고정한다.
+
 ## 본학습 loader 계약
 
 - Text: 선택한 variant row의 `token_offset:token_offset+token_length`를 읽고 batch 최대 길이까지만 padding한다.

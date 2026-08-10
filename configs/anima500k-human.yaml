@@ -54,7 +54,7 @@ anima_cache:
   sd_scripts_revision: 37a1cbbc5725ed2a3575506e7bd2001c9908ac92
   models:
     repo_id: circlestone-labs/Anima
-    revision: main
+    revision: f7382c4bf9d7ffe4ceea593a0adbb470c56dd79b
     qwen3_filename: split_files/text_encoders/qwen_3_06b_base.safetensors
     dit_filename: split_files/diffusion_models/anima-base-v1.0.safetensors
     vae_filename: split_files/vae/qwen_image_vae.safetensors
@@ -74,7 +74,7 @@ anima_cache:
   latents:
     output_directory: anima_latent_cache_qwen_2d
     device: cuda
-    batch_size: 4
+    batch_size: 8
     shard_rows: 512
     reader_workers: 32
     decoder_workers: 16
