@@ -72,13 +72,13 @@ style_features:
   statistics: [mean, std]
   storage_dtype: float16
   amp_dtype: bfloat16
-  batch_size: 4
+  batch_size: 32
   shard_rows: 128
   max_open_buckets: 64
-  preprocess_workers: 8
-  prefetch_images: 64
-  writer_workers: 2
-  pending_writes: 4
+  preprocess_workers: 32
+  prefetch_images: 2048
+  writer_workers: 8
+  pending_writes: 16
   preprocess:
     max_side: 512
     max_pixels: 262144
