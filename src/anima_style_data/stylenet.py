@@ -315,11 +315,17 @@ def extract_stylenet_layer_features(
     return summary
 
 
-def controlled_style_ranking(values, rows: list[dict[str, Any]], reference_count: int):
+def controlled_style_ranking(
+    values,
+    rows: list[dict[str, Any]],
+    reference_count: int,
+    *,
+    normalized: bool = False,
+):
     import torch
     import torch.nn.functional as F
 
-    values = F.normalize(values.float(), dim=-1)
+    values = values.float() if normalized else F.normalize(values.float(), dim=-1)
     originals: dict[str, list[dict[str, Any]]] = defaultdict(list)
     groups: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for row in rows:
@@ -329,8 +335,10 @@ def controlled_style_ranking(values, rows: list[dict[str, Any]], reference_count
     for artist_rows in originals.values():
         artist_rows.sort(key=lambda row: (int(row["group_index"]), int(row["id"])))
 
-    ranks = []
-    margins = []
+    correct = 0
+    reciprocal_rank_sum = 0.0
+    margin_sum = 0.0
+    query_count = 0
     for artist, artist_rows in originals.items():
         if len(artist_rows) <= reference_count:
             continue
@@ -339,35 +347,43 @@ def controlled_style_ranking(values, rows: list[dict[str, Any]], reference_count
             values[[int(row["feature_index"]) for row in references]].mean(dim=0), dim=0
         )
         reference_groups = {row["group_key"] for row in references}
+        candidate_indices = []
+        positive_indices = []
         for positive in artist_rows[reference_count:]:
             if positive["group_key"] in reference_groups:
                 continue
             candidates = groups[positive["group_key"]]
             if len(candidates) != 4:
                 continue
-            candidate_values = values[
+            candidate_indices.append(
                 [int(row["feature_index"]) for row in candidates]
-            ]
-            scores = candidate_values @ prototype
-            positive_index = next(
-                index for index, row in enumerate(candidates) if row["is_original"]
             )
-            positive_score = scores[positive_index]
-            rank = 1 + int((scores > positive_score).sum().item())
-            negative_scores = torch.cat(
-                (scores[:positive_index], scores[positive_index + 1 :])
+            positive_indices.append(
+                next(index for index, row in enumerate(candidates) if row["is_original"])
             )
-            ranks.append(rank)
-            margins.append(float(positive_score - negative_scores.max()))
-    if not ranks:
+        if not candidate_indices:
+            continue
+        candidate_index = torch.tensor(candidate_indices, dtype=torch.long)
+        positive_index = torch.tensor(positive_indices, dtype=torch.long)
+        scores = values[candidate_index] @ prototype
+        row_index = torch.arange(scores.shape[0])
+        positive_scores = scores[row_index, positive_index]
+        ranks = 1 + (scores > positive_scores[:, None]).sum(dim=1)
+        negative_scores = scores.clone()
+        negative_scores[row_index, positive_index] = -torch.inf
+        margins = positive_scores - negative_scores.max(dim=1).values
+        correct += int((ranks == 1).sum())
+        reciprocal_rank_sum += float((1.0 / ranks.float()).sum())
+        margin_sum += float(margins.sum())
+        query_count += int(ranks.numel())
+    if not query_count:
         raise RuntimeError(f"No controlled StyleNet queries for {reference_count} references")
-    rank_tensor = torch.tensor(ranks, dtype=torch.float32)
     return {
         "references": int(reference_count),
-        "queries": len(ranks),
-        "top1": float((rank_tensor == 1).float().mean()),
-        "mrr": float((1.0 / rank_tensor).mean()),
-        "margin": sum(margins) / len(margins),
+        "queries": query_count,
+        "top1": correct / query_count,
+        "mrr": reciprocal_rank_sum / query_count,
+        "margin": margin_sum / query_count,
     }
 
 
@@ -394,7 +410,11 @@ def evaluate_stylenet_layer_features(
     reference_counts = [int(value) for value in cfg["reference_counts"]]
     ranking = []
     for name, values in representations.items():
-        metrics = [controlled_style_ranking(values, rows, count) for count in reference_counts]
+        values = F.normalize(values.float(), dim=-1)
+        metrics = [
+            controlled_style_ranking(values, rows, count, normalized=True)
+            for count in reference_counts
+        ]
         ranking.append(
             {
                 "representation": name,
