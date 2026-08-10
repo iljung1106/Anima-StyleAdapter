@@ -579,13 +579,14 @@ def train_style_adapter(config: dict[str, Any], destination: Path, *, steps_over
             noise = torch.randn_like(latents)
             timesteps = torch.rand(latents.shape[0], device=device, dtype=torch.float32)
             sigma = timesteps[:, None, None, None].to(latents.dtype)
+            model_timesteps = timesteps.to(latents.dtype)
             noisy = (1 - sigma) * latents + sigma * noise
             padding_mask = torch.zeros(
                 latents.shape[0], 1, latents.shape[-2], latents.shape[-1],
                 device=device, dtype=latents.dtype,
             )
             prediction = anima(
-                noisy.unsqueeze(2), timesteps, context=conditioning,
+                noisy.unsqueeze(2), model_timesteps, context=conditioning,
                 padding_mask=padding_mask, target_input_ids=None,
             ).squeeze(2)
             target = noise - latents
