@@ -323,6 +323,10 @@ C-RADIO는 전 단계에서 동결한다. 공동학습 중 reconstruction decode
 
 최종 feature contract가 정해졌으므로 pilot 10,000장만 별도 캐싱하지 않는다. 전체 human manifest 149,877장에 대해 `style_features_l18_l24_siglip_l24` cache를 생성한다. 각 shard에는 L18/L24 full spatial FP16과 L24 SigLIP teacher CLS FP16을 함께 저장한다. Per-reference Resampler 사전학습은 이 전체 cache의 manifest에서 artist-disjoint 1,000명×10장 subset만 선택해 사용하며, 이후 더 큰 사전학습 및 Anima adapter 학습도 같은 cache를 재사용한다. 기존 L20/L24/L8-stat cache는 이전 실험 재현을 위해 삭제하거나 덮어쓰지 않는다.
 
+Pilot의 반복 학습에서는 전체 NFS shard를 무작위로 다시 읽지 않는다. 선택된 10,000장의 세 tensor만 약 33GB의 container-local `/tmp/anima-style-resampler-l18-l24-siglip-l24` cache로 한 번 repack한다. Loader는 저장 FP16을 FP32로 승격하지 않고 유지하며, 두 개의 재사용 pinned host buffer와 별도 CUDA transfer stream으로 다음 batch H2D를 현재 forward/backward와 겹친다. Reconstruction target이 input tap과 같을 때 GPU tensor를 alias하여 중복 전송하지 않는다. 8개 spatial-token quantile bucket을 순환하며 작가별로 목표 크기에 가까운 4장을 골라 padding 비율을 낮춘다.
+
+학습은 W&B project `anima-style-adapter`의 고정 resume ID로 기록한다. 20 step마다 reconstruction, slot/pooled prototype, total loss, prototype ramp, gradient norm, learning rate, step/data-wait 시간과 padding efficiency를 기록하고, validation/meta-test의 1/2/4/8-reference Top-1·MRR 및 tap별 reconstruction cosine을 남긴다. 반복 checkpoint는 W&B에 업로드하지 않고 500 step마다 workspace에 원자적으로 저장한다.
+
 각 단계는 다시 실행할 수 있고 중간 결과만 교체할 수 있도록 sharded Parquet 또는 유사한 columnar manifest로 저장한다.
 
 | 산출물 | 핵심 내용 |
