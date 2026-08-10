@@ -428,7 +428,10 @@ def evaluate_stylenet_layer_features(
         representations[f"{layer_name}_dino_cls"] = values[:, spatial_dim:]
 
     def normalized_concat(names: list[str]):
-        return torch.cat([F.normalize(tensors[name].float(), dim=-1) for name in names], dim=-1)
+        return torch.cat(
+            [F.normalize(representations[name].float(), dim=-1) for name in names],
+            dim=-1,
+        )
 
     for combo in cfg.get("combinations", []):
         names = [str(name) for name in combo["representations"]]
