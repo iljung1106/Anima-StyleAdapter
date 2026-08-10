@@ -101,6 +101,8 @@ stylenet_benchmark:
   amp_dtype: bfloat16
   batch_size: 64
   max_open_buckets: 64
+  decoder_workers: 32
+  decode_prefetch: 1024
   preprocess:
     max_side: 512
     max_pixels: 262144

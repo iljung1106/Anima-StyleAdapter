@@ -4,7 +4,9 @@ import hashlib
 import io
 import re
 import tarfile
-from collections import Counter, defaultdict
+import time
+from collections import Counter, defaultdict, deque
+from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
@@ -170,12 +172,17 @@ def extract_stylenet_layer_features(
         raise ValueError(f"StyleNet layers must be in [0, {len(model.model.blocks) - 1}]")
     batch_size = int(cfg.get("batch_size", 32))
     max_open_buckets = int(cfg.get("max_open_buckets", 32))
+    decoder_workers = int(cfg.get("decoder_workers", 16))
+    decode_prefetch = int(cfg.get("decode_prefetch", 512))
     storage_dtype = _storage_dtype(cfg.get("storage_dtype", "float16"))
     amp_dtype = {"float16": torch.float16, "bfloat16": torch.bfloat16}[
         cfg.get("amp_dtype", radio_cfg["amp_dtype"])
     ]
     features: dict[str, torch.Tensor] = {}
     buckets: dict[tuple[int, int], list[tuple[int, torch.Tensor]]] = defaultdict(list)
+    started = time.monotonic()
+    encoded = 0
+    batches = 0
 
     def put(name: str, indices: list[int], value: torch.Tensor) -> None:
         value = value.detach().to("cpu", dtype=storage_dtype)
@@ -184,8 +191,19 @@ def extract_stylenet_layer_features(
         features[name][indices] = value
 
     def run_batch(items: list[tuple[int, torch.Tensor]]) -> None:
+        nonlocal encoded, batches
         indices = [item[0] for item in items]
-        images = torch.stack([item[1] for item in items]).to(device, non_blocking=True)
+        tensors = [item[1] for item in items]
+        if device.startswith("cuda"):
+            host_images = torch.empty(
+                (len(tensors), *tensors[0].shape),
+                dtype=tensors[0].dtype,
+                pin_memory=True,
+            )
+            torch.stack(tensors, out=host_images)
+        else:
+            host_images = torch.stack(tensors)
+        images = host_images.to(device, non_blocking=device.startswith("cuda"))
         with torch.inference_mode(), torch.autocast(
             device_type="cuda", dtype=amp_dtype, enabled=device.startswith("cuda")
         ):
@@ -208,23 +226,52 @@ def extract_stylenet_layer_features(
                 indices,
                 torch.cat((spatial.mean(dim=1), spatial.std(dim=1)), dim=-1),
             )
+        encoded += len(items)
+        batches += 1
+        if encoded // 1000 != (encoded - len(items)) // 1000:
+            elapsed = time.monotonic() - started
+            print(
+                f"encoded StyleNet features {encoded}/{len(rows)} "
+                f"({encoded / elapsed:.2f} images/s, "
+                f"mean_batch={encoded / batches:.1f})",
+                flush=True,
+            )
 
     def flush(key: tuple[int, int]) -> None:
         items = buckets.pop(key)
         for offset in range(0, len(items), batch_size):
             run_batch(items[offset : offset + batch_size])
 
-    for index, row in enumerate(rows):
+    def decode(index: int, row: dict[str, Any]):
         with Image.open(row["local_path"]) as image:
+            image.load()
             array, info = preprocess_cradio_image(image, radio_cfg)
+        return index, torch.from_numpy(array), info
+
+    def decoded_rows():
+        pending: deque[Future] = deque()
+        iterator = iter(enumerate(rows))
+        with ThreadPoolExecutor(max_workers=decoder_workers) as pool:
+            for _ in range(min(decode_prefetch, len(rows))):
+                index, row = next(iterator)
+                pending.append(pool.submit(decode, index, row))
+            while pending:
+                result = pending.popleft().result()
+                try:
+                    index, row = next(iterator)
+                except StopIteration:
+                    pass
+                else:
+                    pending.append(pool.submit(decode, index, row))
+                yield result
+
+    for index, tensor, info in decoded_rows():
         key = (info.target_height, info.target_width)
-        buckets[key].append((index, torch.from_numpy(array)))
+        buckets[key].append((index, tensor))
         if len(buckets[key]) >= batch_size:
             flush(key)
         elif len(buckets) > max_open_buckets:
             flush(max(buckets, key=lambda item: len(buckets[item])))
-        if (index + 1) % 1000 == 0:
-            print(f"prepared StyleNet features {index + 1}/{len(rows)}", flush=True)
     for key in list(buckets):
         flush(key)
 
@@ -239,6 +286,11 @@ def extract_stylenet_layer_features(
     summary = {
         "images": len(rows),
         "layers": layers,
+        "elapsed_s": time.monotonic() - started,
+        "decoder_workers": decoder_workers,
+        "decode_prefetch": decode_prefetch,
+        "batches": batches,
+        "mean_batch_size": len(rows) / batches,
         "representations": {name: list(value.shape) for name, value in features.items()},
     }
     write_json(feature_dir / "extract_summary.json", summary)
