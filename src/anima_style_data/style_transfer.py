@@ -768,23 +768,33 @@ def _sample_style_adapter(
 
     def denoise(*, with_style: bool) -> torch.Tensor:
         x = initial_noise.clone()
-        for index in range(steps):
-            timestep = sigmas[index].to(torch.bfloat16)
-            if with_style:
-                base = predict(x, null_text, null_style, timestep)
-                text_only = predict(x, positive_text, null_style, timestep)
-                full = predict(x, positive_text, positive_style, timestep)
-                velocity = base + text_scale * (text_only - base) + style_scale * (full - text_only)
-            else:
-                # This control bypasses the adapter completely and must remain
-                # a valid frozen-Anima sample for every learned checkpoint.
-                base = predict(x, null_text, None, timestep)
-                text_only = predict(x, positive_text, None, timestep)
-                velocity = base + text_scale * (text_only - base)
-            x = (x.float() + velocity * (sigmas[index + 1] - sigmas[index]).float()).to(torch.bfloat16)
-            if not torch.isfinite(x).all():
-                mode = "styled" if with_style else "base"
-                raise FloatingPointError(f"Non-finite {mode} latent at sampling step {index + 1}")
+        patched_forwards = None
+        if not with_style:
+            # Bypass both the learned branch and our Block._forward wrapper.
+            # This makes the control a bit-for-bit check of upstream Anima.
+            patched_forwards = [block._forward for block in anima.blocks]
+            for block in anima.blocks:
+                block._forward = block.__dict__["_style_original_forward"]
+        try:
+            for index in range(steps):
+                timestep = sigmas[index].to(torch.bfloat16)
+                if with_style:
+                    base = predict(x, null_text, null_style, timestep)
+                    text_only = predict(x, positive_text, null_style, timestep)
+                    full = predict(x, positive_text, positive_style, timestep)
+                    velocity = base + text_scale * (text_only - base) + style_scale * (full - text_only)
+                else:
+                    base = predict(x, null_text, None, timestep)
+                    text_only = predict(x, positive_text, None, timestep)
+                    velocity = base + text_scale * (text_only - base)
+                x = (x.float() + velocity * (sigmas[index + 1] - sigmas[index]).float()).to(torch.bfloat16)
+                if not torch.isfinite(x).all():
+                    mode = "styled" if with_style else "base"
+                    raise FloatingPointError(f"Non-finite {mode} latent at sampling step {index + 1}")
+        finally:
+            if patched_forwards is not None:
+                for block, patched in zip(anima.blocks, patched_forwards, strict=True):
+                    block._forward = patched
         return x
 
     try:
