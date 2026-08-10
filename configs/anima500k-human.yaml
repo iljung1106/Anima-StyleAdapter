@@ -73,10 +73,13 @@ style_features:
   storage_dtype: float16
   amp_dtype: bfloat16
   batch_size: 32
-  shard_rows: 128
+  shard_rows: 512
   max_open_buckets: 64
-  preprocess_workers: 32
-  prefetch_images: 2048
+  reader_workers: 64
+  decoder_workers: 32
+  read_prefetch: 32768
+  decode_prefetch: 4096
+  raw_queue_gib: 12
   writer_workers: 8
   pending_writes: 16
   preprocess:

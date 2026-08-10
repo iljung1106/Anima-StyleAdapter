@@ -1,8 +1,10 @@
 import numpy as np
 import torch
+from io import BytesIO
 from PIL import Image
 
 from anima_style_data.cradio import (
+    _decode_preprocess_bytes,
     _selected_style_tensors,
     build_style_feature_combiner,
     compute_cradio_size,
@@ -38,6 +40,27 @@ def test_cradio_preprocess_preserves_rgb_range_and_records_crop():
     assert array.dtype == np.float32
     np.testing.assert_allclose(array[:, 0, 0], [1.0, 0.0, 0.0])
     assert info.crop_left == 5 and info.crop_top == 2
+
+
+def test_webp_byte_pipeline_preserves_existing_preprocess_pixels():
+    source = Image.new("RGBA", (203, 101), (10, 120, 240, 180))
+    encoded = BytesIO()
+    source.save(encoded, format="WEBP", lossless=True)
+    cfg = {
+        "max_side": 512,
+        "max_pixels": 512 * 512,
+        "patch_size": 16,
+        "min_side": 16,
+    }
+    with Image.open(BytesIO(encoded.getvalue())) as image:
+        expected, expected_info = preprocess_cradio_image(image, cfg)
+    actual, actual_info, decode_s, resize_s = _decode_preprocess_bytes(
+        encoded.getvalue(), cfg
+    )
+
+    np.testing.assert_array_equal(actual, expected)
+    assert actual_info == expected_info
+    assert decode_s >= 0 and resize_s >= 0
 
 
 def test_content_subtraction_and_trainable_combiner_shapes():

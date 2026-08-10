@@ -5,11 +5,13 @@ import json
 import math
 import os
 import time
-from collections import defaultdict
-from collections import deque
+from collections import defaultdict, deque
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
+from io import BytesIO
 from pathlib import Path
+from queue import Empty, Queue
+from threading import Condition
 from typing import Any
 
 import numpy as np
@@ -89,6 +91,42 @@ def preprocess_cradio_image(
         crop_left=left,
         crop_top=top,
     )
+
+
+class _ByteBudget:
+    """Bound compressed-image RAM independently from the number of futures."""
+
+    def __init__(self, limit_bytes: int):
+        self.limit_bytes = int(limit_bytes)
+        self.used_bytes = 0
+        self.peak_bytes = 0
+        self._condition = Condition()
+
+    def acquire(self, size: int) -> None:
+        with self._condition:
+            while self.used_bytes and self.used_bytes + size > self.limit_bytes:
+                self._condition.wait()
+            self.used_bytes += size
+            self.peak_bytes = max(self.peak_bytes, self.used_bytes)
+
+    def release(self, size: int) -> None:
+        with self._condition:
+            self.used_bytes -= size
+            self._condition.notify_all()
+
+
+def _decode_preprocess_bytes(
+    payload: bytes, cfg: dict[str, Any]
+) -> tuple[np.ndarray, PreprocessInfo, float, float]:
+    """Decode WebP bytes, then preserve the established PIL preprocessing path."""
+    with Image.open(BytesIO(payload)) as image:
+        decode_started = time.monotonic()
+        image.load()
+        decode_s = time.monotonic() - decode_started
+        resize_started = time.monotonic()
+        array, info = preprocess_cradio_image(image, cfg)
+        resize_s = time.monotonic() - resize_started
+    return array, info, decode_s, resize_s
 
 
 def _load_cradio(cfg: dict[str, Any], cache_dir: Path):
@@ -295,9 +333,16 @@ def extract_selected_style_features(
     batch_size = int(feature_cfg.get("batch_size", radio_cfg["batch_size"]))
     shard_rows = int(feature_cfg.get("shard_rows", 128))
     max_open_buckets = int(feature_cfg.get("max_open_buckets", 64))
-    preprocess_workers = int(feature_cfg.get("preprocess_workers", 8))
-    prefetch_images = max(
-        preprocess_workers, int(feature_cfg.get("prefetch_images", 64))
+    reader_workers = int(feature_cfg.get("reader_workers", 64))
+    decoder_workers = int(feature_cfg.get("decoder_workers", 32))
+    read_prefetch = max(
+        reader_workers, int(feature_cfg.get("read_prefetch", 32768))
+    )
+    decode_prefetch = max(
+        decoder_workers, int(feature_cfg.get("decode_prefetch", 4096))
+    )
+    raw_budget = _ByteBudget(
+        int(float(feature_cfg.get("raw_queue_gib", 12)) * (1024**3))
     )
     writer_workers = int(feature_cfg.get("writer_workers", 2))
     pending_writes_limit = max(
@@ -319,15 +364,30 @@ def extract_selected_style_features(
     output_rows = list(completed_rows)
     newly_encoded = 0
     started = time.monotonic()
+    timing = {
+        "read_s": 0.0,
+        "read_wait_s": 0.0,
+        "decode_s": 0.0,
+        "decode_wait_s": 0.0,
+        "resize_s": 0.0,
+        "pin_s": 0.0,
+        "gpu_s": 0.0,
+        "write_s": 0.0,
+        "write_wait_s": 0.0,
+        "written_bytes": 0,
+    }
     write_executor = ThreadPoolExecutor(max_workers=writer_workers)
-    pending_writes: deque[Future[list[dict[str, Any]]]] = deque()
+    pending_writes: deque[
+        Future[tuple[list[dict[str, Any]], float, int]]
+    ] = deque()
 
     def write_shard(
         feature_path: Path,
         manifest_path: Path,
         tensors: dict[str, torch.Tensor],
         records: list[dict[str, Any]],
-    ) -> list[dict[str, Any]]:
+    ) -> tuple[list[dict[str, Any]], float, int]:
+        write_started = time.monotonic()
         temporary = feature_path.with_suffix(feature_path.suffix + ".tmp")
         save_file(
             {key: value.contiguous() for key, value in tensors.items()}, temporary
@@ -341,13 +401,21 @@ def extract_selected_style_features(
             f"({len(records)} images)",
             flush=True,
         )
-        return records
+        return records, time.monotonic() - write_started, feature_path.stat().st_size
+
+    def consume_write(future: Future[tuple[list[dict[str, Any]], float, int]]) -> None:
+        wait_started = time.monotonic()
+        records, write_s, written_bytes = future.result()
+        timing["write_wait_s"] += time.monotonic() - wait_started
+        timing["write_s"] += write_s
+        timing["written_bytes"] += written_bytes
+        output_rows.extend(records)
 
     def collect_write(*, block: bool) -> None:
         if block and pending_writes:
-            output_rows.extend(pending_writes.popleft().result())
+            consume_write(pending_writes.popleft())
         while pending_writes and pending_writes[0].done():
-            output_rows.extend(pending_writes.popleft().result())
+            consume_write(pending_writes.popleft())
 
     def flush_shard() -> None:
         nonlocal tensor_buffer, record_buffer, shard_index
@@ -371,7 +439,13 @@ def extract_selected_style_features(
 
     def run_batch(items: list[tuple[dict[str, Any], torch.Tensor, PreprocessInfo]]) -> None:
         nonlocal newly_encoded
-        images = torch.stack([item[1] for item in items]).to(device, non_blocking=True)
+        host_images = torch.stack([item[1] for item in items])
+        pin_started = time.monotonic()
+        if device.startswith("cuda"):
+            host_images = host_images.pin_memory()
+        timing["pin_s"] += time.monotonic() - pin_started
+        gpu_started = time.monotonic()
+        images = host_images.to(device, non_blocking=device.startswith("cuda"))
         with torch.inference_mode(), torch.autocast(
             device_type="cuda", dtype=amp_dtype, enabled=amp_enabled
         ):
@@ -386,6 +460,9 @@ def extract_selected_style_features(
         selected = _selected_style_tensors(
             intermediate, layers, spatial_layers, statistics_layers, storage_dtype
         )
+        if device.startswith("cuda"):
+            torch.cuda.synchronize()
+        timing["gpu_s"] += time.monotonic() - gpu_started
         for (row, _, info), tensors in zip(items, selected):
             image_id = int(row["id"])
             for name, tensor in tensors.items():
@@ -417,33 +494,102 @@ def extract_selected_style_features(
         for offset in range(0, len(items), batch_size):
             run_batch(items[offset : offset + batch_size])
 
-    def load_image(row: dict[str, Any]):
-        with Image.open(row["local_path"]) as image:
-            array, info = preprocess_cradio_image(image, radio_cfg)
-        return row, torch.from_numpy(array), info
+    def read_image(row: dict[str, Any]):
+        read_started = time.monotonic()
+        payload = Path(row["local_path"]).read_bytes()
+        read_s = time.monotonic() - read_started
+        raw_budget.acquire(len(payload))
+        return row, payload, read_s
 
-    with ThreadPoolExecutor(max_workers=preprocess_workers) as executor:
-        pending: dict[int, Future[Any]] = {}
-        next_submit = 0
-        for index in range(len(rows)):
-            while next_submit < len(rows) and next_submit < index + prefetch_images:
-                pending[next_submit] = executor.submit(load_image, rows[next_submit])
-                next_submit += 1
-            row, tensor, info = pending.pop(index).result()
-            key = (info.target_height, info.target_width)
-            buckets[key].append((row, tensor, info))
-            if len(buckets[key]) >= batch_size:
-                flush_bucket(key)
-            elif len(buckets) > max_open_buckets:
-                fullest = max(buckets, key=lambda bucket: len(buckets[bucket]))
-                flush_bucket(fullest)
-            if (index + 1) % 1000 == 0:
-                elapsed = time.monotonic() - started
-                print(
-                    f"prepared selected style images {index + 1}/{len(rows)} "
-                    f"({(index + 1) / elapsed:.2f} images/s)",
-                    flush=True,
-                )
+    def decode_image(item: tuple[dict[str, Any], bytes, float]):
+        row, payload, read_s = item
+        payload_size = len(payload)
+        try:
+            array, info, decode_s, resize_s = _decode_preprocess_bytes(
+                payload, radio_cfg
+            )
+        finally:
+            raw_budget.release(payload_size)
+        return row, torch.from_numpy(array), info, read_s, decode_s, resize_s
+
+    with (
+        ThreadPoolExecutor(max_workers=reader_workers) as read_executor,
+        ThreadPoolExecutor(max_workers=decoder_workers) as decode_executor,
+    ):
+        ready_reads: Queue[Future[Any]] = Queue()
+        ready_decodes: Queue[Future[Any]] = Queue()
+        outstanding_reads = 0
+        outstanding_decodes = 0
+        next_read = 0
+        processed = 0
+
+        def submit_decode(future: Future[Any]) -> None:
+            nonlocal outstanding_reads, outstanding_decodes
+            outstanding_reads -= 1
+            decode_future = decode_executor.submit(decode_image, future.result())
+            decode_future.add_done_callback(ready_decodes.put)
+            outstanding_decodes += 1
+
+        while processed < len(rows):
+            while next_read < len(rows) and outstanding_reads < read_prefetch:
+                read_future = read_executor.submit(read_image, rows[next_read])
+                read_future.add_done_callback(ready_reads.put)
+                outstanding_reads += 1
+                next_read += 1
+
+            while outstanding_decodes < decode_prefetch:
+                try:
+                    submit_decode(ready_reads.get_nowait())
+                except Empty:
+                    break
+
+            if not outstanding_decodes and outstanding_reads:
+                wait_started = time.monotonic()
+                submit_decode(ready_reads.get())
+                timing["read_wait_s"] += time.monotonic() - wait_started
+
+            if outstanding_decodes:
+                wait_started = time.monotonic()
+                completed_decodes = [ready_decodes.get()]
+                timing["decode_wait_s"] += time.monotonic() - wait_started
+                while True:
+                    try:
+                        completed_decodes.append(ready_decodes.get_nowait())
+                    except Empty:
+                        break
+                outstanding_decodes -= len(completed_decodes)
+                for future in completed_decodes:
+                    row, tensor, info, read_s, decode_s, resize_s = future.result()
+                    timing["read_s"] += read_s
+                    timing["decode_s"] += decode_s
+                    timing["resize_s"] += resize_s
+                    key = (info.target_height, info.target_width)
+                    buckets[key].append((row, tensor, info))
+                    if len(buckets[key]) >= batch_size:
+                        flush_bucket(key)
+                    elif len(buckets) > max_open_buckets:
+                        fullest = max(
+                            buckets, key=lambda bucket: len(buckets[bucket])
+                        )
+                        flush_bucket(fullest)
+                    processed += 1
+                    if processed % 1000 == 0:
+                        elapsed = time.monotonic() - started
+                        print(
+                            f"prepared selected style images {processed}/{len(rows)} "
+                            f"({processed / elapsed:.2f} images/s) "
+                            f"read={timing['read_s'] / processed:.4f}s/img "
+                            f"read_wait={timing['read_wait_s']:.2f}s "
+                            f"decode={timing['decode_s'] / processed:.4f}s/img "
+                            f"decode_wait={timing['decode_wait_s']:.2f}s "
+                            f"resize={timing['resize_s'] / processed:.4f}s/img "
+                            f"pin={timing['pin_s'] / processed:.4f}s/img "
+                            f"gpu={timing['gpu_s'] / max(newly_encoded, 1):.4f}s/img "
+                            f"write={timing['write_s'] / max(len(output_rows) - len(completed_rows), 1):.4f}s/img "
+                            f"write_wait={timing['write_wait_s']:.2f}s "
+                            f"raw_peak={raw_budget.peak_bytes / (1024**3):.2f}GiB",
+                            flush=True,
+                        )
 
     for key in list(buckets):
         flush_bucket(key)
@@ -466,6 +612,19 @@ def extract_selected_style_features(
         "average_bytes_per_image": total_bytes / len(output_rows),
         "feature_signature": signature,
         "manifest": str((features_dir / "manifest.parquet").resolve()),
+        "pipeline": {
+            "batch_size": batch_size,
+            "shard_rows": shard_rows,
+            "reader_workers": reader_workers,
+            "decoder_workers": decoder_workers,
+            "read_prefetch": read_prefetch,
+            "decode_prefetch": decode_prefetch,
+            "raw_queue_limit_bytes": raw_budget.limit_bytes,
+            "raw_queue_peak_bytes": raw_budget.peak_bytes,
+            "writer_workers": writer_workers,
+            "pending_writes": pending_writes_limit,
+        },
+        "timing": timing,
     }
     write_json(features_dir / "summary.json", summary)
     return summary
