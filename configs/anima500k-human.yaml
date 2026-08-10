@@ -85,6 +85,7 @@ style_features:
   raw_queue_gib: 12
   writer_workers: 8
   pending_writes: 16
+  pinned_buffers: 2
   preprocess:
     max_side: 512
     max_pixels: 262144
