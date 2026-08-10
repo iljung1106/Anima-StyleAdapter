@@ -42,3 +42,47 @@ L24 SigLIP CLS 단독은 L20+L24 full summary와 Top-1 차이가 0.17%p에 불�
 2. L20+L24 spatial + L24 SigLIP CLS
 
 두 번째 변형이 held-out artist prototype과 reconstruction Pareto를 개선할 때만 전체 150k에 L24 SigLIP CLS를 추가 캐싱한다.
+
+## Dense follow-up: L10/L14/L18/L22
+
+기존 tap 사이의 변화와 L20/L24 중복도를 확인하기 위해 L10, L14, L18, L22를 같은 48,984-image protocol로 추가 추출했다. 아래 수치는 각 reference 수의 Top-1 평균이다.
+
+| Layer | spatial mean | full summary | SigLIP CLS | DINO CLS |
+|---|---:|---:|---:|---:|
+| L8 | 52.65% | 58.82% | 58.48% | 57.65% |
+| L10 | 52.86% | 58.43% | 58.22% | 56.53% |
+| L12 | 54.35% | 60.40% | 60.06% | 60.37% |
+| L14 | 54.50% | 60.03% | 59.64% | 60.36% |
+| L16 | 53.80% | 58.93% | 58.56% | 59.76% |
+| **L18** | **56.50%** | 61.69% | 58.88% | **62.03%** |
+| L20 | 55.72% | 61.71% | 58.82% | 61.62% |
+| L22 | 55.21% | 61.31% | 58.23% | 61.65% |
+| L24 | 55.08% | **62.32%** | **63.26%** | 53.96% |
+
+L18 spatial mean은 L20보다 0.78%p, L24보다 1.42%p 높다. L24에서는 teacher slot의 역할이 크게 바뀌어 SigLIP CLS가 최상이므로, spatial tap 선택과 global semantic token 선택을 분리해야 한다.
+
+### Spatial pair와 중복도
+
+두 spatial mean을 단순 결합해 평가하고 exact linear CKA로 표현 중복도를 측정했다. `gain`은 더 강한 단일 layer 대비 변화이며, oracle은 두 단일 layer 중 하나라도 정답을 맞힌 비율이다.
+
+| Pair | Top-1 | gain | CKA | oracle Top-1 |
+|---|---:|---:|---:|---:|
+| L18+L20 | **56.34%** | -0.16%p | **0.991** | 59.26% |
+| **L18+L24** | **56.31%** | -0.19%p | **0.902** | 61.74% |
+| L20+L24 | 55.78% | +0.06%p | 0.912 | 60.31% |
+| L12+L24 | 55.52% | **+0.44%p** | 0.822 | **64.03%** |
+| L14+L24 | 55.50% | +0.43%p | 0.832 | 63.38% |
+
+L18+L20의 근소한 1위는 CKA 0.991의 거의 동일한 표현을 결합한 결과이며 L18 단독보다도 낮다. L18+L24는 raw 성능이 0.03%p밖에 뒤지지 않으면서 중복이 훨씬 낮고, full summary 결합에서는 63.45%로 전체 조합 중 가장 높았다. 반면 L12/L14+L24는 단순 결합 gain과 oracle 여지가 크지만 절대 spatial 성능이 낮고, 기존 learned pilot에서 L12+L24가 L20+L24보다 크게 낮았으므로 CKA만으로 채택하지 않는다.
+
+reference 수별로도 L18 spatial은 51.99/55.13/58.56/60.32%, L18+L24는 51.60/55.18/58.34/60.11%, L20+L24는 51.23/54.66/58.07/59.15%였다.
+
+### 다음 검증
+
+전체 150k cache를 즉시 바꾸지 않는다. 기존 10,000-image pilot subset에 L18 full spatial만 추가 추출한 뒤 동일한 모델·step·split로 다음을 비교한다.
+
+1. L18 단독 spatial: L24가 실제로 보완 정보를 주는지 보는 진단 기준선
+2. L18+L24 spatial: dense sweep이 제시한 주 후보
+3. L20+L24 spatial: 현재 production 기준선
+
+spatial pair를 먼저 확정한 후, 승자에 L24 SigLIP CLS를 통합하는 구조를 별도로 검증한다. prototype loss는 보조 projection만이 아니라 실제 출력 style token에도 적용하고, reconstruction과 held-out-artist 성능의 Pareto로 선택한다.
