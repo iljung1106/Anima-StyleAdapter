@@ -108,8 +108,18 @@ stylenet_benchmark:
     max_side: 512
     max_pixels: 262144
   combinations:
+    - name: combo_l20_l24_summary
+      representations: [layer_20_summary, layer_24_summary]
+    - name: combo_l20_l24_siglip_cls
+      representations: [layer_20_siglip_cls, layer_24_siglip_cls]
+    - name: combo_l20_l24_dino_cls
+      representations: [layer_20_dino_cls, layer_24_dino_cls]
     - name: combo_l20_l24_spatial_mean
       representations: [layer_20_spatial_mean, layer_24_spatial_mean]
+    - name: combo_l20_l24_spatial_mean_l24_siglip
+      representations: [layer_20_spatial_mean, layer_24_spatial_mean, layer_24_siglip_cls]
+    - name: combo_l20_l24_spatial_mean_l24_dino
+      representations: [layer_20_spatial_mean, layer_24_spatial_mean, layer_24_dino_cls]
     - name: combo_l20_l24_spatial_stats
       representations: [layer_20_spatial_stats, layer_24_spatial_stats]
     - name: combo_l8_l20_l24_spatial_stats

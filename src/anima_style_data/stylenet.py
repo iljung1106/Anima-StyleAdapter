@@ -415,6 +415,17 @@ def evaluate_stylenet_layer_features(
     rows = read_records(root / "manifest.parquet")
     tensors = load_file(root / "features.safetensors")
     representations = dict(tensors)
+    for name, values in tensors.items():
+        if not name.endswith("_summary"):
+            continue
+        layer_name = name.removesuffix("_summary")
+        spatial_dim = int(tensors[f"{layer_name}_spatial_mean"].shape[-1])
+        if int(values.shape[-1]) != 2 * spatial_dim:
+            raise ValueError(
+                f"Expected two teacher CLS slots for {name}, got {values.shape[-1]}"
+            )
+        representations[f"{layer_name}_siglip_cls"] = values[:, :spatial_dim]
+        representations[f"{layer_name}_dino_cls"] = values[:, spatial_dim:]
 
     def normalized_concat(names: list[str]):
         return torch.cat([F.normalize(tensors[name].float(), dim=-1) for name in names], dim=-1)
