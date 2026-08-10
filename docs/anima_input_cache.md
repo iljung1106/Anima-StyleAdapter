@@ -51,6 +51,8 @@ HF_HOME=/workspace/.cache/huggingface \
 
 H100 SXM 실측에서 text batch 64는 16.64 items/s였고 128로 키워도 16.58 items/s로 개선되지 않았다. VAE batch 8은 29.08 images/s였고 16은 28.89 images/s였다. 따라서 production 기본값은 text 64, VAE 8로 고정한다.
 
+VAE activation memory는 해상도에 따라 증가한다. 최대 batch 8에 더해 batch당 target pixel budget을 4,194,304로 제한하여 512²에서는 8, 704×768에서는 7, 1024²에서는 4로 자동 조절한다. 이 제한은 H100 80GB에서 후반 고해상도 bucket의 OOM을 막기 위한 것이다.
+
 ## 본학습 loader 계약
 
 - Text: 선택한 variant row의 `token_offset:token_offset+token_length`를 읽고 batch 최대 길이까지만 padding한다.

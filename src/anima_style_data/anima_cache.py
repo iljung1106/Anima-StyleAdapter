@@ -117,6 +117,14 @@ def compute_anima_geometry(
     )
 
 
+def effective_vae_batch_size(
+    height: int, width: int, max_batch_size: int, max_batch_pixels: int | None
+) -> int:
+    if max_batch_pixels is None or max_batch_pixels <= 0:
+        return max_batch_size
+    return max(1, min(max_batch_size, max_batch_pixels // (height * width)))
+
+
 def _decode_anima_image(payload: bytes, cfg: dict[str, Any]):
     decode_started = time.monotonic()
     with Image.open(BytesIO(payload)) as source:
@@ -569,6 +577,10 @@ def cache_anima_vae_latents(config: dict[str, Any], destination: Path) -> dict[s
     if latent_cfg.get("max_images") is not None:
         rows = rows[: int(latent_cfg["max_images"])]
     batch_size = int(latent_cfg.get("batch_size", 4))
+    max_batch_pixels_value = latent_cfg.get("max_batch_pixels")
+    max_batch_pixels = (
+        int(max_batch_pixels_value) if max_batch_pixels_value is not None else None
+    )
     shard_rows = int(latent_cfg.get("shard_rows", 512))
     reader_workers = int(latent_cfg.get("reader_workers", 32))
     decoder_workers = int(latent_cfg.get("decoder_workers", 16))
@@ -738,9 +750,12 @@ def cache_anima_vae_latents(config: dict[str, Any], destination: Path) -> dict[s
                 key = (geometry.target_height, geometry.target_width)
                 bucket = buckets.setdefault(key, [])
                 bucket.append((row, tensor, geometry))
-                if len(bucket) >= batch_size:
-                    submit_batch(bucket[:batch_size])
-                    del bucket[:batch_size]
+                bucket_batch = effective_vae_batch_size(
+                    key[0], key[1], batch_size, max_batch_pixels
+                )
+                if len(bucket) >= bucket_batch:
+                    submit_batch(bucket[:bucket_batch])
+                    del bucket[:bucket_batch]
                 processed += 1
                 if processed % 1000 == 0:
                     while pending_gpu and pending_gpu[0][0].done():
@@ -778,6 +793,7 @@ def cache_anima_vae_latents(config: dict[str, Any], destination: Path) -> dict[s
         "timing": timing,
         "pipeline": {
             "batch_size": batch_size,
+            "max_batch_pixels": max_batch_pixels,
             "shard_rows": shard_rows,
             "reader_workers": reader_workers,
             "decoder_workers": decoder_workers,

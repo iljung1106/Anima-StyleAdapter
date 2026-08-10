@@ -75,6 +75,7 @@ anima_cache:
     output_directory: anima_latent_cache_qwen_2d
     device: cuda
     batch_size: 8
+    max_batch_pixels: 4194304
     shard_rows: 512
     reader_workers: 32
     decoder_workers: 16

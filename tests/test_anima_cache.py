@@ -7,6 +7,7 @@ from anima_style_data.anima_cache import (
     _decode_anima_image,
     build_anima_caption_variants,
     compute_anima_geometry,
+    effective_vae_batch_size,
 )
 
 
@@ -79,3 +80,10 @@ def test_only_tiny_images_are_upscaled_to_minimum_bucket():
     tiny = compute_anima_geometry(200, 300, cfg)
     assert (regular.target_height, regular.target_width) == (768, 768)
     assert min(tiny.target_height, tiny.target_width) >= 256
+
+
+def test_vae_batch_respects_pixel_budget():
+    assert effective_vae_batch_size(512, 512, 8, 4 * 1024 * 1024) == 8
+    assert effective_vae_batch_size(768, 704, 8, 4 * 1024 * 1024) == 7
+    assert effective_vae_batch_size(1024, 1024, 8, 4 * 1024 * 1024) == 4
+    assert effective_vae_batch_size(1024, 1024, 8, None) == 8
