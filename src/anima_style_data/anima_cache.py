@@ -463,32 +463,24 @@ def cache_anima_text_conditions(config: dict[str, Any], destination: Path) -> di
     if output_rows:
         write_records(output / "manifest.parquet", output_rows)
 
-    # Cache both the normal empty prompt and the exact official caption-dropout
-    # path. The latter supplies zero Qwen context and a one-token T5 target.
-    empty_q = qwen_tokenizer([""], return_tensors="pt", padding=True).to(device)
-    empty_t = t5_tokenizer([""], return_tensors="pt", padding=True).to(device)
+    # Reproduce sd-scripts' Anima caption-dropout path exactly: zero Qwen
+    # context plus a one-token T5 </s> target. Dynamic tokenization of an empty
+    # string produces a zero-length Qwen sequence, which Qwen3 cannot execute.
+    null_source = torch.zeros((1, 1, 1024), dtype=dtype, device=device)
+    null_source_mask = torch.zeros((1, 1), dtype=torch.long, device=device)
+    null_target_ids = torch.ones((1, 1), dtype=torch.long, device=device)
+    null_target_mask = torch.ones_like(null_target_ids)
     with torch.inference_mode(), torch.autocast("cuda", dtype=dtype, enabled=device.startswith("cuda")):
-        empty_hidden = qwen(**empty_q).last_hidden_state
-        empty_condition = adapter(
-            empty_hidden,
-            empty_t["input_ids"],
-            target_attention_mask=empty_t["attention_mask"],
-            source_attention_mask=empty_q["attention_mask"],
-        )
-        dropout_hidden = torch.zeros_like(empty_hidden)
-        dropout_q_mask = torch.zeros_like(empty_q["attention_mask"])
-        dropout_t_ids = torch.ones((1, 1), dtype=torch.long, device=device)
-        dropout_t_mask = torch.ones_like(dropout_t_ids)
-        dropout_condition = adapter(
-            dropout_hidden,
-            dropout_t_ids,
-            target_attention_mask=dropout_t_mask,
-            source_attention_mask=dropout_q_mask,
+        null_condition = adapter(
+            null_source,
+            null_target_ids,
+            target_attention_mask=null_target_mask,
+            source_attention_mask=null_source_mask,
         )
     save_file(
         {
-            "empty_prompt": empty_condition[0, : int(empty_t["attention_mask"].sum())].half().cpu(),
-            "caption_dropout_null": dropout_condition[0].half().cpu(),
+            "empty_prompt": null_condition[0].half().cpu(),
+            "caption_dropout_null": null_condition[0].half().cpu(),
         },
         output / "null_conditioning.safetensors",
     )
