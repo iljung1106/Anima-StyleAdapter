@@ -11,6 +11,7 @@ from .anima_cache import (
     cache_all_anima_inputs,
     cache_anima_text_conditions,
     cache_anima_vae_latents,
+    validate_anima_caches,
 )
 from .caption import create_anima_captions
 from .config import load_config, output_dir
@@ -75,6 +76,7 @@ def build_parser() -> argparse.ArgumentParser:
         ("anima-text-cache", "Cache packed post-LLM Anima text conditioning"),
         ("anima-latent-cache", "Cache packed Qwen-Image VAE latents"),
         ("anima-cache", "Cache all frozen Anima training inputs"),
+        ("anima-cache-validate", "Validate packed Anima cache manifests and tensors"),
         ("prepare", "Run selection, download, and duplicate removal"),
         ("all", "Run every stage, including tagger and C-RADIO models"),
     ):
@@ -134,6 +136,8 @@ def main() -> None:
         _run(cache_anima_vae_latents, config, destination)
     elif args.command == "anima-cache":
         _run(cache_all_anima_inputs, config, destination)
+    elif args.command == "anima-cache-validate":
+        _run(validate_anima_caches, config, destination)
     elif args.command in {"prepare", "all"}:
         for stage in (select_candidates, download_candidates, deduplicate):
             _run(stage, config, destination)

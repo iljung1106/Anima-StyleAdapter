@@ -45,6 +45,8 @@ HF_HOME=/workspace/.cache/huggingface \
 
 HF_HOME=/workspace/.cache/huggingface \
   .venv/bin/anima-data --config configs/anima500k-human.yaml anima-latent-cache
+
+.venv/bin/anima-data --config configs/anima500k-human.yaml anima-cache-validate
 ```
 
 `anima-cache`는 두 단계를 순차 실행한다. 각 단계는 `manifests/part-*.parquet`을 기준으로 완료 shard를 재사용하므로 중단 후 같은 명령으로 resume할 수 있다. 기존 cache와 model/config signature가 다르면 덮어쓰지 않고 오류를 낸다.

@@ -814,3 +814,94 @@ def cache_all_anima_inputs(config: dict[str, Any], destination: Path) -> dict[st
     summary = {"text": text, "latents": latents}
     write_json(destination / "anima_cache_summary.json", summary)
     return summary
+
+
+def validate_anima_caches(config: dict[str, Any], destination: Path) -> dict[str, Any]:
+    import torch
+    from safetensors.torch import load_file
+
+    cfg = config["anima_cache"]
+    text_dir = destination / str(cfg["text"].get("output_directory", "anima_text_cache"))
+    latent_dir = destination / str(cfg["latents"].get("output_directory", "anima_latent_cache"))
+    text_rows = read_records(text_dir / "manifest.parquet")
+    latent_rows = read_records(latent_dir / "manifest.parquet")
+    text_keys = {(int(row["id"]), int(row["variant"])) for row in text_rows}
+    latent_ids = {int(row["id"]) for row in latent_rows}
+    if len(text_keys) != len(text_rows):
+        raise RuntimeError("Duplicate (image, variant) rows in Anima text cache")
+    if len(latent_ids) != len(latent_rows):
+        raise RuntimeError("Duplicate image rows in Anima latent cache")
+
+    text_parts = sorted((text_dir / "manifests").glob("part-*.parquet"))
+    latent_parts = sorted((latent_dir / "manifests").glob("part-*.parquet"))
+    if sum(len(read_records(path)) for path in text_parts) != len(text_rows):
+        raise RuntimeError("Text part manifests do not match the global manifest")
+    if sum(len(read_records(path)) for path in latent_parts) != len(latent_rows):
+        raise RuntimeError("Latent part manifests do not match the global manifest")
+
+    def sample_indices(length: int) -> list[int]:
+        return sorted({0, length // 2, length - 1})
+
+    text_samples = []
+    for index in sample_indices(len(text_parts)):
+        part_path = text_parts[index]
+        part_rows = read_records(part_path)
+        shard = text_dir / str(part_rows[0]["cache_shard"])
+        tensors = load_file(shard, device="cpu")
+        condition = tensors["conditioning"]
+        offsets = tensors["offsets"]
+        ids = tensors["ids"]
+        variants = tensors["variants"]
+        expected_ids = torch.tensor([int(row["id"]) for row in part_rows])
+        expected_variants = torch.tensor([int(row["variant"]) for row in part_rows])
+        if not torch.equal(ids, expected_ids):
+            raise RuntimeError(f"Text IDs disagree with {part_path.name}")
+        if not torch.equal(variants.to(torch.int64), expected_variants):
+            raise RuntimeError(f"Text variants disagree with {part_path.name}")
+        if offsets.numel() != len(part_rows) + 1 or int(offsets[-1]) != condition.shape[0]:
+            raise RuntimeError(f"Invalid packed text offsets in {shard.name}")
+        if condition.dtype != torch.float16 or not bool(torch.isfinite(condition).all()):
+            raise RuntimeError(f"Invalid text tensor values in {shard.name}")
+        text_samples.append(
+            {"shard": shard.name, "items": len(part_rows), "tokens": int(condition.shape[0])}
+        )
+
+    null_tensors = load_file(text_dir / "null_conditioning.safetensors", device="cpu")
+    if set(null_tensors) != {"empty_prompt", "caption_dropout_null"}:
+        raise RuntimeError("Unexpected null conditioning tensor contract")
+    if not all(bool(torch.isfinite(value).all()) for value in null_tensors.values()):
+        raise RuntimeError("Non-finite null conditioning")
+
+    latent_samples = []
+    for index in sample_indices(len(latent_parts)):
+        part_path = latent_parts[index]
+        part_rows = read_records(part_path)
+        shard = latent_dir / str(part_rows[0]["cache_shard"])
+        tensors = load_file(shard, device="cpu")
+        latents = tensors["latents"]
+        ids = tensors["ids"]
+        expected_ids = torch.tensor([int(row["id"]) for row in part_rows])
+        if not torch.equal(ids, expected_ids):
+            raise RuntimeError(f"Latent IDs disagree with {part_path.name}")
+        if latents.shape[0] != len(part_rows) or latents.shape[1] != 16:
+            raise RuntimeError(f"Invalid latent shape in {shard.name}: {tuple(latents.shape)}")
+        if latents.dtype != torch.float16 or not bool(torch.isfinite(latents).all()):
+            raise RuntimeError(f"Invalid latent tensor values in {shard.name}")
+        latent_samples.append(
+            {"shard": shard.name, "items": len(part_rows), "shape": list(latents.shape)}
+        )
+
+    summary = {
+        "text_items": len(text_rows),
+        "text_images": len({int(row["id"]) for row in text_rows}),
+        "text_shards": len(text_parts),
+        "text_samples": text_samples,
+        "latent_items": len(latent_rows),
+        "latent_shards": len(latent_parts),
+        "latent_samples": latent_samples,
+        "storage_bytes": sum(path.stat().st_size for path in text_dir.glob("*.safetensors"))
+        + sum(path.stat().st_size for path in latent_dir.glob("*.safetensors")),
+        "valid": True,
+    }
+    write_json(destination / "anima_cache_validation.json", summary)
+    return summary
