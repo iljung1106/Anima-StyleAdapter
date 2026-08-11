@@ -1429,8 +1429,9 @@ def _forward_flow_loss(
                 kv_contrastive = _symmetric_style_contrastive_loss(
                     reference_signature[:, None], target_signature[:, None], temperature
                 )
+        flow_weight = float(loss_config.get("style_flow_loss_weight", 1.0))
         loss = (
-            flow_loss
+            flow_weight * flow_loss
             + oracle_weight * oracle_distill_loss
             + magnitude_weight * magnitude_loss
             + direction_weight * direction_loss
@@ -2209,6 +2210,7 @@ def overfit_exact_self_batch(config: dict[str, Any], destination: Path) -> dict[
         "resampler_train_start_step": -1,
         "resampler_auxiliary_weight": 0.0,
         "style_magnitude_weight": 0.0,
+        "style_flow_loss_weight": float(overfit_cfg.get("flow_loss_weight", 1.0)),
         "style_flow_direction_weight": float(overfit_cfg.get("direction_weight", 0.0)),
         "style_token_contrastive_weight": 0.0,
         "style_kv_contrastive_weight": 0.0,
@@ -2243,11 +2245,12 @@ def overfit_exact_self_batch(config: dict[str, Any], destination: Path) -> dict[
         }
 
     fixed_noise_each_step = bool(overfit_cfg.get("fixed_noise_each_step", False))
-    output = source_output / (
+    default_output_name = (
         "overfit_exact_self_fixed_flow"
         if fixed_noise_each_step
         else "overfit_exact_self_random_flow"
     )
+    output = source_output / str(overfit_cfg.get("output_name", default_output_name))
     output.mkdir(parents=True, exist_ok=True)
     history = []
     steps = int(overfit_cfg.get("steps", 500))
@@ -2332,7 +2335,12 @@ def overfit_exact_self_batch(config: dict[str, Any], destination: Path) -> dict[
         "evaluation_noise_seed": fixed_noise_seed,
         "fixed_noise_and_timestep_during_training": fixed_noise_each_step,
         "resampler_trainable": False,
-        "losses": "flow MSE only",
+        "losses": {
+            "flow_mse_weight": float(loss_config.get("style_flow_loss_weight", 1.0)),
+            "normalized_direction_weight": float(
+                loss_config.get("style_flow_direction_weight", 0.0)
+            ),
+        },
         "optimization_counts": optimization_counts,
         "initial": history[0],
         "final": history[-1],
