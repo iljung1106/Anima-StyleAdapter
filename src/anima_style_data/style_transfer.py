@@ -1036,7 +1036,10 @@ def diagnose_style_reference_dependence(
     checkpoint_name = str(diagnostic_cfg.get("checkpoint", "selected-step-0005500.pt"))
     checkpoint_path = Path(checkpoint_name)
     if not checkpoint_path.is_absolute():
-        checkpoint_path = output / checkpoint_path
+        output_candidate = output / checkpoint_path
+        checkpoint_path = (
+            output_candidate if output_candidate.exists() else destination / checkpoint_path
+        )
     state = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     adapter.load_state_dict(state["adapter"])
 
@@ -1106,6 +1109,16 @@ def diagnose_style_reference_dependence(
             "correct_vs_null_rms": float(
                 (correct_prediction - null_prediction).square().mean().sqrt()
             ),
+            "correct_vs_bypass_rms": float(
+                (correct_prediction - bypass_prediction).square().mean().sqrt()
+            ),
+            "shuffled_vs_bypass_rms": float(
+                (shuffled_prediction - bypass_prediction).square().mean().sqrt()
+            ),
+            "null_vs_bypass_rms": float(
+                (null_prediction - bypass_prediction).square().mean().sqrt()
+            ),
+            "prediction_rms": float(correct_prediction.square().mean().sqrt()),
             "style_pairwise_cosine": float(similarities[off_diagonal].mean()),
             "style_centered_rms": float(
                 (correct_style.float() - correct_style.float().mean(0, keepdim=True))

@@ -315,7 +315,7 @@ style_transfer:
       name: anima-style-transfer-l18-l24-reference-contrastive-v3
       id: anima-style-transfer-l18-l24-reference-contrastive-v3
   diagnostics:
-    checkpoint: training_state.pt
+    checkpoint: style_transfer_l18_l24_siglip_l24_crossslot1_fixedtext_v2/selected-step-0005500.pt
     batch_size: 8
     batches: 4
   sampling:
