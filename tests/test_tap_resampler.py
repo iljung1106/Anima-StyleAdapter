@@ -6,6 +6,7 @@ from anima_style_data.tap_resampler import (
     _joint_token_prototype_loss,
     _load_feature_batch,
     _prototype_loss,
+    _slot_variation_diversity_loss,
     _training_rows_for_step,
     build_tap_resampler_model,
     select_tap_experiment_rows,
@@ -112,6 +113,16 @@ def test_joint_descriptor_uses_all_ordered_slots_without_projection():
     swapped = tokens.clone()
     swapped[:, [0, 1]] = swapped[:, [1, 0]]
     assert not torch.allclose(descriptor, _joint_token_descriptor(swapped))
+
+
+def test_slot_diversity_measures_image_dependent_collapse():
+    shared = torch.randn(8, 1, 64).expand(-1, 4, -1)
+    independent = torch.randn(8, 4, 64)
+
+    collapsed_loss = _slot_variation_diversity_loss(shared)
+    independent_loss = _slot_variation_diversity_loss(independent)
+
+    assert collapsed_loss > independent_loss
 
 
 def test_training_episode_is_step_addressable():

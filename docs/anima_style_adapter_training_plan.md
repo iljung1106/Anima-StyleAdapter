@@ -336,12 +336,14 @@ Pilot의 반복 학습에서는 전체 NFS shard를 무작위로 다시 읽지 �
 cache로 `32×1024` 직접 style token을 다시 학습한다. Encoder/decoder 깊이는 각각 4/2층을
 유지하여 token 수와 width의 효과에 집중한다.
 
-Artist supervision은 각 token을 LayerNorm한 뒤 순서를 보존해 concatenate한 32,768차원
+Artist supervision은 token 순서를 보존해 concatenate한 뒤 전체를 LayerNorm한 32,768차원
 descriptor 전체에 prototype loss를 적용한다. 별도의 학습형 prototype projection이나 mean
 pooling은 사용하지 않는다. Joint prototype 가중치는 0.13, 보조 slot-wise prototype은 0.02로
 두어 총 artist loss를 기존 0.30의 절반인 0.15로 낮춘다. Reconstruction이 정보 보존과 slot
 분화를 주도하며, slot cosine matrix에서 실제 중복 붕괴가 확인될 때만 약한 diversity loss를
-추가한다.
+추가한다. Slot 역할 분화에는 batch에서 slot별 평균을 제거한 image-dependent variation의
+상관을 측정하고, 절대 cosine이 0.20을 넘는 부분만 가중치 0.01로 억제한다. 고정 learned-query
+offset은 제거되므로 slot identity 자체로 diversity loss를 우회할 수 없다.
 
 각 단계는 다시 실행할 수 있고 중간 결과만 교체할 수 있도록 sharded Parquet 또는 유사한 columnar manifest로 저장한다.
 

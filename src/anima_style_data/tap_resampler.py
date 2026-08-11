@@ -750,8 +750,8 @@ def _joint_token_descriptor(style_tokens):
 
     if style_tokens.ndim != 3:
         return F.normalize(style_tokens, dim=-1)
-    normalized_slots = F.layer_norm(style_tokens.float(), (style_tokens.shape[-1],))
-    return F.normalize(normalized_slots.flatten(1), dim=-1)
+    flattened = style_tokens.float().flatten(1)
+    return F.normalize(F.layer_norm(flattened, (flattened.shape[-1],)), dim=-1)
 
 
 def _joint_token_prototype_loss(
@@ -763,6 +763,27 @@ def _joint_token_prototype_loss(
         images_per_artist,
         temperature,
     )
+
+
+def _slot_variation_diversity_loss(style_tokens, margin: float = 0.20):
+    """Discourage slots from encoding the same image-dependent variation.
+
+    Centering every slot over the batch removes fixed learned-query offsets, so
+    the objective cannot be satisfied merely by assigning each slot a constant
+    identity vector.
+    """
+    import torch
+    import torch.nn.functional as F
+
+    if style_tokens.ndim != 3 or style_tokens.shape[1] < 2:
+        return style_tokens.new_zeros(())
+    centered = style_tokens.float() - style_tokens.float().mean(dim=0, keepdim=True)
+    variation = F.normalize(centered.transpose(0, 1).flatten(1), dim=-1)
+    similarities = variation @ variation.T
+    off_diagonal = ~torch.eye(
+        similarities.shape[0], dtype=torch.bool, device=similarities.device
+    )
+    return F.relu(similarities[off_diagonal].abs() - margin).square().mean()
 
 
 def _evaluation_descriptor(representation):
@@ -913,11 +934,20 @@ def _evaluate_fixed_episodes(
                     training.get("slot_prototype_weight", training.get("prototype_weight", 0.0))
                 )
                 joint_weight = float(training.get("joint_prototype_weight", 0.0))
-                total = rec + slot_weight * slot + joint_weight * joint
+                diversity = _slot_variation_diversity_loss(
+                    representation, float(training.get("slot_diversity_margin", 0.20))
+                )
+                total = (
+                    rec
+                    + slot_weight * slot
+                    + joint_weight * joint
+                    + float(training.get("slot_diversity_weight", 0.0)) * diversity
+                )
             totals["total"] += float(total)
             totals["reconstruction"] += float(rec)
             totals["slot_prototype"] += float(slot)
             totals["joint_prototype"] += float(joint)
+            totals["slot_diversity"] += float(diversity)
     if was_training:
         model.train()
     return {key: value / episodes for key, value in totals.items()}
@@ -1244,6 +1274,9 @@ def train_tap_resampler_variants(config: dict[str, Any], destination: Path) -> d
                         if representation.ndim == 3
                         else representation.new_zeros(())
                     )
+                    diversity_loss = _slot_variation_diversity_loss(
+                        representation, float(training.get("slot_diversity_margin", 0.20))
+                    )
                     ramp = min(
                         1.0,
                         (step + 1)
@@ -1258,6 +1291,8 @@ def train_tap_resampler_variants(config: dict[str, Any], destination: Path) -> d
                         * proto_loss
                         + float(training.get("joint_prototype_weight", 0.0))
                         * joint_proto_loss
+                        + float(training.get("slot_diversity_weight", 0.0))
+                        * diversity_loss
                     )
                 loss.backward()
                 grad_norm = torch.nn.utils.clip_grad_norm_(
@@ -1270,6 +1305,7 @@ def train_tap_resampler_variants(config: dict[str, Any], destination: Path) -> d
                 running["reconstruction"] += rec_loss.detach()
                 running["prototype"] += proto_loss.detach()
                 running["joint_prototype"] += joint_proto_loss.detach()
+                running["slot_diversity"] += diversity_loss.detach()
                 running["grad_norm"] += grad_norm.detach()
                 running["padding_efficiency"] += float(current["padding_efficiency"])
                 if (step + 1) % int(training["log_every"]) == 0:
@@ -1280,6 +1316,7 @@ def train_tap_resampler_variants(config: dict[str, Any], destination: Path) -> d
                         "train/reconstruction": float(running["reconstruction"] / interval),
                         "train/slot_prototype": float(running["prototype"] / interval),
                         "train/joint_prototype": float(running["joint_prototype"] / interval),
+                        "train/slot_diversity": float(running["slot_diversity"] / interval),
                         "train/grad_norm": float(running["grad_norm"] / interval),
                         "train/prototype_ramp": ramp,
                         "perf/step_s": elapsed / interval,
@@ -1293,6 +1330,7 @@ def train_tap_resampler_variants(config: dict[str, Any], destination: Path) -> d
                         f"rec={log_values['train/reconstruction']:.4f} "
                         f"proto={log_values['train/slot_prototype']:.4f} "
                         f"joint_proto={log_values['train/joint_prototype']:.4f} "
+                        f"diversity={log_values['train/slot_diversity']:.4f} "
                         f"padding={log_values['perf/padding_efficiency']:.3f} "
                         f"step_s={log_values['perf/step_s']:.3f} "
                         f"data_wait_s={log_values['perf/data_wait_s']:.3f}",
