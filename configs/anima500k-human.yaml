@@ -362,7 +362,7 @@ style_transfer:
     prefetch_workers: 2
     prefetch_batches: 4
     log_every: 10
-    debug_autograd_steps: 1
+    debug_autograd_steps: 0
     validation_every: 250
     validation_batches: 8
     full_validation_every: 500
