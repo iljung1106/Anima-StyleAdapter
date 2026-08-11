@@ -1663,8 +1663,11 @@ def train_style_adapter(config: dict[str, Any], destination: Path, *, steps_over
     started = time.perf_counter()
     if device.startswith("cuda"):
         torch.cuda.reset_peak_memory_stats()
+    accumulation_steps = max(1, int(training.get("gradient_accumulation_steps", 1)))
     iterator = iter(loader.prefetch(
-        start_step, steps - start_step, workers=int(training.get("prefetch_workers", 2)),
+        start_step * accumulation_steps,
+        (steps - start_step) * accumulation_steps,
+        workers=int(training.get("prefetch_workers", 2)),
         depth=int(training.get("prefetch_batches", 4)),
     ))
     checkpoint_every = int(training.get("checkpoint_every", 500))
@@ -1713,9 +1716,6 @@ def train_style_adapter(config: dict[str, Any], destination: Path, *, steps_over
                 step=0,
             )
     for zero_based_step in range(start_step, steps):
-        wait_started = time.perf_counter()
-        batch = next(iterator)
-        data_wait = time.perf_counter() - wait_started
         step = zero_based_step + 1
         curriculum = _self_reference_curriculum_state(step, curriculum_cfg)
         _set_adapter_trainable_stage(adapter, gate_only=bool(curriculum["gate_only"]))
@@ -1733,14 +1733,23 @@ def train_style_adapter(config: dict[str, Any], destination: Path, *, steps_over
             )
         data_ready = time.perf_counter()
         optimizer.zero_grad(set_to_none=True)
-        loss, details = _forward_flow_loss(
-            anima, adapter, resampler, batch, device, loss_config=training, step=step,
-            oracle_adapter=oracle_adapter,
-        )
-        loss.backward()
-        # Style tokens are part of the adapter's live autograd graph, so keep
-        # them attached until backward completes.
-        adapter.clear_style_tokens()
+        data_wait = 0.0
+        accumulated_loss = 0.0
+        details = None
+        for _ in range(accumulation_steps):
+            wait_started = time.perf_counter()
+            batch = next(iterator)
+            data_wait += time.perf_counter() - wait_started
+            loss, details = _forward_flow_loss(
+                anima, adapter, resampler, batch, device,
+                loss_config=training, step=step, oracle_adapter=oracle_adapter,
+            )
+            accumulated_loss += float(loss.detach()) / accumulation_steps
+            (loss / accumulation_steps).backward()
+            # Style tokens are part of the adapter's live autograd graph, so
+            # keep them attached until each microbatch backward completes.
+            adapter.clear_style_tokens()
+        assert details is not None
         grad_norm = torch.nn.utils.clip_grad_norm_(parameters, float(training.get("max_grad_norm", 1.0)))
         group_grads = {
             "aggregator_grad": _parameter_grad_norm(adapter.aggregator.parameters()),
@@ -1752,8 +1761,9 @@ def train_style_adapter(config: dict[str, Any], destination: Path, *, steps_over
         optimizer.step()
         elapsed = time.perf_counter() - data_ready
         row = {
-            "step": step, "loss": float(loss.detach()), "grad_norm": float(grad_norm),
+            "step": step, "loss": accumulated_loss, "grad_norm": float(grad_norm),
             "step_s": elapsed, "data_wait_s": data_wait,
+            "gradient_accumulation_steps": accumulation_steps,
             "peak_vram_gib": torch.cuda.max_memory_allocated() / (1024**3) if device.startswith("cuda") else 0.0,
             **details, **group_grads,
         }
