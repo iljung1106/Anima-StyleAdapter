@@ -369,8 +369,10 @@ Validation, sampling, diagnostics도 checkpoint의 Resampler state를 복원하�
 
 RunPod H100 80GB의 2-step 실제 Anima smoke test에서 batch 5 공동학습 경로는 peak
 69.58GiB를 사용했다. 그러나 production 첫 대형 latent bucket은 실제 activation이
-78GiB를 넘어 OOM이 발생했다. 따라서 본학습은 microbatch 4와 gradient accumulation 4의
-effective batch 16으로 실행한다. Smoke의 gradient accumulation 3 optimizer step은 약 3.5~4.2초였고,
+78GiB를 넘어 OOM이 발생했다. Batch 4는 Resampler 동결 구간에서 약 64GiB로 동작했지만,
+step 500의 decoder 공동학습 전환 여유까지 확보하기 위해 최종 본학습은 microbatch 3과
+gradient accumulation 5의 effective batch 15로 실행한다. Smoke의 gradient accumulation 3
+optimizer step은 약 3.5~4.2초였고,
 Resampler reconstruction 0.27~0.29, joint prototype 0.55~0.86, diversity 0.19~0.21과
 nonzero Resampler grad 0.043~0.061이 기록됐다. Adapter 68.5M과 Resampler 111.2M을 합친
 trainable parameter는 179.75M이다. 전체 optimizer state를 포함한 resumable checkpoint는
