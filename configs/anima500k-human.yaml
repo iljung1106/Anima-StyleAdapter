@@ -427,8 +427,8 @@ style_transfer:
     wandb:
       enabled: true
       project: anima-style-adapter
-      name: anima-style-transfer-l18-l24-32x1024-pretrained-kvo-lora-rank1-from1500-1k
-      id: anima-style-transfer-l18-l24-32x1024-pretrained-kvo-lora-rank1-from1500-1k
+      name: anima-style-transfer-l18-l24-32x1024-pretrained-kvo-lora-rank1-fixed-1k
+      id: anima-style-transfer-l18-l24-32x1024-pretrained-kvo-lora-rank1-fixed-1k
   diagnostics:
     checkpoint: checkpoints/step-0001000.pt
     checkpoints:

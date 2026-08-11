@@ -2948,7 +2948,11 @@ def train_style_adapter(config: dict[str, Any], destination: Path, *, steps_over
             entity=wandb_cfg.get("entity"),
             name=str(wandb_cfg.get("name", "anima-style-transfer")),
             id=str(wandb_cfg.get("id", "anima-style-transfer-l18-l24")),
-            resume="allow",
+            # Do not silently append a fresh optimizer run to stale history
+            # merely because a human-readable ID was reused. True checkpoint
+            # resumes retain the existing W&B run; fresh runs must use a new
+            # ID and fail loudly otherwise.
+            resume="allow" if resume else "never",
             config=cfg,
         )
     metrics = []
