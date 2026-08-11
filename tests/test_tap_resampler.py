@@ -2,6 +2,8 @@ import torch
 
 from anima_style_data.tap_resampler import (
     _PinnedCudaBatchPipeline,
+    _joint_token_descriptor,
+    _joint_token_prototype_loss,
     _load_feature_batch,
     _prototype_loss,
     _training_rows_for_step,
@@ -97,6 +99,19 @@ def test_concat_resampler_returns_direct_style_tokens():
     assert torch.equal(decoded_mask, mask)
     assert style_tokens.shape == (4, 4, 24)
     assert torch.isfinite(_prototype_loss(style_tokens, 2, 2, 0.07))
+
+
+def test_joint_descriptor_uses_all_ordered_slots_without_projection():
+    tokens = torch.randn(8, 32, 1024)
+    descriptor = _joint_token_descriptor(tokens)
+
+    assert descriptor.shape == (8, 32 * 1024)
+    assert torch.allclose(descriptor.norm(dim=-1), torch.ones(8), atol=1e-5)
+    assert torch.isfinite(_joint_token_prototype_loss(tokens, 4, 2, 0.07))
+
+    swapped = tokens.clone()
+    swapped[:, [0, 1]] = swapped[:, [1, 0]]
+    assert not torch.allclose(descriptor, _joint_token_descriptor(swapped))
 
 
 def test_training_episode_is_step_addressable():

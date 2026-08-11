@@ -744,13 +744,29 @@ def _pooled_token_prototype_loss(
     return _prototype_loss(pooled, artists_per_batch, images_per_artist, temperature)
 
 
-def _evaluation_descriptor(representation):
+def _joint_token_descriptor(style_tokens):
+    """Use every ordered style slot without a learned projection bottleneck."""
     import torch.nn.functional as F
 
-    if representation.ndim == 2:
-        return representation
-    normalized_slots = F.normalize(representation, dim=-1)
+    if style_tokens.ndim != 3:
+        return F.normalize(style_tokens, dim=-1)
+    normalized_slots = F.layer_norm(style_tokens.float(), (style_tokens.shape[-1],))
     return F.normalize(normalized_slots.flatten(1), dim=-1)
+
+
+def _joint_token_prototype_loss(
+    style_tokens, artists_per_batch: int, images_per_artist: int, temperature: float
+):
+    return _prototype_loss(
+        _joint_token_descriptor(style_tokens),
+        artists_per_batch,
+        images_per_artist,
+        temperature,
+    )
+
+
+def _evaluation_descriptor(representation):
+    return _joint_token_descriptor(representation)
 
 
 def _training_rows_for_step(
@@ -883,8 +899,8 @@ def _evaluate_fixed_episodes(
                     images_per_artist,
                     float(training["temperature"]),
                 )
-                pooled = (
-                    _pooled_token_prototype_loss(
+                joint = (
+                    _joint_token_prototype_loss(
                         representation,
                         artists_per_batch,
                         images_per_artist,
@@ -893,13 +909,15 @@ def _evaluate_fixed_episodes(
                     if representation.ndim == 3
                     else representation.new_zeros(())
                 )
-                total = rec + float(training["prototype_weight"]) * slot + float(
-                    training.get("pooled_prototype_weight", 0.0)
-                ) * pooled
+                slot_weight = float(
+                    training.get("slot_prototype_weight", training.get("prototype_weight", 0.0))
+                )
+                joint_weight = float(training.get("joint_prototype_weight", 0.0))
+                total = rec + slot_weight * slot + joint_weight * joint
             totals["total"] += float(total)
             totals["reconstruction"] += float(rec)
             totals["slot_prototype"] += float(slot)
-            totals["pooled_prototype"] += float(pooled)
+            totals["joint_prototype"] += float(joint)
     if was_training:
         model.train()
     return {key: value / episodes for key, value in totals.items()}
@@ -1216,8 +1234,8 @@ def train_tap_resampler_variants(config: dict[str, Any], destination: Path) -> d
                         images_per_artist,
                         float(training["temperature"]),
                     )
-                    pooled_proto_loss = (
-                        _pooled_token_prototype_loss(
+                    joint_proto_loss = (
+                        _joint_token_prototype_loss(
                             representation,
                             artists_per_batch,
                             images_per_artist,
@@ -1232,9 +1250,14 @@ def train_tap_resampler_variants(config: dict[str, Any], destination: Path) -> d
                         / max(1, int(steps * float(training["prototype_ramp"]))),
                     )
                     loss = rec_loss + ramp * (
-                        float(training["prototype_weight"]) * proto_loss
-                        + float(training.get("pooled_prototype_weight", 0.0))
-                        * pooled_proto_loss
+                        float(
+                            training.get(
+                                "slot_prototype_weight", training.get("prototype_weight", 0.0)
+                            )
+                        )
+                        * proto_loss
+                        + float(training.get("joint_prototype_weight", 0.0))
+                        * joint_proto_loss
                     )
                 loss.backward()
                 grad_norm = torch.nn.utils.clip_grad_norm_(
@@ -1246,7 +1269,7 @@ def train_tap_resampler_variants(config: dict[str, Any], destination: Path) -> d
                 running["loss"] += loss.detach()
                 running["reconstruction"] += rec_loss.detach()
                 running["prototype"] += proto_loss.detach()
-                running["pooled_prototype"] += pooled_proto_loss.detach()
+                running["joint_prototype"] += joint_proto_loss.detach()
                 running["grad_norm"] += grad_norm.detach()
                 running["padding_efficiency"] += float(current["padding_efficiency"])
                 if (step + 1) % int(training["log_every"]) == 0:
@@ -1256,7 +1279,7 @@ def train_tap_resampler_variants(config: dict[str, Any], destination: Path) -> d
                         "train/loss": float(running["loss"] / interval),
                         "train/reconstruction": float(running["reconstruction"] / interval),
                         "train/slot_prototype": float(running["prototype"] / interval),
-                        "train/pooled_prototype": float(running["pooled_prototype"] / interval),
+                        "train/joint_prototype": float(running["joint_prototype"] / interval),
                         "train/grad_norm": float(running["grad_norm"] / interval),
                         "train/prototype_ramp": ramp,
                         "perf/step_s": elapsed / interval,
@@ -1269,7 +1292,7 @@ def train_tap_resampler_variants(config: dict[str, Any], destination: Path) -> d
                         f"loss={log_values['train/loss']:.4f} "
                         f"rec={log_values['train/reconstruction']:.4f} "
                         f"proto={log_values['train/slot_prototype']:.4f} "
-                        f"pooled_proto={log_values['train/pooled_prototype']:.4f} "
+                        f"joint_proto={log_values['train/joint_prototype']:.4f} "
                         f"padding={log_values['perf/padding_efficiency']:.3f} "
                         f"step_s={log_values['perf/step_s']:.3f} "
                         f"data_wait_s={log_values['perf/data_wait_s']:.3f}",
