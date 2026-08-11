@@ -1419,12 +1419,6 @@ def _forward_flow_loss(
         reference_wrong_grad_samples = max(
             0, int(loss_config.get("style_reference_wrong_grad_samples", 0))
         )
-        if reference_wrong_grad_samples > 0 and reference_rank_weight > 0:
-            raise ValueError(
-                "style_reference_rank_weight must be zero when the wrong-reference "
-                "branch carries gradients; otherwise ranking can improve by damaging "
-                "the wrong condition"
-            )
         reference_rank_active = (
             (reference_rank_weight > 0 or reference_direction_weight > 0)
             and curriculum["target_only"]
@@ -2221,11 +2215,13 @@ def _reference_flow_rank_loss(
     *,
     margin: float,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Require the correct condition to beat a detached wrong condition.
+    """Require the correct condition to beat a wrong condition.
 
-    The wrong branch is evaluated without gradients by the caller. Therefore
-    this objective cannot satisfy its margin by deliberately degrading the
-    shuffled-reference prediction; it must improve the correct condition.
+    The caller chooses whether the wrong branch is detached. With a live wrong
+    branch this becomes a contrastive ranking loss: each style is pulled toward
+    its matching target and pushed away from another target in the cyclic
+    batch permutation. A reference-independent update affects both branches
+    equally and therefore cannot improve their MSE margin.
     """
     comparison = _per_sample_condition_comparison(correct, wrong, bypass, target)
     advantage = comparison["first_advantage"]

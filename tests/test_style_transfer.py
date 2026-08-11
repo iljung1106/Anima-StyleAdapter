@@ -112,6 +112,25 @@ def test_reference_rank_loss_only_penalizes_insufficient_correct_advantage():
     torch.testing.assert_close(loss, torch.tensor(0.45))
 
 
+def test_reference_rank_loss_live_wrong_moves_conditions_in_opposite_directions():
+    bypass = torch.ones(1, 1, 1, 2)
+    target = torch.tensor([[[[2.0, 0.0]]]])
+    correct = bypass.clone().requires_grad_(True)
+    wrong = bypass.clone().requires_grad_(True)
+
+    loss, advantage = _reference_flow_rank_loss(
+        correct, wrong, bypass, target, margin=0.005
+    )
+    loss.backward()
+
+    torch.testing.assert_close(advantage, torch.tensor(0.0))
+    assert correct.grad is not None and wrong.grad is not None
+    desired = target - bypass
+    # Gradient descent moves correct toward the target and wrong away from it.
+    assert (correct.grad * desired).sum() < 0
+    assert (wrong.grad * desired).sum() > 0
+
+
 def test_detached_teacher_does_not_poison_student_autocast_weight_cache():
     layer = nn.Linear(4, 4)
     inputs = torch.randn(2, 4)

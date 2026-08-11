@@ -265,7 +265,7 @@ tap_resampler_experiment:
 # and batches targets by exact latent shape. `style-smoke` forces two steps and
 # writes to a separate smoke directory; `style-train` uses `training.steps`.
 style_transfer:
-  output_directory: style_transfer_l18_l24_siglip_l24_32x1024_pretrained_kvo_lora_livewrong1_from250_500
+  output_directory: style_transfer_l18_l24_siglip_l24_32x1024_pretrained_kvo_lora_liverank1_from250_250
   seed: 20260811
   loader:
     style_cache: style_features_l18_l24_siglip_l24
@@ -324,11 +324,10 @@ style_transfer:
     maximum_artist_similarity: 0.95
   training:
     device: cuda
-    # Detached-wrong direction training increased correct/wrong residual
-    # cosine from 0.891 to 0.908 between its 250 and 500 checkpoints. Restart
-    # from the better 250 checkpoint and differentiate one wrong condition per
-    # microbatch so reference-independent gradients cancel.
-    steps: 500
+    # Live wrong-reference direction training reduced heldout validation by
+    # 0.23% at step 250. Restart from the last good checkpoint and directly
+    # optimize the correct-vs-wrong flow-MSE margin instead of its cosine.
+    steps: 250
     initial_checkpoint: style_transfer_l18_l24_siglip_l24_32x1024_pretrained_kvo_lora_rankdir_from500_500/checkpoints/step-0000250.pt
     # Trainable adapter weights and Adam moments stay FP32. Representation
     # modules need a higher LR than the stabilized zero-output path.
@@ -374,7 +373,7 @@ style_transfer:
     # Make the Adapter's useful residual dominate the gentle Resampler and
     # magnitude auxiliaries. Direction normalization is strongest during the
     # bootstrap, then fades as ordinary flow MSE takes over.
-    style_flow_loss_weight: 2.0
+    style_flow_loss_weight: 4.0
     style_flow_direction_weight: 0.05
     style_direction_epsilon: 0.01
     style_direction_anneal_start: 500
@@ -382,18 +381,19 @@ style_transfer:
     style_token_contrastive_weight: 0.0
     style_kv_contrastive_weight: 0.0
     style_contrastive_temperature: 0.10
-    # Ranking with a live wrong branch could win by degrading that condition,
-    # so it is disabled. The bidirectional direction loss below is contrastive:
-    # each style is positive for its own target and a negative for another.
-    style_reference_rank_weight: 0.0
+    # Each shuffled style is also a positive for another target in the cyclic
+    # batch permutation. Differentiating both sides makes this a contrastive
+    # margin: common residuals cancel and persistent wrong-only damage cannot
+    # solve all pairings.
+    style_reference_rank_weight: 0.25
     style_reference_rank_margin: 0.005
     style_reference_rank_probability: 1.0
     style_reference_rank_start_step: 1
-    style_reference_rank_end_step: 501
-    # Retain one wrong-reference Anima graph per microbatch. Differentiating
-    # correct - wrong cancels a common gate/KV update, while limiting the live
-    # wrong branch to one row keeps the H100 memory requirement practical.
-    style_reference_direction_weight: 0.25
+    style_reference_rank_end_step: 251
+    # Retain one wrong-reference Anima graph per microbatch. The earlier live
+    # cosine objective was not correlated with lower flow error, so only the
+    # direct ranking objective uses this branch in the present ablation.
+    style_reference_direction_weight: 0.0
     style_reference_direction_epsilon: 0.05
     style_reference_wrong_grad_samples: 1
     # Softly match the timestep-conditioned magnitude of Anima's native artist
@@ -426,13 +426,12 @@ style_transfer:
     wandb:
       enabled: true
       project: anima-style-adapter
-      name: anima-style-transfer-l18-l24-32x1024-pretrained-kvo-lora-livewrong1-from250-500
-      id: anima-style-transfer-l18-l24-32x1024-pretrained-kvo-lora-livewrong1-from250-500
+      name: anima-style-transfer-l18-l24-32x1024-pretrained-kvo-lora-liverank1-from250-250
+      id: anima-style-transfer-l18-l24-32x1024-pretrained-kvo-lora-liverank1-from250-250
   diagnostics:
-    checkpoint: checkpoints/step-0000500.pt
+    checkpoint: checkpoints/step-0000250.pt
     checkpoints:
       - checkpoints/step-0000250.pt
-      - checkpoints/step-0000500.pt
     batch_size: 2
     batches: 16
     timesteps: [0.05, 0.15, 0.25, 0.35, 0.45, 0.55, 0.65, 0.75, 0.85, 0.95]
