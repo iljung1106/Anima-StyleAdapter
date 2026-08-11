@@ -1646,8 +1646,13 @@ def diagnose_style_reference_dependence(
         batch = loader.load_step(index)
         references = _encode_reference_tokens(resampler, batch, device)
         reference_mask = batch["reference_mask"].to(device, non_blocking=True)
+        target_tokens = _encode_target_tokens(resampler, batch, device)
+        target_mask = torch.ones(
+            target_tokens.shape[0], 1, dtype=torch.bool, device=device
+        )
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=device.startswith("cuda")):
             correct_style = adapter.aggregate(references, reference_mask)
+            self_style = adapter.aggregate(target_tokens[:, None], target_mask)
         shuffled_style = correct_style.roll(1, dims=0)
         null_style = adapter.unconditional(correct_style.shape[0])
 
@@ -1687,18 +1692,27 @@ def diagnose_style_reference_dependence(
                     for block, patched in zip(anima.blocks, patched_forwards, strict=True):
                         block._forward = patched
 
+        self_prediction = predict(self_style)
         correct_prediction = predict(correct_style)
         shuffled_prediction = predict(shuffled_style)
         null_prediction = predict(null_style)
         bypass_prediction = predict(None, bypass=True)
         flat = F.normalize(correct_style.float().flatten(1), dim=1)
+        self_flat = F.normalize(self_style.float().flatten(1), dim=1)
         similarities = flat @ flat.T
         off_diagonal = ~torch.eye(flat.shape[0], device=device, dtype=torch.bool)
         records.append({
+            "self_loss": float(F.mse_loss(self_prediction, target)),
             "correct_loss": float(F.mse_loss(correct_prediction, target)),
             "shuffled_loss": float(F.mse_loss(shuffled_prediction, target)),
             "null_loss": float(F.mse_loss(null_prediction, target)),
             "bypass_loss": float(F.mse_loss(bypass_prediction, target)),
+            "self_vs_correct_rms": float(
+                (self_prediction - correct_prediction).square().mean().sqrt()
+            ),
+            "self_vs_bypass_rms": float(
+                (self_prediction - bypass_prediction).square().mean().sqrt()
+            ),
             "correct_vs_shuffled_rms": float(
                 (correct_prediction - shuffled_prediction).square().mean().sqrt()
             ),
@@ -1716,6 +1730,10 @@ def diagnose_style_reference_dependence(
             ),
             "prediction_rms": float(correct_prediction.square().mean().sqrt()),
             "style_pairwise_cosine": float(similarities[off_diagonal].mean()),
+            "self_correct_style_cosine": float((self_flat * flat).sum(dim=1).mean()),
+            "self_correct_style_rms": float(
+                (self_style.float() - correct_style.float()).square().mean().sqrt()
+            ),
             "style_centered_rms": float(
                 (correct_style.float() - correct_style.float().mean(0, keepdim=True))
                 .square().mean().sqrt()

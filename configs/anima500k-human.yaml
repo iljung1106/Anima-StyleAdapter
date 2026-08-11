@@ -376,7 +376,7 @@ style_transfer:
   diagnostics:
     checkpoint: training_state.pt
     batch_size: 8
-    batches: 4
+    batches: 16
   sampling:
     episode: 0
     width: 512
