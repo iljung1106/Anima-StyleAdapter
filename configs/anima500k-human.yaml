@@ -259,7 +259,7 @@ tap_resampler_experiment:
 # and batches targets by exact latent shape. `style-smoke` forces two steps and
 # writes to a separate smoke directory; `style-train` uses `training.steps`.
 style_transfer:
-  output_directory: style_transfer_l18_l24_siglip_l24_selfref_oracle_v11_calibrated
+  output_directory: style_transfer_l18_l24_siglip_l24_selfref_oracle_v12_early_open
   seed: 20260811
   loader:
     style_cache: style_features_l18_l24_siglip_l24
@@ -331,6 +331,8 @@ style_transfer:
     log_every: 10
     validation_every: 250
     validation_batches: 8
+    full_validation_every: 500
+    full_validation_batches: 32
     checkpoint_every: 1000
     sample_every: 500
     resume: true
@@ -341,8 +343,9 @@ style_transfer:
     # intervention. Standard target-only flow loss still chooses the direction;
     # this term only prevents the style path from remaining effectively null.
     style_effect_calibration: style_effect_calibration.json
+    style_magnitude_start_step: 5
     style_magnitude_ramp_steps: 250
-    style_magnitude_weight: 0.05
+    style_magnitude_weight: 0.015
     style_interval_huber_beta: 0.01
     style_guided_effect_scale: 1.0
     style_effect_upper_scale: 1.5
@@ -352,7 +355,7 @@ style_transfer:
     # remove target references while weakly distilling on a subset of steps;
     # 5) finish with target-excluded multi-reference episodes only.
     curriculum:
-      gate_only_steps: 250
+      gate_only_steps: 5
       self_reference_steps: 8000
       target_anneal_end: 20000
       oracle_distill_end: 20000
@@ -363,8 +366,8 @@ style_transfer:
     wandb:
       enabled: true
       project: anima-style-adapter
-      name: anima-style-transfer-l18-l24-selfref-oracle-v11-calibrated
-      id: anima-style-transfer-l18-l24-selfref-oracle-v11-calibrated
+      name: anima-style-transfer-l18-l24-selfref-oracle-v12-early-open
+      id: anima-style-transfer-l18-l24-selfref-oracle-v12-early-open
   diagnostics:
     checkpoint: training_state.pt
     batch_size: 8

@@ -871,9 +871,14 @@ def _parameter_grad_norm(parameters) -> float:
     return float(torch.stack(values).norm()) if values else 0.0
 
 
-def _style_bootstrap_state(step: int, config: dict[str, Any]) -> tuple[float, float, float]:
+def _style_magnitude_ramp(step: int, config: dict[str, Any]) -> float:
+    start_step = max(0, int(config.get("style_magnitude_start_step", 0)))
     ramp_steps = max(1, int(config.get("style_magnitude_ramp_steps", 250)))
-    ramp = min(1.0, max(0.0, step / ramp_steps))
+    return min(1.0, max(0.0, (step - start_step) / ramp_steps))
+
+
+def _style_bootstrap_state(step: int, config: dict[str, Any]) -> tuple[float, float, float]:
+    ramp = _style_magnitude_ramp(step, config)
     anneal_start = int(config.get("style_aux_anneal_start", 10**12))
     anneal_end = max(anneal_start + 1, int(config.get("style_aux_anneal_end", anneal_start + 1)))
     if step <= anneal_start:
@@ -1117,7 +1122,11 @@ def _forward_flow_loss(
             device=device, dtype=latents.dtype,
         )
 
-        magnitude_weight = float(loss_config.get("style_magnitude_weight", 0.0)) * auxiliary
+        magnitude_start = max(0, int(loss_config.get("style_magnitude_start_step", 0)))
+        magnitude_weight = (
+            float(loss_config.get("style_magnitude_weight", 0.0)) * auxiliary
+            if step > magnitude_start else 0.0
+        )
         direction_weight = float(loss_config.get("style_flow_direction_weight", 0.0)) * direction_multiplier
         bypass_prediction = None
         if bool(loss_config.get("measure_bypass", False)) or magnitude_weight > 0 or direction_weight > 0:
@@ -1206,10 +1215,7 @@ def _forward_flow_loss(
                                 1.0,
                                 max(
                                     0.0,
-                                    step / max(
-                                        1,
-                                        int(loss_config.get("style_magnitude_ramp_steps", 250)),
-                                    ),
+                                    _style_magnitude_ramp(step, loss_config),
                                 ),
                             )
                         ),
@@ -1324,10 +1330,21 @@ def _validate_style_adapter(
         adapter.clear_style_tokens()
         anima.train()
         adapter.train()
+    paired_mean = sum(paired_improvements) / len(paired_improvements)
+    if len(paired_improvements) > 1:
+        paired_variance = sum(
+            (value - paired_mean) ** 2 for value in paired_improvements
+        ) / (len(paired_improvements) - 1)
+        paired_ci95 = 1.96 * math.sqrt(paired_variance / len(paired_improvements))
+    else:
+        paired_ci95 = 0.0
     return {
         "loss": sum(losses) / len(losses),
         "base_loss": sum(base_losses) / len(base_losses),
-        "paired_improvement": sum(paired_improvements) / len(paired_improvements),
+        "paired_improvement": paired_mean,
+        "paired_improvement_ci95": paired_ci95,
+        "paired_positive_fraction": sum(value > 0 for value in paired_improvements)
+        / len(paired_improvements),
         "style_output_ratio": sum(output_ratios) / len(output_ratios),
         "batches": float(batches),
         "mean_references": sum(references) / len(references),
@@ -1875,6 +1892,10 @@ def train_style_adapter(config: dict[str, Any], destination: Path, *, steps_over
     checkpoint_every = int(training.get("checkpoint_every", 500))
     validation_every = int(training.get("validation_every", 500))
     validation_batches = int(training.get("validation_batches", 8))
+    full_validation_every = int(training.get("full_validation_every", 0))
+    full_validation_batches = int(
+        training.get("full_validation_batches", validation_batches)
+    )
     sample_every = int(training.get("sample_every", 1000))
     log_every = int(training.get("log_every", 10))
     vae = None
@@ -1892,6 +1913,7 @@ def train_style_adapter(config: dict[str, Any], destination: Path, *, steps_over
             f"validation step=0 loss={baseline['loss']:.6f} "
             f"base={baseline['base_loss']:.6f} "
             f"paired={baseline['paired_improvement']:.6f} "
+            f"ci95=±{baseline['paired_improvement_ci95']:.6f} "
             f"output_ratio={baseline['style_output_ratio']:.6f} "
             f"batches={validation_batches} elapsed_s={baseline['elapsed_s']:.2f}",
             flush=True,
@@ -1998,16 +2020,23 @@ def train_style_adapter(config: dict[str, Any], destination: Path, *, steps_over
                     step=step,
                 )
         if validation_every and step % validation_every == 0:
+            current_validation_batches = (
+                full_validation_batches
+                if full_validation_every and step % full_validation_every == 0
+                else validation_batches
+            )
             validation = _validate_style_adapter(
                 anima, adapter, resampler, validation_loader, device,
-                batches=validation_batches, seed=seed ^ 0xA11CE,
+                batches=current_validation_batches, seed=seed ^ 0xA11CE,
             )
             print(
                 f"validation step={step} loss={validation['loss']:.6f} "
                 f"base={validation['base_loss']:.6f} "
                 f"paired={validation['paired_improvement']:.6f} "
+                f"ci95=±{validation['paired_improvement_ci95']:.6f} "
+                f"positive={validation['paired_positive_fraction']:.3f} "
                 f"output_ratio={validation['style_output_ratio']:.6f} "
-                f"batches={validation_batches} elapsed_s={validation['elapsed_s']:.2f}",
+                f"batches={current_validation_batches} elapsed_s={validation['elapsed_s']:.2f}",
                 flush=True,
             )
             if wandb_run is not None:

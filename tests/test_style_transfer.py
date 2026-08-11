@@ -180,13 +180,15 @@ def test_style_contrastive_prefers_matching_artist_tokens():
 def test_style_bootstrap_ramps_then_anneals_to_zero():
     config = {
         "style_output_ratio_floor": 0.05,
+        "style_magnitude_start_step": 10,
         "style_magnitude_ramp_steps": 100,
         "target_reference_probability": 1.0,
         "style_aux_anneal_start": 200,
         "style_aux_anneal_end": 300,
     }
     assert _style_bootstrap_state(0, config) == (1.0, 0.0, 1.0)
-    assert _style_bootstrap_state(100, config) == (1.0, 0.05, 1.0)
+    assert _style_bootstrap_state(10, config) == (1.0, 0.0, 1.0)
+    assert _style_bootstrap_state(110, config) == (1.0, 0.05, 1.0)
     auxiliary, floor, probability = _style_bootstrap_state(250, config)
     assert auxiliary == pytest.approx(0.5)
     assert floor == pytest.approx(0.025)
