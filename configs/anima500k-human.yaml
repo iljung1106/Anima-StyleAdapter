@@ -265,7 +265,7 @@ tap_resampler_experiment:
 # and batches targets by exact latent shape. `style-smoke` forces two steps and
 # writes to a separate smoke directory; `style-train` uses `training.steps`.
 style_transfer:
-  output_directory: style_transfer_l18_l24_siglip_l24_32x1024_direction_flow4_2k
+  output_directory: style_transfer_l18_l24_siglip_l24_32x1024_pretrained_kvo_lora_flow4_2k
   seed: 20260811
   loader:
     style_cache: style_features_l18_l24_siglip_l24
@@ -285,6 +285,11 @@ style_transfer:
   resampler:
     checkpoint: per_reference_resampler_l18_l24_siglip_l24_32x1024_joint_global_ln/runs/l18_l24_native_siglip_l24/checkpoint.pt
   adapter:
+    # Project Resampler tokens into Anima's post-LLM condition space, then use
+    # every block's frozen pretrained K/V/O as the full-rank base. Only the
+    # style-only rank-32 deltas and the shared alignment projector are learned.
+    projection_mode: pretrained_block_lora
+    context_dim: 1024
     style_dim: 1024
     slots: 32
     hidden_dim: 2048
@@ -400,8 +405,8 @@ style_transfer:
     wandb:
       enabled: true
       project: anima-style-adapter
-      name: anima-style-transfer-l18-l24-32x1024-direction-flow4-2k
-      id: anima-style-transfer-l18-l24-32x1024-direction-flow4-2k
+      name: anima-style-transfer-l18-l24-32x1024-pretrained-kvo-lora-flow4-2k
+      id: anima-style-transfer-l18-l24-32x1024-pretrained-kvo-lora-flow4-2k
   diagnostics:
     checkpoint: checkpoints/step-0001000.pt
     batch_size: 2

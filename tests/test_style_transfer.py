@@ -297,9 +297,12 @@ def test_episode_sampler_never_uses_target_as_reference():
 
 
 class _FakeCrossAttention(nn.Module):
-    def __init__(self, hidden: int):
+    def __init__(self, hidden: int, context: int | None = None):
         super().__init__()
+        context = hidden if context is None else context
         self.q_proj = nn.Linear(hidden, hidden, bias=False)
+        self.k_proj = nn.Linear(context, hidden, bias=False)
+        self.v_proj = nn.Linear(context, hidden, bias=False)
         self.q_norm = nn.Identity()
         self.k_norm = nn.Identity()
         self.output_proj = nn.Linear(hidden, hidden, bias=False)
@@ -336,6 +339,41 @@ def test_zero_output_projection_gets_direction_before_opening_kv_path():
     output.square().mean().backward()
     assert adapter.shared_k.weight.grad is not None
     assert cross.q_proj.weight.grad is None
+
+
+def test_pretrained_block_projection_starts_zero_then_trains_style_alignment():
+    torch.manual_seed(17)
+    adapter = SharedLowRankStyleAdapter(
+        style_dim=8, slots=2, hidden_dim=16, output_dim=16,
+        heads=4, blocks=28, rank=2,
+        aggregator_heads=2, aggregator_layers=1, style_dropout=0.0, gate_dim=4,
+        projection_mode="pretrained_block_lora", context_dim=8,
+    )
+    cross = _FakeCrossAttention(16, context=8).requires_grad_(False)
+    adapter.set_style_tokens(torch.randn(2, 2, 8))
+    query = torch.randn(2, 5, 16)
+    timestep = torch.randn(2, 1, 16)
+
+    initial = adapter.attend(0, query, timestep, cross)
+    assert torch.count_nonzero(initial) == 0
+    initial.sum().backward()
+    assert adapter.gate[-1].weight.grad is not None
+    assert adapter.gate[-1].weight.grad.norm() > 0
+    assert adapter.style_context_proj.weight.grad is not None
+    assert adapter.style_context_proj.weight.grad.norm() == 0
+
+    adapter.zero_grad(set_to_none=True)
+    with torch.no_grad():
+        adapter.gate[-1].bias.fill_(0.25)
+    output = adapter.attend(0, query, timestep, cross)
+    assert output.shape == query.shape
+    assert torch.count_nonzero(output) > 0
+    output.square().mean().backward()
+    assert adapter.style_context_proj.weight.grad is not None
+    assert adapter.style_context_proj.weight.grad.norm() > 0
+    assert adapter.k_up[0].weight.grad is not None
+    assert cross.k_proj.weight.grad is None
+    assert cross.output_proj.weight.grad is None
 
 
 def test_attach_patches_all_28_blocks_without_copying_adapter():

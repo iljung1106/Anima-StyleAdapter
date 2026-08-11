@@ -276,9 +276,9 @@ Set Aggregator는 입력 `B×R×16×768`에서 같은 번호의 slot끼리 refer
 - Resampler heads: 12, encoder 4 layers, training-only decoder 2 layers
 - Set Aggregator: reference-slot attention 1 layer + slot Transformer 2 layers
 - 개별 slot prototype loss + 약한 pooled prototype loss
-- Anima K/V shared full-rank base + block별 rank-16 delta
+- Anima의 pretrained block별 K/V/O full-rank base + style-only low-rank delta
 
-Anima 28-block 모델은 hidden dimension 2,048, 16-head 구조이며 각 block이 AdaLN으로 조절되는 self-attention, text cross-attention, MLP를 순서대로 수행한다. Style 조건은 text token과 같은 softmax에 단순 연결하지 않고 별도의 decoupled style-attention branch로 추가한다. Style branch는 기존 text cross-attention에 들어가는 정규화된 image hidden state와 block별 `Q` projection을 재사용하고 style K/V만 새로 만든다. 1차 구현에서는 기존 output projection도 재사용하며, 별도 style Q 또는 Q-LoRA는 이 구조의 한계가 실제 생성 평가에서 확인될 때만 검토한다.
+Anima 28-block 모델은 hidden dimension 2,048, 16-head 구조이며 각 block이 AdaLN으로 조절되는 self-attention, text cross-attention, MLP를 순서대로 수행한다. Style 조건은 text token과 같은 softmax에 단순 연결하지 않고 별도의 decoupled style-attention branch로 추가한다. Style branch는 기존 text cross-attention에 들어가는 정규화된 image hidden state와 block별 `Q/K/V/output` projection을 frozen base로 재사용한다. Resampler token은 identity-initialized shared projector로 Anima post-LLM condition 공간에 정렬하고, style 입력에만 block별 low-rank K/V/O delta를 더한다. Text 경로에는 delta를 적용하지 않으며, 별도 style Q 또는 Q-LoRA는 이 구조의 한계가 실제 생성 평가에서 확인될 때만 검토한다.
 
 Style attention은 text cross-attention 직후, MLP 이전에 삽입한다. 따라서 text와 style은 서로 다른 softmax로 조건을 읽되, 두 residual이 합쳐진 hidden state를 같은 block의 MLP가 처리한다. Text token과 style token을 한 attention의 K/V로 concatenate하지 않는다.
 
@@ -288,9 +288,9 @@ Style attention은 text cross-attention 직후, MLP 이전에 삽입한다. 따�
 
 `x_out = x_style + MLP(x_style)`
 
-Style K/V projection은 모든 block이 공유하는 full-rank base와 block별 low-rank delta로 구성한다.
+Style K/V/O projection은 각 block의 pretrained full-rank projection을 frozen base로 삼고 block별 low-rank delta를 더한다. 신규 shared full-rank K/V/O를 처음부터 학습하는 방식은 비교 기준으로만 보존한다.
 
-`W_b = W_shared + A_b B_b`
+`W_b^style = W_b^Anima(frozen) + A_b B_b`
 
 초기 후보 rank는 16과 32이다. Style gate는 Anima timestep embedding을 받는 작은 shared MLP가 28개의 block별 scalar를 출력하는 구조를 1차 기준으로 삼는다. 마지막 projection만 0으로 초기화하여 학습 시작 시 원본 Anima와 같은 출력을 보장하고, 두 개의 0-init 인자를 곱해 gradient가 막히는 구조는 사용하지 않는다. Channel별 gate는 scalar gate의 한계가 확인될 때만 low-rank 형태로 검토한다.
 
@@ -313,7 +313,7 @@ Text와 style의 강도는 다음 세 prediction으로 분리한다.
 ### 11.3 동결 및 공동학습 순서
 
 1. C-RADIO를 계속 동결하고 per-reference Resampler를 reconstruction과 직접적인 slot-wise artist prototype loss로 사전학습한다.
-2. Style Adapter 연결 초기 5~10% 구간에는 Resampler와 Anima를 동결하고 Set Aggregator, shared K/V base, block별 low-rank delta와 style gate만 학습한다.
+2. Style Adapter 연결 초기에는 Resampler와 Anima를 동결한다. Anima 각 블록의 pretrained cross-attention K/V/O는 frozen full-rank base로 재사용하고, style gate와 block별 K/V/O low-rank delta, Set Aggregator만 학습한다.
 3. Style branch가 안정화되면 Resampler 상위 1~2층만 Adapter 학습률의 5~10%로 해제한다. 이때 prototype loss와 사전학습 출력에 대한 anchor loss를 유지하여 style 공간의 붕괴와 content leakage를 억제한다.
 4. 검증 성능 향상이 없으면 Resampler를 다시 동결한다. Anima 본체는 기본적으로 동결하며, Adapter만으로 한계가 확인될 때에만 기존 cross-attention Q/output projection에 작은 LoRA를 검토한다.
 
@@ -517,7 +517,7 @@ Magnitude-only radial loss는 정확한 zero 출력에서 방향 gradient를 만
 250 step 동안 frozen Anima의 실제 flow error 방향을 bootstrap으로 사용하고, target image의
 reference 포함률과 함께 step 100부터 250까지 제거했다.
 
-실제 모델 smoke에서 step 1은 gate만 gradient를 받고 step 2부터 Aggregator와 shared K/V도
+당시 learned-shared K/V 모델 smoke에서 step 1은 gate만 gradient를 받고 step 2부터 Aggregator와 shared K/V도
 gradient를 받는 것을 확인했다. 본 pilot의 absolute output ratio는 step 40의 3.14%, step
 100의 3.27%, step 190의 6.61%까지 증가했다. 그러나 flow-error cosine은 대체로 0에 가까운
 상태에 머물렀고, 고정 validation loss는 step 0의 `0.077076`에서 step 250의 `0.080508`로
@@ -537,8 +537,9 @@ style injection 학습의 differentiable critic으로 사용하는 방안을 우
 
 1. 초기에는 target 이미지 한 장만 reference로 사용하여 표준 rectified-flow loss로
    self-reference bootstrap을 수행한다.
-2. strict zero-init을 유지하기 위해 첫 250 step은 timestep gate만 학습하고, 이후 shared K/V,
-   block별 low-rank delta, Set Aggregator와 null token을 함께 연다.
+2. strict zero-init을 유지하되, pretrained-block K/V/O 경로에서는 첫 5 step 동안 timestep gate만
+   학습한다. 이후 block별 K/V/O low-rank delta, style-context projector, Set Aggregator와 null token을
+   함께 연다. Frozen pretrained K/V/O가 초기 방향을 제공하므로 긴 gate-only 구간은 사용하지 않는다.
 3. 8,000 step의 self-reference 모델을 고정 oracle로 저장한다. 이후 같은 noisy latent와
    prompt에서 target-only oracle 출력과 다른 same-artist reference를 받는 student 출력을
    약하게 증류한다. 계산량을 제한하기 위해 ramp 구간 step의 25%에만 적용한다.

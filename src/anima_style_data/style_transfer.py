@@ -378,7 +378,7 @@ class SlotSetAggregator(nn.Module):
 
 
 class SharedLowRankStyleAdapter(nn.Module):
-    """Set aggregation plus shared K/V and per-block low-rank K/V deltas."""
+    """Set aggregation plus either learned or pretrained block K/V/O projections."""
 
     def __init__(
         self,
@@ -396,6 +396,8 @@ class SharedLowRankStyleAdapter(nn.Module):
         aggregator_slot_mixer_layers: int = 1,
         style_dropout: float = 0.12,
         gate_dim: int = 256,
+        projection_mode: str = "learned_shared",
+        context_dim: int | None = None,
     ):
         super().__init__()
         self.style_dim = style_dim
@@ -407,6 +409,14 @@ class SharedLowRankStyleAdapter(nn.Module):
         self.head_dim = hidden_dim // heads
         self.blocks = blocks
         self.style_dropout = style_dropout
+        self.projection_mode = str(projection_mode)
+        self.context_dim = style_dim if context_dim is None else int(context_dim)
+        if self.projection_mode not in {"learned_shared", "pretrained_block_lora"}:
+            raise ValueError(f"Unknown style projection mode: {self.projection_mode}")
+        if self.projection_mode == "pretrained_block_lora" and self.context_dim != style_dim:
+            raise ValueError("Identity-initialized style context projection requires context_dim == style_dim")
+        if self.projection_mode == "learned_shared" and self.context_dim != style_dim:
+            raise ValueError("The learned shared projection mode requires context_dim == style_dim")
         self.aggregator = SlotSetAggregator(
             slots,
             style_dim,
@@ -416,20 +426,28 @@ class SharedLowRankStyleAdapter(nn.Module):
         )
         self.null_tokens = nn.Parameter(torch.empty(1, slots, style_dim))
         nn.init.normal_(self.null_tokens, std=0.02)
-        self.shared_k = nn.Linear(style_dim, hidden_dim, bias=False)
-        self.shared_v = nn.Linear(style_dim, hidden_dim, bias=False)
-        self.k_down = nn.ModuleList([nn.Linear(style_dim, rank, bias=False) for _ in range(blocks)])
+        if self.projection_mode == "learned_shared":
+            self.shared_k = nn.Linear(style_dim, hidden_dim, bias=False)
+            self.shared_v = nn.Linear(style_dim, hidden_dim, bias=False)
+            self.shared_o = nn.Linear(hidden_dim, output_dim, bias=False)
+            nn.init.zeros_(self.shared_o.weight)
+        else:
+            # C-RADIO/Resampler tokens have the same width as Anima's post-LLM
+            # conditioning but not the same learned coordinate system. Start
+            # from an identity bridge, then let flow supervision align it while
+            # every block retains its own frozen pretrained K/V/O basis.
+            self.style_context_proj = nn.Linear(style_dim, self.context_dim, bias=False)
+            nn.init.eye_(self.style_context_proj.weight)
+        self.k_down = nn.ModuleList([nn.Linear(self.context_dim, rank, bias=False) for _ in range(blocks)])
         self.k_up = nn.ModuleList([nn.Linear(rank, hidden_dim, bias=False) for _ in range(blocks)])
-        self.v_down = nn.ModuleList([nn.Linear(style_dim, rank, bias=False) for _ in range(blocks)])
+        self.v_down = nn.ModuleList([nn.Linear(self.context_dim, rank, bias=False) for _ in range(blocks)])
         self.v_up = nn.ModuleList([nn.Linear(rank, hidden_dim, bias=False) for _ in range(blocks)])
-        self.shared_o = nn.Linear(hidden_dim, output_dim, bias=False)
         self.o_down = nn.ModuleList(
             [nn.Linear(hidden_dim, rank, bias=False) for _ in range(blocks)]
         )
         self.o_up = nn.ModuleList(
             [nn.Linear(rank, output_dim, bias=False) for _ in range(blocks)]
         )
-        nn.init.zeros_(self.shared_o.weight)
         for modules in (self.k_up, self.v_up):
             for layer in modules:
                 nn.init.zeros_(layer.weight)
@@ -455,16 +473,63 @@ class SharedLowRankStyleAdapter(nn.Module):
             tokens = torch.where(dropped[:, None, None], self.null_tokens.expand_as(tokens), tokens)
         return tokens
 
-    def projected_signature(self, tokens: torch.Tensor) -> torch.Tensor:
+    def _context_tokens(self, tokens: torch.Tensor) -> torch.Tensor:
+        if self.projection_mode == "pretrained_block_lora":
+            return self.style_context_proj(tokens)
+        return tokens
+
+    @staticmethod
+    def _pretrained_kv(
+        cross_attention: nn.Module, context: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if hasattr(cross_attention, "kv_proj"):
+            return cross_attention.kv_proj(context).chunk(2, dim=-1)
+        return cross_attention.k_proj(context), cross_attention.v_proj(context)
+
+    def projected_signature(
+        self,
+        tokens: torch.Tensor,
+        cross_attentions: list[nn.Module] | None = None,
+    ) -> torch.Tensor:
         """Compact signature of the actual K/V tensors injected into all blocks."""
-        shared_k = self.shared_k(tokens)
-        shared_v = self.shared_v(tokens)
+        context = self._context_tokens(tokens)
+        if self.projection_mode == "learned_shared":
+            shared_k = self.shared_k(context)
+            shared_v = self.shared_v(context)
+        elif cross_attentions is None or len(cross_attentions) != self.blocks:
+            raise ValueError("Pretrained K/V signatures require every Anima cross-attention block")
         values = []
         for index in range(self.blocks):
-            key = shared_k + self.k_up[index](self.k_down[index](tokens))
-            value = shared_v + self.v_up[index](self.v_down[index](tokens))
+            if self.projection_mode == "learned_shared":
+                base_k, base_v = shared_k, shared_v
+            else:
+                base_k, base_v = self._pretrained_kv(cross_attentions[index], context)
+            key = base_k + self.k_up[index](self.k_down[index](context))
+            value = base_v + self.v_up[index](self.v_down[index](context))
             values.extend((key.mean(1), value.mean(1)))
         return torch.cat(values, dim=-1)
+
+    def output_parameters(self) -> list[nn.Parameter]:
+        values = list(self.o_down.parameters()) + list(self.o_up.parameters())
+        if self.projection_mode == "learned_shared":
+            values = list(self.shared_o.parameters()) + values
+        return values
+
+    def kv_parameters(self) -> list[nn.Parameter]:
+        values = (
+            list(self.k_down.parameters())
+            + list(self.k_up.parameters())
+            + list(self.v_down.parameters())
+            + list(self.v_up.parameters())
+        )
+        if self.projection_mode == "learned_shared":
+            return list(self.shared_k.parameters()) + list(self.shared_v.parameters()) + values
+        return list(self.style_context_proj.parameters()) + values
+
+    def gate_bootstrap_parameters(self) -> list[nn.Parameter]:
+        if self.projection_mode == "pretrained_block_lora":
+            return list(self.gate.parameters())
+        return list(self.gate.parameters()) + self.output_parameters()
 
     def unconditional(self, batch: int) -> torch.Tensor:
         return self.null_tokens.expand(batch, -1, -1)
@@ -505,10 +570,14 @@ class SharedLowRankStyleAdapter(nn.Module):
     ) -> torch.Tensor:
         if self._style_tokens is None:
             return torch.zeros_like(normalized_x)
-        style = self._style_tokens
+        style = self._context_tokens(self._style_tokens)
         q = cross_attention.q_proj(normalized_x)
-        k = self.shared_k(style) + self.k_up[block_index](self.k_down[block_index](style))
-        v = self.shared_v(style) + self.v_up[block_index](self.v_down[block_index](style))
+        if self.projection_mode == "learned_shared":
+            base_k, base_v = self.shared_k(style), self.shared_v(style)
+        else:
+            base_k, base_v = self._pretrained_kv(cross_attention, style)
+        k = base_k + self.k_up[block_index](self.k_down[block_index](style))
+        v = base_v + self.v_up[block_index](self.v_down[block_index](style))
         q = q.reshape(q.shape[0], q.shape[1], self.heads, self.head_dim).transpose(1, 2)
         k = k.reshape(k.shape[0], k.shape[1], self.heads, self.head_dim).transpose(1, 2)
         v = v.reshape(v.shape[0], v.shape[1], self.heads, self.head_dim).transpose(1, 2)
@@ -516,15 +585,21 @@ class SharedLowRankStyleAdapter(nn.Module):
         k = cross_attention.k_norm(k)
         attended = F.scaled_dot_product_attention(q, k, v)
         attended = attended.transpose(1, 2).reshape(normalized_x.shape[0], normalized_x.shape[1], self.hidden_dim)
-        attended = self.shared_o(attended) + self.o_up[block_index](
-            self.o_down[block_index](attended)
+        output_delta = self.o_up[block_index](self.o_down[block_index](attended))
+        if self.projection_mode == "learned_shared":
+            attended = self.shared_o(attended) + output_delta
+        else:
+            attended = cross_attention.output_proj(attended) + output_delta
+        # Learned-shared mode starts through a zero output projection and a
+        # unit-centred gate. Pretrained-block mode already has a useful frozen
+        # K/V/O direction, so its zero gate preserves exact base-model output
+        # while receiving the first bootstrap gradient.
+        raw_gate = self.gate(timestep_embedding)[:, 0, block_index]
+        gate = (
+            torch.tanh(raw_gate)
+            if self.projection_mode == "pretrained_block_lora"
+            else 1.0 + torch.tanh(raw_gate)
         )
-        # The zero-initialized output projection makes the initial residual
-        # exactly zero while still receiving a full matrix gradient. A unit-
-        # centered timestep gate can learn suppression/amplification only after
-        # that useful direction exists; unlike a zero scalar gate it does not
-        # block the representation path at initialization.
-        gate = 1.0 + torch.tanh(self.gate(timestep_embedding)[:, 0, block_index])
         result = attended * (self.output_scale * gate[:, None, None])
         self._runtime_gate_abs[block_index] = gate.detach().abs().mean()
         self._runtime_residual_ratio[block_index] = (
@@ -1125,15 +1200,8 @@ def _set_adapter_trainable_stage(
     for parameter in adapter.parameters():
         parameter.requires_grad_(not gate_only)
     if gate_only:
-        bootstrap_modules = [
-            adapter.gate,
-            adapter.shared_o,
-            adapter.o_down,
-            adapter.o_up,
-        ]
-        for module in bootstrap_modules:
-            for parameter in module.parameters():
-                parameter.requires_grad_(True)
+        for parameter in adapter.gate_bootstrap_parameters():
+            parameter.requires_grad_(True)
 
 
 @contextmanager
@@ -1433,8 +1501,13 @@ def _forward_flow_loss(
                     raw_style_tokens, target_style_tokens, temperature
                 )
             if kv_weight > 0:
-                reference_signature = adapter.projected_signature(raw_style_tokens)
-                target_signature = adapter.projected_signature(target_style_tokens)
+                cross_attentions = [block.cross_attn for block in anima.blocks]
+                reference_signature = adapter.projected_signature(
+                    raw_style_tokens, cross_attentions
+                )
+                target_signature = adapter.projected_signature(
+                    target_style_tokens, cross_attentions
+                )
                 kv_contrastive = _symmetric_style_contrastive_loss(
                     reference_signature[:, None], target_signature[:, None], temperature
                 )
@@ -2237,8 +2310,7 @@ def overfit_exact_self_batch(config: dict[str, Any], destination: Path) -> dict[
         resampler.load_state_dict(state["resampler"])
     adapter.style_dropout = 0.0
 
-    output_parameters = list(adapter.shared_o.parameters())
-    output_parameters += list(adapter.o_down.parameters()) + list(adapter.o_up.parameters())
+    output_parameters = adapter.output_parameters()
     gate_parameters = list(adapter.gate.parameters())
     special_ids = {id(value) for value in output_parameters + gate_parameters}
     representation_parameters = [
@@ -2517,8 +2589,7 @@ def train_style_adapter(config: dict[str, Any], destination: Path, *, steps_over
     # Autocast still executes the expensive attention/linear kernels in BF16.
     adapter = SharedLowRankStyleAdapter(**cfg["adapter"]).to(device)
     attach_style_adapter(anima, adapter)
-    output_parameters = list(adapter.shared_o.parameters())
-    output_parameters += list(adapter.o_down.parameters()) + list(adapter.o_up.parameters())
+    output_parameters = adapter.output_parameters()
     gate_parameters = list(adapter.gate.parameters())
     special_ids = {id(value) for value in output_parameters + gate_parameters}
     representation_parameters = [
@@ -2742,14 +2813,8 @@ def train_style_adapter(config: dict[str, Any], destination: Path, *, steps_over
         )
         group_grads = {
             "aggregator_grad": _parameter_grad_norm(adapter.aggregator.parameters()),
-            "shared_kv_grad": _parameter_grad_norm(
-                list(adapter.shared_k.parameters()) + list(adapter.shared_v.parameters())
-            ),
-            "style_output_grad": _parameter_grad_norm(
-                list(adapter.shared_o.parameters())
-                + list(adapter.o_down.parameters())
-                + list(adapter.o_up.parameters())
-            ),
+            "shared_kv_grad": _parameter_grad_norm(adapter.kv_parameters()),
+            "style_output_grad": _parameter_grad_norm(adapter.output_parameters()),
             "gate_grad": _parameter_grad_norm(adapter.gate.parameters()),
             "resampler_grad": _parameter_grad_norm(resampler.parameters()),
             "resampler_grad_norm": float(resampler_grad_norm),
