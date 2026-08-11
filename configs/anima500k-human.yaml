@@ -429,9 +429,15 @@ style_transfer:
     direction_weight: 0.05
   sampling:
     episode: 0
-    width: 512
-    height: 512
-    steps: 20
+    # Qualitative 1MP checkpoint evaluation across artist-disjoint validation
+    # episodes. Each sheet contains the frozen-base control, styled output,
+    # target, and held-out references for the selected artist.
+    checkpoint: checkpoints/step-0001000.pt
+    episodes: [0, 13, 29, 47, 71, 101]
+    reference_modes: [heldout]
+    width: 1024
+    height: 1024
+    steps: 30
     flow_shift: 3.0
     seed: 20260811
     text_cfg: 4.0

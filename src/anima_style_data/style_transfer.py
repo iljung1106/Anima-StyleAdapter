@@ -1648,6 +1648,7 @@ def _sample_style_adapter(
     vae: nn.Module | None,
     *,
     reference_mode: str = "heldout",
+    episode_index: int | None = None,
 ) -> tuple[Path, nn.Module, float]:
     sample_cfg = config["style_transfer"]["sampling"]
     started = time.perf_counter()
@@ -1656,7 +1657,12 @@ def _sample_style_adapter(
     cuda_rng = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
     anima.eval()
     adapter.eval()
-    batch = loader.load_step(int(sample_cfg.get("episode", 0)))
+    episode_number = (
+        int(sample_cfg.get("episode", 0))
+        if episode_index is None
+        else int(episode_index)
+    )
+    batch = loader.load_step(episode_number)
     episode = batch["episodes"][0]
     sheet_sources: list[tuple[str, int]] = [("target", episode.target_id)]
     if reference_mode == "self":
@@ -1789,13 +1795,18 @@ def _sample_style_adapter(
     sample_dir = output / "samples"
     sample_dir.mkdir(parents=True, exist_ok=True)
     cfg_label = f"{style_scale:g}".replace(".", "p")
-    raw_path = sample_dir / f"step-{step:07d}-{reference_mode}-style-cfg-{cfg_label}.png"
+    episode_label = "" if episode_index is None else f"-episode-{episode_number:05d}"
+    raw_path = sample_dir / (
+        f"step-{step:07d}{episode_label}-{reference_mode}-style-cfg-{cfg_label}.png"
+    )
     sheet_path = sample_dir / (
-        f"step-{step:07d}-{reference_mode}-style-cfg-{cfg_label}-sheet.png"
+        f"step-{step:07d}{episode_label}-{reference_mode}-style-cfg-{cfg_label}-sheet.png"
     )
     generated.save(raw_path)
-    base_generated.save(sample_dir / f"step-{step:07d}-base.png")
-    to_image(target_decoded[0]).save(sample_dir / f"step-{step:07d}-cached-target.png")
+    base_generated.save(sample_dir / f"step-{step:07d}{episode_label}-base.png")
+    to_image(target_decoded[0]).save(
+        sample_dir / f"step-{step:07d}{episode_label}-cached-target.png"
+    )
     _make_sample_sheet(
         generated,
         loader,
@@ -1830,7 +1841,7 @@ def _sample_style_adapter(
 
 
 def sample_style_checkpoint(config: dict[str, Any], destination: Path) -> dict[str, Any]:
-    """Render a frozen-base control and styled sample from the resumable checkpoint."""
+    """Render one or more validation artists from an explicit saved checkpoint."""
     cfg = config["style_transfer"]
     device = str(cfg["training"].get("device", "cuda"))
     loader_cfg = {**cfg["loader"], "split": "validation", "batch_size": 1}
@@ -1841,16 +1852,56 @@ def sample_style_checkpoint(config: dict[str, Any], destination: Path) -> dict[s
     adapter = SharedLowRankStyleAdapter(**cfg["adapter"]).to(device, dtype=torch.bfloat16)
     attach_style_adapter(anima, adapter)
     output = destination / str(cfg.get("output_directory", "style_transfer_training"))
-    checkpoint_path = output / "training_state.pt"
+    sample_cfg = dict(cfg.get("sampling", {}))
+    checkpoint_path = Path(str(sample_cfg.get("checkpoint", "training_state.pt")))
+    if not checkpoint_path.is_absolute():
+        checkpoint_path = output / checkpoint_path
     state = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     adapter.load_state_dict(state["adapter"])
     if "resampler" in state:
         resampler.load_state_dict(state["resampler"])
     step = int(state["step"])
-    sheet, _, elapsed = _sample_style_adapter(
-        anima, adapter, resampler, loader, config, destination, output, device, step, None
-    )
-    return {"step": step, "sheet": str(sheet), "elapsed_s": elapsed}
+    episodes = [
+        int(value)
+        for value in sample_cfg.get("episodes", [sample_cfg.get("episode", 0)])
+    ]
+    reference_modes = [
+        str(value) for value in sample_cfg.get("reference_modes", ["heldout"])
+    ]
+    vae = None
+    sheets: list[dict[str, Any]] = []
+    elapsed_total = 0.0
+    for episode_index in episodes:
+        for reference_mode in reference_modes:
+            sheet, vae, elapsed = _sample_style_adapter(
+                anima,
+                adapter,
+                resampler,
+                loader,
+                config,
+                destination,
+                output,
+                device,
+                step,
+                vae,
+                reference_mode=reference_mode,
+                episode_index=episode_index,
+            )
+            sheets.append(
+                {
+                    "episode": episode_index,
+                    "reference_mode": reference_mode,
+                    "sheet": str(sheet),
+                    "elapsed_s": elapsed,
+                }
+            )
+            elapsed_total += elapsed
+    return {
+        "step": step,
+        "checkpoint": str(checkpoint_path),
+        "sheets": sheets,
+        "elapsed_s": elapsed_total,
+    }
 
 
 def _per_sample_flow_residual_metrics(
