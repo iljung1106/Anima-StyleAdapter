@@ -1416,6 +1416,15 @@ def _forward_flow_loss(
         reference_rank_probability = float(
             loss_config.get("style_reference_rank_probability", 1.0)
         )
+        reference_wrong_grad_samples = max(
+            0, int(loss_config.get("style_reference_wrong_grad_samples", 0))
+        )
+        if reference_wrong_grad_samples > 0 and reference_rank_weight > 0:
+            raise ValueError(
+                "style_reference_rank_weight must be zero when the wrong-reference "
+                "branch carries gradients; otherwise ranking can improve by damaging "
+                "the wrong condition"
+            )
         reference_rank_active = (
             (reference_rank_weight > 0 or reference_direction_weight > 0)
             and curriculum["target_only"]
@@ -1445,19 +1454,52 @@ def _forward_flow_loss(
                     ).squeeze(2).float()
 
         wrong_reference_prediction = None
+        wrong_reference_indices = None
         if reference_rank_active:
-            # The shuffled branch is a detached baseline. It cannot be made
-            # worse by this loss, avoiding the shortcut of satisfying a rank
-            # margin through deliberate corruption of wrong-reference output.
-            with _uncached_no_grad_autocast(device):
-                if step <= int(loss_config.get("debug_autograd_steps", 0)):
-                    adapter.__dict__["_debug_autograd_label"] = "wrong_no_grad"
-                adapter.set_style_tokens(raw_style_tokens.roll(1, dims=0))
-                wrong_reference_prediction = anima(
-                    noisy.unsqueeze(2), timesteps.to(latents.dtype), context=conditioning,
-                    padding_mask=padding_mask, target_input_ids=None,
-                ).squeeze(2).float()
-                adapter.clear_style_tokens()
+            shuffled_tokens = raw_style_tokens.roll(1, dims=0)
+            if reference_wrong_grad_samples > 0:
+                # Keep a small wrong-reference branch in the graph. In the
+                # direction objective, gradients through correct - wrong then
+                # cancel any reference-independent path. A full second batch
+                # would retain two Anima graphs and exceed practical VRAM, so
+                # sample only a few non-dropped rows per optimizer microstep.
+                eligible = (
+                    (~dropped).nonzero(as_tuple=False).flatten()
+                    if adapter.training and adapter.style_dropout > 0
+                    else torch.arange(latents.shape[0], device=device)
+                )
+                if eligible.numel() > 0:
+                    take = min(reference_wrong_grad_samples, int(eligible.numel()))
+                    order = torch.randperm(
+                        eligible.numel(), device=device, generator=generator
+                    )[:take]
+                    wrong_reference_indices = eligible[order]
+                    if step <= int(loss_config.get("debug_autograd_steps", 0)):
+                        adapter.__dict__["_debug_autograd_label"] = "wrong_grad"
+                    adapter.set_style_tokens(shuffled_tokens[wrong_reference_indices])
+                    wrong_reference_prediction = anima(
+                        noisy[wrong_reference_indices].unsqueeze(2),
+                        timesteps[wrong_reference_indices].to(latents.dtype),
+                        context=conditioning[wrong_reference_indices],
+                        padding_mask=padding_mask[wrong_reference_indices],
+                        target_input_ids=None,
+                    ).squeeze(2).float()
+                    adapter.clear_style_tokens()
+                    adapter.__dict__.pop("_debug_autograd_label", None)
+            else:
+                # Legacy detached comparison. This is valid for measurement
+                # and ranking, but not sufficient to isolate a reference-
+                # specific gradient because shared parameters can still learn
+                # a common residual on the correct branch.
+                with _uncached_no_grad_autocast(device):
+                    if step <= int(loss_config.get("debug_autograd_steps", 0)):
+                        adapter.__dict__["_debug_autograd_label"] = "wrong_no_grad"
+                    adapter.set_style_tokens(shuffled_tokens)
+                    wrong_reference_prediction = anima(
+                        noisy.unsqueeze(2), timesteps.to(latents.dtype), context=conditioning,
+                        padding_mask=padding_mask, target_input_ids=None,
+                    ).squeeze(2).float()
+                    adapter.clear_style_tokens()
 
         adapter.reset_runtime_stats()
         if step <= int(loss_config.get("debug_autograd_steps", 0)):
@@ -1475,29 +1517,42 @@ def _forward_flow_loss(
         reference_rank_advantage = flow_loss.new_full((), float("nan"))
         reference_direction_loss = flow_loss.new_zeros(())
         if wrong_reference_prediction is not None and bypass_prediction is not None:
-            valid = (
-                ~dropped
-                if adapter.training and adapter.style_dropout > 0
-                else torch.ones(
-                    prediction.shape[0], dtype=torch.bool, device=prediction.device
+            if wrong_reference_indices is not None:
+                correct_for_reference = prediction[wrong_reference_indices]
+                wrong_for_reference = wrong_reference_prediction
+                bypass_for_reference = bypass_prediction[wrong_reference_indices]
+                target_for_reference = target_velocity[wrong_reference_indices]
+                wrong_has_grad = True
+            else:
+                valid = (
+                    ~dropped
+                    if adapter.training and adapter.style_dropout > 0
+                    else torch.ones(
+                        prediction.shape[0], dtype=torch.bool, device=prediction.device
+                    )
                 )
-            )
-            if valid.any():
+                correct_for_reference = prediction[valid]
+                wrong_for_reference = wrong_reference_prediction[valid]
+                bypass_for_reference = bypass_prediction[valid]
+                target_for_reference = target_velocity[valid]
+                wrong_has_grad = False
+            if correct_for_reference.shape[0] > 0:
                 reference_rank_loss, reference_rank_advantage = _reference_flow_rank_loss(
-                    prediction[valid],
-                    wrong_reference_prediction[valid],
-                    bypass_prediction[valid],
-                    target_velocity[valid],
+                    correct_for_reference,
+                    wrong_for_reference,
+                    bypass_for_reference,
+                    target_for_reference,
                     margin=float(loss_config.get("style_reference_rank_margin", 0.005)),
                 )
                 if reference_direction_weight > 0:
                     reference_direction_loss = _reference_flow_direction_loss(
-                        prediction[valid],
-                        wrong_reference_prediction[valid],
-                        target_velocity[valid],
+                        correct_for_reference,
+                        wrong_for_reference,
+                        target_for_reference,
                         epsilon=float(
                             loss_config.get("style_reference_direction_epsilon", 0.05)
                         ),
+                        wrong_has_grad=wrong_has_grad,
                     )
 
         oracle_distill_loss = flow_loss.new_zeros(())
@@ -2183,19 +2238,22 @@ def _reference_flow_direction_loss(
     target: torch.Tensor,
     *,
     epsilon: float,
+    wrong_has_grad: bool = False,
 ) -> torch.Tensor:
     """Align only the reference-specific residual with the remaining error.
 
-    ``wrong`` is detached by the caller. Subtracting it from both the correct
-    prediction and target removes the common style residual that otherwise
-    dominates early flow training. The resulting direction loss can therefore
-    teach which part of the target is explained by the correct reference
-    without rewarding deliberate damage to the wrong-reference branch.
+    When ``wrong_has_grad`` is true, the difference path differentiates both
+    conditions. A reference-independent residual then has equal Jacobians and
+    cancels, while the desired direction keeps the wrong prediction detached.
+    This prevents the objective from being optimized through a common gate/KV
+    update. The legacy detached mode remains useful for inexpensive pilots.
     """
     dimensions = tuple(range(1, correct.ndim))
-    wrong = wrong.detach().float()
-    delta = correct.float() - wrong
-    desired = target.float() - wrong
+    wrong_value = wrong.float()
+    delta = correct.float() - (
+        wrong_value if wrong_has_grad else wrong_value.detach()
+    )
+    desired = target.float() - wrong_value.detach()
     desired_rms = desired.square().mean(dim=dimensions).sqrt().clamp_min(1e-6)
     return _flow_direction_loss(
         delta,

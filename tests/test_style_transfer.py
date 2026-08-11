@@ -150,6 +150,24 @@ def test_reference_direction_loss_removes_common_residual_and_trains_correct_onl
     assert orthogonal_loss > 0.9
 
 
+def test_reference_direction_loss_live_wrong_branch_cancels_common_gradient():
+    common = torch.tensor([[[[2.0, 2.0]]]])
+    desired = torch.tensor([[[[1.0, -1.0]]]])
+    correct = (common + torch.tensor([[[[0.2, 0.1]]]])).requires_grad_(True)
+    wrong = common.clone().requires_grad_(True)
+    target = common + desired
+
+    loss = _reference_flow_direction_loss(
+        correct, wrong, target, epsilon=0.05, wrong_has_grad=True
+    )
+    loss.backward()
+
+    assert correct.grad is not None
+    assert wrong.grad is not None
+    assert correct.grad.norm() > 0
+    torch.testing.assert_close(wrong.grad, -correct.grad)
+
+
 class RMSNorm(nn.Module):
     def __init__(self, dim: int):
         super().__init__()
