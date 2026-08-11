@@ -777,6 +777,7 @@ def _optimize_frozen_anima(
             ),
             torch.bfloat16,
         )
+        rmsnorm_classes: set[type[nn.Module]] = set()
         for module in modules:
             if module.__class__.__name__ != "RMSNorm":
                 continue
@@ -784,8 +785,12 @@ def _optimize_frozen_anima(
             # loader even when the DiT matrices are BF16. Convert the frozen
             # scale itself, otherwise a weight-dtype keyed forward stays FP32.
             module.weight.data = module.weight.data.to(dtype=compute_dtype)
-            module.forward = types.MethodType(_low_precision_rmsnorm_forward, module)
+            rmsnorm_classes.add(module.__class__)
             counts["low_precision_rmsnorm"] += 1
+        # nn.Module resolves forward from the module class in its call path.
+        # Patch each concrete legacy RMSNorm class once for this process.
+        for rmsnorm_class in rmsnorm_classes:
+            rmsnorm_class.forward = _low_precision_rmsnorm_forward
     if fuse_attention_projections:
         for module in modules:
             if not all(
