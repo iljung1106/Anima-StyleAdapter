@@ -318,6 +318,8 @@ style_transfer:
     # them avoids recomputing all 28 blocks during backward.
     gradient_checkpointing: false
     gradient_accumulation_steps: 4
+    low_precision_rmsnorm: true
+    fuse_attention_projections: true
     allow_tf32: true
     prefetch_workers: 2
     prefetch_batches: 4

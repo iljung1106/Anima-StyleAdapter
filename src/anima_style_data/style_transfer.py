@@ -690,6 +690,112 @@ def _resolve_anima_model(config: dict[str, Any], destination: Path, device: str)
     return model.to(device)
 
 
+def _low_precision_rmsnorm_forward(module: nn.Module, x: torch.Tensor) -> torch.Tensor:
+    """Run the legacy Anima RMSNorm wholly in the activation dtype."""
+    output = x * torch.rsqrt(x.square().mean(-1, keepdim=True) + module.eps)
+    return output * module.weight.to(dtype=x.dtype)
+
+
+def _fused_attention_compute_qkv(
+    module: nn.Module,
+    x: torch.Tensor,
+    context: torch.Tensor | None = None,
+    rope_emb: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Projection-fused equivalent of the legacy Anima Attention path."""
+    if module.is_selfattn:
+        qkv = module.qkv_proj(x)
+        q, k, v = qkv.unflatten(
+            -1, (3, module.n_heads, module.head_dim)
+        ).unbind(dim=-3)
+    else:
+        q = module.q_proj(x).unflatten(-1, (module.n_heads, module.head_dim))
+        context = x if context is None else context
+        kv = module.kv_proj(context)
+        k, v = kv.unflatten(
+            -1, (2, module.n_heads, module.head_dim)
+        ).unbind(dim=-3)
+    q = module.q_norm(q)
+    k = module.k_norm(k)
+    v = module.v_norm(v)
+    if module.is_selfattn and rope_emb is not None:
+        rotary = module.__dict__["_style_apply_rotary"]
+        q = rotary(q, rope_emb, tensor_format=module.qkv_format, fused=False)
+        k = rotary(k, rope_emb, tensor_format=module.qkv_format, fused=False)
+    return q, k, v
+
+
+def _fuse_frozen_linears(layers: list[nn.Linear]) -> nn.Linear:
+    first = layers[0]
+    fused = nn.Linear(
+        first.in_features,
+        sum(layer.out_features for layer in layers),
+        bias=any(layer.bias is not None for layer in layers),
+        device=first.weight.device,
+        dtype=first.weight.dtype,
+    )
+    with torch.no_grad():
+        fused.weight.copy_(torch.cat([layer.weight for layer in layers], dim=0))
+        if fused.bias is not None:
+            fused.bias.copy_(
+                torch.cat(
+                    [
+                        layer.bias
+                        if layer.bias is not None
+                        else torch.zeros(
+                            layer.out_features,
+                            device=first.weight.device,
+                            dtype=first.weight.dtype,
+                        )
+                        for layer in layers
+                    ],
+                    dim=0,
+                )
+            )
+    return fused.requires_grad_(False)
+
+
+def _optimize_frozen_anima(
+    anima: nn.Module,
+    *,
+    low_precision_rmsnorm: bool,
+    fuse_attention_projections: bool,
+) -> dict[str, int]:
+    """Apply inference-safe hot-path optimizations before adapter attachment."""
+    counts = {"low_precision_rmsnorm": 0, "fused_self_attention": 0, "fused_cross_attention": 0}
+    modules = list(anima.modules())
+    if low_precision_rmsnorm:
+        for module in modules:
+            if module.__class__.__name__ != "RMSNorm":
+                continue
+            module.forward = types.MethodType(_low_precision_rmsnorm_forward, module)
+            counts["low_precision_rmsnorm"] += 1
+    if fuse_attention_projections:
+        for module in modules:
+            if not all(
+                hasattr(module, name)
+                for name in ("is_selfattn", "compute_qkv", "n_heads", "head_dim")
+            ):
+                continue
+            original = module.compute_qkv
+            rotary = getattr(original, "__func__", original).__globals__.get(
+                "apply_rotary_pos_emb"
+            )
+            if module.is_selfattn:
+                module.qkv_proj = _fuse_frozen_linears(
+                    [module.q_proj, module.k_proj, module.v_proj]
+                )
+                del module.q_proj, module.k_proj, module.v_proj
+                module.__dict__["_style_apply_rotary"] = rotary
+                counts["fused_self_attention"] += 1
+            else:
+                module.kv_proj = _fuse_frozen_linears([module.k_proj, module.v_proj])
+                del module.k_proj, module.v_proj
+                counts["fused_cross_attention"] += 1
+            module.compute_qkv = types.MethodType(_fused_attention_compute_qkv, module)
+    return counts
+
+
 def _parameter_grad_norm(parameters) -> float:
     values = [value.grad.detach().float().norm() for value in parameters if value.grad is not None]
     return float(torch.stack(values).norm()) if values else 0.0
@@ -890,8 +996,6 @@ def _forward_flow_loss(
         int(loss_config.get("style_direction_anneal_start", 0)),
         int(loss_config.get("style_direction_anneal_end", 1)),
     )
-    references = _encode_reference_tokens(resampler, batch, device)
-    reference_mask = batch["reference_mask"].to(device, non_blocking=True)
     latents = batch["latents"].to(device, non_blocking=True, dtype=torch.bfloat16)
     conditioning = batch["conditioning"].to(device, non_blocking=True, dtype=torch.bfloat16)
     with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=device.startswith("cuda")):
@@ -906,13 +1010,16 @@ def _forward_flow_loss(
             reference_mask = torch.ones(
                 references.shape[:2], dtype=torch.bool, device=references.device
             )
-        elif target_probability > 0:
-            include_target = (
-                torch.rand(references.shape[0], device=references.device)
-                < target_probability
-            )
-            references = torch.cat((references, target_style_tokens[:, None]), dim=1)
-            reference_mask = torch.cat((reference_mask, include_target[:, None]), dim=1)
+        else:
+            references = _encode_reference_tokens(resampler, batch, device)
+            reference_mask = batch["reference_mask"].to(device, non_blocking=True)
+            if target_probability > 0:
+                include_target = (
+                    torch.rand(references.shape[0], device=references.device)
+                    < target_probability
+                )
+                references = torch.cat((references, target_style_tokens[:, None]), dim=1)
+                reference_mask = torch.cat((reference_mask, include_target[:, None]), dim=1)
         raw_style_tokens = adapter.aggregate(
             references, reference_mask, apply_dropout=False
         )
@@ -1590,6 +1697,14 @@ def train_style_adapter(config: dict[str, Any], destination: Path, *, steps_over
     resampler = load_per_reference_resampler(destination, cfg["resampler"], device)
     anima = _resolve_anima_model(config, destination, device)
     anima.requires_grad_(False).train()
+    optimization_counts = _optimize_frozen_anima(
+        anima,
+        low_precision_rmsnorm=bool(training.get("low_precision_rmsnorm", False)),
+        fuse_attention_projections=bool(
+            training.get("fuse_attention_projections", False)
+        ),
+    )
+    print(f"frozen Anima optimizations: {optimization_counts}", flush=True)
     if bool(training.get("gradient_checkpointing", False)):
         anima.enable_gradient_checkpointing()
     adapter = SharedLowRankStyleAdapter(**cfg["adapter"]).to(device, dtype=torch.bfloat16)

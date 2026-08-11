@@ -13,6 +13,7 @@ from anima_style_data.style_transfer import (
     SlotSetAggregator,
     _archive_training_state,
     _flow_direction_loss,
+    _optimize_frozen_anima,
     _pad_text_conditions,
     _save_training_state,
     _self_reference_curriculum_state,
@@ -23,6 +24,80 @@ from anima_style_data.style_transfer import (
     _timestep_interval_bounds,
     attach_style_adapter,
 )
+
+
+class RMSNorm(nn.Module):
+    def __init__(self, dim: int):
+        super().__init__()
+        self.eps = 1e-5
+        self.weight = nn.Parameter(torch.ones(dim, dtype=torch.bfloat16))
+
+    def forward(self, x):
+        return x.float().square().mean(-1, keepdim=True).to(x.dtype)
+
+
+class _LegacyAttention(nn.Module):
+    def __init__(self, *, self_attention: bool):
+        super().__init__()
+        self.is_selfattn = self_attention
+        self.n_heads = 2
+        self.head_dim = 4
+        self.qkv_format = "bshd"
+        self.q_proj = nn.Linear(8, 8, bias=False)
+        self.k_proj = nn.Linear(8, 8, bias=False)
+        self.v_proj = nn.Linear(8, 8, bias=False)
+        self.q_norm = nn.Identity()
+        self.k_norm = nn.Identity()
+        self.v_norm = nn.Identity()
+
+    def compute_qkv(self, x, context=None, rope_emb=None):
+        context = x if context is None else context
+        return tuple(
+            layer(value).unflatten(-1, (self.n_heads, self.head_dim))
+            for layer, value in (
+                (self.q_proj, x),
+                (self.k_proj, context),
+                (self.v_proj, context),
+            )
+        )
+
+
+class _FrozenAnimaStub(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.norm = RMSNorm(8)
+        self.self_attention = _LegacyAttention(self_attention=True)
+        self.cross_attention = _LegacyAttention(self_attention=False)
+
+
+def test_frozen_anima_optimizations_preserve_projection_outputs_in_activation_dtype():
+    model = _FrozenAnimaStub().requires_grad_(False)
+    x = torch.randn(2, 5, 8)
+    context = torch.randn(2, 3, 8)
+    expected_self = model.self_attention.compute_qkv(x)
+    expected_cross = model.cross_attention.compute_qkv(x, context)
+
+    counts = _optimize_frozen_anima(
+        model, low_precision_rmsnorm=True, fuse_attention_projections=True
+    )
+
+    assert counts == {
+        "low_precision_rmsnorm": 1,
+        "fused_self_attention": 1,
+        "fused_cross_attention": 1,
+    }
+    for actual, expected in zip(
+        model.self_attention.compute_qkv(x), expected_self, strict=True
+    ):
+        torch.testing.assert_close(actual, expected)
+    for actual, expected in zip(
+        model.cross_attention.compute_qkv(x, context), expected_cross, strict=True
+    ):
+        torch.testing.assert_close(actual, expected)
+    bf16 = torch.randn(2, 5, 8, dtype=torch.bfloat16)
+    assert model.norm(bf16).dtype == torch.bfloat16
+    assert not hasattr(model.self_attention, "q_proj")
+    assert hasattr(model.cross_attention, "q_proj")
 
 
 def test_self_reference_curriculum_has_explicit_terminal_phase():
