@@ -406,7 +406,10 @@ style_transfer:
     # remove target references while weakly distilling on a subset of steps;
     # 5) finish with target-excluded multi-reference episodes only.
     curriculum:
-      gate_only_steps: 5
+      # This run starts from a checkpoint whose gate and K/V/O path are
+      # already open. Re-entering the zero-init gate bootstrap would freeze
+      # the only active continuation path and leave the loss without a graph.
+      gate_only_steps: 0
       self_reference_steps: 8000
       target_anneal_end: 20000
       oracle_distill_end: 20000
