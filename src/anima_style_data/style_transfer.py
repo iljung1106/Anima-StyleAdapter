@@ -1829,6 +1829,16 @@ def smoke_test_style_adapter(config: dict[str, Any], destination: Path) -> dict[
     training["validation_batches"] = 1
     training["checkpoint_every"] = 1
     training["sample_every"] = 1
+    # Exercise both sides of the new production transition in two real steps:
+    # exact-zero gate-only self-reference, then frozen-oracle distillation with
+    # the complete student path open.
+    training["curriculum"] = {
+        "gate_only_steps": 1,
+        "self_reference_steps": 1,
+        "target_anneal_end": 3,
+        "oracle_distill_end": 3,
+    }
+    training["oracle_distill_probability"] = 1.0
     smoke_config["style_transfer"]["sampling"]["steps"] = 2
     return train_style_adapter(smoke_config, destination, steps_override=2)
 
