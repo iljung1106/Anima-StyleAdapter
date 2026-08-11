@@ -1242,6 +1242,27 @@ def _bypass_style_blocks(anima: nn.Module, adapter: SharedLowRankStyleAdapter):
         adapter.clear_style_tokens()
 
 
+@contextmanager
+def _uncached_no_grad_autocast(device: str):
+    """Run a detached teacher branch without poisoning autocast's weight cache.
+
+    A trainable FP32 weight first cast under ``no_grad`` is cached as a
+    detached low-precision tensor for the rest of the surrounding autocast
+    region. A later student forward would then update only its inputs, not the
+    weight. Disabling the nested cache keeps the subsequent correct-reference
+    forward connected to every adapter parameter.
+    """
+    device_type = torch.device(device).type
+    with torch.no_grad():
+        with torch.autocast(
+            device_type=device_type,
+            dtype=torch.bfloat16,
+            enabled=device_type in {"cpu", "cuda"},
+            cache_enabled=False,
+        ):
+            yield
+
+
 def _soft_interval_loss(
     values: torch.Tensor,
     lower: torch.Tensor,
@@ -1428,7 +1449,7 @@ def _forward_flow_loss(
             # The shuffled branch is a detached baseline. It cannot be made
             # worse by this loss, avoiding the shortcut of satisfying a rank
             # margin through deliberate corruption of wrong-reference output.
-            with torch.no_grad():
+            with _uncached_no_grad_autocast(device):
                 if step <= int(loss_config.get("debug_autograd_steps", 0)):
                     adapter.__dict__["_debug_autograd_label"] = "wrong_no_grad"
                 adapter.set_style_tokens(raw_style_tokens.roll(1, dims=0))

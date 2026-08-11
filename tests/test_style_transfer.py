@@ -30,6 +30,7 @@ from anima_style_data.style_transfer import (
     _summarize_scalar_samples,
     _symmetric_style_contrastive_loss,
     _timestep_interval_bounds,
+    _uncached_no_grad_autocast,
     attach_style_adapter,
 )
 
@@ -109,6 +110,22 @@ def test_reference_rank_loss_only_penalizes_insufficient_correct_advantage():
     )
     torch.testing.assert_close(advantage, torch.tensor(-0.25))
     torch.testing.assert_close(loss, torch.tensor(0.45))
+
+
+def test_detached_teacher_does_not_poison_student_autocast_weight_cache():
+    layer = nn.Linear(4, 4)
+    inputs = torch.randn(2, 4)
+
+    with torch.autocast("cpu", dtype=torch.bfloat16):
+        with _uncached_no_grad_autocast("cpu"):
+            teacher = layer(inputs)
+        student = layer(inputs)
+
+    assert not teacher.requires_grad
+    assert student.requires_grad
+    student.float().sum().backward()
+    assert layer.weight.grad is not None
+    assert layer.weight.grad.norm() > 0
 
 
 def test_reference_direction_loss_removes_common_residual_and_trains_correct_only():
