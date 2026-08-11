@@ -409,6 +409,8 @@ style_transfer:
     evaluate_every: 25
     seed: 20260812
     noise_seed: 2026081201
+    fixed_noise_each_step: false
+    generalization_seeds: 8
     representation_learning_rate: 0.0003
     output_learning_rate: 0.0002
     gate_learning_rate: 0.0001

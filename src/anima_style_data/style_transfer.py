@@ -2242,7 +2242,12 @@ def overfit_exact_self_batch(config: dict[str, Any], destination: Path) -> dict[
             )
         }
 
-    output = source_output / "overfit_exact_self"
+    fixed_noise_each_step = bool(overfit_cfg.get("fixed_noise_each_step", False))
+    output = source_output / (
+        "overfit_exact_self_fixed_flow"
+        if fixed_noise_each_step
+        else "overfit_exact_self_random_flow"
+    )
     output.mkdir(parents=True, exist_ok=True)
     history = []
     steps = int(overfit_cfg.get("steps", 500))
@@ -2262,7 +2267,12 @@ def overfit_exact_self_batch(config: dict[str, Any], destination: Path) -> dict[
         anima.train()
         adapter.train()
         optimizer.zero_grad(set_to_none=True)
-        generator = torch.Generator(device=device).manual_seed(fixed_noise_seed)
+        train_noise_seed = (
+            fixed_noise_seed
+            if fixed_noise_each_step
+            else fixed_noise_seed + step * 10_007
+        )
+        generator = torch.Generator(device=device).manual_seed(train_noise_seed)
         loss, _ = _forward_flow_loss(
             anima, adapter, resampler, fixed_batch, device,
             generator=generator, loss_config=loss_config, step=step,
@@ -2293,17 +2303,40 @@ def overfit_exact_self_batch(config: dict[str, Any], destination: Path) -> dict[
         },
         checkpoint_output,
     )
+    randomized_evaluation: dict[str, dict[str, dict[str, float]]] = {}
+    randomized_records: dict[str, dict[str, list[float]]] = defaultdict(
+        lambda: defaultdict(list)
+    )
+    for index in range(int(overfit_cfg.get("generalization_seeds", 8))):
+        evaluation_seed = fixed_noise_seed + 1_000_003 + index * 97
+        for name, batch in (
+            ("self", fixed_batch),
+            ("wrong", wrong_batch),
+            ("unseen_self", unseen_batch),
+        ):
+            values = evaluate(batch, evaluation_seed)
+            for metric, value in values.items():
+                randomized_records[name][metric].append(value)
+    randomized_evaluation = {
+        name: {
+            metric: _summarize_scalar_samples(values)
+            for metric, values in metrics.items()
+        }
+        for name, metrics in randomized_records.items()
+    }
     result = {
         "source_checkpoint": str(checkpoint),
         "source_step": int(state["step"]),
         "steps": steps,
         "fixed_targets": [item.target_id for item in fixed_batch["episodes"]],
-        "fixed_timesteps_and_noise_seed": fixed_noise_seed,
+        "evaluation_noise_seed": fixed_noise_seed,
+        "fixed_noise_and_timestep_during_training": fixed_noise_each_step,
         "resampler_trainable": False,
         "losses": "flow MSE only",
         "optimization_counts": optimization_counts,
         "initial": history[0],
         "final": history[-1],
+        "randomized_flow_evaluation": randomized_evaluation,
         "history": str(output / "history.json"),
         "checkpoint": str(checkpoint_output),
         "elapsed_s": time.perf_counter() - started,
