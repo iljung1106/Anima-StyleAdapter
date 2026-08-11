@@ -20,6 +20,7 @@ from anima_style_data.style_transfer import (
     _per_sample_condition_comparison,
     _per_sample_cosine,
     _per_sample_flow_residual_metrics,
+    _reference_flow_direction_loss,
     _reference_flow_rank_loss,
     _save_training_state,
     _self_reference_curriculum_state,
@@ -108,6 +109,28 @@ def test_reference_rank_loss_only_penalizes_insufficient_correct_advantage():
     )
     torch.testing.assert_close(advantage, torch.tensor(-0.25))
     torch.testing.assert_close(loss, torch.tensor(0.45))
+
+
+def test_reference_direction_loss_removes_common_residual_and_trains_correct_only():
+    common = torch.tensor([[[[2.0, 2.0]]]])
+    desired = torch.tensor([[[[1.0, -1.0]]]])
+    wrong = common.clone().requires_grad_(True)
+    aligned = (common + 0.5 * desired).requires_grad_(True)
+    target = common + desired
+
+    aligned_loss = _reference_flow_direction_loss(
+        aligned, wrong, target, epsilon=0.01
+    )
+    assert aligned_loss < 0.001
+    aligned_loss.backward()
+    assert aligned.grad is not None
+    assert wrong.grad is None
+
+    orthogonal = (common + torch.tensor([[[[1.0, 1.0]]]])).requires_grad_(True)
+    orthogonal_loss = _reference_flow_direction_loss(
+        orthogonal, wrong, target, epsilon=0.01
+    )
+    assert orthogonal_loss > 0.9
 
 
 class RMSNorm(nn.Module):

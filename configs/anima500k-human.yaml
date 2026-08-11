@@ -390,6 +390,12 @@ style_transfer:
     style_reference_rank_probability: 1.0
     style_reference_rank_start_step: 1
     style_reference_rank_end_step: 1001
+    # Optional second-stage remedy if ranking alone still learns a common
+    # residual. This aligns (correct - detached wrong) with the target error
+    # remaining after the wrong condition, directly isolating reference-
+    # specific flow. It remains disabled for the current rank-only pilot.
+    style_reference_direction_weight: 0.0
+    style_reference_direction_epsilon: 0.05
     # Softly match the timestep-conditioned magnitude of Anima's native artist
     # intervention. Standard target-only flow loss still chooses the direction;
     # this term only prevents the style path from remaining effectively null.

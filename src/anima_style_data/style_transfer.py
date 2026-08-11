@@ -1372,13 +1372,16 @@ def _forward_flow_loss(
         )
         direction_weight = float(loss_config.get("style_flow_direction_weight", 0.0)) * direction_multiplier
         reference_rank_weight = float(loss_config.get("style_reference_rank_weight", 0.0))
+        reference_direction_weight = float(
+            loss_config.get("style_reference_direction_weight", 0.0)
+        )
         reference_rank_start = int(loss_config.get("style_reference_rank_start_step", 0))
         reference_rank_end = int(loss_config.get("style_reference_rank_end_step", 0))
         reference_rank_probability = float(
             loss_config.get("style_reference_rank_probability", 1.0)
         )
         reference_rank_active = (
-            reference_rank_weight > 0
+            (reference_rank_weight > 0 or reference_direction_weight > 0)
             and curriculum["target_only"]
             and style_tokens.shape[0] > 1
             and step >= reference_rank_start
@@ -1429,6 +1432,7 @@ def _forward_flow_loss(
         flow_loss = F.mse_loss(prediction, target_velocity)
         reference_rank_loss = flow_loss.new_zeros(())
         reference_rank_advantage = flow_loss.new_full((), float("nan"))
+        reference_direction_loss = flow_loss.new_zeros(())
         if wrong_reference_prediction is not None and bypass_prediction is not None:
             valid = (
                 ~dropped
@@ -1445,6 +1449,15 @@ def _forward_flow_loss(
                     target_velocity[valid],
                     margin=float(loss_config.get("style_reference_rank_margin", 0.005)),
                 )
+                if reference_direction_weight > 0:
+                    reference_direction_loss = _reference_flow_direction_loss(
+                        prediction[valid],
+                        wrong_reference_prediction[valid],
+                        target_velocity[valid],
+                        epsilon=float(
+                            loss_config.get("style_reference_direction_epsilon", 0.05)
+                        ),
+                    )
 
         oracle_distill_loss = flow_loss.new_zeros(())
         oracle_distill_applied = False
@@ -1571,6 +1584,7 @@ def _forward_flow_loss(
             + magnitude_weight * magnitude_loss
             + direction_weight * direction_loss
             + reference_rank_weight * reference_rank_loss
+            + reference_direction_weight * reference_direction_loss
             + token_weight * token_contrastive
             + kv_weight * kv_contrastive
             + float(loss_config.get("resampler_auxiliary_weight", 0.0))
@@ -1625,6 +1639,7 @@ def _forward_flow_loss(
         "style_reference_rank_loss": float(reference_rank_loss.detach()),
         "style_reference_rank_advantage": float(reference_rank_advantage.detach()),
         "style_reference_rank_applied": bool(wrong_reference_prediction is not None),
+        "style_reference_direction_loss": float(reference_direction_loss.detach()),
         "style_token_contrastive": float(token_contrastive.detach()),
         "style_kv_contrastive": float(kv_contrastive.detach()),
         **adapter.runtime_stats(),
@@ -2119,6 +2134,34 @@ def _reference_flow_rank_loss(
     comparison = _per_sample_condition_comparison(correct, wrong, bypass, target)
     advantage = comparison["first_advantage"]
     return F.relu(float(margin) - advantage).mean(), advantage.mean()
+
+
+def _reference_flow_direction_loss(
+    correct: torch.Tensor,
+    wrong: torch.Tensor,
+    target: torch.Tensor,
+    *,
+    epsilon: float,
+) -> torch.Tensor:
+    """Align only the reference-specific residual with the remaining error.
+
+    ``wrong`` is detached by the caller. Subtracting it from both the correct
+    prediction and target removes the common style residual that otherwise
+    dominates early flow training. The resulting direction loss can therefore
+    teach which part of the target is explained by the correct reference
+    without rewarding deliberate damage to the wrong-reference branch.
+    """
+    dimensions = tuple(range(1, correct.ndim))
+    wrong = wrong.detach().float()
+    delta = correct.float() - wrong
+    desired = target.float() - wrong
+    desired_rms = desired.square().mean(dim=dimensions).sqrt().clamp_min(1e-6)
+    return _flow_direction_loss(
+        delta,
+        desired,
+        desired_rms,
+        epsilon=float(epsilon),
+    )
 
 
 def _summarize_scalar_samples(values: list[float]) -> dict[str, float]:
