@@ -96,6 +96,7 @@ def test_frozen_anima_optimizations_preserve_projection_outputs_in_activation_dt
         torch.testing.assert_close(actual, expected)
     bf16 = torch.randn(2, 5, 8, dtype=torch.bfloat16)
     assert model.norm(bf16).dtype == torch.bfloat16
+    assert model.norm(bf16.float()).dtype == torch.bfloat16
     assert not hasattr(model.self_attention, "q_proj")
     assert hasattr(model.cross_attention, "q_proj")
 

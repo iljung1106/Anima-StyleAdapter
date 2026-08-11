@@ -692,8 +692,12 @@ def _resolve_anima_model(config: dict[str, Any], destination: Path, device: str)
 
 def _low_precision_rmsnorm_forward(module: nn.Module, x: torch.Tensor) -> torch.Tensor:
     """Run the legacy Anima RMSNorm wholly in the activation dtype."""
+    # Timestep embedding enters parts of the legacy model as FP32 even when all
+    # frozen weights and image activations are BF16. The weight dtype is the
+    # model compute contract; normalize there instead of preserving that FP32.
+    x = x.to(dtype=module.weight.dtype)
     output = x * torch.rsqrt(x.square().mean(-1, keepdim=True) + module.eps)
-    return output * module.weight.to(dtype=x.dtype)
+    return output * module.weight
 
 
 def _fused_attention_compute_qkv(
