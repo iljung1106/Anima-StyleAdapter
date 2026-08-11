@@ -14,6 +14,7 @@ from anima_style_data.style_transfer import (
     _archive_training_state,
     _pad_text_conditions,
     _save_training_state,
+    _style_bootstrap_state,
     _symmetric_style_contrastive_loss,
     attach_style_adapter,
 )
@@ -24,6 +25,23 @@ def test_style_contrastive_prefers_matching_artist_tokens():
     matching = _symmetric_style_contrastive_loss(targets, targets, 0.1)
     shuffled = _symmetric_style_contrastive_loss(targets.roll(1, 0), targets, 0.1)
     assert matching < shuffled
+
+
+def test_style_bootstrap_ramps_then_anneals_to_zero():
+    config = {
+        "style_output_ratio_floor": 0.05,
+        "style_magnitude_ramp_steps": 100,
+        "target_reference_probability": 1.0,
+        "style_aux_anneal_start": 200,
+        "style_aux_anneal_end": 300,
+    }
+    assert _style_bootstrap_state(0, config) == (1.0, 0.0, 1.0)
+    assert _style_bootstrap_state(100, config) == (1.0, 0.05, 1.0)
+    auxiliary, floor, probability = _style_bootstrap_state(250, config)
+    assert auxiliary == pytest.approx(0.5)
+    assert floor == pytest.approx(0.025)
+    assert probability == pytest.approx(0.5)
+    assert _style_bootstrap_state(300, config) == (0.0, 0.0, 0.0)
 
 
 def test_text_conditions_restore_animas_fixed_zero_padding():

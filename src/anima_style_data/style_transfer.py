@@ -666,6 +666,22 @@ def _parameter_grad_norm(parameters) -> float:
     return float(torch.stack(values).norm()) if values else 0.0
 
 
+def _style_bootstrap_state(step: int, config: dict[str, Any]) -> tuple[float, float, float]:
+    ramp_steps = max(1, int(config.get("style_magnitude_ramp_steps", 250)))
+    ramp = min(1.0, max(0.0, step / ramp_steps))
+    anneal_start = int(config.get("style_aux_anneal_start", 10**12))
+    anneal_end = max(anneal_start + 1, int(config.get("style_aux_anneal_end", anneal_start + 1)))
+    if step <= anneal_start:
+        auxiliary = 1.0
+    elif step >= anneal_end:
+        auxiliary = 0.0
+    else:
+        auxiliary = 1.0 - (step - anneal_start) / (anneal_end - anneal_start)
+    floor = float(config.get("style_output_ratio_floor", 0.0)) * ramp * auxiliary
+    target_probability = float(config.get("target_reference_probability", 0.0)) * auxiliary
+    return auxiliary, floor, target_probability
+
+
 def _forward_flow_loss(
     anima: nn.Module,
     adapter: SharedLowRankStyleAdapter,
@@ -675,12 +691,30 @@ def _forward_flow_loss(
     *,
     generator: torch.Generator | None = None,
     loss_config: dict[str, Any] | None = None,
+    step: int = 0,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
+    loss_config = loss_config or {}
+    auxiliary, magnitude_floor, target_probability = _style_bootstrap_state(
+        step, loss_config
+    )
     references = _encode_reference_tokens(resampler, batch, device)
     reference_mask = batch["reference_mask"].to(device, non_blocking=True)
     latents = batch["latents"].to(device, non_blocking=True, dtype=torch.bfloat16)
     conditioning = batch["conditioning"].to(device, non_blocking=True, dtype=torch.bfloat16)
     with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=device.startswith("cuda")):
+        target_style_tokens = None
+        if target_probability > 0 or any(
+            float(loss_config.get(key, 0.0)) > 0
+            for key in ("style_token_contrastive_weight", "style_kv_contrastive_weight")
+        ):
+            target_style_tokens = _encode_target_tokens(resampler, batch, device)
+        if target_probability > 0:
+            include_target = (
+                torch.rand(references.shape[0], device=references.device)
+                < target_probability
+            )
+            references = torch.cat((references, target_style_tokens[:, None]), dim=1)
+            reference_mask = torch.cat((reference_mask, include_target[:, None]), dim=1)
         raw_style_tokens = adapter.aggregate(
             references, reference_mask, apply_dropout=False
         )
@@ -694,7 +728,6 @@ def _forward_flow_loss(
                 adapter.null_tokens.expand_as(style_tokens),
                 style_tokens,
             )
-        adapter.set_style_tokens(style_tokens)
         noise = torch.randn(latents.shape, device=device, dtype=latents.dtype, generator=generator)
         timesteps = torch.rand(latents.shape[0], device=device, dtype=torch.float32, generator=generator)
         sigma = timesteps[:, None, None, None].to(latents.dtype)
@@ -703,19 +736,64 @@ def _forward_flow_loss(
             latents.shape[0], 1, latents.shape[-2], latents.shape[-1],
             device=device, dtype=latents.dtype,
         )
+
+        magnitude_weight = float(loss_config.get("style_magnitude_weight", 0.0)) * auxiliary
+        rank_weight = float(loss_config.get("style_shuffled_rank_weight", 0.0)) * auxiliary
+        shuffled_prediction = None
+        if magnitude_weight > 0 or rank_weight > 0:
+            # This branch is a moving reference, not an optimization target.
+            # Detaching it avoids a shortcut that deliberately corrupts wrong
+            # styles while still requiring the correct-style branch to move
+            # away from the common small residual.
+            with torch.no_grad():
+                adapter.set_style_tokens(raw_style_tokens.detach().roll(1, dims=0))
+                shuffled_prediction = anima(
+                    noisy.unsqueeze(2), timesteps.to(latents.dtype), context=conditioning,
+                    padding_mask=padding_mask, target_input_ids=None,
+                ).squeeze(2).float()
+                adapter.clear_style_tokens()
+
+        adapter.set_style_tokens(style_tokens)
         prediction = anima(
             noisy.unsqueeze(2), timesteps.to(latents.dtype), context=conditioning,
             padding_mask=padding_mask, target_input_ids=None,
         ).squeeze(2)
-        flow_loss = F.mse_loss(prediction.float(), (noise - latents).float())
+        prediction = prediction.float()
+        target_velocity = (noise - latents).float()
+        flow_loss = F.mse_loss(prediction, target_velocity)
 
-        loss_config = loss_config or {}
+        magnitude_loss = flow_loss.new_zeros(())
+        rank_loss = flow_loss.new_zeros(())
+        output_ratio = flow_loss.new_zeros(())
+        if shuffled_prediction is not None:
+            dimensions = tuple(range(1, prediction.ndim))
+            difference_rms = (
+                (prediction - shuffled_prediction).square().mean(dim=dimensions) + 1e-8
+            ).sqrt()
+            prediction_rms = (
+                shuffled_prediction.square().mean(dim=dimensions) + 1e-8
+            ).sqrt().detach()
+            ratios = difference_rms / prediction_rms
+            valid = ~dropped if adapter.training and adapter.style_dropout > 0 else torch.ones_like(
+                ratios, dtype=torch.bool
+            )
+            if valid.any():
+                output_ratio = ratios[valid].mean()
+                magnitude_loss = F.relu(magnitude_floor - ratios[valid]).square().mean()
+                correct_mse = (prediction - target_velocity).square().mean(dim=dimensions)
+                shuffled_mse = (
+                    (shuffled_prediction - target_velocity).square().mean(dim=dimensions).detach()
+                )
+                margin = float(loss_config.get("style_shuffled_rank_margin", 0.0))
+                rank_loss = F.relu(
+                    margin + correct_mse[valid] - shuffled_mse[valid]
+                ).mean()
+
         token_weight = float(loss_config.get("style_token_contrastive_weight", 0.0))
         kv_weight = float(loss_config.get("style_kv_contrastive_weight", 0.0))
         token_contrastive = flow_loss.new_zeros(())
         kv_contrastive = flow_loss.new_zeros(())
         if token_weight > 0 or kv_weight > 0:
-            target_style_tokens = _encode_target_tokens(resampler, batch, device)
             temperature = float(loss_config.get("style_contrastive_temperature", 0.07))
             if token_weight > 0:
                 token_contrastive = _symmetric_style_contrastive_loss(
@@ -727,11 +805,23 @@ def _forward_flow_loss(
                 kv_contrastive = _symmetric_style_contrastive_loss(
                     reference_signature[:, None], target_signature[:, None], temperature
                 )
-        loss = flow_loss + token_weight * token_contrastive + kv_weight * kv_contrastive
+        loss = (
+            flow_loss
+            + magnitude_weight * magnitude_loss
+            + rank_weight * rank_loss
+            + token_weight * token_contrastive
+            + kv_weight * kv_contrastive
+        )
     return loss, {
         "references": int(reference_mask.sum()),
         "latent_shape": list(latents.shape),
         "flow_loss": float(flow_loss.detach()),
+        "style_auxiliary": auxiliary,
+        "style_magnitude_floor": magnitude_floor,
+        "target_reference_probability": target_probability,
+        "style_output_ratio": float(output_ratio.detach()),
+        "style_magnitude_loss": float(magnitude_loss.detach()),
+        "style_rank_loss": float(rank_loss.detach()),
         "style_token_contrastive": float(token_contrastive.detach()),
         "style_kv_contrastive": float(kv_contrastive.detach()),
     }
@@ -1310,7 +1400,7 @@ def train_style_adapter(config: dict[str, Any], destination: Path, *, steps_over
         data_ready = time.perf_counter()
         optimizer.zero_grad(set_to_none=True)
         loss, details = _forward_flow_loss(
-            anima, adapter, resampler, batch, device, loss_config=training
+            anima, adapter, resampler, batch, device, loss_config=training, step=step
         )
         loss.backward()
         # Non-reentrant block checkpointing replays style attention during

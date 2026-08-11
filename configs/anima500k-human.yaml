@@ -259,7 +259,7 @@ tap_resampler_experiment:
 # and batches targets by exact latent shape. `style-smoke` forces two steps and
 # writes to a separate smoke directory; `style-train` uses `training.steps`.
 style_transfer:
-  output_directory: style_transfer_l18_l24_siglip_l24_reference_contrastive_v3
+  output_directory: style_transfer_l18_l24_siglip_l24_output_bootstrap_v4
   seed: 20260811
   loader:
     style_cache: style_features_l18_l24_siglip_l24
@@ -291,7 +291,7 @@ style_transfer:
   training:
     device: cuda
     # Reference-dependence repair pilot initialized from the best v2 checkpoint.
-    steps: 1000
+    steps: 500
     learning_rate: 0.00005
     weight_decay: 0.01
     max_grad_norm: 1.0
@@ -303,19 +303,27 @@ style_transfer:
     validation_every: 250
     validation_batches: 8
     checkpoint_every: 250
-    sample_every: 500
+    sample_every: 250
     resume: true
     initial_checkpoint: style_transfer_l18_l24_siglip_l24_crossslot1_fixedtext_v2/selected-step-0005500.pt
-    style_token_contrastive_weight: 0.02
-    style_kv_contrastive_weight: 0.02
+    style_token_contrastive_weight: 0.0
+    style_kv_contrastive_weight: 0.0
     style_contrastive_temperature: 0.10
+    style_output_ratio_floor: 0.05
+    style_magnitude_ramp_steps: 250
+    style_magnitude_weight: 10.0
+    style_shuffled_rank_weight: 0.25
+    style_shuffled_rank_margin: 0.0005
+    target_reference_probability: 1.0
+    style_aux_anneal_start: 1000000
+    style_aux_anneal_end: 1000001
     wandb:
       enabled: true
       project: anima-style-adapter
-      name: anima-style-transfer-l18-l24-reference-contrastive-v3
-      id: anima-style-transfer-l18-l24-reference-contrastive-v3
+      name: anima-style-transfer-l18-l24-output-bootstrap-v4
+      id: anima-style-transfer-l18-l24-output-bootstrap-v4
   diagnostics:
-    checkpoint: style_transfer_l18_l24_siglip_l24_crossslot1_fixedtext_v2/selected-step-0005500.pt
+    checkpoint: training_state.pt
     batch_size: 8
     batches: 4
   sampling:
