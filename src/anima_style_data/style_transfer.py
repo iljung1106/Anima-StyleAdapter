@@ -900,6 +900,130 @@ def sample_style_checkpoint(config: dict[str, Any], destination: Path) -> dict[s
     return {"step": step, "sheet": str(sheet), "elapsed_s": elapsed}
 
 
+@torch.no_grad()
+def diagnose_style_reference_dependence(
+    config: dict[str, Any], destination: Path
+) -> dict[str, Any]:
+    """Measure whether the trained adapter actually uses its references.
+
+    Every comparison reuses the same targets, text, noise and timesteps.  The
+    only changed variable is the style condition: correct references, another
+    artist's references, learned null tokens, or a complete adapter bypass.
+    """
+    cfg = config["style_transfer"]
+    diagnostic_cfg = dict(cfg.get("diagnostics", {}))
+    device = str(cfg["training"].get("device", "cuda"))
+    loader_cfg = {
+        **cfg["loader"],
+        "split": "validation",
+        "batch_size": int(diagnostic_cfg.get("batch_size", 8)),
+    }
+    loader_cfg["seed"] = int(cfg.get("seed", 20260811)) ^ 0x51A7
+    loader = ProductionStyleLoader(destination, loader_cfg)
+    resampler = load_per_reference_resampler(destination, cfg["resampler"], device)
+    anima = _resolve_anima_model(config, destination, device).requires_grad_(False).eval()
+    adapter = SharedLowRankStyleAdapter(**cfg["adapter"]).to(device, dtype=torch.bfloat16)
+    attach_style_adapter(anima, adapter)
+    adapter.eval()
+
+    output = destination / str(cfg.get("output_directory", "style_transfer_training"))
+    checkpoint_name = str(diagnostic_cfg.get("checkpoint", "selected-step-0005500.pt"))
+    checkpoint_path = Path(checkpoint_name)
+    if not checkpoint_path.is_absolute():
+        checkpoint_path = output / checkpoint_path
+    state = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    adapter.load_state_dict(state["adapter"])
+
+    records: list[dict[str, float]] = []
+    batches = int(diagnostic_cfg.get("batches", 4))
+    seed = int(diagnostic_cfg.get("seed", 20260811 ^ 0xD1A6))
+    for index in range(batches):
+        batch = loader.load_step(index)
+        references = _encode_reference_tokens(resampler, batch, device)
+        reference_mask = batch["reference_mask"].to(device, non_blocking=True)
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=device.startswith("cuda")):
+            correct_style = adapter.aggregate(references, reference_mask)
+        shuffled_style = correct_style.roll(1, dims=0)
+        null_style = adapter.unconditional(correct_style.shape[0])
+
+        latents = batch["latents"].to(device, non_blocking=True, dtype=torch.bfloat16)
+        conditioning = batch["conditioning"].to(device, non_blocking=True, dtype=torch.bfloat16)
+        generator = torch.Generator(device=device).manual_seed(seed + index)
+        noise = torch.randn(latents.shape, device=device, dtype=latents.dtype, generator=generator)
+        timesteps = torch.rand(latents.shape[0], device=device, dtype=torch.float32, generator=generator)
+        sigma = timesteps[:, None, None, None].to(latents.dtype)
+        noisy = (1 - sigma) * latents + sigma * noise
+        target = (noise - latents).float()
+        padding_mask = torch.zeros(
+            latents.shape[0], 1, latents.shape[-2], latents.shape[-1],
+            device=device, dtype=latents.dtype,
+        )
+
+        def predict(style: torch.Tensor | None, *, bypass: bool = False) -> torch.Tensor:
+            patched_forwards = None
+            if bypass:
+                adapter.clear_style_tokens()
+                patched_forwards = [block._forward for block in anima.blocks]
+                for block in anima.blocks:
+                    block._forward = block.__dict__["_style_original_forward"]
+            else:
+                adapter.set_style_tokens(style)
+            try:
+                with torch.autocast(
+                    device_type="cuda", dtype=torch.bfloat16, enabled=device.startswith("cuda")
+                ):
+                    return anima(
+                        noisy.unsqueeze(2), timesteps.to(latents.dtype), context=conditioning,
+                        padding_mask=padding_mask, target_input_ids=None,
+                    ).squeeze(2).float()
+            finally:
+                adapter.clear_style_tokens()
+                if patched_forwards is not None:
+                    for block, patched in zip(anima.blocks, patched_forwards, strict=True):
+                        block._forward = patched
+
+        correct_prediction = predict(correct_style)
+        shuffled_prediction = predict(shuffled_style)
+        null_prediction = predict(null_style)
+        bypass_prediction = predict(None, bypass=True)
+        flat = F.normalize(correct_style.float().flatten(1), dim=1)
+        similarities = flat @ flat.T
+        off_diagonal = ~torch.eye(flat.shape[0], device=device, dtype=torch.bool)
+        records.append({
+            "correct_loss": float(F.mse_loss(correct_prediction, target)),
+            "shuffled_loss": float(F.mse_loss(shuffled_prediction, target)),
+            "null_loss": float(F.mse_loss(null_prediction, target)),
+            "bypass_loss": float(F.mse_loss(bypass_prediction, target)),
+            "correct_vs_shuffled_rms": float(
+                (correct_prediction - shuffled_prediction).square().mean().sqrt()
+            ),
+            "correct_vs_null_rms": float(
+                (correct_prediction - null_prediction).square().mean().sqrt()
+            ),
+            "style_pairwise_cosine": float(similarities[off_diagonal].mean()),
+            "style_centered_rms": float(
+                (correct_style.float() - correct_style.float().mean(0, keepdim=True))
+                .square().mean().sqrt()
+            ),
+            "style_rms": float(correct_style.float().square().mean().sqrt()),
+        })
+
+    means = {
+        key: sum(record[key] for record in records) / len(records)
+        for key in records[0]
+    }
+    result = {
+        "checkpoint": str(checkpoint_path.resolve()),
+        "step": int(state["step"]),
+        "batches": batches,
+        "batch_size": loader.batch_size,
+        "means": means,
+        "records": records,
+    }
+    write_json(output / "reference_dependence_diagnostic.json", result)
+    return result
+
+
 def _save_training_state(
     path: Path,
     step: int,
