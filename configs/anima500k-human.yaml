@@ -272,9 +272,9 @@ style_transfer:
     text_cache: anima_text_cache_post_llm
     latent_cache: anima_latent_cache_qwen_2d
     split: train
-    # No-checkpoint batch 8 OOMs on an H100 80GB. Batch 5 leaves headroom while
-    # three microbatches reduce repeated frozen-Anima passes (effective batch 15).
-    batch_size: 5
+    # The 32x1024 jointly-trained path exceeds 80GB on large buckets at batch 5.
+    # Four microbatches of 4 keep effective batch 16 with safe activation headroom.
+    batch_size: 4
     min_references: 1
     max_references: 8
     # Anima cross-attention was trained with 512 post-LLM tokens, including
@@ -319,8 +319,8 @@ style_transfer:
     maximum_artist_similarity: 0.95
   training:
     device: cuda
-    # 119,907 cached train images / effective batch 15 = 7,994 steps per epoch.
-    # The complete staged curriculum is about 4.00 epochs.
+    # 119,907 cached train images / effective batch 16 = 7,494 steps per epoch.
+    # The complete staged curriculum is about 4.27 epochs.
     steps: 32000
     # Trainable adapter weights and Adam moments stay FP32. Representation
     # modules need a higher LR than the stabilized zero-output path.
@@ -348,7 +348,7 @@ style_transfer:
     # H100 80GB has ample headroom for the frozen Anima activations. Keeping
     # them avoids recomputing all 28 blocks during backward.
     gradient_checkpointing: false
-    gradient_accumulation_steps: 3
+    gradient_accumulation_steps: 4
     low_precision_rmsnorm: true
     fuse_attention_projections: true
     allow_tf32: true
