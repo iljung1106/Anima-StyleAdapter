@@ -1303,6 +1303,8 @@ def _validate_style_adapter(
     *,
     batches: int,
     seed: int,
+    step: int = 0,
+    loss_config: dict[str, Any] | None = None,
 ) -> dict[str, float]:
     anima.eval()
     adapter.eval()
@@ -1318,9 +1320,13 @@ def _validate_style_adapter(
             generator = torch.Generator(device=device).manual_seed(seed + index)
             loss, details = _forward_flow_loss(
                 anima, adapter, resampler, batch, device, generator=generator,
-                loss_config={"measure_bypass": True},
+                loss_config={**(loss_config or {}), "measure_bypass": True},
+                step=step,
             )
-            losses.append(float(loss))
+            # Validation reports the actual flow objective. Auxiliary training
+            # penalties are logged independently and must not contaminate the
+            # comparison against frozen Anima.
+            losses.append(details["flow_loss"])
             references.append(details["references"])
             base_losses.append(details["base_flow_loss"])
             paired_improvements.append(details["paired_flow_improvement"])
@@ -1430,6 +1436,8 @@ def _sample_style_adapter(
     device: str,
     step: int,
     vae: nn.Module | None,
+    *,
+    reference_mode: str = "heldout",
 ) -> tuple[Path, nn.Module, float]:
     sample_cfg = config["style_transfer"]["sampling"]
     started = time.perf_counter()
@@ -1439,8 +1447,16 @@ def _sample_style_adapter(
     anima.eval()
     adapter.eval()
     batch = loader.load_step(int(sample_cfg.get("episode", 0)))
-    references = _encode_reference_tokens(resampler, batch, device)
-    reference_mask = batch["reference_mask"].to(device, non_blocking=True)
+    if reference_mode == "self":
+        references = _encode_target_tokens(resampler, batch, device)[:, None]
+        reference_mask = torch.ones(
+            references.shape[:2], dtype=torch.bool, device=device
+        )
+    elif reference_mode == "heldout":
+        references = _encode_reference_tokens(resampler, batch, device)
+        reference_mask = batch["reference_mask"].to(device, non_blocking=True)
+    else:
+        raise ValueError(f"Unknown sample reference mode: {reference_mode}")
     with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=device.startswith("cuda")):
         positive_style = adapter.aggregate(references, reference_mask)
     positive_text = batch["conditioning"][:1].to(device, dtype=torch.bfloat16)
@@ -1525,8 +1541,10 @@ def _sample_style_adapter(
     sample_dir = output / "samples"
     sample_dir.mkdir(parents=True, exist_ok=True)
     cfg_label = f"{style_scale:g}".replace(".", "p")
-    raw_path = sample_dir / f"step-{step:07d}-style-cfg-{cfg_label}.png"
-    sheet_path = sample_dir / f"step-{step:07d}-style-cfg-{cfg_label}-sheet.png"
+    raw_path = sample_dir / f"step-{step:07d}-{reference_mode}-style-cfg-{cfg_label}.png"
+    sheet_path = sample_dir / (
+        f"step-{step:07d}-{reference_mode}-style-cfg-{cfg_label}-sheet.png"
+    )
     generated.save(raw_path)
     base_generated.save(sample_dir / f"step-{step:07d}-base.png")
     to_image(target_decoded[0]).save(sample_dir / f"step-{step:07d}-cached-target.png")
@@ -1535,7 +1553,10 @@ def _sample_style_adapter(
         loader,
         batch,
         base_generated=base_generated,
-        generated_label=f"styled CFG {style_scale:g} — {batch['episodes'][0].style_id}",
+        generated_label=(
+            f"styled CFG {style_scale:g} ({reference_mode}) — "
+            f"{batch['episodes'][0].style_id}"
+        ),
     ).save(sheet_path)
     print(
         f"sample latent stats step={step} "
@@ -1811,13 +1832,56 @@ def train_style_adapter(config: dict[str, Any], destination: Path, *, steps_over
     print(f"frozen Anima optimizations: {optimization_counts}", flush=True)
     if bool(training.get("gradient_checkpointing", False)):
         anima.enable_gradient_checkpointing()
-    adapter = SharedLowRankStyleAdapter(**cfg["adapter"]).to(device, dtype=torch.bfloat16)
+    # Trainable parameters must remain FP32. Plain AdamW does not maintain FP32
+    # master weights for BF16 parameters; at the production LR, updates to the
+    # nonzero K/V and Aggregator weights otherwise round to exactly zero.
+    # Autocast still executes the expensive attention/linear kernels in BF16.
+    adapter = SharedLowRankStyleAdapter(**cfg["adapter"]).to(device)
     attach_style_adapter(anima, adapter)
-    parameters = [value for value in adapter.parameters() if value.requires_grad]
+    output_parameters = list(adapter.shared_o.parameters())
+    output_parameters += list(adapter.o_down.parameters()) + list(adapter.o_up.parameters())
+    gate_parameters = list(adapter.gate.parameters())
+    special_ids = {id(value) for value in output_parameters + gate_parameters}
+    representation_parameters = [
+        value for value in adapter.parameters() if id(value) not in special_ids
+    ]
+    parameters = representation_parameters + output_parameters + gate_parameters
+    if len({id(value) for value in parameters}) != len(list(adapter.parameters())):
+        raise RuntimeError("Style optimizer parameter groups do not cover the adapter exactly once")
+    representation_lr = float(
+        training.get("representation_learning_rate", training.get("learning_rate", 1e-4))
+    )
+    output_lr = float(training.get("output_learning_rate", representation_lr))
+    gate_lr = float(training.get("gate_learning_rate", output_lr))
+    weight_decay = float(training.get("weight_decay", 0.01))
     optimizer = torch.optim.AdamW(
-        parameters, lr=float(training.get("learning_rate", 1e-4)),
-        weight_decay=float(training.get("weight_decay", 0.01)),
+        [
+            {
+                "params": representation_parameters,
+                "lr": representation_lr,
+                "weight_decay": weight_decay,
+                "name": "representation",
+            },
+            {
+                "params": output_parameters,
+                "lr": output_lr,
+                "weight_decay": weight_decay,
+                "name": "output",
+            },
+            {
+                "params": gate_parameters,
+                "lr": gate_lr,
+                "weight_decay": 0.0,
+                "name": "gate",
+            },
+        ],
         fused=device.startswith("cuda"),
+    )
+    print(
+        "style optimizer: FP32 trainable weights, BF16 autocast; "
+        f"representation_lr={representation_lr:g} output_lr={output_lr:g} "
+        f"gate_lr={gate_lr:g}",
+        flush=True,
     )
     steps = int(steps_override if steps_override is not None else training["steps"])
     output = destination / str(cfg.get("output_directory", "style_transfer_training"))
@@ -1929,6 +1993,7 @@ def train_style_adapter(config: dict[str, Any], destination: Path, *, steps_over
             device,
             0,
             vae,
+            reference_mode="heldout",
         )
         print(f"sample step=0 path={sheet_path} elapsed_s={sample_s:.2f}", flush=True)
         if wandb_run is not None:
@@ -2025,33 +2090,80 @@ def train_style_adapter(config: dict[str, Any], destination: Path, *, steps_over
                 if full_validation_every and step % full_validation_every == 0
                 else validation_batches
             )
-            validation = _validate_style_adapter(
+            heldout_validation = _validate_style_adapter(
                 anima, adapter, resampler, validation_loader, device,
                 batches=current_validation_batches, seed=seed ^ 0xA11CE,
             )
+            self_validation = _validate_style_adapter(
+                anima,
+                adapter,
+                resampler,
+                validation_loader,
+                device,
+                batches=current_validation_batches,
+                seed=seed ^ 0xA11CE,
+                step=step,
+                loss_config=training,
+            )
             print(
-                f"validation step={step} loss={validation['loss']:.6f} "
-                f"base={validation['base_loss']:.6f} "
-                f"paired={validation['paired_improvement']:.6f} "
-                f"ci95=±{validation['paired_improvement_ci95']:.6f} "
-                f"positive={validation['paired_positive_fraction']:.3f} "
-                f"output_ratio={validation['style_output_ratio']:.6f} "
-                f"batches={current_validation_batches} elapsed_s={validation['elapsed_s']:.2f}",
+                f"validation[heldout] step={step} loss={heldout_validation['loss']:.6f} "
+                f"base={heldout_validation['base_loss']:.6f} "
+                f"paired={heldout_validation['paired_improvement']:.6f} "
+                f"ci95=±{heldout_validation['paired_improvement_ci95']:.6f} "
+                f"positive={heldout_validation['paired_positive_fraction']:.3f} "
+                f"output_ratio={heldout_validation['style_output_ratio']:.6f} "
+                f"batches={current_validation_batches} "
+                f"elapsed_s={heldout_validation['elapsed_s']:.2f}",
+                flush=True,
+            )
+            print(
+                f"validation[self] step={step} loss={self_validation['loss']:.6f} "
+                f"base={self_validation['base_loss']:.6f} "
+                f"paired={self_validation['paired_improvement']:.6f} "
+                f"ci95=±{self_validation['paired_improvement_ci95']:.6f} "
+                f"positive={self_validation['paired_positive_fraction']:.3f} "
+                f"output_ratio={self_validation['style_output_ratio']:.6f} "
+                f"batches={current_validation_batches} "
+                f"elapsed_s={self_validation['elapsed_s']:.2f}",
                 flush=True,
             )
             if wandb_run is not None:
-                wandb_run.log({f"validation/{key}": value for key, value in validation.items()}, step=step)
+                wandb_run.log(
+                    {
+                        **{
+                            f"validation_heldout/{key}": value
+                            for key, value in heldout_validation.items()
+                        },
+                        **{
+                            f"validation_self/{key}": value
+                            for key, value in self_validation.items()
+                        },
+                    },
+                    step=step,
+                )
         if sample_every and step % sample_every == 0:
-            sheet_path, vae, sample_s = _sample_style_adapter(
+            heldout_sheet, vae, heldout_sample_s = _sample_style_adapter(
                 anima, adapter, resampler, validation_loader, config, destination,
-                output, device, step, vae,
+                output, device, step, vae, reference_mode="heldout",
             )
-            print(f"sample step={step} path={sheet_path} elapsed_s={sample_s:.2f}", flush=True)
+            self_sheet, vae, self_sample_s = _sample_style_adapter(
+                anima, adapter, resampler, validation_loader, config, destination,
+                output, device, step, vae, reference_mode="self",
+            )
+            print(
+                f"sample step={step} heldout={heldout_sheet} self={self_sheet} "
+                f"elapsed_s={heldout_sample_s + self_sample_s:.2f}",
+                flush=True,
+            )
             if wandb_run is not None:
                 import wandb
 
                 wandb_run.log(
-                    {"sample/image": wandb.Image(str(sheet_path)), "sample/elapsed_s": sample_s},
+                    {
+                        "sample/heldout": wandb.Image(str(heldout_sheet)),
+                        "sample/self": wandb.Image(str(self_sheet)),
+                        "sample/elapsed_s": heldout_sample_s + self_sample_s,
+                    },
                     step=step,
                 )
         if checkpoint_every and step % checkpoint_every == 0:

@@ -259,7 +259,7 @@ tap_resampler_experiment:
 # and batches targets by exact latent shape. `style-smoke` forces two steps and
 # writes to a separate smoke directory; `style-train` uses `training.steps`.
 style_transfer:
-  output_directory: style_transfer_l18_l24_siglip_l24_selfref_oracle_v12_early_open
+  output_directory: style_transfer_l18_l24_siglip_l24_selfref_oracle_v13_fp32
   seed: 20260811
   loader:
     style_cache: style_features_l18_l24_siglip_l24
@@ -316,7 +316,12 @@ style_transfer:
     # 119,907 cached train images / effective batch 15 = 7,994 steps per epoch.
     # The complete staged curriculum is about 4.00 epochs.
     steps: 32000
-    learning_rate: 0.00005
+    # Trainable adapter weights and Adam moments stay FP32. Representation
+    # modules need a higher LR than the stabilized zero-output path.
+    learning_rate: 0.0001
+    representation_learning_rate: 0.0001
+    output_learning_rate: 0.00005
+    gate_learning_rate: 0.00002
     weight_decay: 0.01
     max_grad_norm: 1.0
     # H100 80GB has ample headroom for the frozen Anima activations. Keeping
@@ -366,8 +371,8 @@ style_transfer:
     wandb:
       enabled: true
       project: anima-style-adapter
-      name: anima-style-transfer-l18-l24-selfref-oracle-v12-early-open
-      id: anima-style-transfer-l18-l24-selfref-oracle-v12-early-open
+      name: anima-style-transfer-l18-l24-selfref-oracle-v13-fp32
+      id: anima-style-transfer-l18-l24-selfref-oracle-v13-fp32
   diagnostics:
     checkpoint: training_state.pt
     batch_size: 8
