@@ -1590,7 +1590,7 @@ def train_style_adapter(config: dict[str, Any], destination: Path, *, steps_over
     resampler = load_per_reference_resampler(destination, cfg["resampler"], device)
     anima = _resolve_anima_model(config, destination, device)
     anima.requires_grad_(False).train()
-    if bool(training.get("gradient_checkpointing", True)):
+    if bool(training.get("gradient_checkpointing", False)):
         anima.enable_gradient_checkpointing()
     adapter = SharedLowRankStyleAdapter(**cfg["adapter"]).to(device, dtype=torch.bfloat16)
     attach_style_adapter(anima, adapter)
@@ -1738,8 +1738,8 @@ def train_style_adapter(config: dict[str, Any], destination: Path, *, steps_over
             oracle_adapter=oracle_adapter,
         )
         loss.backward()
-        # Non-reentrant block checkpointing replays style attention during
-        # backward, so the active tokens must remain attached until this point.
+        # Style tokens are part of the adapter's live autograd graph, so keep
+        # them attached until backward completes.
         adapter.clear_style_tokens()
         grad_norm = torch.nn.utils.clip_grad_norm_(parameters, float(training.get("max_grad_norm", 1.0)))
         group_grads = {
