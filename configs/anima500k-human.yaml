@@ -266,9 +266,9 @@ style_transfer:
     text_cache: anima_text_cache_post_llm
     latent_cache: anima_latent_cache_qwen_2d
     split: train
-    # No-checkpoint activation memory does not fit batch 16 on an H100 80GB.
-    # Two batch-8 microbatches retain the planned effective batch of 16.
-    batch_size: 8
+    # No-checkpoint activation memory does not fit batch 8 on an H100 80GB.
+    # Four batch-4 microbatches retain the planned effective batch of 16.
+    batch_size: 4
     min_references: 1
     max_references: 8
     # Anima cross-attention was trained with 512 post-LLM tokens, including
@@ -317,7 +317,7 @@ style_transfer:
     # H100 80GB has ample headroom for the frozen Anima activations. Keeping
     # them avoids recomputing all 28 blocks during backward.
     gradient_checkpointing: false
-    gradient_accumulation_steps: 2
+    gradient_accumulation_steps: 4
     allow_tf32: true
     prefetch_workers: 2
     prefetch_batches: 4
