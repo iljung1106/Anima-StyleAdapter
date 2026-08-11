@@ -1058,6 +1058,19 @@ def _anneal_multiplier(step: int, start: int, end: int) -> float:
     return 1.0 - (step - start) / max(1, end - start)
 
 
+def _direction_anneal_multiplier(step: int, config: dict[str, Any]) -> float:
+    if (
+        "style_direction_anneal_start" not in config
+        and "style_direction_anneal_end" not in config
+    ):
+        return 1.0
+    return _anneal_multiplier(
+        step,
+        int(config.get("style_direction_anneal_start", 0)),
+        int(config.get("style_direction_anneal_end", 1)),
+    )
+
+
 def _self_reference_curriculum_state(step: int, config: dict[str, Any]) -> dict[str, Any]:
     """Resolve the staged self-reference curriculum for one optimizer step."""
     if not config:
@@ -1201,11 +1214,7 @@ def _forward_flow_loss(
         step, loss_config
     )
     target_probability = float(curriculum["target_probability"])
-    direction_multiplier = _anneal_multiplier(
-        step,
-        int(loss_config.get("style_direction_anneal_start", 0)),
-        int(loss_config.get("style_direction_anneal_end", 1)),
-    )
+    direction_multiplier = _direction_anneal_multiplier(step, loss_config)
     latents = batch["latents"].to(device, non_blocking=True, dtype=torch.bfloat16)
     conditioning = batch["conditioning"].to(device, non_blocking=True, dtype=torch.bfloat16)
     resampler_train_start = int(loss_config.get("resampler_train_start_step", -1))

@@ -13,6 +13,7 @@ from anima_style_data.style_transfer import (
     SlotSetAggregator,
     _archive_training_state,
     _episode_resampler_prototype_losses,
+    _direction_anneal_multiplier,
     _flow_direction_loss,
     _optimize_frozen_anima,
     _pad_text_conditions,
@@ -28,6 +29,18 @@ from anima_style_data.style_transfer import (
     _timestep_interval_bounds,
     attach_style_adapter,
 )
+
+
+def test_direction_loss_stays_enabled_without_an_explicit_anneal():
+    assert _direction_anneal_multiplier(1, {}) == 1.0
+    assert _direction_anneal_multiplier(10_000, {}) == 1.0
+    config = {
+        "style_direction_anneal_start": 10,
+        "style_direction_anneal_end": 20,
+    }
+    assert _direction_anneal_multiplier(10, config) == 1.0
+    assert _direction_anneal_multiplier(15, config) == pytest.approx(0.5)
+    assert _direction_anneal_multiplier(20, config) == 0.0
 
 
 def test_flow_residual_diagnostics_separate_magnitude_direction_and_improvement():
