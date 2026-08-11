@@ -214,6 +214,7 @@ class ProductionStyleLoader:
         condition_batch = _pad_text_conditions(conditions, self.text_conditioning_length)
 
         flat_references = [image_id for item in episodes for image_id in item.reference_ids]
+        target_ids = [item.target_id for item in episodes]
         max_refs = max(len(item.reference_ids) for item in episodes)
         reference_mask = torch.zeros(len(episodes), max_refs, dtype=torch.bool)
         cursor = 0
@@ -227,7 +228,7 @@ class ProductionStyleLoader:
         feature_values: dict[int, dict[int, torch.Tensor]] = {}
         global_values: dict[int, torch.Tensor] = {}
         grouped: dict[str, list[int]] = defaultdict(list)
-        for image_id in flat_references:
+        for image_id in dict.fromkeys(flat_references + target_ids):
             grouped[str(self.style_by_id[image_id]["feature_shard"])].append(image_id)
         for shard_name, image_ids in grouped.items():
             with safe_open(self.style_root / shard_name, framework="pt", device="cpu") as handle:
@@ -255,6 +256,18 @@ class ProductionStyleLoader:
             row = self.style_by_id[image_id]
             shapes.append((int(row["target_height"]), int(row["target_width"])))
         global_features = torch.stack([global_values[item] for item in flat_references])
+        max_target_tokens = max(feature_values[item][18].shape[0] for item in target_ids)
+        target_features = {
+            layer: torch.zeros(len(target_ids), max_target_tokens, spatial_dim, dtype=torch.float16)
+            for layer in (18, 24)
+        }
+        target_feature_mask = torch.zeros(len(target_ids), max_target_tokens, dtype=torch.bool)
+        for index, image_id in enumerate(target_ids):
+            count = feature_values[image_id][18].shape[0]
+            target_feature_mask[index, :count] = True
+            for layer in (18, 24):
+                target_features[layer][index, :count] = feature_values[image_id][layer]
+        target_global_features = torch.stack([global_values[item] for item in target_ids])
         return {
             "episodes": episodes,
             "latents": latent_batch.pin_memory(),
@@ -263,6 +276,11 @@ class ProductionStyleLoader:
             "feature_mask": feature_mask.pin_memory(),
             "feature_shapes": shapes,
             "global_features": global_features.pin_memory(),
+            "target_features": {
+                key: value.pin_memory() for key, value in target_features.items()
+            },
+            "target_feature_mask": target_feature_mask.pin_memory(),
+            "target_global_features": target_global_features.pin_memory(),
             "reference_positions": reference_positions,
             "reference_mask": reference_mask.pin_memory(),
         }
@@ -397,12 +415,29 @@ class SharedLowRankStyleAdapter(nn.Module):
         nn.init.zeros_(self.gate[-1].bias)
         self._style_tokens: torch.Tensor | None = None
 
-    def aggregate(self, references: torch.Tensor, reference_mask: torch.Tensor) -> torch.Tensor:
+    def aggregate(
+        self,
+        references: torch.Tensor,
+        reference_mask: torch.Tensor,
+        *,
+        apply_dropout: bool = True,
+    ) -> torch.Tensor:
         tokens = self.aggregator(references, reference_mask)
-        if self.training and self.style_dropout > 0:
+        if apply_dropout and self.training and self.style_dropout > 0:
             dropped = torch.rand(tokens.shape[0], device=tokens.device) < self.style_dropout
             tokens = torch.where(dropped[:, None, None], self.null_tokens.expand_as(tokens), tokens)
         return tokens
+
+    def projected_signature(self, tokens: torch.Tensor) -> torch.Tensor:
+        """Compact signature of the actual K/V tensors injected into all blocks."""
+        shared_k = self.shared_k(tokens)
+        shared_v = self.shared_v(tokens)
+        values = []
+        for index in range(self.blocks):
+            key = shared_k + self.k_up[index](self.k_down[index](tokens))
+            value = shared_v + self.v_up[index](self.v_down[index](tokens))
+            values.extend((key.mean(1), value.mean(1)))
+        return torch.cat(values, dim=-1)
 
     def unconditional(self, batch: int) -> torch.Tensor:
         return self.null_tokens.expand(batch, -1, -1)
@@ -567,6 +602,41 @@ def _encode_reference_tokens(model, batch: dict[str, Any], device: str) -> torch
     return packed
 
 
+def _encode_target_tokens(model, batch: dict[str, Any], device: str) -> torch.Tensor:
+    non_blocking = device.startswith("cuda")
+    features = {
+        key: value.to(device, non_blocking=non_blocking)
+        for key, value in batch["target_features"].items()
+    }
+    mask = batch["target_feature_mask"].to(device, non_blocking=non_blocking)
+    global_features = batch["target_global_features"].to(
+        device, non_blocking=non_blocking
+    )
+    with torch.no_grad(), torch.autocast(
+        device_type="cuda", dtype=torch.bfloat16, enabled=non_blocking
+    ):
+        _, tokens = model.encode(features, mask, global_features)
+    return tokens
+
+
+def _symmetric_style_contrastive_loss(
+    references: torch.Tensor,
+    targets: torch.Tensor,
+    temperature: float,
+) -> torch.Tensor:
+    # Slots are aligned by the frozen per-reference Resampler. Averaging their
+    # cosine scores retains that alignment without letting tensor magnitude
+    # solve the artist-matching task.
+    references = F.normalize(references.float(), dim=-1)
+    targets = F.normalize(targets.float(), dim=-1)
+    logits = torch.einsum("bsd,csd->bc", references, targets)
+    logits = logits / (references.shape[1] * temperature)
+    labels = torch.arange(logits.shape[0], device=logits.device)
+    return 0.5 * (
+        F.cross_entropy(logits, labels) + F.cross_entropy(logits.T, labels)
+    )
+
+
 def _resolve_anima_model(config: dict[str, Any], destination: Path, device: str):
     cache_cfg = config["anima_cache"]
     model_cfg = cache_cfg["models"]
@@ -604,13 +674,26 @@ def _forward_flow_loss(
     device: str,
     *,
     generator: torch.Generator | None = None,
+    loss_config: dict[str, Any] | None = None,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
     references = _encode_reference_tokens(resampler, batch, device)
     reference_mask = batch["reference_mask"].to(device, non_blocking=True)
     latents = batch["latents"].to(device, non_blocking=True, dtype=torch.bfloat16)
     conditioning = batch["conditioning"].to(device, non_blocking=True, dtype=torch.bfloat16)
     with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=device.startswith("cuda")):
-        style_tokens = adapter.aggregate(references, reference_mask)
+        raw_style_tokens = adapter.aggregate(
+            references, reference_mask, apply_dropout=False
+        )
+        style_tokens = raw_style_tokens
+        if adapter.training and adapter.style_dropout > 0:
+            dropped = torch.rand(
+                style_tokens.shape[0], device=style_tokens.device
+            ) < adapter.style_dropout
+            style_tokens = torch.where(
+                dropped[:, None, None],
+                adapter.null_tokens.expand_as(style_tokens),
+                style_tokens,
+            )
         adapter.set_style_tokens(style_tokens)
         noise = torch.randn(latents.shape, device=device, dtype=latents.dtype, generator=generator)
         timesteps = torch.rand(latents.shape[0], device=device, dtype=torch.float32, generator=generator)
@@ -624,10 +707,33 @@ def _forward_flow_loss(
             noisy.unsqueeze(2), timesteps.to(latents.dtype), context=conditioning,
             padding_mask=padding_mask, target_input_ids=None,
         ).squeeze(2)
-        loss = F.mse_loss(prediction.float(), (noise - latents).float())
+        flow_loss = F.mse_loss(prediction.float(), (noise - latents).float())
+
+        loss_config = loss_config or {}
+        token_weight = float(loss_config.get("style_token_contrastive_weight", 0.0))
+        kv_weight = float(loss_config.get("style_kv_contrastive_weight", 0.0))
+        token_contrastive = flow_loss.new_zeros(())
+        kv_contrastive = flow_loss.new_zeros(())
+        if token_weight > 0 or kv_weight > 0:
+            target_style_tokens = _encode_target_tokens(resampler, batch, device)
+            temperature = float(loss_config.get("style_contrastive_temperature", 0.07))
+            if token_weight > 0:
+                token_contrastive = _symmetric_style_contrastive_loss(
+                    raw_style_tokens, target_style_tokens, temperature
+                )
+            if kv_weight > 0:
+                reference_signature = adapter.projected_signature(raw_style_tokens)
+                target_signature = adapter.projected_signature(target_style_tokens)
+                kv_contrastive = _symmetric_style_contrastive_loss(
+                    reference_signature[:, None], target_signature[:, None], temperature
+                )
+        loss = flow_loss + token_weight * token_contrastive + kv_weight * kv_contrastive
     return loss, {
         "references": int(reference_mask.sum()),
         "latent_shape": list(latents.shape),
+        "flow_loss": float(flow_loss.detach()),
+        "style_token_contrastive": float(token_contrastive.detach()),
+        "style_kv_contrastive": float(kv_contrastive.detach()),
     }
 
 
@@ -1103,6 +1209,17 @@ def train_style_adapter(config: dict[str, Any], destination: Path, *, steps_over
         if state.get("cuda_rng") is not None:
             torch.cuda.set_rng_state_all(state["cuda_rng"])
         print(f"resuming style training from step {start_step}", flush=True)
+    elif steps_override is None and training.get("initial_checkpoint"):
+        initial_path = Path(str(training["initial_checkpoint"]))
+        if not initial_path.is_absolute():
+            initial_path = destination / initial_path
+        initial_state = torch.load(initial_path, map_location="cpu", weights_only=False)
+        adapter.load_state_dict(initial_state["adapter"])
+        print(
+            f"initialized style adapter from {initial_path} at source step "
+            f"{int(initial_state.get('step', -1))}",
+            flush=True,
+        )
     if start_step >= steps:
         raise RuntimeError(f"Checkpoint is already at step {start_step}, requested steps={steps}")
 
@@ -1179,7 +1296,9 @@ def train_style_adapter(config: dict[str, Any], destination: Path, *, steps_over
         step = zero_based_step + 1
         data_ready = time.perf_counter()
         optimizer.zero_grad(set_to_none=True)
-        loss, details = _forward_flow_loss(anima, adapter, resampler, batch, device)
+        loss, details = _forward_flow_loss(
+            anima, adapter, resampler, batch, device, loss_config=training
+        )
         loss.backward()
         # Non-reentrant block checkpointing replays style attention during
         # backward, so the active tokens must remain attached until this point.

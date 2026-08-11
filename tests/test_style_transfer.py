@@ -14,8 +14,16 @@ from anima_style_data.style_transfer import (
     _archive_training_state,
     _pad_text_conditions,
     _save_training_state,
+    _symmetric_style_contrastive_loss,
     attach_style_adapter,
 )
+
+
+def test_style_contrastive_prefers_matching_artist_tokens():
+    targets = torch.eye(4).reshape(4, 1, 4)
+    matching = _symmetric_style_contrastive_loss(targets, targets, 0.1)
+    shuffled = _symmetric_style_contrastive_loss(targets.roll(1, 0), targets, 0.1)
+    assert matching < shuffled
 
 
 def test_text_conditions_restore_animas_fixed_zero_padding():
