@@ -15,9 +15,29 @@ from anima_style_data.style_transfer import (
     _pad_text_conditions,
     _save_training_state,
     _style_bootstrap_state,
+    _soft_interval_loss,
     _symmetric_style_contrastive_loss,
+    _timestep_interval_bounds,
     attach_style_adapter,
 )
+
+
+def test_empirical_timestep_interval_only_penalizes_outside_values():
+    calibration = {
+        "timestep_edges": [0.0, 0.5, 1.0],
+        "bins": [
+            {"p25": 0.02, "median": 0.03, "p75": 0.04},
+            {"p25": 0.05, "median": 0.06, "p75": 0.07},
+        ],
+    }
+    timesteps = torch.tensor([0.1, 0.8])
+    lower, upper = _timestep_interval_bounds(timesteps, calibration)
+    torch.testing.assert_close(lower, torch.tensor([0.02, 0.05]))
+    torch.testing.assert_close(upper, torch.tensor([0.04, 0.07]))
+    inside = _soft_interval_loss(torch.tensor([0.03, 0.06]), lower, upper, beta=0.01)
+    outside = _soft_interval_loss(torch.tensor([0.0, 0.10]), lower, upper, beta=0.01)
+    assert inside == 0
+    assert outside > 0
 
 
 def test_style_contrastive_prefers_matching_artist_tokens():

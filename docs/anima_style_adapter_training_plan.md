@@ -434,3 +434,27 @@ RunPod 산출물은 다음과 같다.
 이 결과는 구조와 학습 경로가 실제로 작동함을 확인한 1차 모델이다. 다음 단계에서는 더
 다양한 작가·prompt·reference 수에 대한 정량/블라인드 평가와 실제 inference integration을
 완료한 뒤, 필요하면 learning-rate decay와 validation artist 수 확대로 후속 epoch를 결정한다.
+
+## 17. Reference-dependent velocity 크기 교정
+
+후속 correct/shuffled/null/bypass 진단에서는 step 5,500 모델의 correct reference와 shuffled
+reference 예측 차이가 전체 velocity RMS의 약 1.5%에 불과했고, shuffled reference의 flow
+loss가 근소하게 더 낮았다. 따라서 16절의 생성 변화만으로 reference별 스타일 조건이 제대로
+학습됐다고 결론 내릴 수 없으며, 이는 작은 공통 보정에 가까운 실패 모드로 다시 분류한다.
+
+임의의 5% 하한을 적용한 pilot은 출력 차이는 키웠지만 validation loss를 악화시켰다. 앞으로는
+Anima가 공식적으로 지원하는 `@artist` 조건의 방향을 teacher로 사용하지 않고, 다음 절차로
+측정한 크기 분포만 사용한다.
+
+1. 동일 content prompt, latent, noise와 timestep에서 artist tag 유무만 바꿔 velocity RMS
+   차이를 base velocity RMS로 정규화한다.
+2. 공통 probe prompt와 timestep 구간을 모든 후보 작가에 재사용한다.
+3. 작가별 median effect가 절대 최소치와 후보 하위 분위보다 작은 작가는 제외한다.
+4. 각 residual을 공간적으로 pool한 signature에서 작가 전체의 공통 성분을 제거한다.
+5. centered signature cosine이 임계값 이상인 작가군은 effect가 가장 큰 대표만 남긴다.
+6. 남은 작가의 각 timestep 구간별 p25, median, p75를 저장한다.
+
+본학습에서는 correct-reference와 shuffled-reference velocity 차이 비율이 p25–p75 밖에 있을
+때만 Huber penalty를 적용한다. 구간 안에서는 loss가 정확히 0이며, 방향 일치 loss는 두지
+않는다. 하한은 초기 ramp 동안 점진적으로 높이고 상한은 처음부터 유지해 무근거한 과대
+출력도 막는다. shuffled flow-rank loss는 shortcut 위험 때문에 이 단계에서는 비활성화한다.

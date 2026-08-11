@@ -682,6 +682,47 @@ def _style_bootstrap_state(step: int, config: dict[str, Any]) -> tuple[float, fl
     return auxiliary, floor, target_probability
 
 
+def _timestep_interval_bounds(
+    timesteps: torch.Tensor,
+    calibration: dict[str, Any],
+    *,
+    lower_scale: float = 1.0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Look up the empirical artist-tag effect interval for each timestep."""
+    edges = torch.as_tensor(
+        calibration["timestep_edges"], device=timesteps.device, dtype=timesteps.dtype
+    )
+    bins = calibration["bins"]
+    if edges.numel() != len(bins) + 1:
+        raise ValueError("Style calibration must have one more edge than bins")
+    indices = torch.bucketize(timesteps, edges[1:-1], right=False)
+    lower_values = torch.as_tensor(
+        [float(item["p25"]) for item in bins],
+        device=timesteps.device,
+        dtype=timesteps.dtype,
+    )
+    upper_values = torch.as_tensor(
+        [float(item["p75"]) for item in bins],
+        device=timesteps.device,
+        dtype=timesteps.dtype,
+    )
+    return lower_values[indices] * lower_scale, upper_values[indices]
+
+
+def _soft_interval_loss(
+    values: torch.Tensor,
+    lower: torch.Tensor,
+    upper: torch.Tensor,
+    *,
+    beta: float,
+) -> torch.Tensor:
+    """Huber penalty outside an interval, with exactly zero cost inside it."""
+    violations = F.relu(lower - values) + F.relu(values - upper)
+    return F.smooth_l1_loss(
+        violations, torch.zeros_like(violations), beta=max(float(beta), 1e-8)
+    )
+
+
 def _forward_flow_loss(
     anima: nn.Module,
     adapter: SharedLowRankStyleAdapter,
@@ -779,7 +820,26 @@ def _forward_flow_loss(
             )
             if valid.any():
                 output_ratio = ratios[valid].mean()
-                magnitude_loss = F.relu(magnitude_floor - ratios[valid]).square().mean()
+                calibration = loss_config.get("_style_effect_calibration")
+                if calibration is None:
+                    magnitude_loss = F.relu(magnitude_floor - ratios[valid]).square().mean()
+                else:
+                    lower, upper = _timestep_interval_bounds(
+                        timesteps[valid], calibration, lower_scale=min(
+                            1.0,
+                            max(
+                                0.0,
+                                step / max(
+                                    1,
+                                    int(loss_config.get("style_magnitude_ramp_steps", 250)),
+                                ),
+                            ),
+                        )
+                    )
+                    magnitude_loss = _soft_interval_loss(
+                        ratios[valid], lower, upper,
+                        beta=float(loss_config.get("style_interval_huber_beta", 0.01)),
+                    )
                 correct_mse = (prediction - target_velocity).square().mean(dim=dimensions)
                 shuffled_mse = (
                     (shuffled_prediction - target_velocity).square().mean(dim=dimensions).detach()
@@ -1268,6 +1328,21 @@ def _archive_training_state(source: Path, destination: Path) -> None:
 def train_style_adapter(config: dict[str, Any], destination: Path, *, steps_override: int | None = None) -> dict[str, Any]:
     cfg = config["style_transfer"]
     training = cfg["training"]
+    calibration_path = training.get("style_effect_calibration")
+    if calibration_path:
+        resolved_calibration = Path(str(calibration_path))
+        if not resolved_calibration.is_absolute():
+            resolved_calibration = destination / resolved_calibration
+        with resolved_calibration.open("r", encoding="utf-8") as handle:
+            calibration = json.load(handle)
+        if not calibration.get("bins"):
+            raise ValueError(f"No timestep bins in style calibration: {resolved_calibration}")
+        training["_style_effect_calibration"] = calibration
+        print(
+            f"loaded empirical style-effect calibration from {resolved_calibration} "
+            f"with {len(calibration['bins'])} timestep bins",
+            flush=True,
+        )
     device = str(training.get("device", "cuda"))
     if device.startswith("cuda") and not torch.cuda.is_available():
         raise RuntimeError("CUDA is required for Anima style training")
