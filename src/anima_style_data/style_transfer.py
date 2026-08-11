@@ -1565,12 +1565,14 @@ def _make_sample_sheet(
     *,
     base_generated: Image.Image | None = None,
     generated_label: str | None = None,
+    sources: list[tuple[str, int]] | None = None,
 ) -> Image.Image:
     episode = batch["episodes"][0]
-    sources = [("target", episode.target_id)] + [
-        (f"ref {index + 1}", image_id)
-        for index, image_id in enumerate(episode.reference_ids[:4])
-    ]
+    if sources is None:
+        sources = [("target", episode.target_id)] + [
+            (f"ref {index + 1}", image_id)
+            for index, image_id in enumerate(episode.reference_ids[:4])
+        ]
     thumb = 160
     generated_width = generated.width + (base_generated.width if base_generated is not None else 0)
     sheet = Image.new(
@@ -1628,18 +1630,56 @@ def _sample_style_adapter(
     anima.eval()
     adapter.eval()
     batch = loader.load_step(int(sample_cfg.get("episode", 0)))
+    episode = batch["episodes"][0]
+    sheet_sources: list[tuple[str, int]] = [("target", episode.target_id)]
     if reference_mode == "self":
         references = _encode_target_tokens(resampler, batch, device)[:, None]
         reference_mask = torch.ones(
             references.shape[:2], dtype=torch.bool, device=device
         )
+        sheet_sources.append(("exact target", episode.target_id))
     elif reference_mode == "heldout":
         references = _encode_reference_tokens(resampler, batch, device)
         reference_mask = batch["reference_mask"].to(device, non_blocking=True)
+        sheet_sources.extend(
+            (f"ref {index + 1}", image_id)
+            for index, image_id in enumerate(episode.reference_ids[:4])
+        )
+    elif reference_mode in {"wrong_artist", "mixed"}:
+        if len(batch["episodes"]) < 2:
+            raise ValueError(f"{reference_mode} sampling requires a loader batch size of at least 2")
+        heldout_references = _encode_reference_tokens(resampler, batch, device)
+        heldout_mask = batch["reference_mask"].to(device, non_blocking=True)
+        wrong_references = heldout_references.roll(1, dims=0)
+        wrong_mask = heldout_mask.roll(1, dims=0)
+        donor = batch["episodes"][-1]
+        if reference_mode == "wrong_artist":
+            references, reference_mask = wrong_references, wrong_mask
+            sheet_sources.extend(
+                (f"wrong {index + 1}", image_id)
+                for index, image_id in enumerate(donor.reference_ids[:4])
+            )
+        else:
+            references = torch.cat((heldout_references, wrong_references), dim=1)
+            reference_mask = torch.cat((heldout_mask, wrong_mask), dim=1)
+            sheet_sources.extend(
+                (f"right {index + 1}", image_id)
+                for index, image_id in enumerate(episode.reference_ids[:2])
+            )
+            sheet_sources.extend(
+                (f"wrong {index + 1}", image_id)
+                for index, image_id in enumerate(donor.reference_ids[:2])
+            )
+    elif reference_mode in {"null", "bypass"}:
+        references = None
+        reference_mask = None
     else:
         raise ValueError(f"Unknown sample reference mode: {reference_mode}")
-    with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=device.startswith("cuda")):
-        positive_style = adapter.aggregate(references, reference_mask)
+    if references is None:
+        positive_style = adapter.unconditional(1)
+    else:
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=device.startswith("cuda")):
+            positive_style = adapter.aggregate(references, reference_mask)[:1]
     positive_text = batch["conditioning"][:1].to(device, dtype=torch.bfloat16)
     null_file = loader.text_root / "null_conditioning.safetensors"
     null_text = load_file(null_file, device="cpu")["empty_prompt"]
@@ -1699,7 +1739,7 @@ def _sample_style_adapter(
     try:
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=device.startswith("cuda")):
             base_x = denoise(with_style=False)
-            styled_x = denoise(with_style=True)
+            styled_x = denoise(with_style=reference_mode != "bypass")
     finally:
         adapter.clear_style_tokens()
 
@@ -1738,6 +1778,7 @@ def _sample_style_adapter(
             f"styled CFG {style_scale:g} ({reference_mode}) — "
             f"{batch['episodes'][0].style_id}"
         ),
+        sources=sheet_sources,
     ).save(sheet_path)
     print(
         f"sample latent stats step={step} "
@@ -1785,6 +1826,60 @@ def sample_style_checkpoint(config: dict[str, Any], destination: Path) -> dict[s
     return {"step": step, "sheet": str(sheet), "elapsed_s": elapsed}
 
 
+def _per_sample_flow_residual_metrics(
+    prediction: torch.Tensor,
+    bypass: torch.Tensor,
+    target: torch.Tensor,
+) -> dict[str, torch.Tensor]:
+    """Resolve magnitude and direction of one condition relative to frozen Anima."""
+    dimensions = tuple(range(1, prediction.ndim))
+    delta = prediction.float() - bypass.float()
+    desired = target.float() - bypass.float()
+    base_mse = desired.square().mean(dim=dimensions).clamp_min(1e-12)
+    condition_mse = (prediction.float() - target.float()).square().mean(dim=dimensions)
+    delta_rms = delta.square().mean(dim=dimensions).sqrt()
+    bypass_rms = bypass.float().square().mean(dim=dimensions).sqrt().clamp_min(1e-8)
+    desired_rms = base_mse.sqrt()
+    dot = (delta * desired).mean(dim=dimensions)
+    cosine = dot / (delta_rms * desired_rms).clamp_min(1e-12)
+    return {
+        "loss": condition_mse,
+        "paired_improvement": (base_mse - condition_mse) / base_mse,
+        "delta_to_base_ratio": delta_rms / bypass_rms,
+        "direction_cosine": cosine,
+        "desired_projection": dot / base_mse,
+        "delta_rms": delta_rms,
+        "desired_rms": desired_rms,
+    }
+
+
+def _per_sample_cosine(first: torch.Tensor, second: torch.Tensor) -> torch.Tensor:
+    dimensions = tuple(range(1, first.ndim))
+    first = first.float()
+    second = second.float()
+    numerator = (first * second).mean(dim=dimensions)
+    denominator = (
+        first.square().mean(dim=dimensions).sqrt()
+        * second.square().mean(dim=dimensions).sqrt()
+    ).clamp_min(1e-12)
+    return numerator / denominator
+
+
+def _summarize_scalar_samples(values: list[float]) -> dict[str, float]:
+    tensor = torch.tensor(values, dtype=torch.float64)
+    mean = float(tensor.mean())
+    if tensor.numel() <= 1:
+        ci95 = 0.0
+    else:
+        ci95 = float(1.96 * tensor.std(unbiased=True) / math.sqrt(tensor.numel()))
+    return {
+        "mean": mean,
+        "ci95": ci95,
+        "positive_fraction": float((tensor > 0).double().mean()),
+        "samples": int(tensor.numel()),
+    }
+
+
 @torch.no_grad()
 def diagnose_style_reference_dependence(
     config: dict[str, Any], destination: Path
@@ -1827,6 +1922,18 @@ def diagnose_style_reference_dependence(
     records: list[dict[str, float]] = []
     batches = int(diagnostic_cfg.get("batches", 4))
     seed = int(diagnostic_cfg.get("seed", 20260811 ^ 0xD1A6))
+    timestep_values = [
+        float(value)
+        for value in diagnostic_cfg.get(
+            "timesteps", [0.05, 0.15, 0.25, 0.35, 0.45, 0.55, 0.65, 0.75, 0.85, 0.95]
+        )
+    ]
+    timestep_samples: dict[str, dict[str, list[float]]] = defaultdict(
+        lambda: defaultdict(list)
+    )
+    comparison_samples: dict[str, dict[str, list[float]]] = defaultdict(
+        lambda: defaultdict(list)
+    )
     for index in range(batches):
         batch = loader.load_step(index)
         references = _encode_reference_tokens(resampler, batch, device)
@@ -1838,23 +1945,29 @@ def diagnose_style_reference_dependence(
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=device.startswith("cuda")):
             correct_style = adapter.aggregate(references, reference_mask)
             self_style = adapter.aggregate(target_tokens[:, None], target_mask)
-        shuffled_style = correct_style.roll(1, dims=0)
+            wrong_references = references.roll(1, dims=0)
+            wrong_mask = reference_mask.roll(1, dims=0)
+            wrong_style = adapter.aggregate(wrong_references, wrong_mask)
+            mixed_style = adapter.aggregate(
+                torch.cat((references, wrong_references), dim=1),
+                torch.cat((reference_mask, wrong_mask), dim=1),
+            )
         null_style = adapter.unconditional(correct_style.shape[0])
 
         latents = batch["latents"].to(device, non_blocking=True, dtype=torch.bfloat16)
         conditioning = batch["conditioning"].to(device, non_blocking=True, dtype=torch.bfloat16)
-        generator = torch.Generator(device=device).manual_seed(seed + index)
-        noise = torch.randn(latents.shape, device=device, dtype=latents.dtype, generator=generator)
-        timesteps = torch.rand(latents.shape[0], device=device, dtype=torch.float32, generator=generator)
-        sigma = timesteps[:, None, None, None].to(latents.dtype)
-        noisy = (1 - sigma) * latents + sigma * noise
-        target = (noise - latents).float()
         padding_mask = torch.zeros(
             latents.shape[0], 1, latents.shape[-2], latents.shape[-1],
             device=device, dtype=latents.dtype,
         )
 
-        def predict(style: torch.Tensor | None, *, bypass: bool = False) -> torch.Tensor:
+        def predict(
+            noisy: torch.Tensor,
+            timesteps: torch.Tensor,
+            style: torch.Tensor | None,
+            *,
+            bypass: bool = False,
+        ) -> torch.Tensor:
             patched_forwards = None
             if bypass:
                 adapter.clear_style_tokens()
@@ -1877,43 +1990,11 @@ def diagnose_style_reference_dependence(
                     for block, patched in zip(anima.blocks, patched_forwards, strict=True):
                         block._forward = patched
 
-        self_prediction = predict(self_style)
-        correct_prediction = predict(correct_style)
-        shuffled_prediction = predict(shuffled_style)
-        null_prediction = predict(null_style)
-        bypass_prediction = predict(None, bypass=True)
         flat = F.normalize(correct_style.float().flatten(1), dim=1)
         self_flat = F.normalize(self_style.float().flatten(1), dim=1)
         similarities = flat @ flat.T
         off_diagonal = ~torch.eye(flat.shape[0], device=device, dtype=torch.bool)
-        records.append({
-            "self_loss": float(F.mse_loss(self_prediction, target)),
-            "correct_loss": float(F.mse_loss(correct_prediction, target)),
-            "shuffled_loss": float(F.mse_loss(shuffled_prediction, target)),
-            "null_loss": float(F.mse_loss(null_prediction, target)),
-            "bypass_loss": float(F.mse_loss(bypass_prediction, target)),
-            "self_vs_correct_rms": float(
-                (self_prediction - correct_prediction).square().mean().sqrt()
-            ),
-            "self_vs_bypass_rms": float(
-                (self_prediction - bypass_prediction).square().mean().sqrt()
-            ),
-            "correct_vs_shuffled_rms": float(
-                (correct_prediction - shuffled_prediction).square().mean().sqrt()
-            ),
-            "correct_vs_null_rms": float(
-                (correct_prediction - null_prediction).square().mean().sqrt()
-            ),
-            "correct_vs_bypass_rms": float(
-                (correct_prediction - bypass_prediction).square().mean().sqrt()
-            ),
-            "shuffled_vs_bypass_rms": float(
-                (shuffled_prediction - bypass_prediction).square().mean().sqrt()
-            ),
-            "null_vs_bypass_rms": float(
-                (null_prediction - bypass_prediction).square().mean().sqrt()
-            ),
-            "prediction_rms": float(correct_prediction.square().mean().sqrt()),
+        record = {
             "style_pairwise_cosine": float(similarities[off_diagonal].mean()),
             "self_correct_style_cosine": float((self_flat * flat).sum(dim=1).mean()),
             "self_correct_style_rms": float(
@@ -1924,11 +2005,66 @@ def diagnose_style_reference_dependence(
                 .square().mean().sqrt()
             ),
             "style_rms": float(correct_style.float().square().mean().sqrt()),
-        })
+        }
+        records.append(record)
 
-    means = {
-        key: sum(record[key] for record in records) / len(records)
-        for key in records[0]
+        for timestep in timestep_values:
+            generator = torch.Generator(device=device).manual_seed(
+                seed + index * 10_007 + round(timestep * 10_000)
+            )
+            noise = torch.randn(
+                latents.shape, device=device, dtype=latents.dtype, generator=generator
+            )
+            timesteps = torch.full(
+                (latents.shape[0],), timestep, device=device, dtype=torch.float32
+            )
+            sigma = timesteps[:, None, None, None].to(latents.dtype)
+            noisy = (1 - sigma) * latents + sigma * noise
+            target = (noise - latents).float()
+            predictions = {
+                "self": predict(noisy, timesteps, self_style),
+                "heldout": predict(noisy, timesteps, correct_style),
+                "wrong_artist": predict(noisy, timesteps, wrong_style),
+                "mixed": predict(noisy, timesteps, mixed_style),
+                "null": predict(noisy, timesteps, null_style),
+            }
+            bypass_prediction = predict(noisy, timesteps, None, bypass=True)
+            timestep_key = f"{timestep:.2f}"
+            deltas = {}
+            for condition, prediction in predictions.items():
+                metrics = _per_sample_flow_residual_metrics(
+                    prediction, bypass_prediction, target
+                )
+                deltas[condition] = prediction - bypass_prediction
+                for metric, values in metrics.items():
+                    timestep_samples[f"{timestep_key}/{condition}"][metric].extend(
+                        float(value) for value in values.cpu()
+                    )
+            for comparison, other in (
+                ("heldout_vs_self", "self"),
+                ("heldout_vs_wrong", "wrong_artist"),
+                ("heldout_vs_mixed", "mixed"),
+                ("heldout_vs_null", "null"),
+            ):
+                values = _per_sample_cosine(deltas["heldout"], deltas[other])
+                comparison_samples[timestep_key][comparison].extend(
+                    float(value) for value in values.cpu()
+                )
+
+    means = {key: sum(record[key] for record in records) / len(records) for key in records[0]}
+    timestep_metrics = {
+        key: {
+            metric: _summarize_scalar_samples(values)
+            for metric, values in metrics.items()
+        }
+        for key, metrics in timestep_samples.items()
+    }
+    delta_cosines = {
+        timestep: {
+            name: _summarize_scalar_samples(values)
+            for name, values in comparisons.items()
+        }
+        for timestep, comparisons in comparison_samples.items()
     }
     result = {
         "checkpoint": str(checkpoint_path.resolve()),
@@ -1937,8 +2073,29 @@ def diagnose_style_reference_dependence(
         "batch_size": loader.batch_size,
         "means": means,
         "records": records,
+        "timestep_metrics": timestep_metrics,
+        "condition_delta_cosines": delta_cosines,
     }
-    write_json(output / "reference_dependence_diagnostic.json", result)
+    diagnostic_output = output / "diagnostics" / f"step-{int(state['step']):07d}"
+    diagnostic_output.mkdir(parents=True, exist_ok=True)
+    result_path = diagnostic_output / "reference_dependence_diagnostic.json"
+    write_json(result_path, result)
+    if bool(diagnostic_cfg.get("generate", True)):
+        sampling_loader_cfg = {**loader_cfg, "batch_size": max(2, loader.batch_size)}
+        sampling_loader = ProductionStyleLoader(destination, sampling_loader_cfg)
+        vae = None
+        generated_sheets = {}
+        for reference_mode in (
+            "bypass", "null", "wrong_artist", "heldout", "mixed", "self"
+        ):
+            sheet, vae, _ = _sample_style_adapter(
+                anima, adapter, resampler, sampling_loader, config, destination,
+                diagnostic_output, device, int(state["step"]), vae,
+                reference_mode=reference_mode,
+            )
+            generated_sheets[reference_mode] = str(sheet)
+        result["generated_sheets"] = generated_sheets
+        write_json(result_path, result)
     return result
 
 

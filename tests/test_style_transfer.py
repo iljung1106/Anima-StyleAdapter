@@ -16,15 +16,42 @@ from anima_style_data.style_transfer import (
     _flow_direction_loss,
     _optimize_frozen_anima,
     _pad_text_conditions,
+    _per_sample_cosine,
+    _per_sample_flow_residual_metrics,
     _save_training_state,
     _self_reference_curriculum_state,
     _set_adapter_trainable_stage,
     _style_bootstrap_state,
     _soft_interval_loss,
+    _summarize_scalar_samples,
     _symmetric_style_contrastive_loss,
     _timestep_interval_bounds,
     attach_style_adapter,
 )
+
+
+def test_flow_residual_diagnostics_separate_magnitude_direction_and_improvement():
+    bypass = torch.zeros(2, 1, 1, 2)
+    desired = torch.tensor([[[[1.0, -1.0]]], [[[2.0, -2.0]]]])
+    target = bypass + desired
+    prediction = bypass + 0.5 * desired
+
+    metrics = _per_sample_flow_residual_metrics(prediction, bypass, target)
+
+    torch.testing.assert_close(metrics["direction_cosine"], torch.ones(2))
+    torch.testing.assert_close(metrics["desired_projection"], torch.full((2,), 0.5))
+    torch.testing.assert_close(metrics["paired_improvement"], torch.full((2,), 0.75))
+
+
+def test_condition_delta_cosine_and_summary_report_common_or_opposite_outputs():
+    first = torch.tensor([[[1.0, -1.0]], [[2.0, 0.0]]])
+    second = torch.tensor([[[1.0, -1.0]], [[-2.0, 0.0]]])
+
+    torch.testing.assert_close(_per_sample_cosine(first, second), torch.tensor([1.0, -1.0]))
+    summary = _summarize_scalar_samples([1.0, -1.0, 1.0])
+    assert summary["mean"] == pytest.approx(1 / 3)
+    assert summary["positive_fraction"] == pytest.approx(2 / 3)
+    assert summary["samples"] == 3
 
 
 class RMSNorm(nn.Module):
