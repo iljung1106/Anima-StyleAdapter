@@ -136,11 +136,17 @@ class ProductionStyleLoader:
             buckets[shape].append(image_id)
         self.by_style = {key: value for key, value in by_style.items() if len(value) >= 2}
         valid_ids = {image_id for values in self.by_style.values() for image_id in values}
-        self.buckets = {
-            shape: [image_id for image_id in values if image_id in valid_ids]
-            for shape, values in buckets.items()
-            if any(image_id in valid_ids for image_id in values)
-        }
+        # A training batch must contain distinct targets with an identical
+        # latent shape. Rare aspect-ratio buckets can survive the cache
+        # intersection with fewer rows than the configured batch size; letting
+        # one of those enter weighted sampling makes a long run fail only when
+        # that rare bucket is eventually drawn. References are allowed to come
+        # from other buckets, so only the target bucket needs this size filter.
+        self.buckets = {}
+        for shape, values in buckets.items():
+            eligible = [image_id for image_id in values if image_id in valid_ids]
+            if len(eligible) >= self.batch_size:
+                self.buckets[shape] = eligible
         if not self.by_style or not self.buckets:
             raise RuntimeError("No eligible same-style episodes exist in the cache intersection")
         self.bucket_keys = sorted(self.buckets)
