@@ -12,6 +12,7 @@ from anima_style_data.style_transfer import (
     SharedLowRankStyleAdapter,
     SlotSetAggregator,
     _archive_training_state,
+    _episode_resampler_prototype_losses,
     _flow_direction_loss,
     _optimize_frozen_anima,
     _pad_text_conditions,
@@ -332,3 +333,27 @@ def test_training_state_is_atomic_and_archivable(tmp_path):
     assert state["step"] == 1
     assert state["config"] == {"name": "test"}
     assert set(state["adapter"]) == set(model.state_dict())
+
+
+def test_episode_resampler_prototypes_use_all_references_and_slots():
+    references = torch.randn(3, 4, 8, 16, requires_grad=True)
+    targets = torch.randn(3, 8, 16, requires_grad=True)
+    mask = torch.tensor(
+        [[1, 1, 0, 0], [1, 1, 1, 0], [1, 1, 1, 1]], dtype=torch.bool
+    )
+
+    joint, slot = _episode_resampler_prototype_losses(
+        references, mask, targets, 0.07
+    )
+    (joint + slot).backward()
+
+    assert torch.isfinite(joint)
+    assert torch.isfinite(slot)
+    assert references.grad is not None and bool(torch.isfinite(references.grad).all())
+    assert targets.grad is not None and bool(torch.isfinite(targets.grad).all())
+
+    duplicate_joint, duplicate_slot = _episode_resampler_prototype_losses(
+        references, mask, targets, 0.07, ["same", "same", "other"]
+    )
+    assert torch.isfinite(duplicate_joint)
+    assert torch.isfinite(duplicate_slot)

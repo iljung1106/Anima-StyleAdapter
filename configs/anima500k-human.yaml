@@ -265,7 +265,7 @@ tap_resampler_experiment:
 # and batches targets by exact latent shape. `style-smoke` forces two steps and
 # writes to a separate smoke directory; `style-train` uses `training.steps`.
 style_transfer:
-  output_directory: style_transfer_l18_l24_siglip_l24_selfref_oracle_v13_fp32
+  output_directory: style_transfer_l18_l24_siglip_l24_32x1024_joint_v1
   seed: 20260811
   loader:
     style_cache: style_features_l18_l24_siglip_l24
@@ -283,10 +283,10 @@ style_transfer:
     text_lru_shards: 2
     latent_lru_shards: 2
   resampler:
-    checkpoint: per_reference_resampler_l18_l24_siglip_l24_8k_val/runs/l18_l24_native_siglip_l24/checkpoint.pt
+    checkpoint: per_reference_resampler_l18_l24_siglip_l24_32x1024_joint_global_ln/runs/l18_l24_native_siglip_l24/checkpoint.pt
   adapter:
-    style_dim: 768
-    slots: 16
+    style_dim: 1024
+    slots: 32
     hidden_dim: 2048
     output_dim: 2048
     # The 0.02 stabilization scale left the learned intervention below the
@@ -295,8 +295,8 @@ style_transfer:
     output_scale: 0.1
     heads: 16
     blocks: 28
-    rank: 16
-    aggregator_heads: 12
+    rank: 32
+    aggregator_heads: 16
     aggregator_layers: 2
     aggregator_slot_mixer_layers: 1
     style_dropout: 0.12
@@ -328,6 +328,21 @@ style_transfer:
     representation_learning_rate: 0.0001
     output_learning_rate: 0.00005
     gate_learning_rate: 0.00002
+    # Open the pretrained Resampler only after the style branch has acquired a
+    # nonzero functional path. Its LR is 10% of the representation LR.
+    resampler_learning_rate: 0.00001
+    resampler_max_grad_norm: 0.25
+    resampler_train_start_step: 500
+    # Continue the pretraining objectives at a gentle overall scale while flow
+    # gradients adapt the tokens to Anima. Reconstruction is computed only for
+    # rotating targets; prototype/diversity use target and reference tokens.
+    resampler_auxiliary_weight: 0.10
+    resampler_joint_prototype_weight: 0.13
+    resampler_slot_prototype_weight: 0.02
+    resampler_diversity_weight: 0.01
+    resampler_diversity_margin: 0.20
+    resampler_prototype_temperature: 0.07
+    resampler_huber_weight: 0.10
     weight_decay: 0.01
     max_grad_norm: 1.0
     # H100 80GB has ample headroom for the frozen Anima activations. Keeping
@@ -377,8 +392,8 @@ style_transfer:
     wandb:
       enabled: true
       project: anima-style-adapter
-      name: anima-style-transfer-l18-l24-selfref-oracle-v13-fp32
-      id: anima-style-transfer-l18-l24-selfref-oracle-v13-fp32
+      name: anima-style-transfer-l18-l24-32x1024-joint-v1
+      id: anima-style-transfer-l18-l24-32x1024-joint-v1
   diagnostics:
     checkpoint: training_state.pt
     batch_size: 8

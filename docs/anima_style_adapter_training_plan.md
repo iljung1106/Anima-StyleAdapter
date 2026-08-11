@@ -345,6 +345,28 @@ pooling은 사용하지 않는다. Joint prototype 가중치는 0.13, 보조 slo
 상관을 측정하고, 절대 cosine이 0.20을 넘는 부분만 가중치 0.01로 억제한다. 고정 learned-query
 offset은 제거되므로 slot identity 자체로 diversity loss를 우회할 수 없다.
 
+### 32×1024 Style Adapter 공동학습
+
+본학습은 validation-selected 6,500-step `32×1024` Resampler를 사용하며 Set Aggregator와
+Style Adapter도 32 slots, style width 1024로 맞춘다. Anima hidden/output width 2048과
+28 blocks는 유지한다. 자연스러운 width 증가에 더해 block별 K/V/O delta rank를 16에서
+32로 늘리되, 첫 비교에서는 Set Aggregator 깊이 2층과 cross-slot mixer 1층을 유지한다.
+이에 따라 Style Adapter는 기존 약 40.6M에서 약 68.5M parameters로 증가한다. Aggregator
+깊이까지 동시에 늘려 원인 분리가 어려워지는 것은 피한다.
+
+Resampler는 처음 500 optimizer step 동안 고정한 뒤 전체를 `1e-5` LR(주 representation
+LR의 10%)과 별도 grad-norm 0.25로 연다. 이후 Anima flow gradient가 reference token을
+실제 생성에 맞게 조정하는 동시에, pretraining objective 전체를 0.10의 보조 scale로
+유지한다. 회전하는 target 이미지에서 L18/L24 reconstruction을 계산하고, batch의 각
+target과 그 작가 reference set 사이에 joint prototype 0.13, slot prototype 0.02를 적용한다.
+Target와 reference token 전체에는 diversity 0.01을 유지한다. Decoder self-attention의
+메모리 비용을 제한하기 위해 reconstruction은 target에만 적용하며, target 역할은 전체
+데이터에서 계속 회전한다.
+
+Checkpoint에는 Adapter뿐 아니라 갱신된 Resampler와 optimizer state를 함께 저장한다.
+Validation, sampling, diagnostics도 checkpoint의 Resampler state를 복원하여 사전학습
+원본으로 되돌아가는 평가 오류를 방지한다.
+
 각 단계는 다시 실행할 수 있고 중간 결과만 교체할 수 있도록 sharded Parquet 또는 유사한 columnar manifest로 저장한다.
 
 | 산출물 | 핵심 내용 |

@@ -28,7 +28,12 @@ from torch import nn
 from PIL import Image, ImageDraw, ImageOps
 
 from .io import read_records, write_json
-from .tap_resampler import build_tap_resampler_model
+from .tap_resampler import (
+    _joint_token_descriptor,
+    _reconstruction_loss,
+    _slot_variation_diversity_loss,
+    build_tap_resampler_model,
+)
 
 
 @dataclass(frozen=True)
@@ -262,11 +267,16 @@ class ProductionStyleLoader:
             for layer in (18, 24)
         }
         target_feature_mask = torch.zeros(len(target_ids), max_target_tokens, dtype=torch.bool)
+        target_feature_shapes = []
         for index, image_id in enumerate(target_ids):
             count = feature_values[image_id][18].shape[0]
             target_feature_mask[index, :count] = True
             for layer in (18, 24):
                 target_features[layer][index, :count] = feature_values[image_id][layer]
+            row = self.style_by_id[image_id]
+            target_feature_shapes.append(
+                (int(row["target_height"]), int(row["target_width"]))
+            )
         target_global_features = torch.stack([global_values[item] for item in target_ids])
         return {
             "episodes": episodes,
@@ -280,6 +290,7 @@ class ProductionStyleLoader:
                 key: value.pin_memory() for key, value in target_features.items()
             },
             "target_feature_mask": target_feature_mask.pin_memory(),
+            "target_feature_shapes": target_feature_shapes,
             "target_global_features": target_global_features.pin_memory(),
             "reference_positions": reference_positions,
             "reference_mask": reference_mask.pin_memory(),
@@ -610,7 +621,9 @@ def attach_style_adapter(anima: nn.Module, adapter: SharedLowRankStyleAdapter) -
         block._forward = types.MethodType(patched, block)
 
 
-def load_per_reference_resampler(destination: Path, cfg: dict[str, Any], device: str):
+def load_per_reference_resampler(
+    destination: Path, cfg: dict[str, Any], device: str, *, trainable: bool = False
+):
     checkpoint_path = destination / str(cfg["checkpoint"])
     checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     training = checkpoint["training"]
@@ -634,8 +647,17 @@ def load_per_reference_resampler(destination: Path, cfg: dict[str, Any], device:
         direct_style_tokens=bool(training["direct_style_tokens"]),
     )
     model.load_state_dict(checkpoint["model"])
-    model.requires_grad_(False).eval().to(device)
+    model.requires_grad_(trainable).to(device)
+    model.train(trainable)
     return model
+
+
+def _pack_reference_tokens(tokens, batch: dict[str, Any]) -> torch.Tensor:
+    batch_size, max_refs = batch["reference_mask"].shape
+    packed = tokens.new_zeros(batch_size, max_refs, tokens.shape[1], tokens.shape[2])
+    for source, (batch_index, ref_index) in enumerate(batch["reference_positions"]):
+        packed[batch_index, ref_index] = tokens[source]
+    return packed
 
 
 def _encode_reference_tokens(model, batch: dict[str, Any], device: str) -> torch.Tensor:
@@ -645,11 +667,7 @@ def _encode_reference_tokens(model, batch: dict[str, Any], device: str) -> torch
     global_features = batch["global_features"].to(device, non_blocking=non_blocking)
     with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=non_blocking):
         _, tokens = model.encode(features, mask, global_features)
-    batch_size, max_refs = batch["reference_mask"].shape
-    packed = tokens.new_zeros(batch_size, max_refs, tokens.shape[1], tokens.shape[2])
-    for source, (batch_index, ref_index) in enumerate(batch["reference_positions"]):
-        packed[batch_index, ref_index] = tokens[source]
-    return packed
+    return _pack_reference_tokens(tokens, batch)
 
 
 def _encode_target_tokens(model, batch: dict[str, Any], device: str) -> torch.Tensor:
@@ -667,6 +685,118 @@ def _encode_target_tokens(model, batch: dict[str, Any], device: str) -> torch.Te
     ):
         _, tokens = model.encode(features, mask, global_features)
     return tokens
+
+
+def _encode_reference_tokens_trainable(
+    model, batch: dict[str, Any], device: str
+) -> tuple[torch.Tensor, torch.Tensor]:
+    non_blocking = device.startswith("cuda")
+    features = {
+        key: value.to(device, non_blocking=non_blocking)
+        for key, value in batch["features"].items()
+    }
+    mask = batch["feature_mask"].to(device, non_blocking=non_blocking)
+    global_features = batch["global_features"].to(
+        device, non_blocking=non_blocking
+    )
+    with torch.autocast(
+        device_type="cuda", dtype=torch.bfloat16, enabled=non_blocking
+    ):
+        _, tokens = model.encode(features, mask, global_features)
+    return _pack_reference_tokens(tokens, batch), tokens
+
+
+def _encode_target_tokens_trainable(
+    model, batch: dict[str, Any], device: str, *, huber_weight: float
+) -> tuple[torch.Tensor, torch.Tensor]:
+    non_blocking = device.startswith("cuda")
+    features = {
+        key: value.to(device, non_blocking=non_blocking)
+        for key, value in batch["target_features"].items()
+    }
+    mask = batch["target_feature_mask"].to(device, non_blocking=non_blocking)
+    global_features = batch["target_global_features"].to(
+        device, non_blocking=non_blocking
+    )
+    with torch.autocast(
+        device_type="cuda", dtype=torch.bfloat16, enabled=non_blocking
+    ):
+        decoded, decoded_mask, tokens = model(
+            features,
+            mask,
+            batch["target_feature_shapes"],
+            global_features,
+        )
+        reconstruction = _reconstruction_loss(
+            decoded, features, decoded_mask, huber_weight
+        )
+    return tokens, reconstruction
+
+
+def _episode_resampler_prototype_losses(
+    references: torch.Tensor,
+    reference_mask: torch.Tensor,
+    targets: torch.Tensor,
+    temperature: float,
+    style_ids: list[str] | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Classify each target against its batch peers using its own references."""
+    joint_targets = _joint_token_descriptor(targets)
+    joint_prototypes = []
+    slot_prototypes = []
+    for index in range(references.shape[0]):
+        valid = references[index, reference_mask[index]]
+        joint_prototypes.append(
+            F.normalize(_joint_token_descriptor(valid).mean(dim=0), dim=-1)
+        )
+        slot_prototypes.append(
+            F.normalize(F.normalize(valid.float(), dim=-1).mean(dim=0), dim=-1)
+        )
+    joint_prototypes = torch.stack(joint_prototypes)
+    slot_prototypes = torch.stack(slot_prototypes)
+    style_ids = style_ids or [str(index) for index in range(targets.shape[0])]
+    unique_styles = list(dict.fromkeys(style_ids))
+    labels = torch.tensor(
+        [unique_styles.index(value) for value in style_ids], device=targets.device
+    )
+    if len(unique_styles) != len(style_ids):
+        joint_prototypes = torch.stack(
+            [
+                F.normalize(
+                    joint_prototypes[
+                        torch.tensor(
+                            [value == style for value in style_ids],
+                            device=targets.device,
+                        )
+                    ].mean(dim=0),
+                    dim=-1,
+                )
+                for style in unique_styles
+            ]
+        )
+        slot_prototypes = torch.stack(
+            [
+                F.normalize(
+                    slot_prototypes[
+                        torch.tensor(
+                            [value == style for value in style_ids],
+                            device=targets.device,
+                        )
+                    ].mean(dim=0),
+                    dim=-1,
+                )
+                for style in unique_styles
+            ]
+        )
+    joint_loss = F.cross_entropy(
+        (joint_targets @ joint_prototypes.T) / temperature, labels
+    )
+    normalized_targets = F.normalize(targets.float(), dim=-1)
+    slot_logits = torch.einsum(
+        "bsd,asd->ba", normalized_targets, slot_prototypes
+    ) / targets.shape[1]
+    slot_loss = F.cross_entropy(slot_logits / temperature, labels)
+    return joint_loss, slot_loss
 
 
 def _symmetric_style_contrastive_loss(
@@ -1078,9 +1208,44 @@ def _forward_flow_loss(
     )
     latents = batch["latents"].to(device, non_blocking=True, dtype=torch.bfloat16)
     conditioning = batch["conditioning"].to(device, non_blocking=True, dtype=torch.bfloat16)
+    resampler_train_start = int(loss_config.get("resampler_train_start_step", -1))
+    resampler_trainable = resampler_train_start >= 0 and step >= resampler_train_start
     with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=device.startswith("cuda")):
         target_style_tokens = None
-        if target_probability > 0 or curriculum["oracle_required"] or any(
+        reference_tokens_for_aux = None
+        resampler_reconstruction = latents.new_zeros((), dtype=torch.float32)
+        resampler_joint_prototype = latents.new_zeros((), dtype=torch.float32)
+        resampler_slot_prototype = latents.new_zeros((), dtype=torch.float32)
+        resampler_diversity = latents.new_zeros((), dtype=torch.float32)
+        if resampler_trainable:
+            references, flat_reference_tokens = _encode_reference_tokens_trainable(
+                resampler, batch, device
+            )
+            target_style_tokens, resampler_reconstruction = (
+                _encode_target_tokens_trainable(
+                    resampler,
+                    batch,
+                    device,
+                    huber_weight=float(loss_config.get("resampler_huber_weight", 0.10)),
+                )
+            )
+            reference_mask = batch["reference_mask"].to(device, non_blocking=True)
+            reference_tokens_for_aux = references
+            (
+                resampler_joint_prototype,
+                resampler_slot_prototype,
+            ) = _episode_resampler_prototype_losses(
+                references,
+                reference_mask,
+                target_style_tokens,
+                float(loss_config.get("resampler_prototype_temperature", 0.07)),
+                [str(item.style_id) for item in batch["episodes"]],
+            )
+            resampler_diversity = _slot_variation_diversity_loss(
+                torch.cat((flat_reference_tokens, target_style_tokens), dim=0),
+                float(loss_config.get("resampler_diversity_margin", 0.20)),
+            )
+        elif target_probability > 0 or curriculum["oracle_required"] or any(
             float(loss_config.get(key, 0.0)) > 0
             for key in ("style_token_contrastive_weight", "style_kv_contrastive_weight")
         ):
@@ -1091,8 +1256,9 @@ def _forward_flow_loss(
                 references.shape[:2], dtype=torch.bool, device=references.device
             )
         else:
-            references = _encode_reference_tokens(resampler, batch, device)
-            reference_mask = batch["reference_mask"].to(device, non_blocking=True)
+            if not resampler_trainable:
+                references = _encode_reference_tokens(resampler, batch, device)
+                reference_mask = batch["reference_mask"].to(device, non_blocking=True)
             if target_probability > 0:
                 include_target = (
                     torch.rand(references.shape[0], device=references.device)
@@ -1258,6 +1424,16 @@ def _forward_flow_loss(
             + direction_weight * direction_loss
             + token_weight * token_contrastive
             + kv_weight * kv_contrastive
+            + float(loss_config.get("resampler_auxiliary_weight", 0.0))
+            * (
+                resampler_reconstruction
+                + float(loss_config.get("resampler_joint_prototype_weight", 0.13))
+                * resampler_joint_prototype
+                + float(loss_config.get("resampler_slot_prototype_weight", 0.02))
+                * resampler_slot_prototype
+                + float(loss_config.get("resampler_diversity_weight", 0.01))
+                * resampler_diversity
+            )
         )
     return loss, {
         "references": int(reference_mask.sum()),
@@ -1283,6 +1459,11 @@ def _forward_flow_loss(
         "style_auxiliary": auxiliary,
         "style_magnitude_floor": magnitude_floor,
         "target_reference_probability": target_probability,
+        "resampler_trainable": resampler_trainable,
+        "resampler_reconstruction": float(resampler_reconstruction.detach()),
+        "resampler_joint_prototype": float(resampler_joint_prototype.detach()),
+        "resampler_slot_prototype": float(resampler_slot_prototype.detach()),
+        "resampler_diversity": float(resampler_diversity.detach()),
         "style_output_ratio": float(output_ratio.detach()),
         "style_magnitude_loss": float(magnitude_loss.detach()),
         "style_flow_direction_multiplier": direction_multiplier,
@@ -1595,6 +1776,8 @@ def sample_style_checkpoint(config: dict[str, Any], destination: Path) -> dict[s
     checkpoint_path = output / "training_state.pt"
     state = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     adapter.load_state_dict(state["adapter"])
+    if "resampler" in state:
+        resampler.load_state_dict(state["resampler"])
     step = int(state["step"])
     sheet, _, elapsed = _sample_style_adapter(
         anima, adapter, resampler, loader, config, destination, output, device, step, None
@@ -1638,6 +1821,8 @@ def diagnose_style_reference_dependence(
         )
     state = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     adapter.load_state_dict(state["adapter"])
+    if "resampler" in state:
+        resampler.load_state_dict(state["resampler"])
 
     records: list[dict[str, float]] = []
     batches = int(diagnostic_cfg.get("batches", 4))
@@ -1763,6 +1948,7 @@ def _save_training_state(
     adapter: nn.Module,
     optimizer: torch.optim.Optimizer,
     cfg: dict[str, Any],
+    resampler: nn.Module | None = None,
 ) -> None:
     temporary = path.with_suffix(path.suffix + ".tmp")
     state = {
@@ -1774,6 +1960,8 @@ def _save_training_state(
         "torch_rng": torch.get_rng_state(),
         "cuda_rng": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
     }
+    if resampler is not None:
+        state["resampler"] = resampler.state_dict()
     torch.save(state, temporary)
     temporary.replace(path)
 
@@ -1837,7 +2025,9 @@ def train_style_adapter(config: dict[str, Any], destination: Path, *, steps_over
     validation_loader_cfg = {**cfg["loader"], "split": "validation", "batch_size": 1}
     validation_loader_cfg["seed"] = seed ^ 0x51A7
     validation_loader = ProductionStyleLoader(destination, validation_loader_cfg)
-    resampler = load_per_reference_resampler(destination, cfg["resampler"], device)
+    resampler = load_per_reference_resampler(
+        destination, cfg["resampler"], device, trainable=True
+    )
     anima = _resolve_anima_model(config, destination, device)
     anima.requires_grad_(False).train()
     optimization_counts = _optimize_frozen_anima(
@@ -1871,6 +2061,8 @@ def train_style_adapter(config: dict[str, Any], destination: Path, *, steps_over
     )
     output_lr = float(training.get("output_learning_rate", representation_lr))
     gate_lr = float(training.get("gate_learning_rate", output_lr))
+    resampler_lr = float(training.get("resampler_learning_rate", representation_lr * 0.1))
+    resampler_parameters = list(resampler.parameters())
     weight_decay = float(training.get("weight_decay", 0.01))
     optimizer = torch.optim.AdamW(
         [
@@ -1892,13 +2084,19 @@ def train_style_adapter(config: dict[str, Any], destination: Path, *, steps_over
                 "weight_decay": 0.0,
                 "name": "gate",
             },
+            {
+                "params": resampler_parameters,
+                "lr": resampler_lr,
+                "weight_decay": weight_decay,
+                "name": "resampler",
+            },
         ],
         fused=device.startswith("cuda"),
     )
     print(
         "style optimizer: FP32 trainable weights, BF16 autocast; "
         f"representation_lr={representation_lr:g} output_lr={output_lr:g} "
-        f"gate_lr={gate_lr:g}",
+        f"gate_lr={gate_lr:g} resampler_lr={resampler_lr:g}",
         flush=True,
     )
     steps = int(steps_override if steps_override is not None else training["steps"])
@@ -1915,6 +2113,8 @@ def train_style_adapter(config: dict[str, Any], destination: Path, *, steps_over
     if resume and checkpoint_path.exists():
         state = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
         adapter.load_state_dict(state["adapter"])
+        if "resampler" in state:
+            resampler.load_state_dict(state["resampler"])
         optimizer.load_state_dict(state["optimizer"])
         start_step = int(state["step"])
         random.setstate(state["python_rng"])
@@ -1928,6 +2128,8 @@ def train_style_adapter(config: dict[str, Any], destination: Path, *, steps_over
             initial_path = destination / initial_path
         initial_state = torch.load(initial_path, map_location="cpu", weights_only=False)
         adapter.load_state_dict(initial_state["adapter"])
+        if "resampler" in initial_state:
+            resampler.load_state_dict(initial_state["resampler"])
         print(
             f"initialized style adapter from {initial_path} at source step "
             f"{int(initial_state.get('step', -1))}",
@@ -2060,7 +2262,13 @@ def train_style_adapter(config: dict[str, Any], destination: Path, *, steps_over
             # keep them attached until each microbatch backward completes.
             adapter.clear_style_tokens()
         assert details is not None
-        grad_norm = torch.nn.utils.clip_grad_norm_(parameters, float(training.get("max_grad_norm", 1.0)))
+        grad_norm = torch.nn.utils.clip_grad_norm_(
+            parameters, float(training.get("max_grad_norm", 1.0))
+        )
+        resampler_grad_norm = torch.nn.utils.clip_grad_norm_(
+            resampler_parameters,
+            float(training.get("resampler_max_grad_norm", 0.25)),
+        )
         group_grads = {
             "aggregator_grad": _parameter_grad_norm(adapter.aggregator.parameters()),
             "shared_kv_grad": _parameter_grad_norm(
@@ -2072,6 +2280,8 @@ def train_style_adapter(config: dict[str, Any], destination: Path, *, steps_over
                 + list(adapter.o_up.parameters())
             ),
             "gate_grad": _parameter_grad_norm(adapter.gate.parameters()),
+            "resampler_grad": _parameter_grad_norm(resampler.parameters()),
+            "resampler_grad_norm": float(resampler_grad_norm),
         }
         optimizer.step()
         elapsed = time.perf_counter() - data_ready
@@ -2185,18 +2395,20 @@ def train_style_adapter(config: dict[str, Any], destination: Path, *, steps_over
                     step=step,
                 )
         if checkpoint_every and step % checkpoint_every == 0:
-            _save_training_state(checkpoint_path, step, adapter, optimizer, cfg)
+            _save_training_state(
+                checkpoint_path, step, adapter, optimizer, cfg, resampler
+            )
             _archive_training_state(
                 checkpoint_path, checkpoint_dir / f"step-{step:07d}.pt"
             )
 
     checkpoint = output / "checkpoint.pt"
-    _save_training_state(checkpoint_path, steps, adapter, optimizer, cfg)
+    _save_training_state(checkpoint_path, steps, adapter, optimizer, cfg, resampler)
     _archive_training_state(checkpoint_path, checkpoint)
     summary = {
         "steps": steps, "metrics": metrics, "elapsed_s": time.perf_counter() - started,
         "checkpoint": str(checkpoint.resolve()),
-        "trainable_parameters": sum(value.numel() for value in parameters),
+        "trainable_parameters": sum(value.numel() for value in parameters + resampler_parameters),
     }
     write_json(output / "summary.json", summary)
     if wandb_run is not None:
@@ -2221,6 +2433,7 @@ def smoke_test_style_adapter(config: dict[str, Any], destination: Path) -> dict[
         "oracle_distill_end": 3,
     }
     training["oracle_distill_probability"] = 1.0
+    training["resampler_train_start_step"] = 1
     smoke_config["style_transfer"]["sampling"]["steps"] = 2
     return train_style_adapter(smoke_config, destination, steps_override=2)
 
