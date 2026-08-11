@@ -283,6 +283,7 @@ style_transfer:
     slots: 16
     hidden_dim: 2048
     output_dim: 2048
+    output_scale: 0.02
     heads: 16
     blocks: 28
     rank: 16

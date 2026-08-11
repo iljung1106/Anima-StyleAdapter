@@ -376,6 +376,7 @@ class SharedLowRankStyleAdapter(nn.Module):
         slots: int = 16,
         hidden_dim: int = 2048,
         output_dim: int = 2048,
+        output_scale: float = 0.02,
         heads: int = 16,
         blocks: int = 28,
         rank: int = 16,
@@ -390,6 +391,7 @@ class SharedLowRankStyleAdapter(nn.Module):
         self.slots = slots
         self.hidden_dim = hidden_dim
         self.output_dim = output_dim
+        self.output_scale = float(output_scale)
         self.heads = heads
         self.head_dim = hidden_dim // heads
         self.blocks = blocks
@@ -512,7 +514,7 @@ class SharedLowRankStyleAdapter(nn.Module):
         # that useful direction exists; unlike a zero scalar gate it does not
         # block the representation path at initialization.
         gate = 1.0 + torch.tanh(self.gate(timestep_embedding)[:, 0, block_index])
-        result = attended * gate[:, None, None]
+        result = attended * (self.output_scale * gate[:, None, None])
         self._runtime_gate_abs[block_index] = gate.detach().abs().mean()
         self._runtime_residual_ratio[block_index] = (
             result.detach().float().square().mean().sqrt()
