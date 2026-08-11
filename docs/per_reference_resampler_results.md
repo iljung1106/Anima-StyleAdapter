@@ -55,6 +55,31 @@ W&B run: https://wandb.ai/1wndrla17-kyung-hee-university/anima-style-adapter/run
 
 이는 기존 5,000스텝 실행의 meta-test 평균 47.00%보다 4.13%p 높다. 다만 서로 다른 초기화의 실행이므로 순수한 추가 스텝 효과만을 분리한 비교는 아니다. 새 실행의 W&B 기록은 https://wandb.ai/1wndrla17-kyung-hee-university/anima-style-adapter/runs/per-reference-l18-l24-siglip-l24-8k-val-v2 에 있다.
 
+## 32×1024 joint-token 재학습
+
+표현 용량을 `16×768`에서 `32×1024`로 늘리고, 전체 ordered token을 flatten한 뒤
+global LayerNorm/L2 normalization한 32,768차원 descriptor에 joint prototype loss를
+적용했다. Artist loss는 joint 0.13과 보조 slot-wise 0.02로 총 0.15이며, batch 평균을
+제거한 slot별 image-dependent variation의 중복을 약한 diversity loss 0.01로 억제했다.
+모델은 111,197,696 parameters이며 체크포인트는 약 425 MiB다.
+
+8,000스텝까지 학습했으며 validation 평균 Top-1이 가장 높은 6,500스텝 체크포인트를
+선택했다.
+
+| Split | 1-ref Top-1 | 2-ref | 4-ref | 8-ref | 평균 Top-1 | L18 rec cosine | L24 rec cosine |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| Validation | 42.0% | 55.0% | 62.0% | 70.0% | **57.25%** | 0.6667 | 0.7458 |
+| Meta-test | 39.0% | 52.0% | 63.0% | 69.5% | **55.875%** | 0.6669 | 0.7454 |
+
+기존 선택된 `16×768` 7,000-step 모델과 비교하면 meta-test 평균 Top-1은 51.13%에서
+55.875%로 4.745%p, L18 reconstruction은 0.6347에서 0.6669로 0.0322, L24는
+0.7211에서 0.7454로 0.0243 개선됐다. 학습 중 raw slot-variation diversity loss는
+초기 중복 붕괴값 약 0.64에서 말기 약 0.15~0.20으로 감소했다.
+
+- W&B: https://wandb.ai/1wndrla17-kyung-hee-university/anima-style-adapter/runs/per-reference-l18-l24-siglip-l24-32x1024-joint-v2
+- checkpoint: `per_reference_resampler_l18_l24_siglip_l24_32x1024_joint_global_ln/runs/l18_l24_native_siglip_l24/checkpoint.pt`
+- held-out result: `per_reference_resampler_l18_l24_siglip_l24_32x1024_joint_global_ln/final_test.json`
+
 ## 해석과 다음 단계
 
 이번 수치는 보존 작가에 대한 token-space retrieval와 C-RADIO feature reconstruction 결과다. 실제 Anima 생성 품질을 직접 측정한 값은 아니다. 다음 단계에서는 Resampler를 우선 동결하고 slot-aligned Set Aggregator, shared full-rank K/V base, 28-block low-rank delta와 timestep gate를 연결한다. 초기 Adapter 안정화 뒤에만 Resampler 상위 1~2층을 낮은 학습률로 해제한다.
