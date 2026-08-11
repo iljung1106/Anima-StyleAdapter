@@ -367,6 +367,14 @@ Checkpoint에는 Adapter뿐 아니라 갱신된 Resampler와 optimizer state를 
 Validation, sampling, diagnostics도 checkpoint의 Resampler state를 복원하여 사전학습
 원본으로 되돌아가는 평가 오류를 방지한다.
 
+RunPod H100 80GB의 2-step 실제 Anima smoke test에서 공동학습 경로는 peak 69.58GiB를
+사용했다. Gradient accumulation 3을 포함한 optimizer step은 약 3.5~4.2초였고,
+Resampler reconstruction 0.27~0.29, joint prototype 0.55~0.86, diversity 0.19~0.21과
+nonzero Resampler grad 0.043~0.061이 기록됐다. Adapter 68.5M과 Resampler 111.2M을 합친
+trainable parameter는 179.75M이다. 전체 optimizer state를 포함한 resumable checkpoint는
+약 2.1GiB다. 현재 VRAM 여유가 약 10GiB이므로 첫 본학습 전에 Aggregator 깊이를 더 늘리지
+않는다.
+
 각 단계는 다시 실행할 수 있고 중간 결과만 교체할 수 있도록 sharded Parquet 또는 유사한 columnar manifest로 저장한다.
 
 | 산출물 | 핵심 내용 |
