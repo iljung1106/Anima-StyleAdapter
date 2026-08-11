@@ -950,6 +950,7 @@ def _make_sample_sheet(
     batch: dict[str, Any],
     *,
     base_generated: Image.Image | None = None,
+    generated_label: str | None = None,
 ) -> Image.Image:
     episode = batch["episodes"][0]
     sources = [("target", episode.target_id)] + [
@@ -982,7 +983,7 @@ def _make_sample_sheet(
         draw.text((4, 6), "frozen Anima (adapter bypassed)", fill="white", stroke_width=2, stroke_fill="black")
         draw.text(
             (base_generated.width + 4, 6),
-            f"styled — {episode.style_id}",
+            generated_label or f"styled — {episode.style_id}",
             fill="white",
             stroke_width=2,
             stroke_fill="black",
@@ -1038,7 +1039,7 @@ def _sample_style_adapter(
     sigmas = (sigmas * shift) / (1 + (shift - 1) * sigmas)
     padding_mask = torch.zeros(1, 1, latent_h, latent_w, device=device, dtype=torch.bfloat16)
     text_scale = float(sample_cfg.get("text_cfg", 4.0))
-    style_scale = float(sample_cfg.get("style_cfg", 1.0))
+    style_scale = float(os.environ.get("ANIMA_STYLE_CFG", sample_cfg.get("style_cfg", 1.0)))
 
     def predict(x: torch.Tensor, text: torch.Tensor, style: torch.Tensor | None, timestep: torch.Tensor):
         if style is None:
@@ -1106,12 +1107,19 @@ def _sample_style_adapter(
     generated = to_image(decoded[1])
     sample_dir = output / "samples"
     sample_dir.mkdir(parents=True, exist_ok=True)
-    raw_path = sample_dir / f"step-{step:07d}.png"
-    sheet_path = sample_dir / f"step-{step:07d}-sheet.png"
+    cfg_label = f"{style_scale:g}".replace(".", "p")
+    raw_path = sample_dir / f"step-{step:07d}-style-cfg-{cfg_label}.png"
+    sheet_path = sample_dir / f"step-{step:07d}-style-cfg-{cfg_label}-sheet.png"
     generated.save(raw_path)
     base_generated.save(sample_dir / f"step-{step:07d}-base.png")
     to_image(target_decoded[0]).save(sample_dir / f"step-{step:07d}-cached-target.png")
-    _make_sample_sheet(generated, loader, batch, base_generated=base_generated).save(sheet_path)
+    _make_sample_sheet(
+        generated,
+        loader,
+        batch,
+        base_generated=base_generated,
+        generated_label=f"styled CFG {style_scale:g} — {batch['episodes'][0].style_id}",
+    ).save(sheet_path)
     print(
         f"sample latent stats step={step} "
         f"base_mean={base_x.float().mean().item():.5f} base_std={base_x.float().std().item():.5f} "
