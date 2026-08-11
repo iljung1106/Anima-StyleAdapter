@@ -259,16 +259,16 @@ tap_resampler_experiment:
 # and batches targets by exact latent shape. `style-smoke` forces two steps and
 # writes to a separate smoke directory; `style-train` uses `training.steps`.
 style_transfer:
-  output_directory: style_transfer_l18_l24_siglip_l24_selfref_oracle_v8_nockpt
+  output_directory: style_transfer_l18_l24_siglip_l24_selfref_oracle_v9_bf16_fused
   seed: 20260811
   loader:
     style_cache: style_features_l18_l24_siglip_l24
     text_cache: anima_text_cache_post_llm
     latent_cache: anima_latent_cache_qwen_2d
     split: train
-    # No-checkpoint activation memory does not fit batch 8 on an H100 80GB.
-    # Four batch-4 microbatches retain the planned effective batch of 16.
-    batch_size: 4
+    # No-checkpoint batch 8 OOMs on an H100 80GB. Batch 5 leaves headroom while
+    # three microbatches reduce repeated frozen-Anima passes (effective batch 15).
+    batch_size: 5
     min_references: 1
     max_references: 8
     # Anima cross-attention was trained with 512 post-LLM tokens, including
@@ -308,8 +308,8 @@ style_transfer:
     maximum_artist_similarity: 0.95
   training:
     device: cuda
-    # 119,907 cached train images / batch 16 = 7,494 steps per epoch. The
-    # complete staged curriculum is about 4.27 epochs.
+    # 119,907 cached train images / effective batch 15 = 7,994 steps per epoch.
+    # The complete staged curriculum is about 4.00 epochs.
     steps: 32000
     learning_rate: 0.00005
     weight_decay: 0.01
@@ -317,7 +317,7 @@ style_transfer:
     # H100 80GB has ample headroom for the frozen Anima activations. Keeping
     # them avoids recomputing all 28 blocks during backward.
     gradient_checkpointing: false
-    gradient_accumulation_steps: 4
+    gradient_accumulation_steps: 3
     low_precision_rmsnorm: true
     fuse_attention_projections: true
     allow_tf32: true
@@ -349,8 +349,8 @@ style_transfer:
     wandb:
       enabled: true
       project: anima-style-adapter
-      name: anima-style-transfer-l18-l24-selfref-oracle-v8-nockpt
-      id: anima-style-transfer-l18-l24-selfref-oracle-v8-nockpt
+      name: anima-style-transfer-l18-l24-selfref-oracle-v9-bf16-fused
+      id: anima-style-transfer-l18-l24-selfref-oracle-v9-bf16-fused
   diagnostics:
     checkpoint: training_state.pt
     batch_size: 8
