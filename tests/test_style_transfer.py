@@ -15,12 +15,50 @@ from anima_style_data.style_transfer import (
     _flow_direction_loss,
     _pad_text_conditions,
     _save_training_state,
+    _self_reference_curriculum_state,
+    _set_adapter_trainable_stage,
     _style_bootstrap_state,
     _soft_interval_loss,
     _symmetric_style_contrastive_loss,
     _timestep_interval_bounds,
     attach_style_adapter,
 )
+
+
+def test_self_reference_curriculum_has_explicit_terminal_phase():
+    config = {
+        "gate_only_steps": 2,
+        "self_reference_steps": 5,
+        "target_anneal_end": 9,
+        "oracle_distill_end": 9,
+    }
+    first = _self_reference_curriculum_state(1, config)
+    assert first["phase"] == "gate_only_self_reference"
+    assert first["target_only"] and first["target_probability"] == 1.0
+    opened = _self_reference_curriculum_state(3, config)
+    assert opened["phase"] == "full_self_reference"
+    assert not opened["gate_only"]
+    ramp = _self_reference_curriculum_state(7, config)
+    assert ramp["phase"] == "oracle_target_anneal"
+    assert ramp["target_probability"] == pytest.approx(0.5)
+    assert ramp["oracle_required"]
+    final = _self_reference_curriculum_state(9, config)
+    assert final["phase"] == "target_excluded"
+    assert final["target_probability"] == 0.0
+    assert not final["oracle_required"]
+
+
+def test_gate_only_stage_then_opens_entire_adapter():
+    adapter = SharedLowRankStyleAdapter(
+        style_dim=8, slots=2, hidden_dim=16, heads=4, blocks=28, rank=2,
+        aggregator_heads=2, aggregator_layers=1, gate_dim=4,
+    )
+    _set_adapter_trainable_stage(adapter, gate_only=True)
+    assert all(parameter.requires_grad for parameter in adapter.gate.parameters())
+    assert not adapter.shared_k.weight.requires_grad
+    assert not next(adapter.aggregator.parameters()).requires_grad
+    _set_adapter_trainable_stage(adapter, gate_only=False)
+    assert all(parameter.requires_grad for parameter in adapter.parameters())
 
 
 def test_empirical_timestep_interval_only_penalizes_outside_values():

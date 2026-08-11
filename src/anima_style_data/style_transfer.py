@@ -747,6 +747,76 @@ def _anneal_multiplier(step: int, start: int, end: int) -> float:
     return 1.0 - (step - start) / max(1, end - start)
 
 
+def _self_reference_curriculum_state(step: int, config: dict[str, Any]) -> dict[str, Any]:
+    """Resolve the staged self-reference curriculum for one optimizer step."""
+    if not config:
+        return {
+            "phase": "target_excluded",
+            "gate_only": False,
+            "target_only": False,
+            "target_probability": 0.0,
+            "oracle_required": False,
+            "self_reference_steps": 0,
+        }
+    gate_only_steps = max(0, int(config.get("gate_only_steps", 0)))
+    self_reference_steps = max(gate_only_steps, int(config.get("self_reference_steps", 0)))
+    target_anneal_end = max(
+        self_reference_steps + 1,
+        int(config.get("target_anneal_end", self_reference_steps + 1)),
+    )
+    oracle_distill_end = max(
+        self_reference_steps,
+        int(config.get("oracle_distill_end", target_anneal_end)),
+    )
+    if step <= gate_only_steps:
+        phase = "gate_only_self_reference"
+    elif step <= self_reference_steps:
+        phase = "full_self_reference"
+    elif step < target_anneal_end:
+        phase = "oracle_target_anneal"
+    else:
+        phase = "target_excluded"
+    if step <= self_reference_steps:
+        target_probability = 1.0
+    elif step >= target_anneal_end:
+        target_probability = 0.0
+    else:
+        target_probability = 1.0 - (
+            (step - self_reference_steps) / (target_anneal_end - self_reference_steps)
+        )
+    return {
+        "phase": phase,
+        "gate_only": step <= gate_only_steps,
+        "target_only": step <= self_reference_steps,
+        "target_probability": target_probability,
+        "oracle_required": self_reference_steps < step < oracle_distill_end,
+        "self_reference_steps": self_reference_steps,
+    }
+
+
+def _set_adapter_trainable_stage(
+    adapter: SharedLowRankStyleAdapter, *, gate_only: bool
+) -> None:
+    """Keep exact zero-init stable before opening the representation path."""
+    for parameter in adapter.parameters():
+        parameter.requires_grad_(not gate_only)
+    for parameter in adapter.gate.parameters():
+        parameter.requires_grad_(True)
+
+
+@contextmanager
+def _use_style_controller(anima: nn.Module, adapter: SharedLowRankStyleAdapter):
+    previous = [block.__dict__["_style_controller"] for block in anima.blocks]
+    controller = weakref.ref(adapter)
+    for block in anima.blocks:
+        block.__dict__["_style_controller"] = controller
+    try:
+        yield
+    finally:
+        for block, original in zip(anima.blocks, previous, strict=True):
+            block.__dict__["_style_controller"] = original
+
+
 @contextmanager
 def _bypass_style_blocks(anima: nn.Module, adapter: SharedLowRankStyleAdapter):
     adapter.clear_style_tokens()
@@ -805,16 +875,16 @@ def _forward_flow_loss(
     generator: torch.Generator | None = None,
     loss_config: dict[str, Any] | None = None,
     step: int = 0,
+    oracle_adapter: SharedLowRankStyleAdapter | None = None,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
     loss_config = loss_config or {}
+    curriculum = _self_reference_curriculum_state(
+        step, dict(loss_config.get("curriculum", {}))
+    )
     auxiliary, magnitude_floor, _ = _style_bootstrap_state(
         step, loss_config
     )
-    target_probability = float(loss_config.get("target_reference_probability", 0.0)) * _anneal_multiplier(
-        step,
-        int(loss_config.get("target_reference_anneal_start", 10**12)),
-        int(loss_config.get("target_reference_anneal_end", 10**12 + 1)),
-    )
+    target_probability = float(curriculum["target_probability"])
     direction_multiplier = _anneal_multiplier(
         step,
         int(loss_config.get("style_direction_anneal_start", 0)),
@@ -826,12 +896,17 @@ def _forward_flow_loss(
     conditioning = batch["conditioning"].to(device, non_blocking=True, dtype=torch.bfloat16)
     with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=device.startswith("cuda")):
         target_style_tokens = None
-        if target_probability > 0 or any(
+        if target_probability > 0 or curriculum["oracle_required"] or any(
             float(loss_config.get(key, 0.0)) > 0
             for key in ("style_token_contrastive_weight", "style_kv_contrastive_weight")
         ):
             target_style_tokens = _encode_target_tokens(resampler, batch, device)
-        if target_probability > 0:
+        if curriculum["target_only"]:
+            references = target_style_tokens[:, None]
+            reference_mask = torch.ones(
+                references.shape[:2], dtype=torch.bool, device=references.device
+            )
+        elif target_probability > 0:
             include_target = (
                 torch.rand(references.shape[0], device=references.device)
                 < target_probability
@@ -883,6 +958,44 @@ def _forward_flow_loss(
         prediction = prediction.float()
         target_velocity = (noise - latents).float()
         flow_loss = F.mse_loss(prediction, target_velocity)
+
+        oracle_distill_loss = flow_loss.new_zeros(())
+        oracle_distill_applied = False
+        oracle_weight = float(loss_config.get("oracle_distill_weight", 0.0))
+        oracle_probability = float(loss_config.get("oracle_distill_probability", 1.0))
+        if curriculum["oracle_required"] and oracle_adapter is not None and oracle_weight > 0:
+            apply_oracle = bool(
+                torch.rand((), device=prediction.device, generator=generator)
+                < oracle_probability
+            )
+            if apply_oracle:
+                oracle_mask = torch.ones(
+                    target_style_tokens.shape[0], 1,
+                    dtype=torch.bool, device=target_style_tokens.device,
+                )
+                with torch.no_grad():
+                    oracle_tokens = oracle_adapter.aggregate(
+                        target_style_tokens[:, None], oracle_mask, apply_dropout=False
+                    )
+                    oracle_adapter.set_style_tokens(oracle_tokens)
+                    with _use_style_controller(anima, oracle_adapter):
+                        oracle_prediction = anima(
+                            noisy.unsqueeze(2), timesteps.to(latents.dtype),
+                            context=conditioning, padding_mask=padding_mask,
+                            target_input_ids=None,
+                        ).squeeze(2).float()
+                    oracle_adapter.clear_style_tokens()
+                dimensions = tuple(range(1, prediction.ndim))
+                oracle_scale = (
+                    oracle_prediction.square().mean(dim=dimensions, keepdim=True).sqrt()
+                    * float(loss_config.get("oracle_distill_scale_floor", 0.005))
+                ).clamp_min(1e-5)
+                oracle_distill_loss = F.smooth_l1_loss(
+                    (prediction - oracle_prediction) / oracle_scale,
+                    torch.zeros_like(prediction),
+                    beta=float(loss_config.get("oracle_distill_huber_beta", 0.1)),
+                )
+                oracle_distill_applied = True
 
         magnitude_loss = flow_loss.new_zeros(())
         direction_loss = flow_loss.new_zeros(())
@@ -952,6 +1065,7 @@ def _forward_flow_loss(
                 )
         loss = (
             flow_loss
+            + oracle_weight * oracle_distill_loss
             + magnitude_weight * magnitude_loss
             + direction_weight * direction_loss
             + token_weight * token_contrastive
@@ -961,6 +1075,11 @@ def _forward_flow_loss(
         "references": int(reference_mask.sum()),
         "latent_shape": list(latents.shape),
         "flow_loss": float(flow_loss.detach()),
+        "curriculum_phase": str(curriculum["phase"]),
+        "curriculum_gate_only": bool(curriculum["gate_only"]),
+        "oracle_distill_weight": oracle_weight,
+        "oracle_distill_applied": oracle_distill_applied,
+        "oracle_distill_loss": float(oracle_distill_loss.detach()),
         "style_auxiliary": auxiliary,
         "style_magnitude_floor": magnitude_floor,
         "target_reference_probability": target_probability,
@@ -1420,6 +1539,25 @@ def _archive_training_state(source: Path, destination: Path) -> None:
     temporary.replace(destination)
 
 
+def _save_oracle_adapter(path: Path, adapter: SharedLowRankStyleAdapter) -> None:
+    """Persist the immutable end-of-bootstrap teacher once, without optimizer state."""
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    state = {key: value.detach().cpu() for key, value in adapter.state_dict().items()}
+    torch.save(state, temporary)
+    temporary.replace(path)
+
+
+def _load_oracle_adapter(
+    path: Path,
+    template: SharedLowRankStyleAdapter,
+    device: str,
+) -> SharedLowRankStyleAdapter:
+    oracle = copy.deepcopy(template)
+    oracle.load_state_dict(torch.load(path, map_location="cpu", weights_only=True))
+    oracle.clear_style_tokens()
+    return oracle.requires_grad_(False).eval().to(device, dtype=torch.bfloat16)
+
+
 def train_style_adapter(config: dict[str, Any], destination: Path, *, steps_override: int | None = None) -> dict[str, Any]:
     cfg = config["style_transfer"]
     training = cfg["training"]
@@ -1468,6 +1606,7 @@ def train_style_adapter(config: dict[str, Any], destination: Path, *, steps_over
         output = output / f"smoke-{steps_override}-steps"
     output.mkdir(parents=True, exist_ok=True)
     checkpoint_path = output / "training_state.pt"
+    oracle_path = output / "self_reference_oracle.pt"
     checkpoint_dir = output / "checkpoints"
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     start_step = 0
@@ -1495,6 +1634,17 @@ def train_style_adapter(config: dict[str, Any], destination: Path, *, steps_over
         )
     if start_step >= steps:
         raise RuntimeError(f"Checkpoint is already at step {start_step}, requested steps={steps}")
+
+    oracle_adapter = None
+    curriculum_cfg = dict(training.get("curriculum", {}))
+    self_reference_steps = int(curriculum_cfg.get("self_reference_steps", 0))
+    if start_step > self_reference_steps:
+        if not oracle_path.exists():
+            raise RuntimeError(
+                f"Resuming after self-reference bootstrap requires {oracle_path}"
+            )
+        oracle_adapter = _load_oracle_adapter(oracle_path, adapter, device)
+        print(f"loaded frozen self-reference oracle from {oracle_path}", flush=True)
 
     wandb_run = None
     wandb_cfg = dict(training.get("wandb", {}))
@@ -1567,10 +1717,25 @@ def train_style_adapter(config: dict[str, Any], destination: Path, *, steps_over
         batch = next(iterator)
         data_wait = time.perf_counter() - wait_started
         step = zero_based_step + 1
+        curriculum = _self_reference_curriculum_state(step, curriculum_cfg)
+        _set_adapter_trainable_stage(adapter, gate_only=bool(curriculum["gate_only"]))
+        if curriculum["oracle_required"] and oracle_adapter is None:
+            if step != self_reference_steps + 1:
+                raise RuntimeError(
+                    "Frozen oracle was not available at the curriculum transition"
+                )
+            adapter.clear_style_tokens()
+            _save_oracle_adapter(oracle_path, adapter)
+            oracle_adapter = _load_oracle_adapter(oracle_path, adapter, device)
+            print(
+                f"froze self-reference oracle at step {self_reference_steps}: {oracle_path}",
+                flush=True,
+            )
         data_ready = time.perf_counter()
         optimizer.zero_grad(set_to_none=True)
         loss, details = _forward_flow_loss(
-            anima, adapter, resampler, batch, device, loss_config=training, step=step
+            anima, adapter, resampler, batch, device, loss_config=training, step=step,
+            oracle_adapter=oracle_adapter,
         )
         loss.backward()
         # Non-reentrant block checkpointing replays style attention during
@@ -1597,9 +1762,11 @@ def train_style_adapter(config: dict[str, Any], destination: Path, *, steps_over
         if step == start_step + 1 or step % log_every == 0 or step == steps:
             print(
                 f"style step={step}/{steps} loss={row['loss']:.6f} grad={row['grad_norm']:.4f} "
+                f"phase={row['curriculum_phase']} "
                 f"refs={row['references']} shape={tuple(row['latent_shape'])} step_s={elapsed:.2f} "
                 f"data_wait_s={data_wait:.3f} output_ratio={row['style_output_ratio']:.4f} "
                 f"mag={row['style_magnitude_loss']:.5f} dir={row['style_flow_direction_loss']:.5f} "
+                f"oracle={row['oracle_distill_loss']:.5f}/{int(row['oracle_distill_applied'])} "
                 f"gate={row['style_gate_abs_mean']:.4f} "
                 f"block_res={row['style_block_residual_ratio_mean']:.4f} "
                 f"peak_vram={row['peak_vram_gib']:.2f}GiB",

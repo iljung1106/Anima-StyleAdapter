@@ -259,7 +259,7 @@ tap_resampler_experiment:
 # and batches targets by exact latent shape. `style-smoke` forces two steps and
 # writes to a separate smoke directory; `style-train` uses `training.steps`.
 style_transfer:
-  output_directory: style_transfer_l18_l24_siglip_l24_absolute_guided_v6
+  output_directory: style_transfer_l18_l24_siglip_l24_selfref_oracle_v7
   seed: 20260811
   loader:
     style_cache: style_features_l18_l24_siglip_l24
@@ -306,8 +306,8 @@ style_transfer:
     maximum_artist_similarity: 0.95
   training:
     device: cuda
-    # Empirical-interval run starts from the adapter's exactly neutral zero gate.
-    steps: 500
+    # One approximately full pass over the cached human-only training images.
+    steps: 32000
     learning_rate: 0.00005
     weight_decay: 0.01
     max_grad_norm: 1.0
@@ -316,42 +316,33 @@ style_transfer:
     prefetch_workers: 2
     prefetch_batches: 4
     log_every: 10
-    validation_every: 250
+    validation_every: 1000
     validation_batches: 8
-    checkpoint_every: 250
-    sample_every: 250
+    checkpoint_every: 1000
+    sample_every: 1000
     resume: true
     style_token_contrastive_weight: 0.0
     style_kv_contrastive_weight: 0.0
     style_contrastive_temperature: 0.10
-    style_effect_calibration: style_effect_calibration.json
-    style_output_ratio_floor: 0.0
-    style_magnitude_ramp_steps: 250
-    style_magnitude_weight: 0.25
-    style_interval_huber_beta: 0.01
-    # Match the native @artist effect after ordinary text CFG=4, but at
-    # Style-CFG=1. The upper bound is deliberately looser than the lower bound.
-    style_guided_effect_scale: 4.0
-    style_effect_upper_scale: 6.0
-    # A magnitude-only radial loss has zero gradient at an exactly neutral
-    # adapter. Briefly align with frozen Anima's true flow error to choose a
-    # useful direction, then remove this bootstrap signal completely.
-    style_flow_direction_weight: 0.02
-    style_direction_epsilon: 0.01
-    style_direction_anneal_start: 100
-    style_direction_anneal_end: 250
-    style_shuffled_rank_weight: 0.0
-    style_shuffled_rank_margin: 0.0005
-    target_reference_probability: 1.0
-    target_reference_anneal_start: 100
-    target_reference_anneal_end: 250
-    style_aux_anneal_start: 1000000
-    style_aux_anneal_end: 1000001
+    # 1) target-only standard flow bootstrap; 2) initially train only the
+    # exact-zero gate, then open K/V and the set aggregator; 3) freeze the
+    # end-of-bootstrap adapter as a target-reference oracle; 4) gradually
+    # remove target references while weakly distilling on a subset of steps;
+    # 5) finish with target-excluded multi-reference episodes only.
+    curriculum:
+      gate_only_steps: 250
+      self_reference_steps: 8000
+      target_anneal_end: 20000
+      oracle_distill_end: 20000
+    oracle_distill_weight: 0.02
+    oracle_distill_probability: 0.25
+    oracle_distill_scale_floor: 0.02
+    oracle_distill_huber_beta: 0.1
     wandb:
       enabled: true
       project: anima-style-adapter
-      name: anima-style-transfer-l18-l24-absolute-guided-v6
-      id: anima-style-transfer-l18-l24-absolute-guided-v6
+      name: anima-style-transfer-l18-l24-selfref-oracle-v7
+      id: anima-style-transfer-l18-l24-selfref-oracle-v7
   diagnostics:
     checkpoint: training_state.pt
     batch_size: 8

@@ -480,3 +480,25 @@ base의 이미지별 content/detail 오차를 대부분 포함하므로 bootstra
 비교하는 perceptual objective가 필요하다. 본학습 비용을 줄이려면 먼저 Qwen VAE latent에서
 C-RADIO+Resampler style token을 예측하는 작은 frozen surrogate를 학습하고, 그 surrogate를
 style injection 학습의 differentiable critic으로 사용하는 방안을 우선 검증한다.
+
+## 19. Self-reference oracle curriculum
+
+절대 크기 및 raw flow-error 방향 규제는 사용하지 않고 다음 순서로 다시 학습한다.
+
+1. 초기에는 target 이미지 한 장만 reference로 사용하여 표준 rectified-flow loss로
+   self-reference bootstrap을 수행한다.
+2. strict zero-init을 유지하기 위해 첫 250 step은 timestep gate만 학습하고, 이후 shared K/V,
+   block별 low-rank delta, Set Aggregator와 null token을 함께 연다.
+3. 8,000 step의 self-reference 모델을 고정 oracle로 저장한다. 이후 같은 noisy latent와
+   prompt에서 target-only oracle 출력과 다른 same-artist reference를 받는 student 출력을
+   약하게 증류한다. 계산량을 제한하기 위해 ramp 구간 step의 25%에만 적용한다.
+4. student reference에 target을 포함할 확률을 step 8,000의 1.0에서 step 20,000의 0.0까지
+   선형으로 낮춘다. Oracle은 이 구간에만 사용하며 학습되지 않는다.
+5. step 20,000부터 32,000까지는 target과 겹치지 않는 1~8장 multi-reference만 사용하고
+   표준 flow loss로 마무리한다.
+
+Validation은 전 단계에서 target-excluded reference만 사용한다. 따라서 self-reference의 쉬운
+복원 성능이 아니라 실제 same-artist 다른 이미지 조건의 일반화를 기준으로 checkpoint를
+선택한다. Oracle은 초기 image-conditioning 경로를 전달하는 임시 teacher이며 최종 추론에는
+포함되지 않는다. Content 복사 여부는 고정 seed sample과 correct/null/bypass 진단으로 함께
+확인한다.
