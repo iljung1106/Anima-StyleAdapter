@@ -2016,6 +2016,35 @@ def _per_sample_cosine(first: torch.Tensor, second: torch.Tensor) -> torch.Tenso
     return numerator / denominator
 
 
+def _per_sample_condition_comparison(
+    first: torch.Tensor,
+    second: torch.Tensor,
+    bypass: torch.Tensor,
+    target: torch.Tensor,
+) -> dict[str, torch.Tensor]:
+    """Compare two conditions directly on one identical flow problem.
+
+    Positive ``first_advantage`` means the first condition has lower flow MSE.
+    Direct condition differences are reported alongside the frozen-model error
+    scale so a reference effect can be separated from ordinary flow magnitude.
+    """
+    dimensions = tuple(range(1, first.ndim))
+    first = first.float()
+    second = second.float()
+    bypass = bypass.float()
+    target = target.float()
+    base_mse = (bypass - target).square().mean(dim=dimensions).clamp_min(1e-12)
+    first_mse = (first - target).square().mean(dim=dimensions)
+    second_mse = (second - target).square().mean(dim=dimensions)
+    difference_rms = (first - second).square().mean(dim=dimensions).sqrt()
+    bypass_rms = bypass.square().mean(dim=dimensions).sqrt().clamp_min(1e-8)
+    return {
+        "first_advantage": (second_mse - first_mse) / base_mse,
+        "difference_to_base_ratio": difference_rms / bypass_rms,
+        "difference_to_desired_ratio": difference_rms / base_mse.sqrt(),
+    }
+
+
 def _summarize_scalar_samples(values: list[float]) -> dict[str, float]:
     tensor = torch.tensor(values, dtype=torch.float64)
     mean = float(tensor.mean())
@@ -2084,6 +2113,9 @@ def diagnose_style_reference_dependence(
     )
     comparison_samples: dict[str, dict[str, list[float]]] = defaultdict(
         lambda: defaultdict(list)
+    )
+    direct_comparison_samples: dict[str, dict[str, dict[str, list[float]]]] = defaultdict(
+        lambda: defaultdict(lambda: defaultdict(list))
     )
     for index in range(batches):
         batch = loader.load_step(index)
@@ -2180,6 +2212,9 @@ def diagnose_style_reference_dependence(
                 "null": predict(noisy, timesteps, null_style),
             }
             bypass_prediction = predict(noisy, timesteps, None, bypass=True)
+            # A second identical bypass pass measures the numerical repeatability
+            # floor of a full frozen-Anima evaluation on this hardware/backend.
+            bypass_repeat = predict(noisy, timesteps, None, bypass=True)
             timestep_key = f"{timestep:.2f}"
             deltas = {}
             for condition, prediction in predictions.items():
@@ -2201,6 +2236,26 @@ def diagnose_style_reference_dependence(
                 comparison_samples[timestep_key][comparison].extend(
                     float(value) for value in values.cpu()
                 )
+            for comparison, first, second in (
+                ("self_vs_wrong", "self", "wrong_artist"),
+                ("heldout_vs_wrong", "heldout", "wrong_artist"),
+                ("heldout_vs_null", "heldout", "null"),
+                ("self_vs_heldout", "self", "heldout"),
+                ("bypass_repeatability", None, None),
+            ):
+                first_prediction = (
+                    bypass_prediction if first is None else predictions[first]
+                )
+                second_prediction = (
+                    bypass_repeat if second is None else predictions[second]
+                )
+                metrics = _per_sample_condition_comparison(
+                    first_prediction, second_prediction, bypass_prediction, target
+                )
+                for metric, values in metrics.items():
+                    direct_comparison_samples[timestep_key][comparison][metric].extend(
+                        float(value) for value in values.cpu()
+                    )
 
     means = {key: sum(record[key] for record in records) / len(records) for key in records[0]}
     timestep_metrics = {
@@ -2217,6 +2272,16 @@ def diagnose_style_reference_dependence(
         }
         for timestep, comparisons in comparison_samples.items()
     }
+    direct_comparisons = {
+        timestep: {
+            comparison: {
+                metric: _summarize_scalar_samples(values)
+                for metric, values in metrics.items()
+            }
+            for comparison, metrics in comparisons.items()
+        }
+        for timestep, comparisons in direct_comparison_samples.items()
+    }
     result = {
         "checkpoint": str(checkpoint_path.resolve()),
         "step": int(state["step"]),
@@ -2226,6 +2291,7 @@ def diagnose_style_reference_dependence(
         "records": records,
         "timestep_metrics": timestep_metrics,
         "condition_delta_cosines": delta_cosines,
+        "direct_condition_comparisons": direct_comparisons,
     }
     diagnostic_output = output / "diagnostics" / f"step-{int(state['step']):07d}"
     diagnostic_output.mkdir(parents=True, exist_ok=True)

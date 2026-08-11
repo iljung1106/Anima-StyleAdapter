@@ -17,6 +17,7 @@ from anima_style_data.style_transfer import (
     _flow_direction_loss,
     _optimize_frozen_anima,
     _pad_text_conditions,
+    _per_sample_condition_comparison,
     _per_sample_cosine,
     _per_sample_flow_residual_metrics,
     _save_training_state,
@@ -65,6 +66,27 @@ def test_condition_delta_cosine_and_summary_report_common_or_opposite_outputs():
     assert summary["mean"] == pytest.approx(1 / 3)
     assert summary["positive_fraction"] == pytest.approx(2 / 3)
     assert summary["samples"] == 3
+
+
+def test_direct_condition_comparison_reports_advantage_and_repeatability_floor():
+    bypass = torch.ones(2, 1, 1, 2)
+    desired = torch.tensor([[[[1.0, -1.0]]], [[[1.0, -1.0]]]])
+    target = bypass + desired
+    first = target
+    second = bypass + 0.5 * desired
+
+    metrics = _per_sample_condition_comparison(first, second, bypass, target)
+    torch.testing.assert_close(metrics["first_advantage"], torch.full((2,), 0.25))
+    torch.testing.assert_close(
+        metrics["difference_to_base_ratio"], torch.full((2,), 0.5)
+    )
+    torch.testing.assert_close(
+        metrics["difference_to_desired_ratio"], torch.full((2,), 0.5)
+    )
+
+    repeat = _per_sample_condition_comparison(first, first, bypass, target)
+    torch.testing.assert_close(repeat["first_advantage"], torch.zeros(2))
+    torch.testing.assert_close(repeat["difference_to_base_ratio"], torch.zeros(2))
 
 
 class RMSNorm(nn.Module):
