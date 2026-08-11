@@ -389,3 +389,48 @@ Resampler 구조 확정 전에는 다음 결과가 필요하다.
 - [ComfyUI Anima implementation](https://github.com/Comfy-Org/ComfyUI/blob/master/comfy/ldm/anima/model.py)
 - [ComfyUI Cosmos Predict2 attention implementation](https://github.com/Comfy-Org/ComfyUI/blob/master/comfy/ldm/cosmos/predict2.py)
 - [LuciferTC9527/ComfyUI-Anima_IP-Adapter](https://github.com/LuciferTC9527/ComfyUI-Anima_IP-Adapter)
+
+## 16. 1 epoch Style Adapter 학습 결과 (2026-08-11)
+
+고정 Anima와 per-reference Resampler 위에서 Set Aggregator, cross-slot Transformer 1층,
+shared full-rank K/V, 28-block low-rank delta와 timestep-conditioned gate를 batch 16으로
+7,495 step(1 epoch) 학습했다. 학습 가능한 파라미터는 34,578,204개이며 데이터 대기는
+대부분 3~5ms로 GPU가 주 병목이었다.
+
+초기 샘플의 단색 격자 문제는 Anima가 학습된 512개의 post-LLM text token을 cache loader가
+batch 내 최대 유효 길이로 잘라 cross-attention 정규화를 바꾼 것이 원인이었다. Loader와
+null conditioning을 항상 512 token으로 복원한 뒤 frozen control이 공식 Anima 출력과
+일치하고 step 0 style 경로가 정확히 중립임을 확인한 후 처음부터 다시 학습했다.
+
+6,000 step 이후에는 target 수가 batch 16보다 작은 희귀 latent-shape bucket이 선택되어
+중단됐다. Loader 초기화 시 target bucket을 batch size 이상인 경우로 제한하도록 수정했고,
+86개 유효 bucket의 최소 target 수가 23임을 확인한 뒤 step 6,000에서 재개하여 완주했다.
+
+고정된 8 validation batch의 flow MSE는 다음과 같았다.
+
+| step | validation loss |
+|---:|---:|
+| 0 | 0.077076 |
+| 2,000 | 0.076881 |
+| 3,500 | 0.076800 |
+| 4,500 | 0.076761 |
+| **5,500** | **0.076686** |
+| 6,000 | 0.076795 |
+| 7,000 | 0.076778 |
+
+5,500과 최종 7,495 checkpoint를 동일 seed와 두 validation 작가에서 비교했다. 둘 다
+정상 이미지를 생성하고 reference의 특정 캐릭터나 의상을 그대로 복사하지 않으면서 얼굴,
+선, 광택, 색 대비와 구도를 변화시켰다. 7,495가 일관되게 더 낫다는 근거가 없고 5,500이
+validation 최저값이므로 1차 선택 모델은 step 5,500으로 정한다. Style CFG 1에서 전이가
+확인됐고 4에서는 훨씬 강한 변화가 나타나 독립적인 style strength 조절도 작동했다.
+
+RunPod 산출물은 다음과 같다.
+
+- 전체 resume checkpoint: `selected-step-0005500.pt` (약 199MB)
+- adapter-only 배포 가중치: `anima-style-adapter-step5500.safetensors` (약 66MB)
+- adapter-only SHA-256: `ac55c30379c28d8bdf64ebdc3ebdb5fcf6ef7105ae047515fc90e1728f8473aa`
+- 학습 기록: [W&B run](https://wandb.ai/1wndrla17-kyung-hee-university/anima-style-adapter/runs/anima-style-transfer-l18-l24-siglip-l24-crossslot1-fixedtext-v2)
+
+이 결과는 구조와 학습 경로가 실제로 작동함을 확인한 1차 모델이다. 다음 단계에서는 더
+다양한 작가·prompt·reference 수에 대한 정량/블라인드 평가와 실제 inference integration을
+완료한 뒤, 필요하면 learning-rate decay와 validation artist 수 확대로 후속 epoch를 결정한다.
