@@ -458,3 +458,25 @@ Anima가 공식적으로 지원하는 `@artist` 조건의 방향을 teacher로 �
 때만 Huber penalty를 적용한다. 구간 안에서는 loss가 정확히 0이며, 방향 일치 loss는 두지
 않는다. 하한은 초기 ramp 동안 점진적으로 높이고 상한은 처음부터 유지해 무근거한 과대
 출력도 막는다. shuffled flow-rank loss는 shortcut 위험 때문에 이 단계에서는 비활성화한다.
+
+## 18. 절대 velocity 확대 pilot 결과
+
+`correct-shuffled` 대신 `correct-bypass` 절대 residual을 사용하고, text CFG 4에서의 native
+artist-tag 효과에 대응하도록 timestep별 하한을 4배로 높인 zero-init pilot을 실행했다.
+Magnitude-only radial loss는 정확한 zero 출력에서 방향 gradient를 만들 수 없으므로 초기
+250 step 동안 frozen Anima의 실제 flow error 방향을 bootstrap으로 사용하고, target image의
+reference 포함률과 함께 step 100부터 250까지 제거했다.
+
+실제 모델 smoke에서 step 1은 gate만 gradient를 받고 step 2부터 Aggregator와 shared K/V도
+gradient를 받는 것을 확인했다. 본 pilot의 absolute output ratio는 step 40의 3.14%, step
+100의 3.27%, step 190의 6.61%까지 증가했다. 그러나 flow-error cosine은 대체로 0에 가까운
+상태에 머물렀고, 고정 validation loss는 step 0의 `0.077076`에서 step 250의 `0.080508`로
+악화됐다. 따라서 정확한 PID만 종료했으며 step-250 checkpoint와 sample을 보존했다.
+
+이 결과는 출력량 부족이 실제 문제였지만 출력량만 강제하는 것으로는 스타일 전이가 되지
+않음을 보여준다. Target flow error는 reference가 설명할 수 있는 작가 스타일뿐 아니라 frozen
+base의 이미지별 content/detail 오차를 대부분 포함하므로 bootstrap teacher로 부적절하다.
+다음 실험은 predicted `x0`를 고정된 style encoder 공간으로 보내 reference/target style token과
+비교하는 perceptual objective가 필요하다. 본학습 비용을 줄이려면 먼저 Qwen VAE latent에서
+C-RADIO+Resampler style token을 예측하는 작은 frozen surrogate를 학습하고, 그 surrogate를
+style injection 학습의 differentiable critic으로 사용하는 방안을 우선 검증한다.
