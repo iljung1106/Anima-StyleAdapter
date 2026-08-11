@@ -85,6 +85,7 @@ def test_frozen_anima_optimizations_preserve_projection_outputs_in_activation_dt
         "low_precision_rmsnorm": 1,
         "fused_self_attention": 1,
         "fused_cross_attention": 1,
+        "final_layer_dtype_guard": 0,
     }
     for actual, expected in zip(
         model.self_attention.compute_qkv(x), expected_self, strict=True

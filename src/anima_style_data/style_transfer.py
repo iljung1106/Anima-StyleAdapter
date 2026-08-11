@@ -759,6 +759,24 @@ def _fuse_frozen_linears(layers: list[nn.Linear]) -> nn.Linear:
     return fused.requires_grad_(False)
 
 
+def _final_layer_dtype_guard(
+    module: nn.Module,
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+) -> tuple[tuple[Any, ...], dict[str, Any]]:
+    """Keep legacy final-layer activations on its frozen matrix dtype."""
+    dtype = module.linear.weight.dtype
+    values = list(args)
+    for index in range(min(2, len(values))):
+        if isinstance(values[index], torch.Tensor):
+            values[index] = values[index].to(dtype=dtype)
+    adaln = kwargs.get("adaln_lora_B_T_3D")
+    if isinstance(adaln, torch.Tensor):
+        kwargs["adaln_lora_B_T_3D"] = adaln.to(dtype=dtype)
+    kwargs["use_fp32"] = False
+    return tuple(values), kwargs
+
+
 def _optimize_frozen_anima(
     anima: nn.Module,
     *,
@@ -766,7 +784,12 @@ def _optimize_frozen_anima(
     fuse_attention_projections: bool,
 ) -> dict[str, int]:
     """Apply inference-safe hot-path optimizations before adapter attachment."""
-    counts = {"low_precision_rmsnorm": 0, "fused_self_attention": 0, "fused_cross_attention": 0}
+    counts = {
+        "low_precision_rmsnorm": 0,
+        "fused_self_attention": 0,
+        "fused_cross_attention": 0,
+        "final_layer_dtype_guard": 0,
+    }
     modules = list(anima.modules())
     if low_precision_rmsnorm:
         compute_dtype = next(
@@ -791,6 +814,11 @@ def _optimize_frozen_anima(
         # Patch each concrete legacy RMSNorm class once for this process.
         for rmsnorm_class in rmsnorm_classes:
             rmsnorm_class.forward = _low_precision_rmsnorm_forward
+        if hasattr(anima, "final_layer"):
+            anima.final_layer.register_forward_pre_hook(
+                _final_layer_dtype_guard, with_kwargs=True
+            )
+            counts["final_layer_dtype_guard"] = 1
     if fuse_attention_projections:
         for module in modules:
             if not all(
