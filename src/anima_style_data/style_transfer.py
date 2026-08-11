@@ -1357,6 +1357,9 @@ def _forward_flow_loss(
         magnitude_loss = flow_loss.new_zeros(())
         direction_loss = flow_loss.new_zeros(())
         output_ratio = flow_loss.new_zeros(())
+        flow_direction_cosine = flow_loss.new_full((), float("nan"))
+        flow_desired_projection = flow_loss.new_full((), float("nan"))
+        flow_delta_to_desired_ratio = flow_loss.new_full((), float("nan"))
         if bypass_prediction is not None:
             dimensions = tuple(range(1, prediction.ndim))
             difference_rms = (
@@ -1371,6 +1374,15 @@ def _forward_flow_loss(
             )
             if valid.any():
                 output_ratio = ratios[valid].mean()
+                residual_metrics = _per_sample_flow_residual_metrics(
+                    prediction[valid], bypass_prediction[valid], target_velocity[valid]
+                )
+                flow_direction_cosine = residual_metrics["direction_cosine"].mean()
+                flow_desired_projection = residual_metrics["desired_projection"].mean()
+                flow_delta_to_desired_ratio = (
+                    residual_metrics["delta_rms"]
+                    / residual_metrics["desired_rms"].clamp_min(1e-8)
+                ).mean()
                 calibration = loss_config.get("_style_effect_calibration")
                 if calibration is None:
                     magnitude_loss = F.relu(magnitude_floor - ratios[valid]).square().mean()
@@ -1465,6 +1477,11 @@ def _forward_flow_loss(
         "resampler_slot_prototype": float(resampler_slot_prototype.detach()),
         "resampler_diversity": float(resampler_diversity.detach()),
         "style_output_ratio": float(output_ratio.detach()),
+        "style_flow_direction_cosine": float(flow_direction_cosine.detach()),
+        "style_flow_desired_projection": float(flow_desired_projection.detach()),
+        "style_flow_delta_to_desired_ratio": float(
+            flow_delta_to_desired_ratio.detach()
+        ),
         "style_magnitude_loss": float(magnitude_loss.detach()),
         "style_flow_direction_multiplier": direction_multiplier,
         "style_flow_direction_loss": float(direction_loss.detach()),
@@ -2096,6 +2113,202 @@ def diagnose_style_reference_dependence(
             generated_sheets[reference_mode] = str(sheet)
         result["generated_sheets"] = generated_sheets
         write_json(result_path, result)
+    return result
+
+
+def _roll_exact_target_features(batch: dict[str, Any]) -> dict[str, Any]:
+    """Keep each training target but give it another batch item's visual condition."""
+    return {
+        **batch,
+        "target_features": {
+            layer: values.roll(1, dims=0)
+            for layer, values in batch["target_features"].items()
+        },
+        "target_feature_mask": batch["target_feature_mask"].roll(1, dims=0),
+        "target_feature_shapes": batch["target_feature_shapes"][-1:]
+        + batch["target_feature_shapes"][:-1],
+        "target_global_features": batch["target_global_features"].roll(1, dims=0),
+    }
+
+
+def overfit_exact_self_batch(config: dict[str, Any], destination: Path) -> dict[str, Any]:
+    """Test whether the adapter can memorize a fixed exact-self flow problem."""
+    cfg = config["style_transfer"]
+    overfit_cfg = dict(cfg.get("overfit", {}))
+    training_cfg = dict(cfg["training"])
+    device = str(training_cfg.get("device", "cuda"))
+    if not device.startswith("cuda") or not torch.cuda.is_available():
+        raise RuntimeError("The exact-self overfit diagnostic requires CUDA")
+    seed = int(overfit_cfg.get("seed", 20260812))
+    random.seed(seed)
+    torch.manual_seed(seed)
+    torch.backends.cuda.matmul.allow_tf32 = bool(training_cfg.get("allow_tf32", True))
+
+    loader_cfg = {
+        **cfg["loader"],
+        "split": "train",
+        "batch_size": int(overfit_cfg.get("batch_size", 3)),
+    }
+    loader_cfg["seed"] = seed
+    loader = ProductionStyleLoader(destination, loader_cfg)
+    fixed_batch = loader.load_step(int(overfit_cfg.get("episode", 0)))
+    wrong_batch = _roll_exact_target_features(fixed_batch)
+    unseen_batch = loader.load_step(int(overfit_cfg.get("unseen_episode", 1)))
+
+    resampler = load_per_reference_resampler(destination, cfg["resampler"], device)
+    resampler.requires_grad_(False).eval()
+    anima = _resolve_anima_model(config, destination, device).requires_grad_(False).train()
+    optimization_counts = _optimize_frozen_anima(
+        anima,
+        low_precision_rmsnorm=bool(training_cfg.get("low_precision_rmsnorm", False)),
+        fuse_attention_projections=bool(training_cfg.get("fuse_attention_projections", False)),
+    )
+    adapter = SharedLowRankStyleAdapter(**cfg["adapter"]).to(device)
+    attach_style_adapter(anima, adapter)
+
+    source_output = destination / str(cfg.get("output_directory", "style_transfer_training"))
+    checkpoint = Path(str(overfit_cfg.get("checkpoint", "checkpoints/step-0001000.pt")))
+    if not checkpoint.is_absolute():
+        checkpoint = source_output / checkpoint
+    state = torch.load(checkpoint, map_location="cpu", weights_only=False)
+    adapter.load_state_dict(state["adapter"])
+    if "resampler" in state:
+        resampler.load_state_dict(state["resampler"])
+    adapter.style_dropout = 0.0
+
+    output_parameters = list(adapter.shared_o.parameters())
+    output_parameters += list(adapter.o_down.parameters()) + list(adapter.o_up.parameters())
+    gate_parameters = list(adapter.gate.parameters())
+    special_ids = {id(value) for value in output_parameters + gate_parameters}
+    representation_parameters = [
+        value for value in adapter.parameters() if id(value) not in special_ids
+    ]
+    weight_decay = float(overfit_cfg.get("weight_decay", 0.0))
+    optimizer = torch.optim.AdamW(
+        [
+            {
+                "params": representation_parameters,
+                "lr": float(overfit_cfg.get("representation_learning_rate", 3e-4)),
+                "weight_decay": weight_decay,
+            },
+            {
+                "params": output_parameters,
+                "lr": float(overfit_cfg.get("output_learning_rate", 2e-4)),
+                "weight_decay": weight_decay,
+            },
+            {
+                "params": gate_parameters,
+                "lr": float(overfit_cfg.get("gate_learning_rate", 1e-4)),
+                "weight_decay": 0.0,
+            },
+        ],
+        fused=True,
+    )
+    loss_config = {
+        **training_cfg,
+        "resampler_train_start_step": -1,
+        "resampler_auxiliary_weight": 0.0,
+        "style_magnitude_weight": 0.0,
+        "style_flow_direction_weight": float(overfit_cfg.get("direction_weight", 0.0)),
+        "style_token_contrastive_weight": 0.0,
+        "style_kv_contrastive_weight": 0.0,
+        "measure_bypass": True,
+        "curriculum": {
+            "gate_only_steps": 0,
+            "self_reference_steps": int(overfit_cfg.get("steps", 500)) + 1,
+            "target_anneal_end": int(overfit_cfg.get("steps", 500)) + 1,
+            "oracle_distill_end": int(overfit_cfg.get("steps", 500)) + 1,
+        },
+        "oracle_distill_weight": 0.0,
+    }
+    fixed_noise_seed = int(overfit_cfg.get("noise_seed", seed ^ 0xF10))
+
+    def evaluate(batch: dict[str, Any], noise_seed: int) -> dict[str, float]:
+        anima.eval()
+        adapter.eval()
+        generator = torch.Generator(device=device).manual_seed(noise_seed)
+        with torch.no_grad():
+            _, metrics = _forward_flow_loss(
+                anima, adapter, resampler, batch, device,
+                generator=generator, loss_config=loss_config, step=1,
+            )
+        return {
+            key: float(metrics[key])
+            for key in (
+                "flow_loss", "base_flow_loss", "paired_flow_improvement",
+                "style_output_ratio", "style_flow_direction_cosine",
+                "style_flow_desired_projection",
+                "style_flow_delta_to_desired_ratio",
+            )
+        }
+
+    output = source_output / "overfit_exact_self"
+    output.mkdir(parents=True, exist_ok=True)
+    history = []
+    steps = int(overfit_cfg.get("steps", 500))
+    evaluate_every = int(overfit_cfg.get("evaluate_every", 25))
+    max_grad_norm = float(overfit_cfg.get("max_grad_norm", 1.0))
+    initial = {
+        "step": 0,
+        "self": evaluate(fixed_batch, fixed_noise_seed),
+        "wrong": evaluate(wrong_batch, fixed_noise_seed),
+        "unseen_self": evaluate(unseen_batch, fixed_noise_seed + 1),
+    }
+    history.append(initial)
+    print(f"exact-self overfit step=0 metrics={initial}", flush=True)
+
+    started = time.perf_counter()
+    for step in range(1, steps + 1):
+        anima.train()
+        adapter.train()
+        optimizer.zero_grad(set_to_none=True)
+        generator = torch.Generator(device=device).manual_seed(fixed_noise_seed)
+        loss, _ = _forward_flow_loss(
+            anima, adapter, resampler, fixed_batch, device,
+            generator=generator, loss_config=loss_config, step=step,
+        )
+        loss.backward()
+        grad_norm = torch.nn.utils.clip_grad_norm_(adapter.parameters(), max_grad_norm)
+        optimizer.step()
+        if step % evaluate_every == 0 or step == steps:
+            row = {
+                "step": step,
+                "train_loss": float(loss.detach()),
+                "grad_norm": float(grad_norm),
+                "self": evaluate(fixed_batch, fixed_noise_seed),
+                "wrong": evaluate(wrong_batch, fixed_noise_seed),
+                "unseen_self": evaluate(unseen_batch, fixed_noise_seed + 1),
+            }
+            history.append(row)
+            write_json(output / "history.json", history)
+            print(f"exact-self overfit step={step} metrics={row}", flush=True)
+
+    checkpoint_output = output / "overfit_state.pt"
+    torch.save(
+        {
+            "step": steps,
+            "source_checkpoint": str(checkpoint),
+            "adapter": adapter.state_dict(),
+            "resampler": resampler.state_dict(),
+        },
+        checkpoint_output,
+    )
+    result = {
+        "source_checkpoint": str(checkpoint),
+        "source_step": int(state["step"]),
+        "steps": steps,
+        "fixed_targets": [item.target_id for item in fixed_batch["episodes"]],
+        "fixed_timesteps_and_noise_seed": fixed_noise_seed,
+        "resampler_trainable": False,
+        "losses": "flow MSE only",
+        "optimization_counts": optimization_counts,
+        "initial": history[0],
+        "final": history[-1],
+        "history": str(output / "history.json"),
+        "checkpoint": str(checkpoint_output),
+        "elapsed_s": time.perf_counter() - started,
+    }
+    write_json(output / "summary.json", result)
     return result
 
 
