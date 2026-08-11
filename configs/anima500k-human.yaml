@@ -306,7 +306,8 @@ style_transfer:
     maximum_artist_similarity: 0.95
   training:
     device: cuda
-    # One approximately full pass over the cached human-only training images.
+    # 119,907 cached train images / batch 16 = 7,494 steps per epoch. The
+    # complete staged curriculum is about 4.27 epochs.
     steps: 32000
     learning_rate: 0.00005
     weight_decay: 0.01

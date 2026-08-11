@@ -497,6 +497,10 @@ style injection 학습의 differentiable critic으로 사용하는 방안을 우
 5. step 20,000부터 32,000까지는 target과 겹치지 않는 1~8장 multi-reference만 사용하고
    표준 flow loss로 마무리한다.
 
+현재 cache의 train split은 119,907장이므로 batch 16에서 1 epoch은 약 7,494 step이다. 전체
+32,000 step은 약 4.27 epoch이며 self-reference 약 1.07 epoch, target 포함률 감소 약 1.60
+epoch, 완전 target-excluded 약 1.60 epoch으로 구성된다.
+
 Validation은 전 단계에서 target-excluded reference만 사용한다. 따라서 self-reference의 쉬운
 복원 성능이 아니라 실제 same-artist 다른 이미지 조건의 일반화를 기준으로 checkpoint를
 선택한다. Oracle은 초기 image-conditioning 경로를 전달하는 임시 teacher이며 최종 추론에는
