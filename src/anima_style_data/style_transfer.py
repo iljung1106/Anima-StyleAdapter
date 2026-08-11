@@ -769,9 +769,21 @@ def _optimize_frozen_anima(
     counts = {"low_precision_rmsnorm": 0, "fused_self_attention": 0, "fused_cross_attention": 0}
     modules = list(anima.modules())
     if low_precision_rmsnorm:
+        compute_dtype = next(
+            (
+                parameter.dtype
+                for parameter in anima.parameters()
+                if parameter.dtype in (torch.bfloat16, torch.float16)
+            ),
+            torch.bfloat16,
+        )
         for module in modules:
             if module.__class__.__name__ != "RMSNorm":
                 continue
+            # Legacy RMSNorm parameters are intentionally left FP32 by the
+            # loader even when the DiT matrices are BF16. Convert the frozen
+            # scale itself, otherwise a weight-dtype keyed forward stays FP32.
+            module.weight.data = module.weight.data.to(dtype=compute_dtype)
             module.forward = types.MethodType(_low_precision_rmsnorm_forward, module)
             counts["low_precision_rmsnorm"] += 1
     if fuse_attention_projections:

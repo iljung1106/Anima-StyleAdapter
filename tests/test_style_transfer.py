@@ -30,7 +30,7 @@ class RMSNorm(nn.Module):
     def __init__(self, dim: int):
         super().__init__()
         self.eps = 1e-5
-        self.weight = nn.Parameter(torch.ones(dim, dtype=torch.bfloat16))
+        self.weight = nn.Parameter(torch.ones(dim, dtype=torch.float32))
 
     def forward(self, x):
         return x.float().square().mean(-1, keepdim=True).to(x.dtype)
@@ -97,6 +97,7 @@ def test_frozen_anima_optimizations_preserve_projection_outputs_in_activation_dt
     bf16 = torch.randn(2, 5, 8, dtype=torch.bfloat16)
     assert model.norm(bf16).dtype == torch.bfloat16
     assert model.norm(bf16.float()).dtype == torch.bfloat16
+    assert model.norm.weight.dtype == torch.bfloat16
     assert not hasattr(model.self_attention, "q_proj")
     assert hasattr(model.cross_attention, "q_proj")
 
