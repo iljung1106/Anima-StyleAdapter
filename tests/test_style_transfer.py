@@ -111,7 +111,7 @@ def test_self_reference_curriculum_has_explicit_terminal_phase():
         "oracle_distill_end": 9,
     }
     first = _self_reference_curriculum_state(1, config)
-    assert first["phase"] == "gate_only_self_reference"
+    assert first["phase"] == "output_bootstrap_self_reference"
     assert first["target_only"] and first["target_probability"] == 1.0
     opened = _self_reference_curriculum_state(3, config)
     assert opened["phase"] == "full_self_reference"
@@ -133,6 +133,8 @@ def test_gate_only_stage_then_opens_entire_adapter():
     )
     _set_adapter_trainable_stage(adapter, gate_only=True)
     assert all(parameter.requires_grad for parameter in adapter.gate.parameters())
+    assert adapter.shared_o.weight.requires_grad
+    assert all(parameter.requires_grad for parameter in adapter.o_up.parameters())
     assert not adapter.shared_k.weight.requires_grad
     assert not next(adapter.aggregator.parameters()).requires_grad
     _set_adapter_trainable_stage(adapter, gate_only=False)
@@ -261,10 +263,11 @@ class _FakeCrossAttention(nn.Module):
         self.output_dropout = nn.Identity()
 
 
-def test_style_attention_reuses_frozen_q_and_updates_gate():
+def test_zero_output_projection_gets_direction_before_opening_kv_path():
     torch.manual_seed(3)
     adapter = SharedLowRankStyleAdapter(
-        style_dim=8, slots=2, hidden_dim=16, heads=4, blocks=28, rank=2,
+        style_dim=8, slots=2, hidden_dim=16, output_dim=16,
+        heads=4, blocks=28, rank=2,
         aggregator_heads=2, aggregator_layers=1, style_dropout=0.0, gate_dim=4,
     )
     cross = _FakeCrossAttention(16)
@@ -273,10 +276,18 @@ def test_style_attention_reuses_frozen_q_and_updates_gate():
     query = torch.randn(2, 5, 16)
     timestep = torch.randn(2, 1, 16)
 
-    # Zero-init gate makes attachment exactly neutral before training.
+    # The full style residual is exactly neutral, but its output matrix gets an
+    # informative gradient immediately instead of blocking the whole K/V path
+    # behind a zero scalar gate.
     initial = adapter.attend(0, query, timestep, cross)
     assert torch.count_nonzero(initial) == 0
-    adapter.gate[-1].bias.data[0] = 0.1
+    initial.sum().backward()
+    assert adapter.shared_o.weight.grad is not None
+    assert adapter.shared_o.weight.grad.norm() > 0
+    assert adapter.shared_k.weight.grad is None or adapter.shared_k.weight.grad.norm() == 0
+
+    adapter.zero_grad(set_to_none=True)
+    nn.init.normal_(adapter.shared_o.weight, std=0.01)
     output = adapter.attend(0, query, timestep, cross)
     assert output.shape == query.shape
     output.square().mean().backward()

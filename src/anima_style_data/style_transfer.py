@@ -375,6 +375,7 @@ class SharedLowRankStyleAdapter(nn.Module):
         style_dim: int = 768,
         slots: int = 16,
         hidden_dim: int = 2048,
+        output_dim: int = 3072,
         heads: int = 16,
         blocks: int = 28,
         rank: int = 16,
@@ -388,6 +389,7 @@ class SharedLowRankStyleAdapter(nn.Module):
         self.style_dim = style_dim
         self.slots = slots
         self.hidden_dim = hidden_dim
+        self.output_dim = output_dim
         self.heads = heads
         self.head_dim = hidden_dim // heads
         self.blocks = blocks
@@ -407,9 +409,19 @@ class SharedLowRankStyleAdapter(nn.Module):
         self.k_up = nn.ModuleList([nn.Linear(rank, hidden_dim, bias=False) for _ in range(blocks)])
         self.v_down = nn.ModuleList([nn.Linear(style_dim, rank, bias=False) for _ in range(blocks)])
         self.v_up = nn.ModuleList([nn.Linear(rank, hidden_dim, bias=False) for _ in range(blocks)])
+        self.shared_o = nn.Linear(hidden_dim, output_dim, bias=False)
+        self.o_down = nn.ModuleList(
+            [nn.Linear(hidden_dim, rank, bias=False) for _ in range(blocks)]
+        )
+        self.o_up = nn.ModuleList(
+            [nn.Linear(rank, output_dim, bias=False) for _ in range(blocks)]
+        )
+        nn.init.zeros_(self.shared_o.weight)
         for modules in (self.k_up, self.v_up):
             for layer in modules:
                 nn.init.zeros_(layer.weight)
+        for layer in self.o_up:
+            nn.init.zeros_(layer.weight)
         self.gate = nn.Sequential(nn.Linear(hidden_dim, gate_dim), nn.SiLU(), nn.Linear(gate_dim, blocks))
         nn.init.zeros_(self.gate[-1].weight)
         nn.init.zeros_(self.gate[-1].bias)
@@ -491,8 +503,15 @@ class SharedLowRankStyleAdapter(nn.Module):
         k = cross_attention.k_norm(k)
         attended = F.scaled_dot_product_attention(q, k, v)
         attended = attended.transpose(1, 2).reshape(normalized_x.shape[0], normalized_x.shape[1], self.hidden_dim)
-        attended = cross_attention.output_dropout(cross_attention.output_proj(attended))
-        gate = torch.tanh(self.gate(timestep_embedding)[:, 0, block_index])
+        attended = self.shared_o(attended) + self.o_up[block_index](
+            self.o_down[block_index](attended)
+        )
+        # The zero-initialized output projection makes the initial residual
+        # exactly zero while still receiving a full matrix gradient. A unit-
+        # centered timestep gate can learn suppression/amplification only after
+        # that useful direction exists; unlike a zero scalar gate it does not
+        # block the representation path at initialization.
+        gate = 1.0 + torch.tanh(self.gate(timestep_embedding)[:, 0, block_index])
         result = attended * gate[:, None, None]
         self._runtime_gate_abs[block_index] = gate.detach().abs().mean()
         self._runtime_residual_ratio[block_index] = (
@@ -924,7 +943,7 @@ def _self_reference_curriculum_state(step: int, config: dict[str, Any]) -> dict[
         int(config.get("oracle_distill_end", target_anneal_end)),
     )
     if step <= gate_only_steps:
-        phase = "gate_only_self_reference"
+        phase = "output_bootstrap_self_reference"
     elif step <= self_reference_steps:
         phase = "full_self_reference"
     elif step < target_anneal_end:
@@ -952,11 +971,19 @@ def _self_reference_curriculum_state(step: int, config: dict[str, Any]) -> dict[
 def _set_adapter_trainable_stage(
     adapter: SharedLowRankStyleAdapter, *, gate_only: bool
 ) -> None:
-    """Keep exact zero-init stable before opening the representation path."""
+    """Bootstrap the exact-zero output map before opening the K/V path."""
     for parameter in adapter.parameters():
         parameter.requires_grad_(not gate_only)
-    for parameter in adapter.gate.parameters():
-        parameter.requires_grad_(True)
+    if gate_only:
+        bootstrap_modules = [
+            adapter.gate,
+            adapter.shared_o,
+            adapter.o_down,
+            adapter.o_up,
+        ]
+        for module in bootstrap_modules:
+            for parameter in module.parameters():
+                parameter.requires_grad_(True)
 
 
 @contextmanager
@@ -1091,7 +1118,7 @@ def _forward_flow_loss(
         magnitude_weight = float(loss_config.get("style_magnitude_weight", 0.0)) * auxiliary
         direction_weight = float(loss_config.get("style_flow_direction_weight", 0.0)) * direction_multiplier
         bypass_prediction = None
-        if magnitude_weight > 0 or direction_weight > 0:
+        if bool(loss_config.get("measure_bypass", False)) or magnitude_weight > 0 or direction_weight > 0:
             # Frozen Anima establishes an absolute zero for style intervention.
             # Unlike a shuffled reference, this baseline cannot be made worse by
             # the adapter and therefore cannot satisfy the objective by shortcut.
@@ -1228,6 +1255,18 @@ def _forward_flow_loss(
         "references": int(reference_mask.sum()),
         "latent_shape": list(latents.shape),
         "flow_loss": float(flow_loss.detach()),
+        "base_flow_loss": (
+            float(F.mse_loss(bypass_prediction, target_velocity).detach())
+            if bypass_prediction is not None else float("nan")
+        ),
+        "paired_flow_improvement": (
+            float(
+                (
+                    F.mse_loss(bypass_prediction, target_velocity) - flow_loss
+                ).div(F.mse_loss(bypass_prediction, target_velocity).clamp_min(1e-8)).detach()
+            )
+            if bypass_prediction is not None else float("nan")
+        ),
         "curriculum_phase": str(curriculum["phase"]),
         "curriculum_gate_only": bool(curriculum["gate_only"]),
         "oracle_distill_weight": oracle_weight,
@@ -1261,16 +1300,23 @@ def _validate_style_adapter(
     adapter.eval()
     losses = []
     references = []
+    base_losses = []
+    paired_improvements = []
+    output_ratios = []
     started = time.perf_counter()
     try:
         for index in range(batches):
             batch = loader.load_step(index)
             generator = torch.Generator(device=device).manual_seed(seed + index)
             loss, details = _forward_flow_loss(
-                anima, adapter, resampler, batch, device, generator=generator
+                anima, adapter, resampler, batch, device, generator=generator,
+                loss_config={"measure_bypass": True},
             )
             losses.append(float(loss))
             references.append(details["references"])
+            base_losses.append(details["base_flow_loss"])
+            paired_improvements.append(details["paired_flow_improvement"])
+            output_ratios.append(details["style_output_ratio"])
             adapter.clear_style_tokens()
     finally:
         adapter.clear_style_tokens()
@@ -1278,6 +1324,9 @@ def _validate_style_adapter(
         adapter.train()
     return {
         "loss": sum(losses) / len(losses),
+        "base_loss": sum(base_losses) / len(base_losses),
+        "paired_improvement": sum(paired_improvements) / len(paired_improvements),
+        "style_output_ratio": sum(output_ratios) / len(output_ratios),
         "batches": float(batches),
         "mean_references": sum(references) / len(references),
         "elapsed_s": time.perf_counter() - started,
@@ -1839,6 +1888,9 @@ def train_style_adapter(config: dict[str, Any], destination: Path, *, steps_over
         )
         print(
             f"validation step=0 loss={baseline['loss']:.6f} "
+            f"base={baseline['base_loss']:.6f} "
+            f"paired={baseline['paired_improvement']:.6f} "
+            f"output_ratio={baseline['style_output_ratio']:.6f} "
             f"batches={validation_batches} elapsed_s={baseline['elapsed_s']:.2f}",
             flush=True,
         )
@@ -1907,6 +1959,11 @@ def train_style_adapter(config: dict[str, Any], destination: Path, *, steps_over
             "shared_kv_grad": _parameter_grad_norm(
                 list(adapter.shared_k.parameters()) + list(adapter.shared_v.parameters())
             ),
+            "style_output_grad": _parameter_grad_norm(
+                list(adapter.shared_o.parameters())
+                + list(adapter.o_down.parameters())
+                + list(adapter.o_up.parameters())
+            ),
             "gate_grad": _parameter_grad_norm(adapter.gate.parameters()),
         }
         optimizer.step()
@@ -1945,6 +2002,9 @@ def train_style_adapter(config: dict[str, Any], destination: Path, *, steps_over
             )
             print(
                 f"validation step={step} loss={validation['loss']:.6f} "
+                f"base={validation['base_loss']:.6f} "
+                f"paired={validation['paired_improvement']:.6f} "
+                f"output_ratio={validation['style_output_ratio']:.6f} "
                 f"batches={validation_batches} elapsed_s={validation['elapsed_s']:.2f}",
                 flush=True,
             )
