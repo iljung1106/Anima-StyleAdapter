@@ -2148,6 +2148,27 @@ def diagnose_style_reference_dependence(
     """
     cfg = config["style_transfer"]
     diagnostic_cfg = dict(cfg.get("diagnostics", {}))
+    checkpoint_sweep = diagnostic_cfg.get("checkpoints")
+    if checkpoint_sweep:
+        results = []
+        for checkpoint in checkpoint_sweep:
+            candidate = copy.deepcopy(config)
+            candidate_diagnostics = candidate["style_transfer"]["diagnostics"]
+            candidate_diagnostics.pop("checkpoints", None)
+            candidate_diagnostics["checkpoint"] = str(checkpoint)
+            result = diagnose_style_reference_dependence(candidate, destination)
+            results.append(
+                {
+                    "step": int(result["step"]),
+                    "checkpoint": str(result["checkpoint"]),
+                }
+            )
+        output = destination / str(
+            cfg.get("output_directory", "style_transfer_training")
+        )
+        index = {"checkpoint_diagnostics": results}
+        write_json(output / "diagnostics" / "checkpoint_comparison_index.json", index)
+        return index
     device = str(cfg["training"].get("device", "cuda"))
     loader_cfg = {
         **cfg["loader"],

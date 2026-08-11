@@ -418,6 +418,10 @@ style_transfer:
       id: anima-style-transfer-l18-l24-32x1024-pretrained-kvo-lora-flow4-2k
   diagnostics:
     checkpoint: checkpoints/step-0002000.pt
+    checkpoints:
+      - checkpoints/step-0001000.pt
+      - checkpoints/step-0001500.pt
+      - checkpoints/step-0002000.pt
     batch_size: 2
     batches: 16
     timesteps: [0.05, 0.15, 0.25, 0.35, 0.45, 0.55, 0.65, 0.75, 0.85, 0.95]
