@@ -265,7 +265,7 @@ tap_resampler_experiment:
 # and batches targets by exact latent shape. `style-smoke` forces two steps and
 # writes to a separate smoke directory; `style-train` uses `training.steps`.
 style_transfer:
-  output_directory: style_transfer_l18_l24_siglip_l24_32x1024_pretrained_kvo_lora_rank1_from1500_1k
+  output_directory: style_transfer_l18_l24_siglip_l24_32x1024_pretrained_kvo_lora_rankdir_from500_500
   seed: 20260811
   loader:
     style_cache: style_features_l18_l24_siglip_l24
@@ -324,11 +324,11 @@ style_transfer:
     maximum_artist_similarity: 0.95
   training:
     device: cuda
-    # Reference-discrimination pilot initialized from the best checkpoint of
-    # the 2k pretrained-K/V run. Optimizer state is intentionally reset so the
-    # stronger counterfactual objective starts with clean moments.
-    steps: 1000
-    initial_checkpoint: style_transfer_l18_l24_siglip_l24_32x1024_pretrained_kvo_lora_flow4_2k/checkpoints/step-0001500.pt
+    # The rank-only continuation still produced nearly identical heldout and
+    # exact-self samples at step 500. Continue from that checkpoint with an
+    # explicit wrong-anchored direction objective and clean optimizer moments.
+    steps: 500
+    initial_checkpoint: style_transfer_l18_l24_siglip_l24_32x1024_pretrained_kvo_lora_rank1_from1500_1k/checkpoints/step-0000500.pt
     # Trainable adapter weights and Adam moments stay FP32. Representation
     # modules need a higher LR than the stabilized zero-output path.
     learning_rate: 0.0003
@@ -339,7 +339,7 @@ style_transfer:
     # nonzero functional path. Its LR is 10% of the representation LR.
     resampler_learning_rate: 0.00001
     resampler_max_grad_norm: 0.25
-    resampler_train_start_step: 500
+    resampler_train_start_step: 1
     # Continue the pretraining objectives at a gentle overall scale while flow
     # gradients adapt the tokens to Anima. Reconstruction is computed only for
     # rotating targets; prototype/diversity use target and reference tokens.
@@ -367,8 +367,8 @@ style_transfer:
     validation_batches: 8
     full_validation_every: 500
     full_validation_batches: 32
-    checkpoint_every: 500
-    sample_every: 500
+    checkpoint_every: 250
+    sample_every: 250
     resume: false
     # Make the Adapter's useful residual dominate the gentle Resampler and
     # magnitude auxiliaries. Direction normalization is strongest during the
@@ -383,19 +383,18 @@ style_transfer:
     style_contrastive_temperature: 0.10
     # The 1k/1.5k/2k direct-condition sweep found a useful style-vs-null
     # residual but essentially zero correct-vs-wrong advantage. Apply the
-    # detached-wrong ranking objective on every step. With base flow MSE near
-    # 0.1, weight 1.0 makes its active correct-path gradient about 2.5x the
-    # ordinary flow gradient (weight 4) until the 0.5% margin is reached.
-    style_reference_rank_weight: 1.0
+    # detached-wrong ranking objective on every step. Reduce its weight after
+    # the rank-only pilot so the wrong-anchored direction term can shape the
+    # reference-specific component without excessive gate-gradient spikes.
+    style_reference_rank_weight: 0.5
     style_reference_rank_margin: 0.005
     style_reference_rank_probability: 1.0
     style_reference_rank_start_step: 1
-    style_reference_rank_end_step: 1001
-    # Optional second-stage remedy if ranking alone still learns a common
-    # residual. This aligns (correct - detached wrong) with the target error
-    # remaining after the wrong condition, directly isolating reference-
-    # specific flow. It remains disabled for the current rank-only pilot.
-    style_reference_direction_weight: 0.0
+    style_reference_rank_end_step: 501
+    # Ranking alone learned a common residual. Align (correct - detached wrong)
+    # with the target error remaining after the wrong condition, directly
+    # isolating the reference-specific flow component.
+    style_reference_direction_weight: 0.05
     style_reference_direction_epsilon: 0.05
     # Softly match the timestep-conditioned magnitude of Anima's native artist
     # intervention. Standard target-only flow loss still chooses the direction;
@@ -427,13 +426,13 @@ style_transfer:
     wandb:
       enabled: true
       project: anima-style-adapter
-      name: anima-style-transfer-l18-l24-32x1024-pretrained-kvo-lora-rank1-fixed-1k
-      id: anima-style-transfer-l18-l24-32x1024-pretrained-kvo-lora-rank1-fixed-1k
+      name: anima-style-transfer-l18-l24-32x1024-pretrained-kvo-lora-rankdir-from500-500
+      id: anima-style-transfer-l18-l24-32x1024-pretrained-kvo-lora-rankdir-from500-500
   diagnostics:
-    checkpoint: checkpoints/step-0001000.pt
+    checkpoint: checkpoints/step-0000500.pt
     checkpoints:
+      - checkpoints/step-0000250.pt
       - checkpoints/step-0000500.pt
-      - checkpoints/step-0001000.pt
     batch_size: 2
     batches: 16
     timesteps: [0.05, 0.15, 0.25, 0.35, 0.45, 0.55, 0.65, 0.75, 0.85, 0.95]
