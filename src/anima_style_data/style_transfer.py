@@ -375,7 +375,7 @@ class SharedLowRankStyleAdapter(nn.Module):
         style_dim: int = 768,
         slots: int = 16,
         hidden_dim: int = 2048,
-        output_dim: int = 3072,
+        output_dim: int = 2048,
         heads: int = 16,
         blocks: int = 28,
         rank: int = 16,
