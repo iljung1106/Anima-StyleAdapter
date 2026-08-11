@@ -306,7 +306,7 @@ style_transfer:
     maximum_artist_similarity: 0.95
   training:
     device: cuda
-    # Reference-dependence repair pilot initialized from the best v2 checkpoint.
+    # Empirical-interval run starts from the adapter's exactly neutral zero gate.
     steps: 500
     learning_rate: 0.00005
     weight_decay: 0.01
@@ -321,7 +321,6 @@ style_transfer:
     checkpoint_every: 250
     sample_every: 250
     resume: true
-    initial_checkpoint: style_transfer_l18_l24_siglip_l24_crossslot1_fixedtext_v2/selected-step-0005500.pt
     style_token_contrastive_weight: 0.0
     style_kv_contrastive_weight: 0.0
     style_contrastive_temperature: 0.10
