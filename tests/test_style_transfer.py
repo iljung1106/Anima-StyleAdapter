@@ -12,6 +12,7 @@ from anima_style_data.style_transfer import (
     SharedLowRankStyleAdapter,
     SlotSetAggregator,
     _archive_training_state,
+    _flow_direction_loss,
     _pad_text_conditions,
     _save_training_state,
     _style_bootstrap_state,
@@ -38,6 +39,17 @@ def test_empirical_timestep_interval_only_penalizes_outside_values():
     outside = _soft_interval_loss(torch.tensor([0.0, 0.10]), lower, upper, beta=0.01)
     assert inside == 0
     assert outside > 0
+
+
+def test_flow_direction_bootstrap_escapes_exact_zero_output():
+    delta = torch.zeros(2, 3, 4, requires_grad=True)
+    desired = torch.randn_like(delta)
+    loss = _flow_direction_loss(
+        delta, desired, torch.ones(2), epsilon=0.01
+    )
+    loss.backward()
+    assert torch.isfinite(delta.grad).all()
+    assert delta.grad.norm() > 0
 
 
 def test_style_contrastive_prefers_matching_artist_tokens():

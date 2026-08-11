@@ -414,6 +414,8 @@ class SharedLowRankStyleAdapter(nn.Module):
         nn.init.zeros_(self.gate[-1].weight)
         nn.init.zeros_(self.gate[-1].bias)
         self._style_tokens: torch.Tensor | None = None
+        self._runtime_gate_abs: dict[int, torch.Tensor] = {}
+        self._runtime_residual_ratio: dict[int, torch.Tensor] = {}
 
     def aggregate(
         self,
@@ -448,6 +450,27 @@ class SharedLowRankStyleAdapter(nn.Module):
     def clear_style_tokens(self) -> None:
         self._style_tokens = None
 
+    def reset_runtime_stats(self) -> None:
+        self._runtime_gate_abs.clear()
+        self._runtime_residual_ratio.clear()
+
+    def runtime_stats(self) -> dict[str, float]:
+        if not self._runtime_gate_abs:
+            return {
+                "style_gate_abs_mean": 0.0,
+                "style_gate_abs_max": 0.0,
+                "style_block_residual_ratio_mean": 0.0,
+                "style_block_residual_ratio_max": 0.0,
+            }
+        gates = torch.stack(list(self._runtime_gate_abs.values())).float()
+        ratios = torch.stack(list(self._runtime_residual_ratio.values())).float()
+        return {
+            "style_gate_abs_mean": float(gates.mean()),
+            "style_gate_abs_max": float(gates.max()),
+            "style_block_residual_ratio_mean": float(ratios.mean()),
+            "style_block_residual_ratio_max": float(ratios.max()),
+        }
+
     def attend(
         self,
         block_index: int,
@@ -470,7 +493,13 @@ class SharedLowRankStyleAdapter(nn.Module):
         attended = attended.transpose(1, 2).reshape(normalized_x.shape[0], normalized_x.shape[1], self.hidden_dim)
         attended = cross_attention.output_dropout(cross_attention.output_proj(attended))
         gate = torch.tanh(self.gate(timestep_embedding)[:, 0, block_index])
-        return attended * gate[:, None, None]
+        result = attended * gate[:, None, None]
+        self._runtime_gate_abs[block_index] = gate.detach().abs().mean()
+        self._runtime_residual_ratio[block_index] = (
+            result.detach().float().square().mean().sqrt()
+            / normalized_x.detach().float().square().mean().sqrt().clamp_min(1e-8)
+        )
+        return result
 
 
 def _style_block_forward(
@@ -687,6 +716,7 @@ def _timestep_interval_bounds(
     calibration: dict[str, Any],
     *,
     lower_scale: float = 1.0,
+    upper_scale: float = 1.0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Look up the empirical artist-tag effect interval for each timestep."""
     edges = torch.as_tensor(
@@ -706,7 +736,28 @@ def _timestep_interval_bounds(
         device=timesteps.device,
         dtype=timesteps.dtype,
     )
-    return lower_values[indices] * lower_scale, upper_values[indices]
+    return lower_values[indices] * lower_scale, upper_values[indices] * upper_scale
+
+
+def _anneal_multiplier(step: int, start: int, end: int) -> float:
+    if step <= start:
+        return 1.0
+    if step >= end:
+        return 0.0
+    return 1.0 - (step - start) / max(1, end - start)
+
+
+@contextmanager
+def _bypass_style_blocks(anima: nn.Module, adapter: SharedLowRankStyleAdapter):
+    adapter.clear_style_tokens()
+    patched = [block._forward for block in anima.blocks]
+    for block in anima.blocks:
+        block._forward = block.__dict__["_style_original_forward"]
+    try:
+        yield
+    finally:
+        for block, forward in zip(anima.blocks, patched, strict=True):
+            block._forward = forward
 
 
 def _soft_interval_loss(
@@ -723,6 +774,27 @@ def _soft_interval_loss(
     )
 
 
+def _flow_direction_loss(
+    delta: torch.Tensor,
+    desired: torch.Tensor,
+    base_rms: torch.Tensor,
+    *,
+    epsilon: float,
+) -> torch.Tensor:
+    """Choose a useful residual direction even when the adapter is exactly zero."""
+    dimensions = tuple(range(1, delta.ndim))
+    scale = base_rms.view(-1, *([1] * (delta.ndim - 1))).clamp_min(1e-6)
+    delta_normalized = delta / scale
+    desired_unit = desired / (
+        desired.square().mean(dim=dimensions, keepdim=True).sqrt().clamp_min(1e-6)
+    )
+    dot = (delta_normalized * desired_unit).mean(dim=dimensions)
+    delta_norm = (
+        delta_normalized.square().mean(dim=dimensions) + float(epsilon) ** 2
+    ).sqrt()
+    return (1.0 - dot / delta_norm).mean()
+
+
 def _forward_flow_loss(
     anima: nn.Module,
     adapter: SharedLowRankStyleAdapter,
@@ -735,8 +807,18 @@ def _forward_flow_loss(
     step: int = 0,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
     loss_config = loss_config or {}
-    auxiliary, magnitude_floor, target_probability = _style_bootstrap_state(
+    auxiliary, magnitude_floor, _ = _style_bootstrap_state(
         step, loss_config
+    )
+    target_probability = float(loss_config.get("target_reference_probability", 0.0)) * _anneal_multiplier(
+        step,
+        int(loss_config.get("target_reference_anneal_start", 10**12)),
+        int(loss_config.get("target_reference_anneal_end", 10**12 + 1)),
+    )
+    direction_multiplier = _anneal_multiplier(
+        step,
+        int(loss_config.get("style_direction_anneal_start", 0)),
+        int(loss_config.get("style_direction_anneal_end", 1)),
     )
     references = _encode_reference_tokens(resampler, batch, device)
     reference_mask = batch["reference_mask"].to(device, non_blocking=True)
@@ -779,21 +861,20 @@ def _forward_flow_loss(
         )
 
         magnitude_weight = float(loss_config.get("style_magnitude_weight", 0.0)) * auxiliary
-        rank_weight = float(loss_config.get("style_shuffled_rank_weight", 0.0)) * auxiliary
-        shuffled_prediction = None
-        if magnitude_weight > 0 or rank_weight > 0:
-            # This branch is a moving reference, not an optimization target.
-            # Detaching it avoids a shortcut that deliberately corrupts wrong
-            # styles while still requiring the correct-style branch to move
-            # away from the common small residual.
+        direction_weight = float(loss_config.get("style_flow_direction_weight", 0.0)) * direction_multiplier
+        bypass_prediction = None
+        if magnitude_weight > 0 or direction_weight > 0:
+            # Frozen Anima establishes an absolute zero for style intervention.
+            # Unlike a shuffled reference, this baseline cannot be made worse by
+            # the adapter and therefore cannot satisfy the objective by shortcut.
             with torch.no_grad():
-                adapter.set_style_tokens(raw_style_tokens.detach().roll(1, dims=0))
-                shuffled_prediction = anima(
-                    noisy.unsqueeze(2), timesteps.to(latents.dtype), context=conditioning,
-                    padding_mask=padding_mask, target_input_ids=None,
-                ).squeeze(2).float()
-                adapter.clear_style_tokens()
+                with _bypass_style_blocks(anima, adapter):
+                    bypass_prediction = anima(
+                        noisy.unsqueeze(2), timesteps.to(latents.dtype), context=conditioning,
+                        padding_mask=padding_mask, target_input_ids=None,
+                    ).squeeze(2).float()
 
+        adapter.reset_runtime_stats()
         adapter.set_style_tokens(style_tokens)
         prediction = anima(
             noisy.unsqueeze(2), timesteps.to(latents.dtype), context=conditioning,
@@ -804,15 +885,15 @@ def _forward_flow_loss(
         flow_loss = F.mse_loss(prediction, target_velocity)
 
         magnitude_loss = flow_loss.new_zeros(())
-        rank_loss = flow_loss.new_zeros(())
+        direction_loss = flow_loss.new_zeros(())
         output_ratio = flow_loss.new_zeros(())
-        if shuffled_prediction is not None:
+        if bypass_prediction is not None:
             dimensions = tuple(range(1, prediction.ndim))
             difference_rms = (
-                (prediction - shuffled_prediction).square().mean(dim=dimensions) + 1e-8
+                (prediction - bypass_prediction).square().mean(dim=dimensions) + 1e-12
             ).sqrt()
             prediction_rms = (
-                shuffled_prediction.square().mean(dim=dimensions) + 1e-8
+                bypass_prediction.square().mean(dim=dimensions) + 1e-8
             ).sqrt().detach()
             ratios = difference_rms / prediction_rms
             valid = ~dropped if adapter.training and adapter.style_dropout > 0 else torch.ones_like(
@@ -825,29 +906,33 @@ def _forward_flow_loss(
                     magnitude_loss = F.relu(magnitude_floor - ratios[valid]).square().mean()
                 else:
                     lower, upper = _timestep_interval_bounds(
-                        timesteps[valid], calibration, lower_scale=min(
-                            1.0,
-                            max(
-                                0.0,
-                                step / max(
-                                    1,
-                                    int(loss_config.get("style_magnitude_ramp_steps", 250)),
+                        timesteps[valid], calibration, lower_scale=(
+                            float(loss_config.get("style_guided_effect_scale", 1.0)) * min(
+                                1.0,
+                                max(
+                                    0.0,
+                                    step / max(
+                                        1,
+                                        int(loss_config.get("style_magnitude_ramp_steps", 250)),
+                                    ),
                                 ),
-                            ),
-                        )
+                            )
+                        ),
+                        upper_scale=float(loss_config.get("style_effect_upper_scale", 1.0)),
                     )
                     magnitude_loss = _soft_interval_loss(
                         ratios[valid], lower, upper,
                         beta=float(loss_config.get("style_interval_huber_beta", 0.01)),
                     )
-                correct_mse = (prediction - target_velocity).square().mean(dim=dimensions)
-                shuffled_mse = (
-                    (shuffled_prediction - target_velocity).square().mean(dim=dimensions).detach()
-                )
-                margin = float(loss_config.get("style_shuffled_rank_margin", 0.0))
-                rank_loss = F.relu(
-                    margin + correct_mse[valid] - shuffled_mse[valid]
-                ).mean()
+                if direction_weight > 0:
+                    delta = (prediction - bypass_prediction)[valid]
+                    desired = (target_velocity - bypass_prediction).detach()[valid]
+                    direction_loss = _flow_direction_loss(
+                        delta,
+                        desired,
+                        prediction_rms[valid],
+                        epsilon=float(loss_config.get("style_direction_epsilon", 0.01)),
+                    )
 
         token_weight = float(loss_config.get("style_token_contrastive_weight", 0.0))
         kv_weight = float(loss_config.get("style_kv_contrastive_weight", 0.0))
@@ -868,7 +953,7 @@ def _forward_flow_loss(
         loss = (
             flow_loss
             + magnitude_weight * magnitude_loss
-            + rank_weight * rank_loss
+            + direction_weight * direction_loss
             + token_weight * token_contrastive
             + kv_weight * kv_contrastive
         )
@@ -881,9 +966,11 @@ def _forward_flow_loss(
         "target_reference_probability": target_probability,
         "style_output_ratio": float(output_ratio.detach()),
         "style_magnitude_loss": float(magnitude_loss.detach()),
-        "style_rank_loss": float(rank_loss.detach()),
+        "style_flow_direction_multiplier": direction_multiplier,
+        "style_flow_direction_loss": float(direction_loss.detach()),
         "style_token_contrastive": float(token_contrastive.detach()),
         "style_kv_contrastive": float(kv_contrastive.detach()),
+        **adapter.runtime_stats(),
     }
 
 
@@ -1511,7 +1598,11 @@ def train_style_adapter(config: dict[str, Any], destination: Path, *, steps_over
             print(
                 f"style step={step}/{steps} loss={row['loss']:.6f} grad={row['grad_norm']:.4f} "
                 f"refs={row['references']} shape={tuple(row['latent_shape'])} step_s={elapsed:.2f} "
-                f"data_wait_s={data_wait:.3f} peak_vram={row['peak_vram_gib']:.2f}GiB",
+                f"data_wait_s={data_wait:.3f} output_ratio={row['style_output_ratio']:.4f} "
+                f"mag={row['style_magnitude_loss']:.5f} dir={row['style_flow_direction_loss']:.5f} "
+                f"gate={row['style_gate_abs_mean']:.4f} "
+                f"block_res={row['style_block_residual_ratio_mean']:.4f} "
+                f"peak_vram={row['peak_vram_gib']:.2f}GiB",
                 flush=True,
             )
             if wandb_run is not None:
