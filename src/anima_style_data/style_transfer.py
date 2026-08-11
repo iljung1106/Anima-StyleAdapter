@@ -601,6 +601,21 @@ class SharedLowRankStyleAdapter(nn.Module):
             else 1.0 + torch.tanh(raw_gate)
         )
         result = attended * (self.output_scale * gate[:, None, None])
+        debug_label = self.__dict__.get("_debug_autograd_label")
+        if block_index == 0 and debug_label:
+            print(
+                "style autograd probe "
+                f"label={debug_label} grad_enabled={torch.is_grad_enabled()} "
+                f"tokens_grad={self._style_tokens.requires_grad} "
+                f"context_grad={style.requires_grad} k_grad={k.requires_grad} "
+                f"v_grad={v.requires_grad} attended_grad={attended.requires_grad} "
+                f"gate_grad={gate.requires_grad} result_grad={result.requires_grad} "
+                f"context_weight_trainable={self.style_context_proj.weight.requires_grad if self.projection_mode == 'pretrained_block_lora' else True} "
+                f"kv_trainable={self.k_up[block_index].weight.requires_grad} "
+                f"output_trainable={self.o_up[block_index].weight.requires_grad} "
+                f"gate_trainable={self.gate[-1].weight.requires_grad}",
+                flush=True,
+            )
         self._runtime_gate_abs[block_index] = gate.detach().abs().mean()
         self._runtime_residual_ratio[block_index] = (
             result.detach().float().square().mean().sqrt()
@@ -1414,6 +1429,8 @@ def _forward_flow_loss(
             # worse by this loss, avoiding the shortcut of satisfying a rank
             # margin through deliberate corruption of wrong-reference output.
             with torch.no_grad():
+                if step <= int(loss_config.get("debug_autograd_steps", 0)):
+                    adapter.__dict__["_debug_autograd_label"] = "wrong_no_grad"
                 adapter.set_style_tokens(raw_style_tokens.roll(1, dims=0))
                 wrong_reference_prediction = anima(
                     noisy.unsqueeze(2), timesteps.to(latents.dtype), context=conditioning,
@@ -1422,11 +1439,14 @@ def _forward_flow_loss(
                 adapter.clear_style_tokens()
 
         adapter.reset_runtime_stats()
+        if step <= int(loss_config.get("debug_autograd_steps", 0)):
+            adapter.__dict__["_debug_autograd_label"] = "correct_grad"
         adapter.set_style_tokens(style_tokens)
         prediction = anima(
             noisy.unsqueeze(2), timesteps.to(latents.dtype), context=conditioning,
             padding_mask=padding_mask, target_input_ids=None,
         ).squeeze(2)
+        adapter.__dict__.pop("_debug_autograd_label", None)
         prediction = prediction.float()
         target_velocity = (noise - latents).float()
         flow_loss = F.mse_loss(prediction, target_velocity)
@@ -3046,6 +3066,9 @@ def train_style_adapter(config: dict[str, Any], destination: Path, *, steps_over
                 f"oracle={row['oracle_distill_loss']:.5f}/{int(row['oracle_distill_applied'])} "
                 f"gate={row['style_gate_abs_mean']:.4f} "
                 f"block_res={row['style_block_residual_ratio_mean']:.4f} "
+                f"grads=agg:{row['aggregator_grad']:.4g}/kv:{row['shared_kv_grad']:.4g}/"
+                f"o:{row['style_output_grad']:.4g}/gate:{row['gate_grad']:.4g}/"
+                f"res:{row['resampler_grad']:.4g} "
                 f"peak_vram={row['peak_vram_gib']:.2f}GiB",
                 flush=True,
             )
