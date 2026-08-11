@@ -1371,8 +1371,30 @@ def _forward_flow_loss(
             if step > magnitude_start else 0.0
         )
         direction_weight = float(loss_config.get("style_flow_direction_weight", 0.0)) * direction_multiplier
+        reference_rank_weight = float(loss_config.get("style_reference_rank_weight", 0.0))
+        reference_rank_start = int(loss_config.get("style_reference_rank_start_step", 0))
+        reference_rank_end = int(loss_config.get("style_reference_rank_end_step", 0))
+        reference_rank_probability = float(
+            loss_config.get("style_reference_rank_probability", 1.0)
+        )
+        reference_rank_active = (
+            reference_rank_weight > 0
+            and curriculum["target_only"]
+            and style_tokens.shape[0] > 1
+            and step >= reference_rank_start
+            and (reference_rank_end <= 0 or step < reference_rank_end)
+            and bool(
+                torch.rand((), device=style_tokens.device, generator=generator)
+                < reference_rank_probability
+            )
+        )
         bypass_prediction = None
-        if bool(loss_config.get("measure_bypass", False)) or magnitude_weight > 0 or direction_weight > 0:
+        if (
+            bool(loss_config.get("measure_bypass", False))
+            or magnitude_weight > 0
+            or direction_weight > 0
+            or reference_rank_active
+        ):
             # Frozen Anima establishes an absolute zero for style intervention.
             # Unlike a shuffled reference, this baseline cannot be made worse by
             # the adapter and therefore cannot satisfy the objective by shortcut.
@@ -1383,6 +1405,19 @@ def _forward_flow_loss(
                         padding_mask=padding_mask, target_input_ids=None,
                     ).squeeze(2).float()
 
+        wrong_reference_prediction = None
+        if reference_rank_active:
+            # The shuffled branch is a detached baseline. It cannot be made
+            # worse by this loss, avoiding the shortcut of satisfying a rank
+            # margin through deliberate corruption of wrong-reference output.
+            with torch.no_grad():
+                adapter.set_style_tokens(raw_style_tokens.roll(1, dims=0))
+                wrong_reference_prediction = anima(
+                    noisy.unsqueeze(2), timesteps.to(latents.dtype), context=conditioning,
+                    padding_mask=padding_mask, target_input_ids=None,
+                ).squeeze(2).float()
+                adapter.clear_style_tokens()
+
         adapter.reset_runtime_stats()
         adapter.set_style_tokens(style_tokens)
         prediction = anima(
@@ -1392,6 +1427,24 @@ def _forward_flow_loss(
         prediction = prediction.float()
         target_velocity = (noise - latents).float()
         flow_loss = F.mse_loss(prediction, target_velocity)
+        reference_rank_loss = flow_loss.new_zeros(())
+        reference_rank_advantage = flow_loss.new_full((), float("nan"))
+        if wrong_reference_prediction is not None and bypass_prediction is not None:
+            valid = (
+                ~dropped
+                if adapter.training and adapter.style_dropout > 0
+                else torch.ones(
+                    prediction.shape[0], dtype=torch.bool, device=prediction.device
+                )
+            )
+            if valid.any():
+                reference_rank_loss, reference_rank_advantage = _reference_flow_rank_loss(
+                    prediction[valid],
+                    wrong_reference_prediction[valid],
+                    bypass_prediction[valid],
+                    target_velocity[valid],
+                    margin=float(loss_config.get("style_reference_rank_margin", 0.005)),
+                )
 
         oracle_distill_loss = flow_loss.new_zeros(())
         oracle_distill_applied = False
@@ -1517,6 +1570,7 @@ def _forward_flow_loss(
             + oracle_weight * oracle_distill_loss
             + magnitude_weight * magnitude_loss
             + direction_weight * direction_loss
+            + reference_rank_weight * reference_rank_loss
             + token_weight * token_contrastive
             + kv_weight * kv_contrastive
             + float(loss_config.get("resampler_auxiliary_weight", 0.0))
@@ -1568,6 +1622,9 @@ def _forward_flow_loss(
         "style_magnitude_loss": float(magnitude_loss.detach()),
         "style_flow_direction_multiplier": direction_multiplier,
         "style_flow_direction_loss": float(direction_loss.detach()),
+        "style_reference_rank_loss": float(reference_rank_loss.detach()),
+        "style_reference_rank_advantage": float(reference_rank_advantage.detach()),
+        "style_reference_rank_applied": bool(wrong_reference_prediction is not None),
         "style_token_contrastive": float(token_contrastive.detach()),
         "style_kv_contrastive": float(kv_contrastive.detach()),
         **adapter.runtime_stats(),
@@ -2043,6 +2100,25 @@ def _per_sample_condition_comparison(
         "difference_to_base_ratio": difference_rms / bypass_rms,
         "difference_to_desired_ratio": difference_rms / base_mse.sqrt(),
     }
+
+
+def _reference_flow_rank_loss(
+    correct: torch.Tensor,
+    wrong: torch.Tensor,
+    bypass: torch.Tensor,
+    target: torch.Tensor,
+    *,
+    margin: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Require the correct condition to beat a detached wrong condition.
+
+    The wrong branch is evaluated without gradients by the caller. Therefore
+    this objective cannot satisfy its margin by deliberately degrading the
+    shuffled-reference prediction; it must improve the correct condition.
+    """
+    comparison = _per_sample_condition_comparison(correct, wrong, bypass, target)
+    advantage = comparison["first_advantage"]
+    return F.relu(float(margin) - advantage).mean(), advantage.mean()
 
 
 def _summarize_scalar_samples(values: list[float]) -> dict[str, float]:

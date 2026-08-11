@@ -378,6 +378,15 @@ style_transfer:
     style_token_contrastive_weight: 0.0
     style_kv_contrastive_weight: 0.0
     style_contrastive_temperature: 0.10
+    # Optional self-reference bootstrap aid. The shuffled prediction is a
+    # detached baseline, so this cannot win by learning to damage wrong-style
+    # output. Keep disabled until the 2k direct-condition diagnostic confirms
+    # that correct references do not beat wrong references above noise.
+    style_reference_rank_weight: 0.0
+    style_reference_rank_margin: 0.005
+    style_reference_rank_probability: 0.25
+    style_reference_rank_start_step: 500
+    style_reference_rank_end_step: 8000
     # Softly match the timestep-conditioned magnitude of Anima's native artist
     # intervention. Standard target-only flow loss still chooses the direction;
     # this term only prevents the style path from remaining effectively null.

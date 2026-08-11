@@ -20,6 +20,7 @@ from anima_style_data.style_transfer import (
     _per_sample_condition_comparison,
     _per_sample_cosine,
     _per_sample_flow_residual_metrics,
+    _reference_flow_rank_loss,
     _save_training_state,
     _self_reference_curriculum_state,
     _set_adapter_trainable_stage,
@@ -87,6 +88,26 @@ def test_direct_condition_comparison_reports_advantage_and_repeatability_floor()
     repeat = _per_sample_condition_comparison(first, first, bypass, target)
     torch.testing.assert_close(repeat["first_advantage"], torch.zeros(2))
     torch.testing.assert_close(repeat["difference_to_base_ratio"], torch.zeros(2))
+
+
+def test_reference_rank_loss_only_penalizes_insufficient_correct_advantage():
+    bypass = torch.ones(2, 1, 1, 2)
+    desired = torch.tensor([[[[1.0, -1.0]]], [[[1.0, -1.0]]]])
+    target = bypass + desired
+    correct = target
+    wrong = bypass + 0.5 * desired
+
+    loss, advantage = _reference_flow_rank_loss(
+        correct, wrong, bypass, target, margin=0.20
+    )
+    torch.testing.assert_close(advantage, torch.tensor(0.25))
+    torch.testing.assert_close(loss, torch.tensor(0.0))
+
+    loss, advantage = _reference_flow_rank_loss(
+        wrong, correct, bypass, target, margin=0.20
+    )
+    torch.testing.assert_close(advantage, torch.tensor(-0.25))
+    torch.testing.assert_close(loss, torch.tensor(0.45))
 
 
 class RMSNorm(nn.Module):
