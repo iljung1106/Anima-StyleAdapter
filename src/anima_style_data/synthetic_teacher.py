@@ -7,7 +7,7 @@ import math
 import random
 import re
 import time
-from collections import Counter
+from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
@@ -683,3 +683,139 @@ def build_synthetic_teacher_kv_cache(config: dict[str, Any], destination: Path) 
     text = cache_synthetic_teacher_text(config, destination, prompts)
     teacher = cache_synthetic_teacher_kv_basis(config, destination, prompts)
     return {"text": text, "kv_teacher": teacher}
+
+
+def build_real_artist_teacher_plan(
+    config: dict[str, Any], destination: Path
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Build a 5k-artist offline teacher plan without generating new images."""
+    cfg = config["real_artist_teacher"]
+    output = destination / str(cfg.get("output_directory", "real_artist_teacher_5000"))
+    output.mkdir(parents=True, exist_ok=True)
+    feature_manifest = destination / str(
+        cfg.get("feature_manifest", "style_features/manifest.parquet")
+    )
+    feature_rows = read_records(feature_manifest)
+    by_artist: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for row in feature_rows:
+        by_artist[str(row["artist"])].append(row)
+    artist_count = int(cfg.get("artist_count", 5000))
+    if len(by_artist) < artist_count:
+        raise RuntimeError(f"Need {artist_count} real artists, found {len(by_artist)}")
+    seed = int(cfg.get("seed", 20260813))
+    rng = random.Random(seed)
+    artists = sorted(by_artist)
+    rng.shuffle(artists)
+    artists = artists[:artist_count]
+    validation_count = int(cfg.get("validation_artists", 250))
+    meta_count = int(cfg.get("meta_test_artists", 250))
+    artist_splits = {
+        artist: (
+            "validation" if index < validation_count else
+            "meta_test" if index < validation_count + meta_count else "train"
+        )
+        for index, artist in enumerate(artists)
+    }
+
+    synthetic_root = destination / str(
+        cfg.get("content_source_directory", "synthetic_teacher_500x16")
+    )
+    source_prompts = read_records(synthetic_root / "prompts.parquet")
+    contents = sorted(
+        (row for row in source_prompts if row["kind"] == "content"),
+        key=lambda row: int(row["content_index"]),
+    )
+    if len(contents) != 8:
+        raise RuntimeError(f"Expected eight shared content prompts, found {len(contents)}")
+    prompts = [
+        {
+            "condition_id": int(row["content_index"]), "kind": "content",
+            "artist": None, "content_index": int(row["content_index"]),
+            "prompt": str(row["prompt"]),
+        }
+        for row in contents
+    ]
+    plan = []
+    for artist_index, artist in enumerate(artists):
+        raw_tag = artist_tag(artist)
+        escaped_tag = comfy_literal_artist_tag(artist)
+        for content in contents:
+            condition_id = len(prompts)
+            content_index = int(content["content_index"])
+            prompts.append({
+                "condition_id": condition_id, "kind": "artist",
+                "artist": artist, "artist_index": artist_index,
+                "artist_split": artist_splits[artist],
+                "content_index": content_index,
+                "artist_tag": raw_tag, "comfy_literal_artist_tag": escaped_tag,
+                "prompt": f"{content['prompt']}, {raw_tag}",
+            })
+            plan.append({
+                "artist": artist, "artist_index": artist_index,
+                "artist_split": artist_splits[artist],
+                "content_index": content_index,
+                "content_split": (
+                    "validation" if content_index == 6 else
+                    "test" if content_index == 7 else "train"
+                ),
+                "content_condition_id": content_index,
+                "artist_condition_id": condition_id,
+                "artist_tag": raw_tag,
+            })
+
+    reference_counts = dict(cfg.get(
+        "reference_images_per_split", {"train": 4, "validation": 1, "test": 1}
+    ))
+    references = []
+    for artist in artists:
+        rows = by_artist[artist]
+        for reference_split, count in reference_counts.items():
+            candidates = [row for row in rows if str(row.get("split")) == reference_split]
+            candidates.sort(key=lambda row: hashlib.blake2b(
+                f"{seed}:{row['id']}".encode(), digest_size=8
+            ).digest())
+            if len(candidates) < int(count):
+                raise RuntimeError(
+                    f"Artist {artist!r} has {len(candidates)} {reference_split} references; "
+                    f"need {count}"
+                )
+            references.extend({
+                **row,
+                "artist_split": artist_splits[artist],
+                "reference_split": reference_split,
+            } for row in candidates[:int(count)])
+    write_records(output / "plan.parquet", plan)
+    write_records(output / "prompts.parquet", prompts)
+    write_records(output / "references.parquet", references)
+    summary = {
+        "artists": len(artists), "conditions": len(prompts),
+        "artist_conditions": len(plan), "references": len(references),
+        "artist_splits": dict(Counter(artist_splits.values())),
+        "reference_splits": dict(Counter(str(row["reference_split"]) for row in references)),
+        "heldout_contents": [6, 7], "images_generated": 0,
+    }
+    write_json(output / "plan_summary.json", summary)
+    return plan, prompts
+
+
+def build_real_artist_teacher_kv_cache(
+    config: dict[str, Any], destination: Path
+) -> dict[str, Any]:
+    """Encode 5k real artists against shared probes and cache native K/V basis."""
+    plan, prompts = build_real_artist_teacher_plan(config, destination)
+    copied = copy.deepcopy(config)
+    real_cfg = config["real_artist_teacher"]
+    copied["synthetic_teacher"].update({
+        "output_directory": str(real_cfg.get("output_directory", "real_artist_teacher_5000")),
+        "text_batch_size": int(real_cfg.get("text_batch_size", 128)),
+        "text_shard_rows": int(real_cfg.get("text_shard_rows", 128)),
+    })
+    text = cache_synthetic_teacher_text(copied, destination, prompts)
+    teacher = cache_synthetic_teacher_kv_basis(copied, destination, prompts)
+    result = {"plan": len(plan), "text": text, "kv_teacher": teacher}
+    write_json(
+        destination / str(real_cfg.get("output_directory", "real_artist_teacher_5000"))
+        / "summary.json",
+        result,
+    )
+    return result

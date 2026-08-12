@@ -681,3 +681,18 @@ synthetic_teacher:
       project: anima-style-adapter
       name: offline-kvo-phase-b-exact512-two-stage-curriculum
       id: offline-kvo-phase-b-exact512-two-stage-curriculum-v1
+
+real_artist_teacher:
+  output_directory: real_artist_teacher_5000
+  feature_manifest: style_features/manifest.parquet
+  content_source_directory: synthetic_teacher_500x16
+  artist_count: 5000
+  validation_artists: 250
+  meta_test_artists: 250
+  reference_images_per_split:
+    train: 4
+    validation: 1
+    test: 1
+  seed: 20260813
+  text_batch_size: 128
+  text_shard_rows: 128
