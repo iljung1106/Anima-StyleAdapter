@@ -150,10 +150,10 @@ def validate_synthetic_teacher_corpus(
     def inspect_image(item: tuple[int, dict[str, Any]]) -> str | None:
         index, row = item
         try:
-            path = Path(row["local_path"])
-            if not path.is_file() or path.stat().st_size == 0:
-                return f"missing or empty image: {row['id']}"
             if index % decode_stride == 0:
+                path = Path(row["local_path"])
+                if not path.is_file() or path.stat().st_size == 0:
+                    return f"missing or empty image: {row['id']}"
                 with Image.open(path) as image:
                     image.load()
                     if image.size != (int(row["width"]), int(row["height"])):
@@ -168,8 +168,8 @@ def validate_synthetic_teacher_corpus(
             if error:
                 errors.append(error)
     print(
-        f"validated {len(manifest)} image paths and "
-        f"{math.ceil(len(manifest) / decode_stride)} decoded samples with {image_workers} workers",
+        f"C-RADIO manifest proves {len(manifest)} full decodes; additionally validated "
+        f"{math.ceil(len(manifest) / decode_stride)} image samples with {image_workers} workers",
         flush=True,
     )
 
