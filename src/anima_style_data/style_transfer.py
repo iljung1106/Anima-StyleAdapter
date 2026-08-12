@@ -3322,7 +3322,11 @@ def train_style_adapter(config: dict[str, Any], destination: Path, *, steps_over
                 batches=current_validation_batches,
                 seed=seed ^ 0xA11CE,
                 step=step,
-                loss_config=training,
+                # Compare self and heldout references on the same fixed
+                # uniform validation distribution, regardless of the training
+                # timestep sampler. Only the curriculum/reference mode should
+                # differ between these paired reports.
+                loss_config={**training, "timestep_sampling": "uniform"},
             )
             print(
                 f"validation[heldout] step={step} loss={heldout_validation['loss']:.6f} "

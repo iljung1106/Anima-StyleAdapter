@@ -107,6 +107,22 @@ def test_shifted_timestep_sampling_matches_flow_transform():
     assert 0.65 < float(actual.mean()) < 0.75
 
 
+def test_uniform_timestep_sampling_ignores_shift_options():
+    generator = torch.Generator().manual_seed(321)
+    actual = _sample_flow_timesteps(
+        32,
+        "cpu",
+        {
+            "timestep_sampling": "uniform",
+            "discrete_flow_shift": 99.0,
+            "sigmoid_bias": 9.0,
+        },
+        generator,
+    )
+    generator.manual_seed(321)
+    assert torch.equal(actual, torch.rand(32, generator=generator))
+
+
 def test_direction_loss_stays_enabled_without_an_explicit_anneal():
     assert _direction_anneal_multiplier(1, {}) == 1.0
     assert _direction_anneal_multiplier(10_000, {}) == 1.0
