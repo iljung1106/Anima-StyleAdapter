@@ -783,6 +783,34 @@ native timestep gate는 offline target에 사용하지 않는다.
 `0.02`를 출발점으로 삼는다. Teacher text token과 student style slot은 일대일 대응하지 않으므로
 raw K/V token MSE는 쓰지 않거나 매우 약한 보조항으로만 둔다.
 
+실제 실행은 두 단계로 분리한다.
+
+**Phase A — frozen-token connector alignment**
+
+- Artist-effect 검증을 통과한 492명, 7,872장의 frozen Resampler 출력을
+  `128 × 1024` BF16으로 물질화한다. 총 캐시는 약 2.06GB다.
+- Resampler와 minimal Set Aggregator를 동결하고, single-reference 경로에서 Aggregator를
+  우회한다.
+- `style_context_proj` bridge, shared/grouped connector, block별 rank-128 K/V/O delta만
+  학습한다.
+- Bridge/connector/KVO는 각각 별도 AdamW group과 독립 gradient clip을 사용한다. 작은
+  `1e-4 I` bridge가 connector update에 의해 즉시 파괴되지 않도록 bridge LR을 가장 낮게 둔다.
+- 250 step부터 target-excluded same-artist reference를 늘려 1,500 step에 75%가 되게 한다.
+- Prototype 분류 대신 실제 Anima query에서 correct reference attention residual이 batch 내
+  wrong-artist residual보다 teacher에 가까워야 하는 functional ranking loss를 약하게 사용한다.
+- Validation만 checkpoint 선택과 early stop에 사용하고 meta-test는 best checkpoint 선택 후
+  단 한 번 평가한다.
+
+**Phase B — partial Resampler joint tuning**
+
+- Phase A validation-best connector에서 시작한다.
+- Resampler의 최종 `1536 → 1024` style projection과 마지막 encoder block만 연다.
+- Resampler LR은 connector/KVO보다 낮게 두며 frozen Phase-A token에 대한 cosine drift를
+  약하게 유지한다.
+- Target-excluded same-artist reference를 75%, exact-self를 25%로 섞는다.
+- Phase A와 동일한 native attention-output, direction, magnitude, functional ranking loss를
+  사용한다. Validation-best 선택 후 unseen-artist/content meta-test를 한 번 수행한다.
+
 ### 22.6 Offline validation과 통과 조건
 
 250~500 step마다 teacher/student attention-output cosine, normalized MSE와 zero-output 대비
