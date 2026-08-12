@@ -89,6 +89,8 @@ def build_parser() -> argparse.ArgumentParser:
         ("synthetic-teacher-kv", "Cache factorized native Anima K/V/O teacher targets"),
         ("synthetic-validate", "Validate synthetic corpus, artist effects, and fixed splits"),
         ("synthetic-query-probes", "Capture native Anima query probe bank"),
+        ("offline-kvo-smoke", "Run two offline K/V/O bootstrap steps"),
+        ("offline-kvo-train", "Train and validate offline K/V/O connector bootstrap"),
         ("prepare", "Run selection, download, and duplicate removal"),
         ("all", "Run every stage, including tagger and C-RADIO models"),
     ):
@@ -196,6 +198,10 @@ def main() -> None:
         from .synthetic_bootstrap import build_anima_query_probe_bank
 
         _run(build_anima_query_probe_bank, config, destination)
+    elif args.command in {"offline-kvo-smoke", "offline-kvo-train"}:
+        from .synthetic_bootstrap import smoke_offline_kvo_bootstrap, train_offline_kvo_bootstrap
+
+        _run(smoke_offline_kvo_bootstrap if args.command == "offline-kvo-smoke" else train_offline_kvo_bootstrap, config, destination)
     elif args.command in {"prepare", "all"}:
         for stage in (select_candidates, download_candidates, deduplicate):
             _run(stage, config, destination)

@@ -337,3 +337,217 @@ def build_anima_query_probe_bank(config: dict[str, Any], destination: Path) -> d
     }
     write_json(output / "summary.json", summary)
     return summary
+
+
+def _native_rms_norm(value: torch.Tensor, weight: torch.Tensor | None) -> torch.Tensor:
+    normalized = value * torch.rsqrt(value.float().square().mean(dim=-1, keepdim=True) + 1e-6).to(value.dtype)
+    return normalized if weight is None else normalized * weight
+
+
+def _attention_output(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, output_weight: torch.Tensor) -> torch.Tensor:
+    # q/k/v are [heads, tokens, head_dim].
+    attended = F.scaled_dot_product_attention(q.unsqueeze(0), k.unsqueeze(0), v.unsqueeze(0)).squeeze(0)
+    return F.linear(attended.transpose(0, 1).reshape(attended.shape[1], -1), output_weight)
+
+
+def train_offline_kvo_bootstrap(
+    config: dict[str, Any], destination: Path, *, steps_override: int | None = None
+) -> dict[str, Any]:
+    """Distill native artist attention effects without running Anima's transformer."""
+    from safetensors.torch import load_file
+
+    from .style_transfer import SharedLowRankStyleAdapter, load_per_reference_resampler
+    from .tap_resampler import _load_feature_batch
+
+    cfg = config["synthetic_teacher"]
+    training = cfg.get("offline_bootstrap", {})
+    root = _root(config, destination)
+    output = root / str(training.get("output_directory", "offline_kvo_bootstrap"))
+    output.mkdir(parents=True, exist_ok=True)
+    validated = [row for row in read_records(root / "validated_manifest.parquet") if row.get("bootstrap_eligible")]
+    feature_rows = {int(row["id"]): row for row in read_records(root / "style_features" / "manifest.parquet")}
+    rows = [{**row, **feature_rows[int(row["id"])]} for row in validated]
+    by_split = {name: [row for row in rows if row["artist_split"] == name] for name in ("train", "validation", "meta_test")}
+    train_rows = [row for row in by_split["train"] if row["content_split"] == "train"]
+    validation_rows = [row for row in by_split["validation"] if row["content_split"] == "validation"]
+    meta_rows = [row for row in by_split["meta_test"] if row["content_split"] == "test"]
+    if not train_rows or not validation_rows or not meta_rows:
+        raise RuntimeError("Offline bootstrap split is empty")
+
+    device = str(cfg.get("device", "cuda"))
+    resampler_cfg = config["style_transfer"]["resampler"]
+    resampler = load_per_reference_resampler(destination, resampler_cfg, device, trainable=False)
+    adapter = SharedLowRankStyleAdapter(**config["style_transfer"]["adapter"]).to(device)
+    adapter.aggregator.requires_grad_(False)
+    adapter.null_tokens.requires_grad_(False)
+    adapter.train()
+    basis = load_file(root / "anima_kv_teacher" / "native_cross_attention.safetensors", device="cpu")
+    basis = {key: value.to(device=device, dtype=torch.bfloat16) for key, value in basis.items()}
+    probe_values = load_file(root / "query_probe_bank" / "queries.safetensors", device="cpu")
+    probe_rows = read_records(root / "query_probe_bank" / "manifest.parquet")
+    probe_keys: dict[tuple[int, int], list[str]] = defaultdict(list)
+    for row in probe_rows:
+        probe_keys[(int(row["content_index"]), int(row["block"]))].append(str(row["key"]))
+    text_rows = {int(row["condition_id"]): row for row in read_records(root / "text" / "manifest.parquet")}
+    text_cache: dict[str, torch.Tensor] = {}
+
+    def text(condition_id: int) -> torch.Tensor:
+        row = text_rows[condition_id]
+        name = str(row["cache_shard"])
+        if name not in text_cache:
+            text_cache[name] = load_file(root / "text" / name, device="cpu")["conditioning"]
+        value = text_cache[name][int(row["row_index"])]
+        length = int(value.abs().amax(dim=-1).ne(0).sum())
+        return value[:length].to(device=device, dtype=torch.bfloat16)
+
+    heads = int(config["style_transfer"]["adapter"]["heads"])
+    hidden = int(config["style_transfer"]["adapter"]["hidden_dim"])
+    head_dim = hidden // heads
+
+    def projected(condition: torch.Tensor, block: int) -> tuple[torch.Tensor, torch.Tensor]:
+        kw = basis[f"block_{block:02d}.k_proj.weight"]
+        vw = basis[f"block_{block:02d}.v_proj.weight"]
+        k = F.linear(condition, kw).reshape(-1, heads, head_dim).transpose(0, 1)
+        v = F.linear(condition, vw).reshape(-1, heads, head_dim).transpose(0, 1)
+        norm_weight = basis.get(f"block_{block:02d}.k_norm.weight")
+        return _native_rms_norm(k, norm_weight), v
+
+    taps = [18, 24]
+    variant_global = "native_24"
+    batch_size = int(training.get("batch_size", 2))
+    seed = int(training.get("seed", int(cfg.get("seed", 20260812)) ^ 0x0FF1))
+    generator = random.Random(seed)
+    total_steps = int(steps_override or training.get("steps", 10000))
+    parameters = [value for value in adapter.parameters() if value.requires_grad]
+    optimizer = torch.optim.AdamW(
+        parameters, lr=float(training.get("learning_rate", 1e-4)),
+        betas=(0.9, 0.95), weight_decay=float(training.get("weight_decay", 0.01)),
+    )
+    warmup = int(training.get("warmup_steps", 500))
+
+    def lr_scale(step: int) -> float:
+        if step <= warmup:
+            return step / max(warmup, 1)
+        progress = (step - warmup) / max(total_steps - warmup, 1)
+        return float(training.get("minimum_lr_ratio", 0.1)) + (1 - float(training.get("minimum_lr_ratio", 0.1))) * 0.5 * (1 + math.cos(math.pi * progress))
+
+    def encode(batch_rows: list[dict[str, Any]]) -> torch.Tensor:
+        features, _, mask, _, global_feature = _load_feature_batch(
+            batch_rows, root / "style_features", taps, taps, variant_global
+        )
+        with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
+            _, tokens = resampler.encode(
+                {key: value.to(device) for key, value in features.items()}, mask.to(device), global_feature.to(device)
+            )
+        return tokens
+
+    def loss_for(batch_rows: list[dict[str, Any]], *, train: bool) -> tuple[torch.Tensor, dict[str, float]]:
+        tokens = encode(batch_rows)
+        contexts = adapter._block_context_tokens(tokens)
+        output_losses = []
+        cosines = []
+        rms_losses = []
+        zero_mses = []
+        student_mses = []
+        block_count = int(training.get("blocks_per_step", 7)) if train else 28
+        blocks = generator.sample(range(28), block_count) if block_count < 28 else list(range(28))
+        for sample_index, row in enumerate(batch_rows):
+            content_id = int(row["content_condition_id"])
+            artist_id = int(row["artist_condition_id"])
+            artist_context, content_context = text(artist_id), text(content_id)
+            for block in blocks:
+                query_key = generator.choice(probe_keys[(int(row["content_index"]), block)])
+                q = probe_values[query_key].to(device=device, dtype=torch.bfloat16).transpose(0, 1)
+                ka, va = projected(artist_context, block)
+                kc, vc = projected(content_context, block)
+                ow = basis[f"block_{block:02d}.output_proj.weight"]
+                with torch.no_grad():
+                    teacher = _attention_output(q, ka, va, ow) - _attention_output(q, kc, vc, ow)
+                context = contexts[block][sample_index]
+                sk = F.linear(context, basis[f"block_{block:02d}.k_proj.weight"])
+                sv = F.linear(context, basis[f"block_{block:02d}.v_proj.weight"])
+                sk = sk + adapter.k_up[block](adapter.k_down[block](context))
+                sv = sv + adapter.v_up[block](adapter.v_down[block](context))
+                sk = _native_rms_norm(sk.reshape(-1, heads, head_dim).transpose(0, 1), basis.get(f"block_{block:02d}.k_norm.weight"))
+                sv = sv.reshape(-1, heads, head_dim).transpose(0, 1)
+                attended = F.scaled_dot_product_attention(q.unsqueeze(0), sk.unsqueeze(0), sv.unsqueeze(0)).squeeze(0)
+                attended = attended.transpose(0, 1).reshape(attended.shape[1], hidden)
+                student = F.linear(attended, ow) + adapter.o_up[block](adapter.o_down[block](attended))
+                scale = teacher.detach().float().square().mean().sqrt().clamp_min(1e-4)
+                output_losses.append(F.smooth_l1_loss(student.float() / scale, teacher.float() / scale, beta=0.1))
+                cosine = F.cosine_similarity(student.float().flatten(), teacher.float().flatten(), dim=0)
+                cosines.append(cosine)
+                rms_losses.append((torch.log(student.float().square().mean().sqrt().clamp_min(1e-6)) - torch.log(scale)).square())
+                student_mses.append(F.mse_loss(student.float(), teacher.float()))
+                zero_mses.append(teacher.float().square().mean())
+        output_loss = torch.stack(output_losses).mean()
+        cosine_loss = (1 - torch.stack(cosines)).mean()
+        rms_loss = torch.stack(rms_losses).mean()
+        loss = output_loss + float(training.get("direction_weight", 0.2)) * cosine_loss + float(training.get("magnitude_weight", 0.02)) * rms_loss
+        zero_mse = torch.stack(zero_mses).mean()
+        student_mse = torch.stack(student_mses).mean()
+        return loss, {
+            "loss": float(loss.detach()), "output_loss": float(output_loss.detach()),
+            "cosine": float(torch.stack(cosines).mean().detach()),
+            "rms_loss": float(rms_loss.detach()),
+            "zero_improvement": float((1 - student_mse / zero_mse.clamp_min(1e-12)).detach()),
+        }
+
+    def evaluate(source: list[dict[str, Any]], batches: int) -> dict[str, float]:
+        adapter.eval()
+        metrics: list[dict[str, float]] = []
+        with torch.no_grad():
+            for index in range(batches):
+                start = (index * batch_size) % len(source)
+                batch = (source + source)[start : start + batch_size]
+                _, values = loss_for(batch, train=False)
+                metrics.append(values)
+        adapter.train()
+        return {key: sum(item[key] for item in metrics) / len(metrics) for key in metrics[0]}
+
+    log_every = int(training.get("log_every", 20))
+    validation_every = int(training.get("validation_every", 250))
+    checkpoint_every = int(training.get("checkpoint_every", 500))
+    checkpoint_dir = output / "checkpoints"
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    history = []
+    for step in range(1, total_steps + 1):
+        batch = generator.sample(train_rows, batch_size)
+        optimizer.zero_grad(set_to_none=True)
+        loss, metrics = loss_for(batch, train=True)
+        loss.backward()
+        grad_norm = torch.nn.utils.clip_grad_norm_(parameters, float(training.get("max_grad_norm", 1.0)))
+        scale = lr_scale(step)
+        for group in optimizer.param_groups:
+            group["lr"] = float(training.get("learning_rate", 1e-4)) * scale
+        optimizer.step()
+        if step % log_every == 0:
+            print(f"offline-kvo step={step}/{total_steps} loss={metrics['loss']:.4f} cos={metrics['cosine']:.4f} improve={metrics['zero_improvement']:.4f} grad={float(grad_norm):.3f}", flush=True)
+        if step % validation_every == 0 or step == total_steps:
+            val = evaluate(validation_rows, int(training.get("validation_batches", 8)))
+            meta = evaluate(meta_rows, int(training.get("meta_test_batches", 8)))
+            record = {"step": step, "validation": val, "meta_test": meta}
+            history.append(record)
+            write_json(output / "evaluation.json", {"history": history, "latest": record})
+            print(f"offline-kvo validation step={step} val_cos={val['cosine']:.4f} val_improve={val['zero_improvement']:.4f} meta_cos={meta['cosine']:.4f}", flush=True)
+        if step % checkpoint_every == 0 or step == total_steps:
+            state = {"step": step, "adapter": adapter.state_dict(), "optimizer": optimizer.state_dict(), "config": training}
+            temporary = checkpoint_dir / f"step-{step:07d}.tmp"
+            torch.save(state, temporary)
+            temporary.replace(checkpoint_dir / f"step-{step:07d}.pt")
+    summary = {"steps": total_steps, "checkpoint": str((checkpoint_dir / f"step-{total_steps:07d}.pt").resolve()), "latest": history[-1]}
+    write_json(output / "summary.json", summary)
+    return summary
+
+
+def smoke_offline_kvo_bootstrap(config: dict[str, Any], destination: Path) -> dict[str, Any]:
+    copied = dict(config)
+    copied["synthetic_teacher"] = dict(config["synthetic_teacher"])
+    copied["synthetic_teacher"]["offline_bootstrap"] = dict(config["synthetic_teacher"]["offline_bootstrap"])
+    copied["synthetic_teacher"]["offline_bootstrap"]["output_directory"] = "offline_kvo_smoke"
+    copied["synthetic_teacher"]["offline_bootstrap"]["validation_every"] = 2
+    copied["synthetic_teacher"]["offline_bootstrap"]["checkpoint_every"] = 2
+    copied["synthetic_teacher"]["offline_bootstrap"]["validation_batches"] = 1
+    copied["synthetic_teacher"]["offline_bootstrap"]["meta_test_batches"] = 1
+    copied["synthetic_teacher"]["offline_bootstrap"]["blocks_per_step"] = 2
+    return train_offline_kvo_bootstrap(copied, destination, steps_override=2)
