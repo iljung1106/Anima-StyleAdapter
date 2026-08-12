@@ -926,3 +926,33 @@ validation/meta improvement가 약 `0.5296/0.4636`, gap `-0.0050/-0.0076`으로 
 teacher의 공통 효과와 artist-specific 효과를 별도 head/단계로 분리하고, validation checkpoint
 선택도 평균 reconstruction과 reference discrimination의 Pareto 기준으로 수행해야 한다.
 단순 연장이나 용량 증설은 평균 artist-effect shortcut을 더 정교하게 만들 가능성이 높다.
+
+### 22.14 Reference 신호·최적화·summary-token 진단
+
+Student 문제가 teacher 자체의 약한 작가 신호 때문인지 확인하기 위해, 동일 content/query에서
+정답 작가와 잘못된 작가의 native Anima attention effect를 직접 비교하는 oracle 지표를
+추가했다. Validation에서 wrong-artist teacher cosine은 `0.6934`, 정답 teacher RMS 대비
+상대 거리는 `0.7691`이었다. Meta-test에서도 각각 `0.8125`, `0.5914`였다. 반면 기존
+student의 correct/wrong cosine gap은 약 `0.001`이었다. 따라서 teacher와 query bank에는
+작가를 구분할 신호가 충분하며, student가 reference-independent 평균 효과를 택한 것이
+병목이다.
+
+Bridge/connector gradient clip을 각각 `0.01→0.05`, `0.1→0.2`로만 완화한 단일 변수
+실험에서도 3,000 step 결과는 validation improvement `0.5934`, cosine gap `0.0013`,
+meta-test improvement `0.5333`, gap 약 `0`이었다. 더 큰 완화와 LR/auxiliary-loss 동시
+증가는 validation improvement를 500 step에 `0.335`까지 붕괴시켰다. 즉 단순히 더 큰
+update를 허용하는 것도 해결책이 아니다.
+
+Resampler probe에서 유효했던 slot mean/std를 학습 파라미터 없이 두 개의 explicit summary
+token으로 connector에 추가했다(`128→130` token). Phase A는 늦게 회복해 best validation
+improvement 약 `0.567`을 기록했다. Phase B best는 validation improvement `0.5910`, cosine
+gap `+0.0061`; unseen-artist meta-test는 improvement `0.5212`, cosine gap `+0.0084`였다.
+방향 구분은 소폭 개선됐지만 meta-test improvement gap은 `-0.0083`이므로 통과 기준에는
+미달한다.
+
+결론적으로 현 모델의 크기나 3,000-step 학습량을 먼저 늘리지 않는다. 다음 실험은
+artist-centered teacher effect만 예측하는 작은 전용 latent/head를 먼저 학습하여
+reference-independent 평균 shortcut을 구조적으로 제거하고, 이 head가 correct-reference
+retrieval과 effect regression을 동시에 통과한 뒤 190M connector의 초기값으로 증류한다.
+평균 improvement `>=0.55`, validation/meta correct-wrong cosine 및 improvement gap이 모두
+안정적으로 양수라는 조건을 만족하기 전에는 online Anima adapter 학습으로 넘어가지 않는다.
