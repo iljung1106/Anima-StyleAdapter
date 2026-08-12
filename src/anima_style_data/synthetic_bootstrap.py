@@ -70,7 +70,10 @@ class ArtistCenteredEffectHead(nn.Module):
             split_heads(query), split_heads(key), split_heads(value)
         )
         attended = attended.transpose(1, 2).reshape(batch, query_count, -1)
-        return self.output(attended + query)
+        # Do not add the query as an output residual: that would let the head
+        # predict a reference-independent correction while completely ignoring
+        # style values. The query may only select which style slots are read.
+        return self.output(attended)
 
 
 def _root(config: dict[str, Any], destination: Path) -> Path:
