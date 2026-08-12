@@ -273,7 +273,7 @@ tap_resampler_experiment:
 # and batches targets by exact latent shape. `style-smoke` forces two steps and
 # writes to a separate smoke directory; `style-train` uses `training.steps`.
 style_transfer:
-  output_directory: style_transfer_high_capacity_connector_exactself
+  output_directory: style_transfer_high_capacity_connector_exactself_bootstrap_8000
   seed: 20260811
   loader:
     style_cache: style_features_l18_l24_siglip_l24
@@ -345,26 +345,26 @@ style_transfer:
     maximum_artist_similarity: 0.95
   training:
     device: cuda
-    # Capacity diagnostic: start a fresh Adapter (while still reusing frozen
-    # Anima block K/V/O), feed only the exact target as its own reference, and
-    # let ordinary flow supervision update the complete style-token encoder.
-    steps: 2000
+    # Bootstrap a fresh connector while reusing frozen Anima block K/V/O. Feed
+    # only the exact target as reference; keep the pretrained Resampler and the
+    # parameter-free single-reference aggregation path fixed.
+    steps: 8000
     # Trainable adapter weights and Adam moments stay FP32. Representation
     # modules need a higher LR than the stabilized zero-output path.
     learning_rate: 0.0012
     representation_learning_rate: 0.0012
     output_learning_rate: 0.0008
     gate_learning_rate: 0.0004
-    # Open the complete pretrained Resampler from step one. Its LR is exactly
-    # four times the previous 1e-5 setting.
+    # Retained for later stages; the negative start step below keeps this group
+    # frozen throughout exact-self connector bootstrap.
     resampler_learning_rate: 0.00004
-    warmup_steps: 100
+    warmup_steps: 400
     minimum_lr_ratio: 0.10
     resampler_max_grad_norm: 1.0
     # First prove the new connector on exact-self inputs without moving the
     # newly pretrained 128-token representation.
     resampler_train_start_step: -1
-    # The freshly initialized Set Aggregator is also open from step one.
+    # The Minimal Set Aggregator remains frozen and is bypassed for one input.
     aggregator_train_start_step: -1
     # Disable every Resampler auxiliary. In this ablation its encoder and style
     # slots learn exclusively through Anima's exact-self flow objective.
@@ -406,8 +406,8 @@ style_transfer:
     full_validation_every: 250
     full_validation_batches: 32
     checkpoint_every: 250
-    sample_every: 250
-    resume: false
+    sample_every: 500
+    resume: true
     # Make the Adapter's useful residual dominate the gentle Resampler and
     # magnitude auxiliaries. Direction normalization is strongest during the
     # bootstrap, then fades as ordinary flow MSE takes over.
@@ -417,8 +417,8 @@ style_transfer:
     # representation-preserving checkpoint.
     style_flow_direction_weight: 0.05
     style_direction_epsilon: 0.01
-    style_direction_anneal_start: 500
-    style_direction_anneal_end: 2000
+    style_direction_anneal_start: 1000
+    style_direction_anneal_end: 4000
     # Remove representation constraints so this is a pure flow-capacity test.
     style_token_contrastive_weight: 0.0
     style_kv_contrastive_weight: 0.0
@@ -445,12 +445,13 @@ style_transfer:
     style_interval_huber_beta: 0.01
     style_guided_effect_scale: 1.0
     style_effect_upper_scale: 1.5
-    # Keep exact-target self-reference for all 2,000 optimizer steps.
+    # Keep exact-target self-reference for the complete bootstrap. This makes
+    # the one-reference Minimal Aggregator path an exact parameter-free bypass.
     curriculum:
       gate_only_steps: 0
-      self_reference_steps: 2000
-      target_anneal_end: 2001
-      oracle_distill_end: 2000
+      self_reference_steps: 8000
+      target_anneal_end: 8001
+      oracle_distill_end: 8000
     oracle_distill_weight: 0.0
     oracle_distill_probability: 0.25
     oracle_distill_scale_floor: 0.02
@@ -458,8 +459,8 @@ style_transfer:
     wandb:
       enabled: true
       project: anima-style-adapter
-      name: anima-style-transfer-exactself-norms-cosine-gate025-scratch-2000
-      id: anima-style-transfer-exactself-norms-cosine-gate025-scratch-2000
+      name: anima-style-transfer-high-capacity-exactself-bootstrap-8000
+      id: anima-style-transfer-high-capacity-exactself-bootstrap-8000-v1
   diagnostics:
     checkpoint: checkpoints/step-0000250.pt
     checkpoints:
