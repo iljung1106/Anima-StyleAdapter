@@ -557,6 +557,8 @@ synthetic_teacher:
     # Exactly two of eight contents are held out: one for validation and one
     # for the final content-disjoint meta-test.
     heldout_contents: [6, 7]
+    feature_reduction_device: cuda
+    feature_reduction_batch_size: 64
   query_probes:
     seed: 20260812
     trajectories_per_content: 8

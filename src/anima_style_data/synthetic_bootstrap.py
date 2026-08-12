@@ -19,13 +19,20 @@ def _root(config: dict[str, Any], destination: Path) -> Path:
     return destination / str(name)
 
 
-def _feature_descriptor(handle: Any, image_id: int) -> torch.Tensor:
+def _feature_descriptors(handle: Any, image_ids: list[int], device: str) -> torch.Tensor:
+    """Reduce one same-shape feature shard as GPU batches, returning compact CPU rows."""
     parts = []
     for layer in (18, 24):
-        value = handle.get_tensor(f"{image_id}.layer_{layer:02d}_spatial").float()
-        parts.extend((value.mean(0), value.std(0, correction=0)))
-    parts.append(handle.get_tensor(f"{image_id}.layer_24_siglip_cls").float().flatten())
-    return torch.cat([F.layer_norm(value, value.shape) for value in parts])
+        value = torch.stack([
+            handle.get_tensor(f"{image_id}.layer_{layer:02d}_spatial") for image_id in image_ids
+        ]).to(device=device, dtype=torch.float32)
+        parts.extend((value.mean(1), value.std(1, correction=0)))
+    cls = torch.stack([
+        handle.get_tensor(f"{image_id}.layer_24_siglip_cls").flatten() for image_id in image_ids
+    ]).to(device=device, dtype=torch.float32)
+    parts.append(cls)
+    normalized = [F.layer_norm(value, value.shape[1:]) for value in parts]
+    return torch.cat(normalized, dim=-1).cpu()
 
 
 def classify_artist_effects(rows: list[dict[str, Any]]) -> dict[str, str]:
@@ -154,13 +161,21 @@ def validate_synthetic_teacher_corpus(
     for row in feature_rows:
         by_shard[str(row["feature_shard"])].append(row)
     descriptors: dict[int, torch.Tensor] = {}
-    for shard, shard_rows in sorted(by_shard.items()):
+    reduction_device = str(bootstrap.get("feature_reduction_device", "cuda"))
+    reduction_batch = int(bootstrap.get("feature_reduction_batch_size", 64))
+    for shard_index, (shard, shard_rows) in enumerate(sorted(by_shard.items())):
         with safe_open(feature_root / shard, framework="pt", device="cpu") as handle:
-            for row in shard_rows:
-                descriptor = _feature_descriptor(handle, int(row["id"]))
-                if not torch.isfinite(descriptor).all():
-                    raise FloatingPointError(f"Non-finite C-RADIO descriptor for {row['id']}")
-                descriptors[int(row["id"])] = descriptor
+            for offset in range(0, len(shard_rows), reduction_batch):
+                part = shard_rows[offset : offset + reduction_batch]
+                image_ids = [int(row["id"]) for row in part]
+                values = _feature_descriptors(handle, image_ids, reduction_device)
+                if not torch.isfinite(values).all():
+                    raise FloatingPointError(f"Non-finite C-RADIO descriptor in {shard}")
+                descriptors.update(zip(image_ids, values, strict=True))
+        print(
+            f"validated feature shard {shard_index + 1}/{len(by_shard)} "
+            f"({len(descriptors)}/{len(feature_rows)} images)", flush=True,
+        )
 
     control_descriptor = {int(row["id"]): descriptors[int(row["id"])] for row in controls}
     by_artist: dict[str, list[dict[str, Any]]] = defaultdict(list)
