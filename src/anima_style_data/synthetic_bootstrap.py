@@ -502,6 +502,17 @@ def _attention_output(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, output_
     return F.linear(attended.transpose(0, 1).reshape(attended.shape[1], -1), output_weight)
 
 
+def _batched_attention_output(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, output_weight: torch.Tensor
+) -> torch.Tensor:
+    """Project batched [B,H,Q,D] attention back to Anima hidden space."""
+    attended = F.scaled_dot_product_attention(q, k, v)
+    return F.linear(
+        attended.transpose(1, 2).reshape(attended.shape[0], attended.shape[2], -1),
+        output_weight,
+    )
+
+
 def _load_resampler_token_cache(root: Path) -> tuple[dict[int, dict[str, Any]], dict[str, torch.Tensor]]:
     """Load the small Phase-A cache into RAM, avoiding NFS random page faults."""
     from safetensors.torch import load_file
@@ -584,9 +595,12 @@ def train_offline_kvo_bootstrap(
         name = str(row["cache_shard"])
         if name not in text_cache:
             text_cache[name] = load_file(root / "text" / name, device="cpu")["conditioning"]
-        value = text_cache[name][int(row["row_index"])]
-        length = int(value.abs().amax(dim=-1).ne(0).sum())
-        return value[:length].to(device=device, dtype=torch.bfloat16)
+        # Anima receives all 512 post-LLM positions without a text padding
+        # mask.  The trailing zero K/V positions therefore remain in the
+        # attention softmax denominator and must not be trimmed here.
+        return text_cache[name][int(row["row_index"])].to(
+            device=device, dtype=torch.bfloat16
+        )
 
     heads = int(config["style_transfer"]["adapter"]["heads"])
     hidden = int(config["style_transfer"]["adapter"]["hidden_dim"])
@@ -664,8 +678,14 @@ def train_offline_kvo_bootstrap(
         baseline = cached_tokens(batch_rows)
         if phase == "a":
             return baseline, baseline.new_zeros(())
+        configured_feature_root = training.get("local_feature_directory")
+        feature_root = (
+            Path(str(configured_feature_root))
+            if configured_feature_root and Path(str(configured_feature_root)).is_dir()
+            else root / "style_features"
+        )
         features, _, mask, _, global_feature = _load_feature_batch(
-            batch_rows, root / "style_features", taps, taps, variant_global
+            batch_rows, feature_root, taps, taps, variant_global
         )
         with torch.autocast("cuda", dtype=torch.bfloat16):
             _, tokens = resampler.encode(
@@ -695,59 +715,75 @@ def train_offline_kvo_bootstrap(
         rank_losses = []
         block_count = int(training.get("blocks_per_step", 7)) if train else 28
         blocks = generator.sample(range(28), block_count) if block_count < 28 else list(range(28))
-        for sample_index, row in enumerate(batch_rows):
-            content_id = int(row["content_condition_id"])
-            artist_id = int(row["artist_condition_id"])
-            artist_context, content_context = text(artist_id), text(content_id)
-            for block in blocks:
+        artist_contexts = torch.stack([text(int(row["artist_condition_id"])) for row in batch_rows])
+        content_contexts = torch.stack([text(int(row["content_condition_id"])) for row in batch_rows])
+        for block in blocks:
+            queries = []
+            for row in batch_rows:
                 available_queries = probe_keys[(int(row["content_index"]), block)]
                 query_key = (
                     generator.choice(available_queries)
                     if train
                     else available_queries[(int(row["id"]) + block) % len(available_queries)]
                 )
-                q = probe_values[query_key].to(device=device, dtype=torch.bfloat16).transpose(0, 1)
-                ka, va = projected(artist_context, block)
-                kc, vc = projected(content_context, block)
-                ow = basis[f"block_{block:02d}.output_proj.weight"]
-                with torch.no_grad():
-                    teacher = _attention_output(q, ka, va, ow) - _attention_output(q, kc, vc, ow)
-                def student_output(context: torch.Tensor) -> torch.Tensor:
-                    with torch.autocast("cuda", dtype=torch.bfloat16):
-                        sk = F.linear(context, basis[f"block_{block:02d}.k_proj.weight"])
-                        sv = F.linear(context, basis[f"block_{block:02d}.v_proj.weight"])
-                        sk = sk + adapter.k_up[block](adapter.k_down[block](context))
-                        sv = sv + adapter.v_up[block](adapter.v_down[block](context))
-                        sk = _native_rms_norm(
-                            sk.reshape(-1, heads, head_dim).transpose(0, 1),
-                            basis.get(f"block_{block:02d}.k_norm.weight"),
-                        )
-                        sv = sv.reshape(-1, heads, head_dim).transpose(0, 1)
-                        attended = F.scaled_dot_product_attention(
-                            q.unsqueeze(0), sk.unsqueeze(0), sv.unsqueeze(0)
-                        ).squeeze(0)
-                        attended = attended.transpose(0, 1).reshape(attended.shape[1], hidden)
-                        return F.linear(attended, ow) + adapter.o_up[block](adapter.o_down[block](attended))
+                queries.append(probe_values[query_key])
+            q = torch.stack(queries).to(device=device, dtype=torch.bfloat16).transpose(1, 2)
+            kw = basis[f"block_{block:02d}.k_proj.weight"]
+            vw = basis[f"block_{block:02d}.v_proj.weight"]
+            ow = basis[f"block_{block:02d}.output_proj.weight"]
+            norm_weight = basis.get(f"block_{block:02d}.k_norm.weight")
 
-                context = contexts[block][sample_index]
-                student = student_output(context)
-                if train and len(batch_rows) > 1 and float(training.get("functional_rank_weight", 0.0)) > 0:
-                    wrong_context = contexts[block][(sample_index + 1) % len(batch_rows)]
-                    wrong_student = student_output(wrong_context)
-                scale = teacher.detach().float().square().mean().sqrt().clamp_min(1e-4)
-                output_losses.append(F.smooth_l1_loss(student.float() / scale, teacher.float() / scale, beta=0.1))
-                cosine = F.cosine_similarity(student.float().flatten(), teacher.float().flatten(), dim=0)
-                cosines.append(cosine)
-                rms_losses.append((torch.log(student.float().square().mean().sqrt().clamp_min(1e-6)) - torch.log(scale)).square())
-                student_mses.append(F.mse_loss(student.float(), teacher.float()))
-                zero_mses.append(teacher.float().square().mean())
-                if train and len(batch_rows) > 1 and float(training.get("functional_rank_weight", 0.0)) > 0:
-                    correct_distance = (student.float() / scale - teacher.float() / scale).square().mean()
-                    wrong_distance = (wrong_student.float() / scale - teacher.float() / scale).square().mean()
-                    rank_losses.append(F.relu(
-                        correct_distance - wrong_distance
-                        + float(training.get("functional_rank_margin", 0.02))
-                    ))
+            def native_kv(condition: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+                k = F.linear(condition, kw).reshape(condition.shape[0], -1, heads, head_dim).transpose(1, 2)
+                v = F.linear(condition, vw).reshape(condition.shape[0], -1, heads, head_dim).transpose(1, 2)
+                return _native_rms_norm(k, norm_weight), v
+
+            with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
+                ka, va = native_kv(artist_contexts)
+                kc, vc = native_kv(content_contexts)
+                teacher = (
+                    _batched_attention_output(q, ka, va, ow)
+                    - _batched_attention_output(q, kc, vc, ow)
+                )
+
+            def student_output(context: torch.Tensor) -> torch.Tensor:
+                with torch.autocast("cuda", dtype=torch.bfloat16):
+                    sk = F.linear(context, kw) + adapter.k_up[block](adapter.k_down[block](context))
+                    sv = F.linear(context, vw) + adapter.v_up[block](adapter.v_down[block](context))
+                    sk = _native_rms_norm(
+                        sk.reshape(context.shape[0], -1, heads, head_dim).transpose(1, 2),
+                        norm_weight,
+                    )
+                    sv = sv.reshape(context.shape[0], -1, heads, head_dim).transpose(1, 2)
+                    attended = F.scaled_dot_product_attention(q, sk, sv)
+                    attended = attended.transpose(1, 2).reshape(context.shape[0], attended.shape[2], hidden)
+                    return F.linear(attended, ow) + adapter.o_up[block](adapter.o_down[block](attended))
+
+            student = student_output(contexts[block])
+            use_rank = train and len(batch_rows) > 1 and float(training.get("functional_rank_weight", 0.0)) > 0
+            wrong_student = student_output(contexts[block].roll(1, dims=0)) if use_rank else None
+            teacher_float, student_float = teacher.float(), student.float()
+            scale = teacher_float.square().mean(dim=(1, 2), keepdim=True).sqrt().clamp_min(1e-4)
+            per_sample_output = F.smooth_l1_loss(
+                student_float / scale, teacher_float / scale, beta=0.1, reduction="none"
+            ).mean(dim=(1, 2))
+            output_losses.extend(per_sample_output.unbind())
+            block_cosines = F.cosine_similarity(
+                student_float.flatten(1), teacher_float.flatten(1), dim=1
+            )
+            cosines.extend(block_cosines.unbind())
+            student_rms = student_float.square().mean(dim=(1, 2)).sqrt().clamp_min(1e-6)
+            teacher_rms = scale.flatten()
+            rms_losses.extend((torch.log(student_rms) - torch.log(teacher_rms)).square().unbind())
+            student_mses.extend((student_float - teacher_float).square().mean(dim=(1, 2)).unbind())
+            zero_mses.extend(teacher_float.square().mean(dim=(1, 2)).unbind())
+            if use_rank and wrong_student is not None:
+                correct_distance = ((student_float - teacher_float) / scale).square().mean(dim=(1, 2))
+                wrong_distance = ((wrong_student.float() - teacher_float) / scale).square().mean(dim=(1, 2))
+                rank_losses.extend(F.relu(
+                    correct_distance - wrong_distance
+                    + float(training.get("functional_rank_margin", 0.02))
+                ).unbind())
         output_loss = torch.stack(output_losses).mean()
         cosine_loss = (1 - torch.stack(cosines)).mean()
         rms_loss = torch.stack(rms_losses).mean()

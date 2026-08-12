@@ -1,4 +1,8 @@
+import torch
+
 from anima_style_data.synthetic_bootstrap import (
+    _attention_output,
+    _batched_attention_output,
     _bootstrap_eligible,
     assign_bootstrap_splits,
     classify_artist_effects,
@@ -29,3 +33,18 @@ def test_bootstrap_eligibility_matches_validated_manifest_contract():
     assert _bootstrap_eligible({"kind": "artist", "artist_split": "validation"})
     assert not _bootstrap_eligible({"kind": "artist", "artist_split": "excluded"})
     assert not _bootstrap_eligible({"kind": "content_control", "artist_split": "control"})
+
+
+def test_batched_attention_matches_individual_attention():
+    torch.manual_seed(23)
+    batch, heads, queries, context, dim = 3, 2, 5, 7, 4
+    q = torch.randn(batch, heads, queries, dim)
+    k = torch.randn(batch, heads, context, dim)
+    v = torch.randn(batch, heads, context, dim)
+    output_weight = torch.randn(heads * dim, heads * dim)
+    batched = _batched_attention_output(q, k, v, output_weight)
+    individual = torch.stack([
+        _attention_output(q[index], k[index], v[index], output_weight)
+        for index in range(batch)
+    ])
+    torch.testing.assert_close(batched, individual)
