@@ -3123,6 +3123,8 @@ def train_style_adapter(config: dict[str, Any], destination: Path, *, steps_over
         data_wait = 0.0
         accumulated_loss = 0.0
         details = None
+        numeric_detail_samples: dict[str, list[float]] = defaultdict(list)
+        boolean_detail_any: dict[str, bool] = defaultdict(bool)
         for _ in range(accumulation_steps):
             wait_started = time.perf_counter()
             batch = next(iterator)
@@ -3132,11 +3134,22 @@ def train_style_adapter(config: dict[str, Any], destination: Path, *, steps_over
                 loss_config=training, step=step, oracle_adapter=oracle_adapter,
             )
             accumulated_loss += float(loss.detach()) / accumulation_steps
+            for key, value in details.items():
+                if isinstance(value, bool):
+                    boolean_detail_any[key] = boolean_detail_any[key] or value
+                elif key != "references" and isinstance(value, (int, float)):
+                    numeric = float(value)
+                    if math.isfinite(numeric):
+                        numeric_detail_samples[key].append(numeric)
             (loss / accumulation_steps).backward()
             # Style tokens are part of the adapter's live autograd graph, so
             # keep them attached until each microbatch backward completes.
             adapter.clear_style_tokens()
         assert details is not None
+        details = dict(details)
+        for key, values in numeric_detail_samples.items():
+            details[key] = sum(values) / len(values)
+        details.update(boolean_detail_any)
         grad_norm = torch.nn.utils.clip_grad_norm_(
             parameters, float(training.get("max_grad_norm", 1.0))
         )
