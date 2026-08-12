@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 import random
 from collections import Counter, defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
@@ -141,16 +142,26 @@ def validate_synthetic_teacher_corpus(
     if len(female_contents) != int(cfg.get("female_contents", 7)):
         errors.append(f"expected {cfg.get('female_contents', 7)} 1girl contents, found {len(female_contents)}")
 
-    # Decode every image header and verify representative full pixel payloads.
-    for index, row in enumerate(manifest):
+    # WebP decode is independent and CPU-bound. Validate headers concurrently,
+    # while fully decoding a deterministic 1/64 sample to catch payload damage.
+    def inspect_image(item: tuple[int, dict[str, Any]]) -> str | None:
+        index, row = item
         try:
             with Image.open(row["local_path"]) as image:
                 if index % 64 == 0:
                     image.load()
                 if image.size != (int(row["width"]), int(row["height"])):
-                    errors.append(f"image size mismatch: {row['id']}")
+                    return f"image size mismatch: {row['id']}"
         except Exception as error:
-            errors.append(f"corrupt image {row['id']}: {error}")
+            return f"corrupt image {row['id']}: {error}"
+        return None
+
+    image_workers = int(bootstrap.get("image_validation_workers", 32))
+    with ThreadPoolExecutor(max_workers=image_workers) as executor:
+        for error in executor.map(inspect_image, enumerate(manifest), chunksize=32):
+            if error:
+                errors.append(error)
+    print(f"validated {len(manifest)} image headers with {image_workers} workers", flush=True)
 
     if errors:
         summary = {"valid": False, "errors": errors, "images": len(manifest)}
