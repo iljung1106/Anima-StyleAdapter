@@ -535,6 +535,7 @@ def _load_resident_feature_cache(
     taps: list[int],
     global_layer: int,
     device: str = "cpu",
+    workers: int = 1,
 ) -> dict[str, Any]:
     """Materialize C-RADIO shards into contiguous system-RAM tensors once.
 
@@ -555,8 +556,10 @@ def _load_resident_feature_cache(
     grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for row in ordered:
         grouped[str(row["feature_shard"])].append(row)
-    loaded = 0
-    for shard_index, (name, shard_rows) in enumerate(sorted(grouped.items()), start=1):
+    shard_groups = sorted(grouped.items())
+
+    def load_shard(item: tuple[str, list[dict[str, Any]]]) -> int:
+        name, shard_rows = item
         with safe_open(feature_root / name, framework="pt", device="cpu") as handle:
             for row in shard_rows:
                 image_id = int(row["id"])
@@ -568,14 +571,31 @@ def _load_resident_feature_cache(
                     features[layer][index, :count].copy_(value)
                 value = handle.get_tensor(f"{image_id}.layer_{global_layer:02d}_siglip_cls").flatten()
                 if global_values is None:
-                    global_values = torch.empty(len(ordered), value.numel(), dtype=value.dtype)
+                    raise RuntimeError("Global cache must be allocated before parallel loading")
                 global_values[index].copy_(value)
-                loaded += 1
-        print(
-            f"resident C-RADIO cache {shard_index}/{len(grouped)} "
-            f"({loaded}/{len(ordered)} images)",
-            flush=True,
-        )
+        return len(shard_rows)
+
+    # Every C-RADIO summary has the backbone width. Allocate this before
+    # workers start so they only write disjoint rows into fixed storage.
+    global_values = torch.empty(len(ordered), spatial_dim, dtype=torch.float16)
+    loaded = 0
+    if workers > 1:
+        with ThreadPoolExecutor(max_workers=min(workers, len(shard_groups))) as executor:
+            for shard_index, count in enumerate(executor.map(load_shard, shard_groups), start=1):
+                loaded += count
+                print(
+                    f"resident C-RADIO cache {shard_index}/{len(grouped)} "
+                    f"({loaded}/{len(ordered)} images)",
+                    flush=True,
+                )
+    else:
+        for shard_index, item in enumerate(shard_groups, start=1):
+            loaded += load_shard(item)
+            print(
+                f"resident C-RADIO cache {shard_index}/{len(grouped)} "
+                f"({loaded}/{len(ordered)} images)",
+                flush=True,
+            )
     if global_values is None:
         raise RuntimeError("Resident C-RADIO cache is empty")
     gib = (
@@ -709,7 +729,12 @@ def train_offline_kvo_bootstrap(
             device if bool(training.get("gpu_resident_features", False)) else "cpu"
         )
         resident_features = _load_resident_feature_cache(
-            rows, feature_root, [18, 24], 24, feature_cache_device
+            rows,
+            feature_root,
+            [18, 24],
+            24,
+            feature_cache_device,
+            int(training.get("feature_cache_load_workers", 8)),
         )
     bridge_parameters = [value for value in adapter.bridge_parameters() if value.requires_grad]
     connector_parameters = [

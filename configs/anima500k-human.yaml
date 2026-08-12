@@ -618,6 +618,7 @@ synthetic_teacher:
     gpu_resident_small_caches: true
     ram_resident_features: true
     gpu_resident_features: true
+    feature_cache_load_workers: 8
     representation_warmup_steps: 250
     learning_rate: 0.00001
     connector_learning_rate: 0.000003
