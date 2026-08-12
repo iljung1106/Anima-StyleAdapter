@@ -617,10 +617,16 @@ def _load_resident_feature_cache(
     }
 
 
-def _enable_phase_b_resampler(resampler: torch.nn.Module) -> list[torch.nn.Parameter]:
-    """Open only the style boundary and final encoder block for joint tuning."""
+def _enable_phase_b_resampler(
+    resampler: torch.nn.Module, encoder_layers: int = 1
+) -> list[torch.nn.Parameter]:
+    """Open the style boundary and a configurable number of final encoder blocks."""
     resampler.requires_grad_(False)
-    modules = [resampler.encoder[-1], resampler.style_projection]
+    if not 1 <= encoder_layers <= len(resampler.encoder):
+        raise ValueError(
+            f"resampler_trainable_encoder_layers must be in [1, {len(resampler.encoder)}]"
+        )
+    modules = [*resampler.encoder[-encoder_layers:], resampler.style_projection]
     parameters: list[torch.nn.Parameter] = []
     for module in modules:
         module.requires_grad_(True)
@@ -763,7 +769,12 @@ def train_offline_kvo_bootstrap(
     if remaining_parameters:
         raise RuntimeError(f"Unassigned adapter parameters: {len(remaining_parameters)}")
     adapter_parameters = bridge_parameters + connector_parameters + kvo_parameters
-    resampler_parameters = _enable_phase_b_resampler(resampler) if phase == "b" else []
+    resampler_parameters = (
+        _enable_phase_b_resampler(
+            resampler, int(training.get("resampler_trainable_encoder_layers", 1))
+        )
+        if phase == "b" else []
+    )
     parameters = adapter_parameters + resampler_parameters
     optimizer_groups: list[dict[str, Any]] = [
         {"params": bridge_parameters, "lr": float(training.get("bridge_learning_rate", 2e-6)), "name": "bridge"},
@@ -835,11 +846,40 @@ def train_offline_kvo_bootstrap(
     def loss_for(
         batch_rows: list[dict[str, Any]], *, train: bool,
         reference_rows: list[dict[str, Any]] | None = None,
+        positive_reference_rows: list[dict[str, Any]] | None = None,
         detach_representation: bool = False,
         current_step: int = 0,
     ) -> tuple[torch.Tensor, dict[str, float]]:
         reference_rows = batch_rows if reference_rows is None else reference_rows
         tokens, drift_loss = encode(reference_rows)
+        artist_token_loss = tokens.new_zeros(())
+        artist_token_accuracy = tokens.new_zeros(())
+        if train and positive_reference_rows is not None:
+            positive_tokens, positive_drift = encode(positive_reference_rows)
+            drift_loss = 0.5 * (drift_loss + positive_drift)
+            def token_descriptor(value: torch.Tensor) -> torch.Tensor:
+                normalized = F.layer_norm(value.float(), (value.shape[-1],))
+                return F.normalize(
+                    torch.cat(
+                        (normalized.mean(dim=1), normalized.std(dim=1, correction=0)),
+                        dim=-1,
+                    ),
+                    dim=-1,
+                )
+            anchor_descriptor = token_descriptor(tokens)
+            positive_descriptor = token_descriptor(positive_tokens)
+            token_logits = anchor_descriptor @ positive_descriptor.T / float(
+                training.get("artist_token_temperature", 0.07)
+            )
+            token_labels = torch.arange(len(reference_rows), device=tokens.device)
+            artist_token_loss = 0.5 * (
+                F.cross_entropy(token_logits, token_labels)
+                + F.cross_entropy(token_logits.T, token_labels)
+            )
+            artist_token_accuracy = 0.5 * (
+                (token_logits.argmax(1) == token_labels).float().mean()
+                + (token_logits.argmax(0) == token_labels).float().mean()
+            )
         # Keep trainable parameters and optimizer state in FP32, but execute
         # connector/native K/V/O projections and SDPA in BF16 like Anima.
         # The cached native basis and query probes are BF16; autocast supplies
@@ -1044,6 +1084,9 @@ def train_offline_kvo_bootstrap(
                 + float(training.get("functional_all_pairs_magnitude_weight", 0.02))
                 * all_pair_magnitude_loss
             )
+            + contrastive_scale
+            * float(training.get("artist_token_contrastive_weight", 0.0))
+            * artist_token_loss
         )
         zero_mse = torch.stack(zero_mses).mean()
         student_mse = torch.stack(student_mses).mean()
@@ -1065,6 +1108,8 @@ def train_offline_kvo_bootstrap(
             "functional_all_pairs_magnitude_loss": float(
                 all_pair_magnitude_loss.detach()
             ),
+            "artist_token_contrastive_loss": float(artist_token_loss.detach()),
+            "artist_token_contrastive_accuracy": float(artist_token_accuracy.detach()),
             "zero_improvement": float((1 - student_mse / zero_mse.clamp_min(1e-12)).detach()),
             "teacher_rms": float(torch.stack(zero_mses).mean().sqrt().detach()),
             "student_rms": float(torch.stack(student_mses).mean().sqrt().detach()),
@@ -1186,6 +1231,7 @@ def train_offline_kvo_bootstrap(
         batch_artists = generator.sample(list(by_train_artist), batch_size)
         batch = [generator.choice(by_train_artist[artist]) for artist in batch_artists]
         reference_batch = batch
+        positive_reference_batch = None
         target_excluded_start = int(training.get("target_excluded_start_step", total_steps + 1))
         target_excluded_end = int(training.get("target_excluded_end_step", target_excluded_start))
         final_exact_probability = float(training.get("exact_self_probability", 1.0))
@@ -1202,11 +1248,21 @@ def train_offline_kvo_bootstrap(
                 ])
                 for target in batch
             ]
+        if phase == "b" and float(training.get("artist_token_contrastive_weight", 0.0)) > 0:
+            positive_reference_batch = [
+                generator.choice([
+                    row for row in by_train_artist[str(reference["artist"])]
+                    if int(row["id"]) != int(reference["id"])
+                    and int(row["content_index"]) != int(reference["content_index"])
+                ])
+                for reference in reference_batch
+            ]
         optimizer.zero_grad(set_to_none=True)
         loss, metrics = loss_for(
             batch,
             train=True,
             reference_rows=reference_batch,
+            positive_reference_rows=positive_reference_batch,
             detach_representation=step <= representation_warmup,
             current_step=step,
         )
@@ -1248,6 +1304,8 @@ def train_offline_kvo_bootstrap(
                 f"contrast={metrics['functional_contrastive_loss']:.3f}/"
                 f"{metrics['functional_contrastive_accuracy']:.3f}/"
                 f"{metrics['functional_contrastive_scale']:.2f} "
+                f"token={metrics['artist_token_contrastive_loss']:.3f}/"
+                f"{metrics['artist_token_contrastive_accuracy']:.3f} "
                 f"teacher_rms={metrics['teacher_rms']:.6f} student_rms={metrics['student_rms']:.6f} "
                 f"step_s={metrics['step_s']:.3f} {grad_text}",
                 flush=True,

@@ -612,7 +612,7 @@ synthetic_teacher:
       name: offline-kvo-phase-a-exact512-vectorized
       id: offline-kvo-phase-a-exact512-vectorized-v3
   offline_phase_b:
-    output_directory: offline_kvo_phase_b_exact512_all_pairs
+    output_directory: offline_kvo_phase_b_exact512_artist_tokens
     phase_a_checkpoint: offline_kvo_bootstrap_exact512/checkpoints/best.pt
     local_feature_directory: /tmp/anima-style-bootstrap/style_features
     seed: 20260813
@@ -624,6 +624,7 @@ synthetic_teacher:
     gpu_resident_features: true
     feature_cache_load_workers: 8
     representation_warmup_steps: 250
+    resampler_trainable_encoder_layers: 2
     learning_rate: 0.00001
     connector_learning_rate: 0.000003
     bridge_learning_rate: 0.000001
@@ -646,6 +647,8 @@ synthetic_teacher:
     functional_contrastive_ramp_steps: 750
     functional_all_pairs_weight: 0.50
     functional_all_pairs_magnitude_weight: 0.02
+    artist_token_contrastive_weight: 0.25
+    artist_token_temperature: 0.07
     target_excluded_start_step: 1
     target_excluded_end_step: 1
     exact_self_probability: 0.25
@@ -660,5 +663,5 @@ synthetic_teacher:
     wandb:
       enabled: true
       project: anima-style-adapter
-      name: offline-kvo-phase-b-exact512-all-pairs
-      id: offline-kvo-phase-b-exact512-all-pairs-v1
+      name: offline-kvo-phase-b-exact512-artist-tokens
+      id: offline-kvo-phase-b-exact512-artist-tokens-v1
