@@ -100,6 +100,12 @@ def validate_synthetic_teacher_corpus(
 ) -> dict[str, Any]:
     cfg = config["synthetic_teacher"]
     bootstrap = cfg.get("bootstrap", {})
+    # Large RunPod hosts may expose more than 100 CPU threads.  The artist
+    # effect pass consists of many small reductions where that many OpenMP
+    # workers are dramatically slower than a compact pool.
+    validation_threads = int(bootstrap.get("cpu_threads", 8))
+    torch.set_num_threads(max(1, validation_threads))
+    torch.set_num_interop_threads(max(1, min(4, validation_threads)))
     root = _root(config, destination)
     manifest = read_records(root / "manifest.parquet")
     feature_root = root / "style_features"
