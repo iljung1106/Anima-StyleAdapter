@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import math
 import random
-from collections import Counter, defaultdict
+from collections import Counter, defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
@@ -592,8 +592,44 @@ def cache_real_artist_resampler_tokens(
         destination, resampler_cfg, device, trainable=False
     )
     batch_size = int(cfg.get("style_token_batch_size", 32))
+    prefetch_shards = int(cfg.get("style_token_prefetch_shards", 4))
     records = []
-    for shard_index, (feature_shard, shard_rows) in enumerate(sorted(grouped.items())):
+    shard_groups = sorted(grouped.items())
+
+    def read_feature_shard(
+        item: tuple[str, list[dict[str, Any]]]
+    ) -> tuple[str, list[dict[str, Any]], list[dict[str, torch.Tensor]]]:
+        feature_shard, shard_rows = item
+        batches = []
+        with safe_open(feature_root / feature_shard, framework="pt", device="cpu") as handle:
+            for offset in range(0, len(shard_rows), batch_size):
+                part = shard_rows[offset : offset + batch_size]
+                ids = [int(row["id"]) for row in part]
+                layer18 = [handle.get_tensor(f"{image_id}.layer_18_spatial") for image_id in ids]
+                layer24 = [handle.get_tensor(f"{image_id}.layer_24_spatial") for image_id in ids]
+                batches.append({
+                    "layer18": torch.nn.utils.rnn.pad_sequence(layer18, batch_first=True),
+                    "layer24": torch.nn.utils.rnn.pad_sequence(layer24, batch_first=True),
+                    "counts": torch.tensor([value.shape[0] for value in layer18]),
+                    "global": torch.stack([
+                        handle.get_tensor(f"{image_id}.layer_24_siglip_cls")
+                        for image_id in ids
+                    ]),
+                })
+        return feature_shard, shard_rows, batches
+
+    executor = ThreadPoolExecutor(max_workers=max(1, prefetch_shards))
+    pending = deque()
+    iterator = iter(shard_groups)
+    for _ in range(max(1, prefetch_shards)):
+        item = next(iterator, None)
+        if item is not None:
+            pending.append(executor.submit(read_feature_shard, item))
+    for shard_index in range(len(shard_groups)):
+        feature_shard, shard_rows, cpu_batches = pending.popleft().result()
+        item = next(iterator, None)
+        if item is not None:
+            pending.append(executor.submit(read_feature_shard, item))
         token_name = f"part-{shard_index:05d}.safetensors"
         token_path = output / token_name
         row_path = output / f"part-{shard_index:05d}.parquet"
@@ -601,36 +637,19 @@ def cache_real_artist_resampler_tokens(
             records.extend(read_records(row_path))
             continue
         token_parts = []
-        with safe_open(feature_root / feature_shard, framework="pt", device="cpu") as handle:
-            for offset in range(0, len(shard_rows), batch_size):
-                part = shard_rows[offset : offset + batch_size]
-                ids = [int(row["id"]) for row in part]
-                feature_lists = {
-                    layer: [
-                        handle.get_tensor(f"{image_id}.layer_{layer:02d}_spatial")
-                        for image_id in ids
-                    ]
-                    for layer in (18, 24)
-                }
-                counts = torch.tensor(
-                    [value.shape[0] for value in feature_lists[18]], device=device
-                )
-                features = {
-                    layer: torch.nn.utils.rnn.pad_sequence(
-                        values, batch_first=True
-                    ).to(device, non_blocking=True)
-                    for layer, values in feature_lists.items()
-                }
-                mask = torch.arange(features[18].shape[1], device=device)[None] < counts[:, None]
-                global_feature = torch.stack([
-                    handle.get_tensor(f"{image_id}.layer_24_siglip_cls")
-                    for image_id in ids
-                ]).to(device, non_blocking=True)
-                with torch.inference_mode(), torch.autocast(
-                    "cuda", dtype=torch.bfloat16, enabled=device.startswith("cuda")
-                ):
-                    _, tokens = resampler.encode(features, mask, global_feature)
-                token_parts.append(tokens.cpu().to(torch.bfloat16).contiguous())
+        for batch in cpu_batches:
+            features = {
+                18: batch["layer18"].to(device, non_blocking=True),
+                24: batch["layer24"].to(device, non_blocking=True),
+            }
+            counts = batch["counts"].to(device, non_blocking=True)
+            mask = torch.arange(features[18].shape[1], device=device)[None] < counts[:, None]
+            global_feature = batch["global"].to(device, non_blocking=True)
+            with torch.inference_mode(), torch.autocast(
+                "cuda", dtype=torch.bfloat16, enabled=device.startswith("cuda")
+            ):
+                _, tokens = resampler.encode(features, mask, global_feature)
+            token_parts.append(tokens.cpu().to(torch.bfloat16).contiguous())
         tokens = torch.cat(token_parts)
         if tuple(tokens.shape[1:]) != (128, 1024) or not torch.isfinite(tokens).all():
             raise RuntimeError(f"Invalid real-reference token shard: {tuple(tokens.shape)}")
@@ -650,6 +669,7 @@ def cache_real_artist_resampler_tokens(
             f"cached real-artist token shard {shard_index + 1}/{len(grouped)} "
             f"({len(records)}/{len(rows)} images)", flush=True,
         )
+    executor.shutdown(wait=True)
     if {int(row["id"]) for row in records} != {int(row["id"]) for row in rows}:
         raise RuntimeError("Real-artist token cache ID set mismatch")
     write_records(final_manifest, sorted(records, key=lambda row: int(row["id"])))

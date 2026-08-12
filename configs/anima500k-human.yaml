@@ -701,6 +701,7 @@ real_artist_teacher:
   text_shard_rows: 512
   style_token_directory: resampler_tokens
   style_token_batch_size: 32
+  style_token_prefetch_shards: 4
   offline_bootstrap:
     output_directory: offline_kvo_reference_head
     # Reuse the frozen common-effect connector learned on exact synthetic
