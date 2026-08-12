@@ -808,7 +808,7 @@ def _enable_phase_b_resampler(
 
 def train_offline_kvo_bootstrap(
     config: dict[str, Any], destination: Path, *, steps_override: int | None = None,
-    phase: str = "a",
+    phase: str = "a", real_artist: bool = False,
 ) -> dict[str, Any]:
     """Distill native artist attention effects without running Anima's transformer."""
     from safetensors.torch import load_file
@@ -819,20 +819,70 @@ def train_offline_kvo_bootstrap(
     cfg = config["synthetic_teacher"]
     if phase not in {"a", "b"}:
         raise ValueError(f"Unknown offline bootstrap phase: {phase}")
-    training = cfg.get("offline_bootstrap" if phase == "a" else "offline_phase_b", {})
-    root = _root(config, destination)
+    if real_artist:
+        real_cfg = config["real_artist_teacher"]
+        training = real_cfg.get("offline_bootstrap", {})
+        root = destination / str(real_cfg.get("output_directory", "real_artist_teacher_5000"))
+    else:
+        training = cfg.get("offline_bootstrap" if phase == "a" else "offline_phase_b", {})
+        root = _root(config, destination)
     output = root / str(training.get("output_directory", "offline_kvo_bootstrap"))
     output.mkdir(parents=True, exist_ok=True)
-    validated = [row for row in read_records(root / "validated_manifest.parquet") if _bootstrap_eligible(row)]
-    feature_rows = {int(row["id"]): row for row in read_records(root / "style_features" / "manifest.parquet")}
-    rows = [{**row, **feature_rows[int(row["id"])]} for row in validated]
-    by_split = {name: [row for row in rows if row["artist_split"] == name] for name in ("train", "validation", "meta_test")}
-    train_rows = [row for row in by_split["train"] if row["content_split"] == "train"]
-    train_heldout_rows = [
-        row for row in by_split["train"] if row["content_split"] == "validation"
-    ]
-    validation_rows = [row for row in by_split["validation"] if row["content_split"] == "validation"]
-    meta_rows = [row for row in by_split["meta_test"] if row["content_split"] == "test"]
+    if real_artist:
+        references = read_records(root / "references.parquet")
+        conditions = {
+            (str(row["artist"]), int(row["content_index"])): row
+            for row in read_records(root / "plan.parquet")
+        }
+        rows = []
+        for reference in references:
+            for content_index in range(8):
+                condition = conditions[(str(reference["artist"]), content_index)]
+                rows.append({
+                    **reference,
+                    "content_index": content_index,
+                    "content_split": (
+                        "validation" if content_index == 6 else
+                        "test" if content_index == 7 else "train"
+                    ),
+                    "content_condition_id": int(condition["content_condition_id"]),
+                    "artist_condition_id": int(condition["artist_condition_id"]),
+                })
+        train_rows = [
+            row for row in rows
+            if row["artist_split"] == "train"
+            and row["reference_split"] == "train"
+            and row["content_split"] == "train"
+        ]
+        train_heldout_rows = [
+            row for row in rows
+            if row["artist_split"] == "train"
+            and row["reference_split"] == "validation"
+            and row["content_split"] == "validation"
+        ]
+        validation_rows = [
+            row for row in rows
+            if row["artist_split"] == "validation"
+            and row["reference_split"] == "validation"
+            and row["content_split"] == "validation"
+        ]
+        meta_rows = [
+            row for row in rows
+            if row["artist_split"] == "meta_test"
+            and row["reference_split"] == "test"
+            and row["content_split"] == "test"
+        ]
+    else:
+        validated = [row for row in read_records(root / "validated_manifest.parquet") if _bootstrap_eligible(row)]
+        feature_rows = {int(row["id"]): row for row in read_records(root / "style_features" / "manifest.parquet")}
+        rows = [{**row, **feature_rows[int(row["id"])]} for row in validated]
+        by_split = {name: [row for row in rows if row["artist_split"] == name] for name in ("train", "validation", "meta_test")}
+        train_rows = [row for row in by_split["train"] if row["content_split"] == "train"]
+        train_heldout_rows = [
+            row for row in by_split["train"] if row["content_split"] == "validation"
+        ]
+        validation_rows = [row for row in by_split["validation"] if row["content_split"] == "validation"]
+        meta_rows = [row for row in by_split["meta_test"] if row["content_split"] == "test"]
     if not train_rows or not train_heldout_rows or not validation_rows or not meta_rows:
         raise RuntimeError("Offline bootstrap split is empty")
 
@@ -883,13 +933,15 @@ def train_offline_kvo_bootstrap(
     basis = load_file(root / "anima_kv_teacher" / "native_cross_attention.safetensors", device="cpu")
     basis = {key: value.to(device=device, dtype=torch.bfloat16) for key, value in basis.items()}
     resident_device = device if bool(training.get("gpu_resident_small_caches", True)) else "cpu"
+    probe_device = device if bool(training.get("gpu_resident_probes", True)) else resident_device
+    probe_root = root / str(training.get("query_probe_directory", "query_probe_bank"))
     probe_values = {
-        key: value.to(resident_device)
+        key: value.to(probe_device)
         for key, value in load_file(
-            root / "query_probe_bank" / "queries.safetensors", device="cpu"
+            probe_root / "queries.safetensors", device="cpu"
         ).items()
     }
-    probe_rows = read_records(root / "query_probe_bank" / "manifest.parquet")
+    probe_rows = read_records(probe_root / "manifest.parquet")
     probe_keys: dict[tuple[int, int], list[str]] = defaultdict(list)
     for row in probe_rows:
         probe_keys[(int(row["content_index"]), int(row["block"]))].append(str(row["key"]))
@@ -932,7 +984,10 @@ def train_offline_kvo_bootstrap(
     seed = int(training.get("seed", int(cfg.get("seed", 20260812)) ^ 0x0FF1))
     generator = random.Random(seed)
     total_steps = int(steps_override or training.get("steps", 10000))
-    token_rows, token_tensors = _load_resampler_token_cache(root, resident_device)
+    token_device = device if bool(
+        training.get("gpu_resident_tokens", training.get("gpu_resident_small_caches", True))
+    ) else "cpu"
+    token_rows, token_tensors = _load_resampler_token_cache(root, token_device)
     resident_features = None
     if phase == "b" and bool(training.get("ram_resident_features", True)):
         configured_feature_root = training.get("local_feature_directory")
@@ -1027,7 +1082,7 @@ def train_offline_kvo_bootstrap(
 
     def encode(batch_rows: list[dict[str, Any]]) -> tuple[torch.Tensor, torch.Tensor]:
         baseline = cached_tokens(batch_rows)
-        if phase == "a":
+        if phase == "a" or real_artist:
             return baseline, baseline.new_zeros(())
         if resident_features is not None:
             cache_device = resident_features["features"][18].device
@@ -1517,6 +1572,11 @@ def train_offline_kvo_bootstrap(
         all_by_artist[str(row["artist"])].append(row)
 
     def distinct_references(targets: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        if real_artist:
+            # The native teacher target is the abstract @artist effect, not an
+            # image reconstruction target. The held-out real image itself is
+            # therefore the correct evaluation reference and is not leakage.
+            return targets
         references = []
         for target in targets:
             candidates = [
@@ -1794,7 +1854,8 @@ def train_offline_kvo_bootstrap(
     # the checkpoint.  It never participates in early stopping or tuning.
     final_meta = evaluate(meta_rows, int(training.get("meta_test_batches", 8)))
     summary = {
-        "phase": phase, "steps": last_step, "best_step": best_step,
+        "phase": phase, "real_artist": real_artist,
+        "steps": last_step, "best_step": best_step,
         "checkpoint": str((checkpoint_dir / "best.pt").resolve()),
         "train_artist_heldout_content": final_train_heldout,
         "validation": final_validation, "meta_test": final_meta,

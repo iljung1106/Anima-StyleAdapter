@@ -89,6 +89,7 @@ def build_parser() -> argparse.ArgumentParser:
         ("synthetic-teacher-kv", "Cache factorized native Anima K/V/O teacher targets"),
         ("real-artist-teacher-kv", "Cache 5k real-artist text and native K/V/O teacher targets"),
         ("real-artist-style-tokens", "Cache Resampler tokens for fixed 5k-artist references"),
+        ("real-artist-offline-kvo", "Train reference-discriminative K/V/O head on 5k real artists"),
         ("synthetic-validate", "Validate synthetic corpus, artist effects, and fixed splits"),
         ("synthetic-query-probes", "Capture native Anima query probe bank"),
         ("synthetic-style-tokens", "Cache frozen per-reference Resampler tokens"),
@@ -203,6 +204,16 @@ def main() -> None:
         from .synthetic_bootstrap import cache_real_artist_resampler_tokens
 
         _run(cache_real_artist_resampler_tokens, config, destination)
+    elif args.command == "real-artist-offline-kvo":
+        from .synthetic_bootstrap import train_offline_kvo_bootstrap
+
+        _run(
+            lambda cfg, out: train_offline_kvo_bootstrap(
+                cfg, out, phase="b", real_artist=True
+            ),
+            config,
+            destination,
+        )
     elif args.command == "synthetic-validate":
         from .synthetic_bootstrap import validate_synthetic_teacher_corpus
 
