@@ -92,6 +92,7 @@ def build_parser() -> argparse.ArgumentParser:
         ("synthetic-style-tokens", "Cache frozen per-reference Resampler tokens"),
         ("offline-kvo-smoke", "Run two offline K/V/O bootstrap steps"),
         ("offline-kvo-train", "Train and validate offline K/V/O connector bootstrap"),
+        ("offline-kvo-phase-b", "Jointly tune the Resampler top and connector"),
         ("prepare", "Run selection, download, and duplicate removal"),
         ("all", "Run every stage, including tagger and C-RADIO models"),
     ):
@@ -203,10 +204,19 @@ def main() -> None:
         from .synthetic_bootstrap import cache_synthetic_resampler_tokens
 
         _run(cache_synthetic_resampler_tokens, config, destination)
-    elif args.command in {"offline-kvo-smoke", "offline-kvo-train"}:
-        from .synthetic_bootstrap import smoke_offline_kvo_bootstrap, train_offline_kvo_bootstrap
+    elif args.command in {"offline-kvo-smoke", "offline-kvo-train", "offline-kvo-phase-b"}:
+        from .synthetic_bootstrap import (
+            smoke_offline_kvo_bootstrap,
+            train_offline_kvo_bootstrap,
+            train_offline_kvo_phase_b,
+        )
 
-        _run(smoke_offline_kvo_bootstrap if args.command == "offline-kvo-smoke" else train_offline_kvo_bootstrap, config, destination)
+        stage = {
+            "offline-kvo-smoke": smoke_offline_kvo_bootstrap,
+            "offline-kvo-train": train_offline_kvo_bootstrap,
+            "offline-kvo-phase-b": train_offline_kvo_phase_b,
+        }[args.command]
+        _run(stage, config, destination)
     elif args.command in {"prepare", "all"}:
         for stage in (select_candidates, download_candidates, deduplicate):
             _run(stage, config, destination)

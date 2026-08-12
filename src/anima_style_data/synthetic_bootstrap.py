@@ -502,8 +502,35 @@ def _attention_output(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, output_
     return F.linear(attended.transpose(0, 1).reshape(attended.shape[1], -1), output_weight)
 
 
+def _load_resampler_token_cache(root: Path) -> tuple[dict[int, dict[str, Any]], dict[str, torch.Tensor]]:
+    """Load the small Phase-A cache into RAM, avoiding NFS random page faults."""
+    from safetensors.torch import load_file
+
+    cache_root = root / "resampler_tokens"
+    rows = read_records(cache_root / "manifest.parquet")
+    row_by_id = {int(row["id"]): row for row in rows}
+    tensors = {
+        name: load_file(cache_root / name, device="cpu")["tokens"].clone()
+        for name in sorted({str(row["token_shard"]) for row in rows})
+    }
+    return row_by_id, tensors
+
+
+def _enable_phase_b_resampler(resampler: torch.nn.Module) -> list[torch.nn.Parameter]:
+    """Open only the style boundary and final encoder block for joint tuning."""
+    resampler.requires_grad_(False)
+    modules = [resampler.encoder[-1], resampler.style_projection]
+    parameters: list[torch.nn.Parameter] = []
+    for module in modules:
+        module.requires_grad_(True)
+        parameters.extend(module.parameters())
+    resampler.train()
+    return parameters
+
+
 def train_offline_kvo_bootstrap(
-    config: dict[str, Any], destination: Path, *, steps_override: int | None = None
+    config: dict[str, Any], destination: Path, *, steps_override: int | None = None,
+    phase: str = "a",
 ) -> dict[str, Any]:
     """Distill native artist attention effects without running Anima's transformer."""
     from safetensors.torch import load_file
@@ -512,7 +539,9 @@ def train_offline_kvo_bootstrap(
     from .tap_resampler import _load_feature_batch
 
     cfg = config["synthetic_teacher"]
-    training = cfg.get("offline_bootstrap", {})
+    if phase not in {"a", "b"}:
+        raise ValueError(f"Unknown offline bootstrap phase: {phase}")
+    training = cfg.get("offline_bootstrap" if phase == "a" else "offline_phase_b", {})
     root = _root(config, destination)
     output = root / str(training.get("output_directory", "offline_kvo_bootstrap"))
     output.mkdir(parents=True, exist_ok=True)
@@ -533,6 +562,13 @@ def train_offline_kvo_bootstrap(
     adapter.aggregator.requires_grad_(False)
     adapter.null_tokens.requires_grad_(False)
     adapter.train()
+    if phase == "b":
+        phase_a_checkpoint = root / str(training.get(
+            "phase_a_checkpoint", "offline_kvo_bootstrap/checkpoints/best.pt"
+        ))
+        state = torch.load(phase_a_checkpoint, map_location="cpu", weights_only=False)
+        adapter.load_state_dict(state["adapter"])
+        print(f"initialized Phase B from {phase_a_checkpoint}", flush=True)
     basis = load_file(root / "anima_kv_teacher" / "native_cross_attention.safetensors", device="cpu")
     basis = {key: value.to(device=device, dtype=torch.bfloat16) for key, value in basis.items()}
     probe_values = load_file(root / "query_probe_bank" / "queries.safetensors", device="cpu")
@@ -570,9 +606,20 @@ def train_offline_kvo_bootstrap(
     seed = int(training.get("seed", int(cfg.get("seed", 20260812)) ^ 0x0FF1))
     generator = random.Random(seed)
     total_steps = int(steps_override or training.get("steps", 10000))
-    parameters = [value for value in adapter.parameters() if value.requires_grad]
+    token_rows, token_tensors = _load_resampler_token_cache(root)
+    adapter_parameters = [value for value in adapter.parameters() if value.requires_grad]
+    resampler_parameters = _enable_phase_b_resampler(resampler) if phase == "b" else []
+    parameters = adapter_parameters + resampler_parameters
+    optimizer_groups: list[dict[str, Any]] = [{
+        "params": adapter_parameters, "lr": float(training.get("learning_rate", 1e-4)),
+    }]
+    if resampler_parameters:
+        optimizer_groups.append({
+            "params": resampler_parameters,
+            "lr": float(training.get("resampler_learning_rate", 1e-5)),
+        })
     optimizer = torch.optim.AdamW(
-        parameters, lr=float(training.get("learning_rate", 1e-4)),
+        optimizer_groups,
         betas=(0.9, 0.95), weight_decay=float(training.get("weight_decay", 0.01)),
     )
     warmup = int(training.get("warmup_steps", 500))
@@ -583,18 +630,34 @@ def train_offline_kvo_bootstrap(
         progress = (step - warmup) / max(total_steps - warmup, 1)
         return float(training.get("minimum_lr_ratio", 0.1)) + (1 - float(training.get("minimum_lr_ratio", 0.1))) * 0.5 * (1 + math.cos(math.pi * progress))
 
-    def encode(batch_rows: list[dict[str, Any]]) -> torch.Tensor:
+    def cached_tokens(batch_rows: list[dict[str, Any]]) -> torch.Tensor:
+        return torch.stack([
+            token_tensors[str(token_rows[int(row["id"])]["token_shard"])][
+                int(token_rows[int(row["id"])]["token_row"])
+            ]
+            for row in batch_rows
+        ]).to(device=device, dtype=torch.bfloat16)
+
+    def encode(batch_rows: list[dict[str, Any]]) -> tuple[torch.Tensor, torch.Tensor]:
+        baseline = cached_tokens(batch_rows)
+        if phase == "a":
+            return baseline, baseline.new_zeros(())
         features, _, mask, _, global_feature = _load_feature_batch(
             batch_rows, root / "style_features", taps, taps, variant_global
         )
-        with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
+        with torch.autocast("cuda", dtype=torch.bfloat16):
             _, tokens = resampler.encode(
                 {key: value.to(device) for key, value in features.items()}, mask.to(device), global_feature.to(device)
             )
-        return tokens
+        drift = (1 - F.cosine_similarity(tokens.float(), baseline.float(), dim=-1)).mean()
+        return tokens, drift
 
-    def loss_for(batch_rows: list[dict[str, Any]], *, train: bool) -> tuple[torch.Tensor, dict[str, float]]:
-        tokens = encode(batch_rows)
+    def loss_for(
+        batch_rows: list[dict[str, Any]], *, train: bool,
+        reference_rows: list[dict[str, Any]] | None = None,
+    ) -> tuple[torch.Tensor, dict[str, float]]:
+        reference_rows = batch_rows if reference_rows is None else reference_rows
+        tokens, drift_loss = encode(reference_rows)
         # Keep trainable parameters and optimizer state in FP32, but execute
         # connector/native K/V/O projections and SDPA in BF16 like Anima.
         # The cached native basis and query probes are BF16; autocast supplies
@@ -642,27 +705,71 @@ def train_offline_kvo_bootstrap(
         output_loss = torch.stack(output_losses).mean()
         cosine_loss = (1 - torch.stack(cosines)).mean()
         rms_loss = torch.stack(rms_losses).mean()
-        loss = output_loss + float(training.get("direction_weight", 0.2)) * cosine_loss + float(training.get("magnitude_weight", 0.02)) * rms_loss
+        loss = (
+            output_loss
+            + float(training.get("direction_weight", 0.2)) * cosine_loss
+            + float(training.get("magnitude_weight", 0.02)) * rms_loss
+            + float(training.get("representation_drift_weight", 0.0)) * drift_loss
+        )
         zero_mse = torch.stack(zero_mses).mean()
         student_mse = torch.stack(student_mses).mean()
         return loss, {
             "loss": float(loss.detach()), "output_loss": float(output_loss.detach()),
             "cosine": float(torch.stack(cosines).mean().detach()),
             "rms_loss": float(rms_loss.detach()),
+            "representation_drift": float(drift_loss.detach()),
             "zero_improvement": float((1 - student_mse / zero_mse.clamp_min(1e-12)).detach()),
         }
 
+    all_by_artist: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for row in rows:
+        all_by_artist[str(row["artist"])].append(row)
+
+    def distinct_references(targets: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        references = []
+        for target in targets:
+            candidates = [
+                row for row in all_by_artist[str(target["artist"])]
+                if int(row["id"]) != int(target["id"]) and row["content_split"] == "train"
+            ]
+            references.append(candidates[int(target["id"]) % len(candidates)])
+        return references
+
+    def wrong_references(correct: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        if len(correct) > 1 and all(
+            correct[index]["artist"] != correct[(index + 1) % len(correct)]["artist"]
+            for index in range(len(correct))
+        ):
+            return correct[1:] + correct[:1]
+        pool = [row for row in train_rows if row["content_split"] == "train"]
+        return [
+            next(row for row in pool if row["artist"] != target["artist"])
+            for target in correct
+        ]
+
     def evaluate(source: list[dict[str, Any]], batches: int) -> dict[str, float]:
         adapter.eval()
+        resampler.eval()
         metrics: list[dict[str, float]] = []
+        wrong_metrics: list[dict[str, float]] = []
         with torch.no_grad():
             for index in range(batches):
                 start = (index * batch_size) % len(source)
                 batch = (source + source)[start : start + batch_size]
-                _, values = loss_for(batch, train=False)
+                references = distinct_references(batch)
+                _, values = loss_for(batch, train=False, reference_rows=references)
+                _, wrong = loss_for(batch, train=False, reference_rows=wrong_references(references))
                 metrics.append(values)
+                wrong_metrics.append(wrong)
         adapter.train()
-        return {key: sum(item[key] for item in metrics) / len(metrics) for key in metrics[0]}
+        if phase == "b":
+            resampler.train()
+        result = {key: sum(item[key] for item in metrics) / len(metrics) for key in metrics[0]}
+        for key in ("cosine", "zero_improvement", "output_loss"):
+            result[f"wrong_{key}"] = sum(item[key] for item in wrong_metrics) / len(wrong_metrics)
+        result["correct_wrong_cosine_gap"] = result["cosine"] - result["wrong_cosine"]
+        result["correct_wrong_improvement_gap"] = result["zero_improvement"] - result["wrong_zero_improvement"]
+        return result
 
     log_every = int(training.get("log_every", 20))
     validation_every = int(training.get("validation_every", 250))
@@ -670,31 +777,90 @@ def train_offline_kvo_bootstrap(
     checkpoint_dir = output / "checkpoints"
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     history = []
+    best_score = -float("inf")
+    best_step = 0
+    stale_validations = 0
+    minimum_steps = int(training.get("minimum_steps", 0))
+    early_stop_patience = int(training.get("early_stop_patience", 0))
+    by_train_artist: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for row in train_rows:
+        by_train_artist[str(row["artist"])].append(row)
+    last_step = 0
     for step in range(1, total_steps + 1):
+        last_step = step
         batch = generator.sample(train_rows, batch_size)
+        reference_batch = batch
+        if phase == "b":
+            exact_probability = float(training.get("exact_self_probability", 0.25))
+            reference_batch = [
+                target if generator.random() < exact_probability else generator.choice([
+                    row for row in by_train_artist[str(target["artist"])]
+                    if int(row["id"]) != int(target["id"])
+                ])
+                for target in batch
+            ]
         optimizer.zero_grad(set_to_none=True)
-        loss, metrics = loss_for(batch, train=True)
+        loss, metrics = loss_for(batch, train=True, reference_rows=reference_batch)
         loss.backward()
         grad_norm = torch.nn.utils.clip_grad_norm_(parameters, float(training.get("max_grad_norm", 1.0)))
         scale = lr_scale(step)
-        for group in optimizer.param_groups:
-            group["lr"] = float(training.get("learning_rate", 1e-4)) * scale
+        optimizer.param_groups[0]["lr"] = float(training.get("learning_rate", 1e-4)) * scale
+        if len(optimizer.param_groups) > 1:
+            optimizer.param_groups[1]["lr"] = float(training.get("resampler_learning_rate", 1e-5)) * scale
         optimizer.step()
         if step % log_every == 0:
             print(f"offline-kvo step={step}/{total_steps} loss={metrics['loss']:.4f} cos={metrics['cosine']:.4f} improve={metrics['zero_improvement']:.4f} grad={float(grad_norm):.3f}", flush=True)
         if step % validation_every == 0 or step == total_steps:
             val = evaluate(validation_rows, int(training.get("validation_batches", 8)))
-            meta = evaluate(meta_rows, int(training.get("meta_test_batches", 8)))
-            record = {"step": step, "validation": val, "meta_test": meta}
+            record = {"step": step, "validation": val}
             history.append(record)
             write_json(output / "evaluation.json", {"history": history, "latest": record})
-            print(f"offline-kvo validation step={step} val_cos={val['cosine']:.4f} val_improve={val['zero_improvement']:.4f} meta_cos={meta['cosine']:.4f}", flush=True)
+            score = val["zero_improvement"] + 0.1 * val["cosine"]
+            if score > best_score:
+                best_score, best_step, stale_validations = score, step, 0
+                state = {
+                    "phase": phase, "step": step, "adapter": adapter.state_dict(),
+                    "resampler": resampler.state_dict() if phase == "b" else None,
+                    "config": training, "validation": val,
+                }
+                torch.save(state, checkpoint_dir / "best.tmp")
+                (checkpoint_dir / "best.tmp").replace(checkpoint_dir / "best.pt")
+            else:
+                stale_validations += 1
+            print(
+                f"offline-kvo phase={phase} validation step={step} "
+                f"cos={val['cosine']:.4f} improve={val['zero_improvement']:.4f} "
+                f"wrong_cos={val['wrong_cosine']:.4f} gap={val['correct_wrong_cosine_gap']:.4f} "
+                f"best={best_step}", flush=True,
+            )
         if step % checkpoint_every == 0 or step == total_steps:
-            state = {"step": step, "adapter": adapter.state_dict(), "optimizer": optimizer.state_dict(), "config": training}
+            state = {
+                "phase": phase, "step": step, "adapter": adapter.state_dict(),
+                "resampler": resampler.state_dict() if phase == "b" else None,
+                "optimizer": optimizer.state_dict(), "config": training,
+            }
             temporary = checkpoint_dir / f"step-{step:07d}.tmp"
             torch.save(state, temporary)
             temporary.replace(checkpoint_dir / f"step-{step:07d}.pt")
-    summary = {"steps": total_steps, "checkpoint": str((checkpoint_dir / f"step-{total_steps:07d}.pt").resolve()), "latest": history[-1]}
+        if (
+            early_stop_patience > 0 and step >= minimum_steps
+            and stale_validations >= early_stop_patience
+        ):
+            print(f"offline-kvo phase={phase} early stop at step={step}; best={best_step}", flush=True)
+            break
+    best = torch.load(checkpoint_dir / "best.pt", map_location="cpu", weights_only=False)
+    adapter.load_state_dict(best["adapter"])
+    if phase == "b" and best.get("resampler") is not None:
+        resampler.load_state_dict(best["resampler"])
+    final_validation = evaluate(validation_rows, int(training.get("validation_batches", 8)))
+    # Meta-test is deliberately touched once, only after validation selected
+    # the checkpoint.  It never participates in early stopping or tuning.
+    final_meta = evaluate(meta_rows, int(training.get("meta_test_batches", 8)))
+    summary = {
+        "phase": phase, "steps": last_step, "best_step": best_step,
+        "checkpoint": str((checkpoint_dir / "best.pt").resolve()),
+        "validation": final_validation, "meta_test": final_meta,
+    }
     write_json(output / "summary.json", summary)
     return summary
 
@@ -709,4 +875,8 @@ def smoke_offline_kvo_bootstrap(config: dict[str, Any], destination: Path) -> di
     copied["synthetic_teacher"]["offline_bootstrap"]["validation_batches"] = 1
     copied["synthetic_teacher"]["offline_bootstrap"]["meta_test_batches"] = 1
     copied["synthetic_teacher"]["offline_bootstrap"]["blocks_per_step"] = 2
-    return train_offline_kvo_bootstrap(copied, destination, steps_override=2)
+    return train_offline_kvo_bootstrap(copied, destination, steps_override=2, phase="a")
+
+
+def train_offline_kvo_phase_b(config: dict[str, Any], destination: Path) -> dict[str, Any]:
+    return train_offline_kvo_bootstrap(config, destination, phase="b")
