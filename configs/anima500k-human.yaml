@@ -603,8 +603,8 @@ synthetic_teacher:
     wandb:
       enabled: true
       project: anima-style-adapter
-      name: offline-kvo-phase-a
-      id: offline-kvo-phase-a-v1
+      name: offline-kvo-phase-a-functional-rank
+      id: offline-kvo-phase-a-functional-rank-v2
   offline_phase_b:
     output_directory: offline_kvo_phase_b
     phase_a_checkpoint: offline_kvo_bootstrap/checkpoints/best.pt
