@@ -962,6 +962,15 @@ def train_offline_kvo_bootstrap(
         reference_rows = batch_rows if reference_rows is None else reference_rows
         tokens, drift_loss = encode(reference_rows)
         representation_tokens = tokens.detach() if detach_representation else tokens
+        # A trainable Resampler must not shift the frozen Phase-A common
+        # connector. Keep that path on its original cached representation and
+        # route the updated representation only through the artist-specific
+        # residual head.
+        common_tokens = (
+            cached_tokens(reference_rows)
+            if centered_head is not None and bool(training.get("freeze_base_connector", True))
+            else representation_tokens
+        )
         artist_token_loss = tokens.new_zeros(())
         artist_token_accuracy = tokens.new_zeros(())
         if train and positive_reference_rows is not None:
@@ -1026,7 +1035,7 @@ def train_offline_kvo_bootstrap(
             if train else []
         )
         with torch.autocast("cuda", dtype=torch.bfloat16):
-            contexts = adapter.selected_block_context_tokens(representation_tokens, blocks)
+            contexts = adapter.selected_block_context_tokens(common_tokens, blocks)
         if detach_representation:
             contexts = {index: value.detach() for index, value in contexts.items()}
         artist_contexts = torch.stack([text(int(row["artist_condition_id"])) for row in batch_rows])
