@@ -550,3 +550,15 @@ synthetic_teacher:
     candidate_batch_sizes: [4, 8, 12]
     require_finite: true
   negative_prompt: worst quality, low quality, score_1, score_2, score_3, blurry, jpeg artifacts, sepia
+  bootstrap:
+    split_seed: 20260812
+    validation_artists: 25
+    meta_test_artists: 25
+    # Exactly two of eight contents are held out: one for validation and one
+    # for the final content-disjoint meta-test.
+    heldout_contents: [6, 7]
+  query_probes:
+    seed: 20260812
+    trajectories_per_content: 8
+    timesteps: [0.15, 0.35, 0.65, 0.85]
+    queries_per_block: 32

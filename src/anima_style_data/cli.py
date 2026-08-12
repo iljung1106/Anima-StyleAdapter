@@ -87,6 +87,8 @@ def build_parser() -> argparse.ArgumentParser:
         ("synthetic-teacher", "Generate and fully cache artist-tag teacher images"),
         ("synthetic-teacher-benchmark", "Validate SPEED and batched VAE before production"),
         ("synthetic-teacher-kv", "Cache factorized native Anima K/V/O teacher targets"),
+        ("synthetic-validate", "Validate synthetic corpus, artist effects, and fixed splits"),
+        ("synthetic-query-probes", "Capture native Anima query probe bank"),
         ("prepare", "Run selection, download, and duplicate removal"),
         ("all", "Run every stage, including tagger and C-RADIO models"),
     ):
@@ -186,6 +188,14 @@ def main() -> None:
         from .synthetic_teacher import build_synthetic_teacher_kv_cache
 
         _run(build_synthetic_teacher_kv_cache, config, destination)
+    elif args.command == "synthetic-validate":
+        from .synthetic_bootstrap import validate_synthetic_teacher_corpus
+
+        _run(validate_synthetic_teacher_corpus, config, destination)
+    elif args.command == "synthetic-query-probes":
+        from .synthetic_bootstrap import build_anima_query_probe_bank
+
+        _run(build_anima_query_probe_bank, config, destination)
     elif args.command in {"prepare", "all"}:
         for stage in (select_candidates, download_candidates, deduplicate):
             _run(stage, config, destination)

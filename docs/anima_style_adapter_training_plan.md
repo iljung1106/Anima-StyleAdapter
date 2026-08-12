@@ -694,3 +694,165 @@ projection한 뒤 원래 head 단위로 적용한다. Raw K/V 원소 MSE보다�
 attention-logit/output loss를 주목표로 쓰며, frozen `output_proj`가 native O 좌표를
 제공한다. Noisy latent와 timestep에 의존하는 실제 block O 및 velocity residual은 정적
 캐시하지 않고 이후 제한된 online Anima distillation에서 계산한다.
+
+## 22. Synthetic teacher 완료 후 단계별 학습 계획
+
+전체 style-transfer flow 학습을 바로 시작하지 않는다. 먼저 synthetic corpus로 Anima의
+native artist conditioning 좌표계에 bridge/connector를 정렬하고, 이 정렬이 unseen artist와
+held-out content에도 일반화되는 것을 확인한 다음 online flow 및 실제 Danbooru 학습으로
+전환한다.
+
+### 22.1 Corpus 무결성 검사
+
+생성 및 C-RADIO 캐시가 끝나면 다음을 자동 검사한다.
+
+- artist-conditioned 이미지 `500 × 8 content × 2 seed = 8,000장`
+- 동일 content/seed의 artist-free control 16장
+- 이미지, latent, post-LLM condition, C-RADIO feature ID와 shape 일치
+- 작가별 16장 및 각 이미지의 정확한 control ID 연결
+- 누락 shard, 중복 ID, 손상 이미지, NaN/Inf feature 검사
+- 8개 content 중 7개에 `1girl`이 포함되었는지 확인
+
+결과는 `validated_manifest.parquet`, `integrity_summary.json`, 일부 작가의 paired contact
+sheet로 저장한다. 검증에 실패한 ID만 격리하고 원본 cache를 삭제하지 않는다.
+
+### 22.2 Native artist effect 품질 평가
+
+동일 content와 seed의 artist-conditioned 이미지와 content-only control을 비교한다. 작가별
+평가 지표는 C-RADIO style-feature 변화량, 8개 content 사이의 effect 방향 일관성, 두 seed
+사이의 재현성, 작가 간 분리도, 지나친 구조·character identity 변화량이다.
+
+작가는 `strong/consistent`, `moderate`, `weak/unstable`로 분류한다. 절대 임계값을 미리
+고정하지 않고 전체 분포의 median과 분위수를 기록한 뒤 결정한다. Strong group은 주
+bootstrap 데이터, moderate group은 낮은 sampling weight, weak/unstable group은 제외 또는
+진단용으로 사용한다.
+
+### 22.3 Artist/content 분할
+
+작가 leakage를 방지하도록 500명을 `train 450 / validation 25 / meta-test 25`로 고정
+분할한다. Content는 `train 6 / held-out validation 1 / held-out test 1`로 나눈다. 두 seed
+이미지는 동일 split 안에서 reference와 target 역할을 교환할 수 있다. 평가는
+`seen artist/seen content`, `seen artist/new content`, `new artist/seen content`,
+`new artist/new content`의 네 영역을 따로 보고한다.
+
+### 22.4 실제 Anima query probe bank
+
+Random Q만으로 bootstrap하면 실제 Anima hidden-state 분포와 어긋날 수 있으므로,
+content-only Anima trajectory에서 작은 실제 query bank를 한 번 수집한다.
+
+- content 8개와 대표 trajectory 약 64개
+- low/mid-low/mid-high/high noise의 timestep 4개
+- Anima 28블록, 블록당 spatial query 16~32개
+- 결정적 reservoir sampling과 FP16/BF16 shard
+- content/timestep/block manifest 및 query RMS/head 분산/norm 통계
+
+예상 용량은 약 0.5~1GB다. 전체 image-token Q를 저장하지 않으며 Gaussian normalized Q도
+일정 비율 섞어 probe bank 표본에만 과적합되는 것을 방지한다.
+
+### 22.5 Offline K/V/O connector bootstrap
+
+이 단계에서는 frozen Anima transformer 전체를 실행하지 않는다.
+
+```text
+C-RADIO L18/L24 spatial + L24 SigLIP CLS
+  -> frozen per-reference Resampler
+  -> 128×1024 style tokens
+  -> bridge + block-conditioned connector
+  -> 28-block student K/V and O delta
+
+cached artist/content post-LLM conditions
+  + frozen native K/V/O basis
+  + cached query probes
+  -> native artist attention-effect target
+```
+
+동일한 content-only query를 사용해 teacher와 student를 비교한다.
+
+```text
+Delta O_teacher = Attn(Q, K_artist, V_artist) W_O
+                - Attn(Q, K_content, V_content) W_O
+Delta O_student = Attn(Q, K_style, V_style) (W_O + Delta W_O)
+```
+
+초기에는 Resampler를 동결하고 single-reference path에서 Set Aggregator를 완전히 우회한다.
+Bridge, connector, block별 K/V/O low-rank delta만 학습하며 prototype/reconstruction loss와
+native timestep gate는 offline target에 사용하지 않는다.
+
+초기 loss 가중치는 attention-output distillation `1.0`, normalized output direction/cosine
+`0.2`, attention-logit distillation `0.1`, K/V subspace loss `0.05`, log-RMS magnitude loss
+`0.02`를 출발점으로 삼는다. Teacher text token과 student style slot은 일대일 대응하지 않으므로
+raw K/V token MSE는 쓰지 않거나 매우 약한 보조항으로만 둔다.
+
+### 22.6 Offline validation과 통과 조건
+
+250~500 step마다 teacher/student attention-output cosine, normalized MSE와 zero-output 대비
+improvement, timestep별 RMS ratio, block별 성능, held-out content, unseen artist meta-test,
+correct/wrong-reference 격차를 측정한다.
+
+최소 통과 조건은 validation에서 zero-output보다 통계적으로 명확히 좋아지고 모든 timestep
+구간에서 평균 direction cosine이 양수이며 unseen artist에서도 개선이 유지되는 것이다.
+Wrong-reference는 correct-reference보다 나빠야 하고 특정 몇 개 block만 학습한 채 나머지가
+붕괴해서는 안 된다. 우선 최대 10k step으로 설정하고 2k/5k/10k checkpoint의 Pareto 성능을
+비교한다.
+
+### 22.7 Exact-self online flow distillation
+
+Offline 정렬이 통과한 뒤 frozen Anima를 연결한다.
+
+```text
+Delta v_teacher = F(x_t, t, content + @artist) - F(x_t, t, content)
+Delta v_student = F_style(x_t, t, content, z(reference)) - F(x_t, t, content)
+```
+
+초기 reference는 해당 synthetic target 자체다. Connector, bridge, K/V/O delta만 학습하고
+Resampler는 동결한다. Teacher velocity residual Huber, normalized direction, log-RMS
+magnitude, target flow MSE를 사용하며 offline block attention-output loss를 약하게 유지한다.
+250~500 step마다 timestep별 residual cosine/RMS, paired flow improvement와 실제 생성 sample을
+검사한다. Exact-self조차 teacher 방향을 재현하지 못하면 다음 단계로 진행하지 않는다.
+
+### 22.8 Resampler 점진적 개방
+
+Connector가 teacher 방향을 재현한 뒤 마지막 Resampler block, 마지막 두 block, 필요할 때만
+전체 Resampler 순서로 연다. Resampler LR은 connector LR의 5~10%로 시작한다. Feature
+reconstruction을 유지해 정보 붕괴를 막고 prototype loss는 끄거나 매우 작게 둔다. Teacher
+attention/flow loss가 계속 주목표이며 slot diversity는 약한 보조항으로만 유지한다.
+
+### 22.9 Reference curriculum
+
+| 구간 | exact-self | 같은 작가의 target-excluded reference |
+|---|---:|---:|
+| 초기 | 100% | 0% |
+| 전환 1 | 75% | 25% |
+| 전환 2 | 50% | 50% |
+| 전환 3 | 25% | 75% |
+| 최종 | 0% | 100% |
+
+고정 step만으로 전환하지 않고 held-out reference의 teacher alignment가 개선되는 것을 확인한
+뒤 다음 비율로 이동한다.
+
+### 22.10 Minimal Set Aggregator
+
+단일 reference가 정상 작동한 뒤에만 minimal Aggregator를 연다. 1/2/4/8 reference 수,
+순서 무작위화, target-excluded 동일 작가 이미지, reference dropout을 혼합한다. 중복
+reference는 방지하고 reference 수 증가에 따른 teacher alignment와 생성 품질 곡선을
+측정한다. Aggregator를 연 뒤 1-reference 성능이 유의하게 떨어지면 구조나 LR을 수정한다.
+
+### 22.11 실제 Danbooru 본학습 전환
+
+초기에는 synthetic teacher와 실제 Danbooru를 `50:50`으로 섞고 이후 `25:75`, `10:90`을
+거쳐 실제 데이터 중심으로 전환한다. Synthetic batch에는 K/V/attention/velocity teacher
+loss를 사용하고 실제 batch에는 rectified-flow target과 style representation 보존 loss를
+사용한다. 최종 모델이 기존 artist tag 모사에 머물지 않도록 synthetic 비중은 점차 낮춘다.
+
+### 22.12 구현 순서
+
+1. Synthetic corpus integrity 및 artist-effect evaluator
+2. 고정 artist/content split 생성
+3. 실제 Anima query probe bank 생성기
+4. Offline K/V/O bootstrap dataset, loader, trainer
+5. 2-step smoke test와 소수 표본 overfit
+6. 최대 10k-step offline bootstrap 및 meta-test
+7. Exact-self online flow distillation
+8. Resampler 점진 개방과 target-excluded curriculum
+9. Minimal Set Aggregator의 1/2/4/8-reference 학습
+10. 실제 Danbooru 혼합 본학습
