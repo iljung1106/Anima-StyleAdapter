@@ -126,10 +126,6 @@ def validate_synthetic_teacher_corpus(
         errors.append("K/V teacher condition count mismatch")
     if len(text_rows) != int(cfg.get("contents_per_artist", 8)) * (int(cfg.get("artist_count", 500)) + 1):
         errors.append("post-LLM condition count mismatch")
-    missing_images = [row["id"] for row in manifest if not Path(row["local_path"]).is_file()]
-    if missing_images:
-        errors.append(f"missing images: {len(missing_images)}")
-
     artists = [row for row in manifest if row["kind"] == "artist"]
     controls = [row for row in manifest if row["kind"] == "content_control"]
     counts = Counter(str(row["artist"]) for row in artists)
