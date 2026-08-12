@@ -355,8 +355,11 @@ style_transfer:
     bridge_adam_eps: 0.000001
     bridge_weight_decay: 0.0
     adapter_adam_eps: 0.000001
-    representation_learning_rate: 0.0012
-    output_learning_rate: 0.0008
+    # Native gate_cross has |gate| ~= 2.3e2 on this model. Even a globally
+    # clipped 1e-3 first update is therefore destructive across 28 blocks;
+    # open the zero-init connector on the corresponding inverse scale.
+    representation_learning_rate: 0.000005
+    output_learning_rate: 0.000005
     # Retained for later stages; the negative start step below keeps this group
     # frozen throughout exact-self connector bootstrap.
     resampler_learning_rate: 0.00004
