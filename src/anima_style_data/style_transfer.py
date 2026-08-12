@@ -1050,7 +1050,9 @@ def _symmetric_style_contrastive_loss(
     )
 
 
-def _resolve_anima_model(config: dict[str, Any], destination: Path, device: str):
+def _resolve_anima_model(
+    config: dict[str, Any], destination: Path, device: str, *, attn_mode: str = "torch"
+):
     cache_cfg = config["anima_cache"]
     model_cfg = cache_cfg["models"]
     from huggingface_hub import hf_hub_download
@@ -1065,7 +1067,7 @@ def _resolve_anima_model(config: dict[str, Any], destination: Path, device: str)
     from library import anima_utils
 
     model = anima_utils.load_anima_model(
-        device=device, dit_path=dit_path, attn_mode="torch", split_attn=False,
+        device=device, dit_path=dit_path, attn_mode=attn_mode, split_attn=False,
         loading_device=device, dit_weight_dtype=torch.bfloat16,
     )
     # load_anima_model places checkpoint tensors directly, while accelerator in

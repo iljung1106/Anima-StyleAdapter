@@ -84,6 +84,8 @@ def build_parser() -> argparse.ArgumentParser:
         ("style-diagnose", "Measure correct, shuffled, null, and bypass style conditioning"),
         ("style-overfit", "Overfit a fixed exact-self batch to diagnose style-flow capacity"),
         ("style-calibrate", "Measure empirical Anima artist-tag velocity effect ranges"),
+        ("synthetic-teacher", "Generate and fully cache artist-tag teacher images"),
+        ("synthetic-teacher-benchmark", "Validate SPEED and batched VAE before production"),
         ("prepare", "Run selection, download, and duplicate removal"),
         ("all", "Run every stage, including tagger and C-RADIO models"),
     ):
@@ -171,6 +173,14 @@ def main() -> None:
             "style-calibrate": calibrate_artist_tag_velocity,
         }[args.command]
         _run(stage, config, destination)
+    elif args.command == "synthetic-teacher":
+        from .synthetic_teacher import build_synthetic_teacher_cache
+
+        _run(build_synthetic_teacher_cache, config, destination)
+    elif args.command == "synthetic-teacher-benchmark":
+        from .synthetic_teacher import benchmark_synthetic_teacher_cache
+
+        _run(benchmark_synthetic_teacher_cache, config, destination)
     elif args.command in {"prepare", "all"}:
         for stage in (select_candidates, download_candidates, deduplicate):
             _run(stage, config, destination)

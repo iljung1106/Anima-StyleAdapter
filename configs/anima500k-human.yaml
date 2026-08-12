@@ -512,3 +512,41 @@ style_transfer:
     batch_sizes: [4, 8, 16]
     steps: 8
     warmup_steps: 2
+
+# Cross-modal bootstrap corpus: 500 train artists × eight shared content prompts
+# × two shared seeds. Seven prompts explicitly contain 1girl. The 16 matching
+# artist-free images provide paired content controls. Text conditions, generated latents/images, and selected
+# C-RADIO features are all resumable caches under one directory.
+synthetic_teacher:
+  output_directory: synthetic_teacher_500x16
+  device: cuda
+  seed: 20260812
+  artist_count: 500
+  contents_per_artist: 8
+  female_contents: 7
+  seeds_per_content: 2
+  width: 512
+  height: 512
+  steps: 20
+  text_cfg: 4.0
+  flow_shift: 3.0
+  batch_size: 8
+  text_batch_size: 64
+  text_shard_rows: 128
+  latent_shard_rows: 256
+  image_writer_workers: 8
+  webp_quality: 95
+  sage_attention: true
+  torch_compile: true
+  compile_mode: reduce-overhead
+  speed:
+    enabled: true
+    transform: dct
+    scales: [0.5, 1.0]
+    manual_sigmas: [0.85]
+  benchmark:
+    images: 16
+    baseline_batch_size: 1
+    candidate_batch_sizes: [4, 8, 12]
+    require_finite: true
+  negative_prompt: worst quality, low quality, score_1, score_2, score_3, blurry, jpeg artifacts, sepia

@@ -619,3 +619,60 @@ reconstruction과 heldout generalization ablation으로 조정한다.
 중간 activation에는 Q/K/V normalization, Resampler/Aggregator 최종 LayerNorm, LR warmup과
 decay를 유지한다. Exact-self조차 재현하지 못한 상태에서는 prototype 분리 성능이나
 multi-reference 성능보다 정보 보존과 block별 flow 개선을 우선한다.
+
+## 21. Artist-tag teacher를 이용한 context 정렬 bootstrap
+
+현재 방식은 C-RADIO/Resampler 토큰을 Anima의 text cross-attention 좌표계에 직접 넣어
+초기 residual 방향이 정렬되지 않는다. 이를 해결하기 위해 Anima가 이미 지원하는
+`@artist` 조건을 frozen teacher로 사용한다. 목표는 작가 태그의 K/V tensor를 원소별로
+복제하는 것이 아니라, 동일한 noisy latent·timestep·content 조건에서 작가 태그가 만든
+**블록별 attention residual과 최종 velocity residual**을 image-style branch가 재현하는 것이다.
+
+작가 `a`에 대해 여러 content prompt와 seed로 synthetic image를 생성한다. 학습 episode는
+reference `I(a,i)`와 서로 다른 target `I(a,j)`를 사용하고, target prompt의 content-only 및
+`content + @artist_a` 출력을 비교한다.
+
+```text
+teacher: Δv_T = F(x_t, t, content + @artist_a) - F(x_t, t, content)
+student: Δv_S = F_style(x_t, t, content, z(I(a,i))) - F(x_t, t, content)
+```
+
+최종 residual에는 normalized Huber, cosine direction, log-RMS amplitude loss를 적용한다.
+또한 group별 대표 block에서 content-only 경로의 동일한 Q를 사용해 artist context가 만든
+attention residual과 student style residual을 직접 맞춘다. `O`는 작가별 teacher 대상이
+아니라 Anima의 고정 projection이므로 별도로 복제하지 않는다.
+
+초기 학습 순서는 다음과 같다.
+
+1. Frozen Anima로 synthetic image와 content/artist teacher condition을 캐싱한다.
+2. Resampler와 Aggregator를 동결하고 bridge 및 block별 K/V/O delta만 teacher residual로
+   정렬한다.
+3. 블록 residual 정렬 후 최종 velocity residual 증류를 함께 적용한다.
+4. Same-artist/different-image 성능이 확인되면 Resampler 상단을 낮은 LR로 연다.
+5. Synthetic teacher 비중을 줄이면서 실제 Danbooru flow loss와 target-excluded reference를
+   늘린다.
+6. 마지막에 minimal Set Aggregator를 열어 1/2/4/8-reference를 학습한다.
+
+Bridge 내부의 표현 정규화와 최종 출력 크기 제어는 분리한다. `1e-4 I` 뒤 LayerNorm처럼
+작은 초기 크기를 즉시 제거하는 구조를 쓰지 않고, 최종 style residual에 비학습형 bootstrap
+scale을 두어 validation 방향 정렬에 맞춰 외부 스케줄로 증가시킨다. Teacher 정렬 단계에서는
+기존 임의 magnitude floor와 prototype loss를 끄고 Style CFG 1로 평가한다. Paired flow
+improvement와 direction cosine이 안정적으로 양수가 된 뒤에만 CFG와 실제-data 비중을 높인다.
+
+### Synthetic corpus 및 예상 시간
+
+Train 작가 목록에서 500명을 결정적으로 선택하고, 서로 다른 출처의 content prompt 8개와
+공통 seed 2개를 완전 교차해 작가당 16장, 총 8,000장을 512×512로 생성한다. Content 중
+7개는 Anima 학습 분포에 맞춰 `1girl`을 포함하고 하나는 비여성 대조 주제로 둔다. 같은
+8×2 조합을 artist tag 없이도 한 번씩 생성하여 16개의 공유 content-only control과
+8,000개의 artist-conditioned image, 총 8,016장을 만든다. Anima artist
+조건은 항상 literal `@작가명`을 사용한다. Python tokenizer 경로에서는 괄호를 그대로
+tokenize하고, ComfyUI 재현용 metadata에는 `\(`와 `\)`로 escape한 별도 문자열을 저장한다.
+
+Post-LLM content/artist condition, generation seed와 prompt plan, 최종 latent, WebP 이미지,
+L18/L24 spatial 및 L24 SigLIP CLS를 shard 단위로 저장하고 manifest로 재개한다. Qwen text
+encoder, VAE decode와 C-RADIO는 batch 실행한다. Anima sampling은 SageAttention,
+`torch.compile`, Anima용 SPEED 경로를 사용한다. Production 시작 전 동일 seed로 baseline과
+SPEED를 비교하고, VAE batch 1과 후보 batch의 decode 결과가 정상·유한하며 실제 처리량이
+증가하는지 확인한다. 목표 wall time은 H100 한 장에서 4시간 이내이며, 최초 benchmark의 실측
+처리량으로 전체 ETA를 갱신한다.

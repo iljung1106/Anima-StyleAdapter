@@ -327,7 +327,12 @@ def extract_selected_style_features(
     completed_ids = {int(row["id"]) for row in completed_rows}
     # This cache is image-only. Read the post-dedup inventory directly so it
     # neither consumes captions nor depends on the caption stage.
-    all_rows = read_records(destination / "final_manifest.parquet")
+    manifest_path = Path(
+        feature_cfg.get("manifest_path", destination / "final_manifest.parquet")
+    )
+    if not manifest_path.is_absolute():
+        manifest_path = destination / manifest_path
+    all_rows = read_records(manifest_path)
     rows = [row for row in all_rows if int(row["id"]) not in completed_ids]
     shard_index = max(shard_numbers) + 1 if shard_numbers else 0
 
@@ -363,7 +368,12 @@ def extract_selected_style_features(
     # runtime bucket key, so imperfect source metadata cannot corrupt a batch.
     rows.sort(key=lambda row: (*predicted_target_shape(row), int(row["id"])))
 
-    model, device = _load_cradio(radio_cfg, destination / "cradio_model_cache")
+    model_cache = Path(
+        feature_cfg.get("model_cache_directory", destination / "cradio_model_cache")
+    )
+    if not model_cache.is_absolute():
+        model_cache = destination / model_cache
+    model, device = _load_cradio(radio_cfg, model_cache)
     if min(layers) < 0 or max(layers) >= len(model.model.blocks):
         raise ValueError(f"Feature layers must be in [0, {len(model.model.blocks) - 1}]")
 
