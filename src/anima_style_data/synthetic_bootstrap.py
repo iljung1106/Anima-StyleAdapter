@@ -1321,7 +1321,14 @@ def train_offline_kvo_bootstrap(
                 1.0,
                 max(0.0, (current_step - contrastive_start) / max(contrastive_ramp, 1)),
             )
-        primary_weight = float(training.get("primary_effect_weight", 1.0))
+        primary_weight_final = float(training.get("primary_effect_weight", 1.0))
+        primary_weight_initial = float(
+            training.get("primary_effect_initial_weight", primary_weight_final)
+        )
+        primary_weight = (
+            primary_weight_initial
+            + contrastive_scale * (primary_weight_final - primary_weight_initial)
+        )
         loss = (
             primary_weight * (
                 output_loss
@@ -1367,6 +1374,7 @@ def train_offline_kvo_bootstrap(
                 if contrastive_accuracies else 0.0
             ),
             "functional_contrastive_scale": float(contrastive_scale),
+            "primary_effect_scale": float(primary_weight),
             "functional_all_pairs_direction_loss": float(
                 all_pair_direction_loss.detach()
             ),
