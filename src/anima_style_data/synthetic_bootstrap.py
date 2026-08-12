@@ -927,6 +927,13 @@ def train_offline_kvo_bootstrap(
             blocks = list(range(group * adapter.blocks_per_group, (group + 1) * adapter.blocks_per_group))
         else:
             blocks = generator.sample(range(28), block_count) if block_count < 28 else list(range(28))
+        functional_block_count = min(
+            len(blocks), int(training.get("functional_blocks_per_step", 1))
+        )
+        functional_blocks = set(
+            generator.sample(blocks, functional_block_count)
+            if train else []
+        )
         with torch.autocast("cuda", dtype=torch.bfloat16):
             contexts = adapter.selected_block_context_tokens(tokens, blocks)
         if detach_representation:
@@ -1005,7 +1012,7 @@ def train_offline_kvo_bootstrap(
             contrastive_weight = float(training.get("functional_contrastive_weight", 0.0))
             if (
                 train and len(batch_rows) > 1 and contrastive_weight > 0
-                and block == blocks[0]
+                and block in functional_blocks
             ):
                 count = len(batch_rows)
                 # Every target/query attends to every candidate reference.

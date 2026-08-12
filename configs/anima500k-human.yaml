@@ -612,7 +612,7 @@ synthetic_teacher:
       name: offline-kvo-phase-a-exact512-vectorized
       id: offline-kvo-phase-a-exact512-vectorized-v3
   offline_phase_b:
-    output_directory: offline_kvo_phase_b_exact512_centered_pareto
+    output_directory: offline_kvo_phase_b_exact512_rotating_functional
     phase_a_checkpoint: offline_kvo_bootstrap_exact512/checkpoints/best.pt
     initial_checkpoint: offline_kvo_bootstrap_exact512/checkpoints/best.pt
     resampler_initial_checkpoint: offline_kvo_phase_b_exact512_artist_tokens/checkpoints/step-0001500.pt
@@ -621,6 +621,7 @@ synthetic_teacher:
     steps: 3000
     batch_size: 16
     blocks_per_step: 7
+    functional_blocks_per_step: 2
     gpu_resident_small_caches: true
     ram_resident_features: true
     gpu_resident_features: true
@@ -643,15 +644,15 @@ synthetic_teacher:
     representation_drift_weight: 0.03
     functional_rank_weight: 0.10
     functional_rank_margin: 0.02
-    functional_contrastive_weight: 0.50
+    functional_contrastive_weight: 0.25
     functional_contrastive_temperature: 0.10
     functional_contrastive_start_step: 0
     functional_contrastive_ramp_steps: 1000
-    functional_all_pairs_weight: 0.05
+    functional_all_pairs_weight: 0.02
     functional_all_pairs_magnitude_weight: 0.02
     artist_token_contrastive_weight: 0.0
     artist_token_temperature: 0.07
-    functional_centered_all_pairs_weight: 0.05
+    functional_centered_all_pairs_weight: 0.02
     functional_centered_temperature: 0.07
     target_excluded_start_step: 1
     target_excluded_end_step: 1
@@ -661,11 +662,11 @@ synthetic_teacher:
     validation_batches: 8
     meta_test_batches: 16
     checkpoint_every: 500
-    minimum_steps: 1000
-    early_stop_patience: 5
+    minimum_steps: 3000
+    early_stop_patience: 0
     resume: true
     wandb:
       enabled: true
       project: anima-style-adapter
-      name: offline-kvo-phase-b-exact512-centered-pareto
-      id: offline-kvo-phase-b-exact512-centered-pareto-v1
+      name: offline-kvo-phase-b-exact512-rotating-functional
+      id: offline-kvo-phase-b-exact512-rotating-functional-v1
