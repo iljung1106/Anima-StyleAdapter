@@ -513,18 +513,79 @@ def _batched_attention_output(
     )
 
 
-def _load_resampler_token_cache(root: Path) -> tuple[dict[int, dict[str, Any]], dict[str, torch.Tensor]]:
-    """Load the small Phase-A cache into RAM, avoiding NFS random page faults."""
+def _load_resampler_token_cache(
+    root: Path, device: str = "cpu"
+) -> tuple[dict[int, dict[str, Any]], dict[str, torch.Tensor]]:
+    """Load the small Phase-A cache once, optionally keeping it on the GPU."""
     from safetensors.torch import load_file
 
     cache_root = root / "resampler_tokens"
     rows = read_records(cache_root / "manifest.parquet")
     row_by_id = {int(row["id"]): row for row in rows}
     tensors = {
-        name: load_file(cache_root / name, device="cpu")["tokens"].clone()
+        name: load_file(cache_root / name, device="cpu")["tokens"].clone().to(device)
         for name in sorted({str(row["token_shard"]) for row in rows})
     }
     return row_by_id, tensors
+
+
+def _load_resident_feature_cache(
+    rows: list[dict[str, Any]], feature_root: Path, taps: list[int], global_layer: int
+) -> dict[str, Any]:
+    """Materialize C-RADIO shards into contiguous system-RAM tensors once.
+
+    The synthetic corpus is fixed-resolution, but the cache retains a token
+    count so the same path remains valid if a later corpus contains buckets.
+    This replaces thousands of per-step safetensors opens with index_select.
+    """
+    ordered = sorted(rows, key=lambda row: int(row["id"]))
+    id_to_index = {int(row["id"]): index for index, row in enumerate(ordered)}
+    max_tokens = max(int(row["spatial_tokens"]) for row in ordered)
+    spatial_dim = int(ordered[0]["spatial_dim"])
+    features = {
+        layer: torch.empty(len(ordered), max_tokens, spatial_dim, dtype=torch.float16)
+        for layer in taps
+    }
+    global_values: torch.Tensor | None = None
+    token_counts = torch.empty(len(ordered), dtype=torch.int32)
+    grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for row in ordered:
+        grouped[str(row["feature_shard"])].append(row)
+    loaded = 0
+    for shard_index, (name, shard_rows) in enumerate(sorted(grouped.items()), start=1):
+        with safe_open(feature_root / name, framework="pt", device="cpu") as handle:
+            for row in shard_rows:
+                image_id = int(row["id"])
+                index = id_to_index[image_id]
+                count = int(row["spatial_tokens"])
+                token_counts[index] = count
+                for layer in taps:
+                    value = handle.get_tensor(f"{image_id}.layer_{layer:02d}_spatial")
+                    features[layer][index, :count].copy_(value)
+                value = handle.get_tensor(f"{image_id}.layer_{global_layer:02d}_siglip_cls").flatten()
+                if global_values is None:
+                    global_values = torch.empty(len(ordered), value.numel(), dtype=value.dtype)
+                global_values[index].copy_(value)
+                loaded += 1
+        print(
+            f"resident C-RADIO cache {shard_index}/{len(grouped)} "
+            f"({loaded}/{len(ordered)} images)",
+            flush=True,
+        )
+    if global_values is None:
+        raise RuntimeError("Resident C-RADIO cache is empty")
+    gib = (
+        sum(value.numel() * value.element_size() for value in features.values())
+        + global_values.numel() * global_values.element_size()
+    ) / (1024**3)
+    print(f"resident C-RADIO cache ready: {gib:.2f} GiB system RAM", flush=True)
+    return {
+        "id_to_index": id_to_index,
+        "features": features,
+        "global": global_values,
+        "token_counts": token_counts,
+        "max_tokens": max_tokens,
+    }
 
 
 def _enable_phase_b_resampler(resampler: torch.nn.Module) -> list[torch.nn.Parameter]:
@@ -582,25 +643,31 @@ def train_offline_kvo_bootstrap(
         print(f"initialized Phase B from {phase_a_checkpoint}", flush=True)
     basis = load_file(root / "anima_kv_teacher" / "native_cross_attention.safetensors", device="cpu")
     basis = {key: value.to(device=device, dtype=torch.bfloat16) for key, value in basis.items()}
-    probe_values = load_file(root / "query_probe_bank" / "queries.safetensors", device="cpu")
+    resident_device = device if bool(training.get("gpu_resident_small_caches", True)) else "cpu"
+    probe_values = {
+        key: value.to(resident_device)
+        for key, value in load_file(
+            root / "query_probe_bank" / "queries.safetensors", device="cpu"
+        ).items()
+    }
     probe_rows = read_records(root / "query_probe_bank" / "manifest.parquet")
     probe_keys: dict[tuple[int, int], list[str]] = defaultdict(list)
     for row in probe_rows:
         probe_keys[(int(row["content_index"]), int(row["block"]))].append(str(row["key"]))
     text_rows = {int(row["condition_id"]): row for row in read_records(root / "text" / "manifest.parquet")}
     text_cache: dict[str, torch.Tensor] = {}
+    for name in sorted({str(row["cache_shard"]) for row in text_rows.values()}):
+        text_cache[name] = load_file(root / "text" / name, device="cpu")[
+            "conditioning"
+        ].to(resident_device)
 
     def text(condition_id: int) -> torch.Tensor:
         row = text_rows[condition_id]
         name = str(row["cache_shard"])
-        if name not in text_cache:
-            text_cache[name] = load_file(root / "text" / name, device="cpu")["conditioning"]
         # Anima receives all 512 post-LLM positions without a text padding
         # mask.  The trailing zero K/V positions therefore remain in the
         # attention softmax denominator and must not be trimmed here.
-        return text_cache[name][int(row["row_index"])].to(
-            device=device, dtype=torch.bfloat16
-        )
+        return text_cache[name][int(row["row_index"])].to(device=device, dtype=torch.bfloat16)
 
     heads = int(config["style_transfer"]["adapter"]["heads"])
     hidden = int(config["style_transfer"]["adapter"]["hidden_dim"])
@@ -620,7 +687,16 @@ def train_offline_kvo_bootstrap(
     seed = int(training.get("seed", int(cfg.get("seed", 20260812)) ^ 0x0FF1))
     generator = random.Random(seed)
     total_steps = int(steps_override or training.get("steps", 10000))
-    token_rows, token_tensors = _load_resampler_token_cache(root)
+    token_rows, token_tensors = _load_resampler_token_cache(root, resident_device)
+    resident_features = None
+    if phase == "b" and bool(training.get("ram_resident_features", True)):
+        configured_feature_root = training.get("local_feature_directory")
+        feature_root = (
+            Path(str(configured_feature_root))
+            if configured_feature_root and Path(str(configured_feature_root)).is_dir()
+            else root / "style_features"
+        )
+        resident_features = _load_resident_feature_cache(rows, feature_root, [18, 24], 24)
     bridge_parameters = [value for value in adapter.bridge_parameters() if value.requires_grad]
     connector_parameters = [
         value for module in (adapter.connector_trunk, adapter.connector_branches)
@@ -678,15 +754,30 @@ def train_offline_kvo_bootstrap(
         baseline = cached_tokens(batch_rows)
         if phase == "a":
             return baseline, baseline.new_zeros(())
-        configured_feature_root = training.get("local_feature_directory")
-        feature_root = (
-            Path(str(configured_feature_root))
-            if configured_feature_root and Path(str(configured_feature_root)).is_dir()
-            else root / "style_features"
-        )
-        features, _, mask, _, global_feature = _load_feature_batch(
-            batch_rows, feature_root, taps, taps, variant_global
-        )
+        if resident_features is not None:
+            indices = torch.tensor(
+                [resident_features["id_to_index"][int(row["id"])] for row in batch_rows],
+                dtype=torch.long,
+            )
+            features = {
+                layer: value.index_select(0, indices).to(device, non_blocking=True)
+                for layer, value in resident_features["features"].items()
+            }
+            counts = resident_features["token_counts"].index_select(0, indices).to(device)
+            mask = torch.arange(resident_features["max_tokens"], device=device)[None] < counts[:, None]
+            global_feature = resident_features["global"].index_select(0, indices).to(
+                device, non_blocking=True
+            )
+        else:
+            configured_feature_root = training.get("local_feature_directory")
+            feature_root = (
+                Path(str(configured_feature_root))
+                if configured_feature_root and Path(str(configured_feature_root)).is_dir()
+                else root / "style_features"
+            )
+            features, _, mask, _, global_feature = _load_feature_batch(
+                batch_rows, feature_root, taps, taps, variant_global
+            )
         with torch.autocast("cuda", dtype=torch.bfloat16):
             _, tokens = resampler.encode(
                 {key: value.to(device) for key, value in features.items()}, mask.to(device), global_feature.to(device)
@@ -697,6 +788,7 @@ def train_offline_kvo_bootstrap(
     def loss_for(
         batch_rows: list[dict[str, Any]], *, train: bool,
         reference_rows: list[dict[str, Any]] | None = None,
+        detach_representation: bool = False,
     ) -> tuple[torch.Tensor, dict[str, float]]:
         reference_rows = batch_rows if reference_rows is None else reference_rows
         tokens, drift_loss = encode(reference_rows)
@@ -705,8 +797,6 @@ def train_offline_kvo_bootstrap(
         # The cached native basis and query probes are BF16; autocast supplies
         # a single consistent compute dtype without permanently downcasting
         # the trainable connector weights.
-        with torch.autocast("cuda", dtype=torch.bfloat16):
-            contexts = adapter._block_context_tokens(tokens)
         output_losses = []
         cosines = []
         rms_losses = []
@@ -714,7 +804,15 @@ def train_offline_kvo_bootstrap(
         student_mses = []
         rank_losses = []
         block_count = int(training.get("blocks_per_step", 7)) if train else 28
-        blocks = generator.sample(range(28), block_count) if block_count < 28 else list(range(28))
+        if train and block_count == adapter.blocks_per_group:
+            group = generator.randrange(adapter.blocks // adapter.blocks_per_group)
+            blocks = list(range(group * adapter.blocks_per_group, (group + 1) * adapter.blocks_per_group))
+        else:
+            blocks = generator.sample(range(28), block_count) if block_count < 28 else list(range(28))
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            contexts = adapter.selected_block_context_tokens(tokens, blocks)
+        if detach_representation:
+            contexts = {index: value.detach() for index, value in contexts.items()}
         artist_contexts = torch.stack([text(int(row["artist_condition_id"])) for row in batch_rows])
         content_contexts = torch.stack([text(int(row["content_condition_id"])) for row in batch_rows])
         for block in blocks:
@@ -804,6 +902,8 @@ def train_offline_kvo_bootstrap(
             "representation_drift": float(drift_loss.detach()),
             "functional_rank_loss": float(rank_loss.detach()),
             "zero_improvement": float((1 - student_mse / zero_mse.clamp_min(1e-12)).detach()),
+            "teacher_rms": float(torch.stack(zero_mses).mean().sqrt().detach()),
+            "student_rms": float(torch.stack(student_mses).mean().sqrt().detach()),
         }
 
     all_by_artist: dict[str, list[dict[str, Any]]] = defaultdict(list)
@@ -912,7 +1012,9 @@ def train_offline_kvo_bootstrap(
         )
 
     last_step = start_step - 1
+    representation_warmup = int(training.get("representation_warmup_steps", 0))
     for step in range(start_step, total_steps + 1):
+        step_started = __import__("time").perf_counter()
         last_step = step
         # Artist-balanced batches make the rolled wrong-reference branch a
         # guaranteed different artist rather than occasionally another image
@@ -937,7 +1039,12 @@ def train_offline_kvo_bootstrap(
                 for target in batch
             ]
         optimizer.zero_grad(set_to_none=True)
-        loss, metrics = loss_for(batch, train=True, reference_rows=reference_batch)
+        loss, metrics = loss_for(
+            batch,
+            train=True,
+            reference_rows=reference_batch,
+            detach_representation=step <= representation_warmup,
+        )
         loss.backward()
         grad_norms = {
             "bridge": torch.nn.utils.clip_grad_norm_(
@@ -962,11 +1069,21 @@ def train_offline_kvo_bootstrap(
             "resampler": float(training.get("resampler_learning_rate", 1e-5)),
         }
         for group in optimizer.param_groups:
-            group["lr"] = learning_rates[str(group["name"])] * scale
+            group_scale = 0.0 if (
+                step <= representation_warmup and str(group["name"]) in {"bridge", "connector", "resampler"}
+            ) else scale
+            group["lr"] = learning_rates[str(group["name"])] * group_scale
         optimizer.step()
+        metrics["step_s"] = __import__("time").perf_counter() - step_started
         if step % log_every == 0:
             grad_text = " ".join(f"g_{key}={float(value):.2f}" for key, value in grad_norms.items())
-            print(f"offline-kvo step={step}/{total_steps} loss={metrics['loss']:.4f} cos={metrics['cosine']:.4f} improve={metrics['zero_improvement']:.4f} {grad_text}", flush=True)
+            print(
+                f"offline-kvo step={step}/{total_steps} loss={metrics['loss']:.4f} "
+                f"cos={metrics['cosine']:.4f} improve={metrics['zero_improvement']:.4f} "
+                f"teacher_rms={metrics['teacher_rms']:.6f} student_rms={metrics['student_rms']:.6f} "
+                f"step_s={metrics['step_s']:.3f} {grad_text}",
+                flush=True,
+            )
             if wandb_run is not None:
                 wandb_run.log({
                     **{f"train/{key}": value for key, value in metrics.items()},

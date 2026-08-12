@@ -535,6 +535,10 @@ def test_connector_preserves_tiny_context_bridge_initialization():
     for context in contexts:
         torch.testing.assert_close(context, expected, atol=2e-7, rtol=2e-3)
 
+    selected = adapter.selected_block_context_tokens(tokens, [0, 3])
+    torch.testing.assert_close(selected[0], contexts[0])
+    torch.testing.assert_close(selected[3], contexts[3])
+
 
 def test_cross_slot_mixer_couples_pooled_slots():
     torch.manual_seed(11)

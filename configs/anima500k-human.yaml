@@ -574,8 +574,10 @@ synthetic_teacher:
     output_directory: offline_kvo_bootstrap_exact512
     seed: 20260812
     steps: 3000
-    batch_size: 2
+    batch_size: 16
     blocks_per_step: 7
+    gpu_resident_small_caches: true
+    representation_warmup_steps: 250
     learning_rate: 0.00002
     connector_learning_rate: 0.000005
     bridge_learning_rate: 0.000002
@@ -611,8 +613,11 @@ synthetic_teacher:
     local_feature_directory: /tmp/anima-style-bootstrap/style_features
     seed: 20260813
     steps: 3000
-    batch_size: 4
+    batch_size: 16
     blocks_per_step: 7
+    gpu_resident_small_caches: true
+    ram_resident_features: true
+    representation_warmup_steps: 250
     learning_rate: 0.00001
     connector_learning_rate: 0.000003
     bridge_learning_rate: 0.000001

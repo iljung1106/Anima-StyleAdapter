@@ -600,6 +600,27 @@ class SharedLowRankStyleAdapter(nn.Module):
             for index in range(self.blocks)
         ]
 
+    def selected_block_context_tokens(
+        self, tokens: torch.Tensor, block_indices: list[int]
+    ) -> dict[int, torch.Tensor]:
+        """Compute only connector branches needed by the selected blocks."""
+        shared = self._context_tokens(tokens)
+        if not self.connector_enabled:
+            return {index: shared for index in block_indices}
+        for layer in self.connector_trunk:
+            shared = layer(shared)
+        groups: dict[int, torch.Tensor] = {}
+        for group_index in sorted({index // self.blocks_per_group for index in block_indices}):
+            values = shared
+            for layer in self.connector_branches[group_index]:
+                values = layer(values)
+            groups[group_index] = values
+        return {
+            index: groups[index // self.blocks_per_group]
+            + self.block_embeddings[index][None, None]
+            for index in block_indices
+        }
+
     @staticmethod
     def _pretrained_kv(
         cross_attention: nn.Module, context: torch.Tensor
