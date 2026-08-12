@@ -265,7 +265,7 @@ tap_resampler_experiment:
 # and batches targets by exact latent shape. `style-smoke` forces two steps and
 # writes to a separate smoke directory; `style-train` uses `training.steps`.
 style_transfer:
-  output_directory: style_transfer_l18_l24_siglip_l24_32x1024_pretrained_kvo_lora_heldoutcontrast_rank2_from250_250
+  output_directory: style_transfer_l18_l24_siglip_l24_32x1024_pretrained_kvo_lora_direction05_groupclip_from250_250
   seed: 20260811
   loader:
     style_cache: style_features_l18_l24_siglip_l24
@@ -354,6 +354,13 @@ style_transfer:
     resampler_huber_weight: 0.10
     weight_decay: 0.01
     max_grad_norm: 1.0
+    # The timestep gate produced 3-5x larger gradients than the remaining
+    # paths. A global clip consequently shrank Aggregator/K/V/O updates by the
+    # gate norm. Bound each functional path independently for this ablation.
+    separate_gradient_clipping: true
+    representation_max_grad_norm: 1.0
+    output_max_grad_norm: 1.0
+    gate_max_grad_norm: 1.0
     # H100 80GB has ample headroom for the frozen Anima activations. Keeping
     # them avoids recomputing all 28 blocks during backward.
     gradient_checkpointing: false
@@ -376,7 +383,10 @@ style_transfer:
     # magnitude auxiliaries. Direction normalization is strongest during the
     # bootstrap, then fades as ordinary flow MSE takes over.
     style_flow_loss_weight: 4.0
-    style_flow_direction_weight: 0.05
+    # At 0.05 this term stayed near 0.95 while rank loss did not improve the
+    # correct-reference flow margin. Give residual direction comparable weight
+    # to the weighted flow MSE during the exact-self bootstrap.
+    style_flow_direction_weight: 0.5
     style_direction_epsilon: 0.01
     style_direction_anneal_start: 500
     style_direction_anneal_end: 2000
@@ -386,21 +396,18 @@ style_transfer:
     style_token_contrastive_weight: 0.05
     style_kv_contrastive_weight: 0.01
     style_contrastive_temperature: 0.10
-    # Each shuffled style is also a positive for another target in the cyclic
-    # batch permutation. Differentiating both sides makes this a contrastive
-    # margin: common residuals cancel and persistent wrong-only damage cannot
-    # solve all pairings.
-    style_reference_rank_weight: 2.0
+    # The stronger live rank objective failed its controlled ablation, so keep
+    # its schedule here but disable the expensive wrong-reference branch.
+    style_reference_rank_weight: 0.0
     style_reference_rank_margin: 0.005
     style_reference_rank_probability: 1.0
     style_reference_rank_start_step: 1
     style_reference_rank_end_step: 251
-    # Retain one wrong-reference Anima graph per microbatch. The earlier live
-    # cosine objective was not correlated with lower flow error, so only the
-    # direct ranking objective uses this branch in the present ablation.
+    # Reference-direction and live wrong-reference gradients are also disabled
+    # so this run isolates normalized target-residual direction supervision.
     style_reference_direction_weight: 0.0
     style_reference_direction_epsilon: 0.05
-    style_reference_wrong_grad_samples: 1
+    style_reference_wrong_grad_samples: 0
     # Softly match the timestep-conditioned magnitude of Anima's native artist
     # intervention. Standard target-only flow loss still chooses the direction;
     # this term only prevents the style path from remaining effectively null.
@@ -431,8 +438,8 @@ style_transfer:
     wandb:
       enabled: true
       project: anima-style-adapter
-      name: anima-style-transfer-l18-l24-32x1024-pretrained-kvo-lora-heldoutcontrast-rank2-from250-250
-      id: anima-style-transfer-l18-l24-32x1024-pretrained-kvo-lora-heldoutcontrast-rank2-from250-250
+      name: anima-style-transfer-l18-l24-32x1024-pretrained-kvo-lora-direction05-groupclip-from250-250
+      id: anima-style-transfer-l18-l24-32x1024-pretrained-kvo-lora-direction05-groupclip-from250-250
   diagnostics:
     checkpoint: checkpoints/step-0000250.pt
     checkpoints:

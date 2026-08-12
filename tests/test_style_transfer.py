@@ -12,6 +12,7 @@ from anima_style_data.style_transfer import (
     SharedLowRankStyleAdapter,
     SlotSetAggregator,
     _archive_training_state,
+    _clip_style_gradient_groups,
     _episode_resampler_prototype_losses,
     _direction_anneal_multiplier,
     _flow_direction_loss,
@@ -33,6 +34,33 @@ from anima_style_data.style_transfer import (
     _uncached_no_grad_autocast,
     attach_style_adapter,
 )
+
+
+def test_style_gradient_groups_are_clipped_independently():
+    representation = nn.Parameter(torch.zeros(2))
+    output = nn.Parameter(torch.zeros(1))
+    gate = nn.Parameter(torch.zeros(1))
+    representation.grad = torch.tensor([3.0, 4.0])
+    output.grad = torch.tensor([6.0])
+    gate.grad = torch.tensor([8.0])
+
+    norms = _clip_style_gradient_groups(
+        [representation],
+        [output],
+        [gate],
+        {
+            "representation_max_grad_norm": 1.0,
+            "output_max_grad_norm": 2.0,
+            "gate_max_grad_norm": 4.0,
+        },
+    )
+
+    assert norms["representation"] == pytest.approx(5.0)
+    assert norms["output"] == pytest.approx(6.0)
+    assert norms["gate"] == pytest.approx(8.0)
+    assert representation.grad.norm() == pytest.approx(1.0)
+    assert output.grad.norm() == pytest.approx(2.0)
+    assert gate.grad.norm() == pytest.approx(4.0)
 
 
 def test_direction_loss_stays_enabled_without_an_explicit_anneal():

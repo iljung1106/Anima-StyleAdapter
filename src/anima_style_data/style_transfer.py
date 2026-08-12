@@ -1091,6 +1091,38 @@ def _parameter_grad_norm(parameters) -> float:
     return float(torch.stack(values).norm()) if values else 0.0
 
 
+def _clip_style_gradient_groups(
+    representation_parameters: list[nn.Parameter],
+    output_parameters: list[nn.Parameter],
+    gate_parameters: list[nn.Parameter],
+    training: dict[str, Any],
+) -> dict[str, float]:
+    """Clip functional adapter paths independently.
+
+    Timestep-gate gradients can be much larger than the K/V and output-path
+    gradients. A single global clip then suppresses every path according to
+    the gate norm. Independent bounds keep the safety limit without starving
+    the representation and output paths on those hard batches.
+    """
+    default = float(training.get("max_grad_norm", 1.0))
+    groups = {
+        "representation": representation_parameters,
+        "output": output_parameters,
+        "gate": gate_parameters,
+    }
+    limits = {
+        "representation": float(training.get("representation_max_grad_norm", default)),
+        "output": float(training.get("output_max_grad_norm", default)),
+        "gate": float(training.get("gate_max_grad_norm", default)),
+    }
+    norms = {
+        name: float(torch.nn.utils.clip_grad_norm_(parameters, limits[name]))
+        for name, parameters in groups.items()
+    }
+    norms["combined"] = math.sqrt(sum(value * value for value in norms.values()))
+    return norms
+
+
 def _style_magnitude_ramp(step: int, config: dict[str, Any]) -> float:
     start_step = max(0, int(config.get("style_magnitude_start_step", 0)))
     ramp_steps = max(1, int(config.get("style_magnitude_ramp_steps", 250)))
@@ -3150,14 +3182,32 @@ def train_style_adapter(config: dict[str, Any], destination: Path, *, steps_over
         for key, values in numeric_detail_samples.items():
             details[key] = sum(values) / len(values)
         details.update(boolean_detail_any)
-        grad_norm = torch.nn.utils.clip_grad_norm_(
-            parameters, float(training.get("max_grad_norm", 1.0))
-        )
+        if bool(training.get("separate_gradient_clipping", False)):
+            clipped_norms = _clip_style_gradient_groups(
+                representation_parameters,
+                output_parameters,
+                gate_parameters,
+                training,
+            )
+            grad_norm = clipped_norms["combined"]
+        else:
+            global_norm = torch.nn.utils.clip_grad_norm_(
+                parameters, float(training.get("max_grad_norm", 1.0))
+            )
+            clipped_norms = {
+                "representation": float("nan"),
+                "output": float("nan"),
+                "gate": float("nan"),
+            }
+            grad_norm = float(global_norm)
         resampler_grad_norm = torch.nn.utils.clip_grad_norm_(
             resampler_parameters,
             float(training.get("resampler_max_grad_norm", 0.25)),
         )
         group_grads = {
+            "representation_grad_norm": clipped_norms["representation"],
+            "output_grad_norm": clipped_norms["output"],
+            "gate_grad_norm": clipped_norms["gate"],
             "aggregator_grad": _parameter_grad_norm(adapter.aggregator.parameters()),
             "shared_kv_grad": _parameter_grad_norm(adapter.kv_parameters()),
             "style_output_grad": _parameter_grad_norm(adapter.output_parameters()),
