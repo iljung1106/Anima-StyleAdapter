@@ -670,12 +670,17 @@ def train_offline_kvo_bootstrap(
     adapter.null_tokens.requires_grad_(False)
     adapter.train()
     if phase == "b":
-        phase_a_checkpoint = root / str(training.get(
+        initialization = training.get("initial_checkpoint") or training.get(
             "phase_a_checkpoint", "offline_kvo_bootstrap/checkpoints/best.pt"
-        ))
-        state = torch.load(phase_a_checkpoint, map_location="cpu", weights_only=False)
+        )
+        initialization_checkpoint = root / str(initialization)
+        state = torch.load(
+            initialization_checkpoint, map_location="cpu", weights_only=False
+        )
         adapter.load_state_dict(state["adapter"])
-        print(f"initialized Phase B from {phase_a_checkpoint}", flush=True)
+        if state.get("resampler") is not None:
+            resampler.load_state_dict(state["resampler"])
+        print(f"initialized Phase B from {initialization_checkpoint}", flush=True)
     basis = load_file(root / "anima_kv_teacher" / "native_cross_attention.safetensors", device="cpu")
     basis = {key: value.to(device=device, dtype=torch.bfloat16) for key, value in basis.items()}
     resident_device = device if bool(training.get("gpu_resident_small_caches", True)) else "cpu"
@@ -895,6 +900,8 @@ def train_offline_kvo_bootstrap(
         contrastive_accuracies = []
         all_pair_direction_losses = []
         all_pair_magnitude_losses = []
+        centered_pair_losses = []
+        centered_pair_accuracies = []
         block_count = int(training.get("blocks_per_step", 7)) if train else 28
         if train and block_count == adapter.blocks_per_group:
             group = generator.randrange(adapter.blocks // adapter.blocks_per_group)
@@ -1040,6 +1047,28 @@ def train_offline_kvo_bootstrap(
                         torch.log(pair_teacher_rms),
                         beta=0.5,
                     ))
+                    centered_student = pair_student_flat - pair_student_flat.mean(
+                        dim=1, keepdim=True
+                    )
+                    centered_teacher = pair_teacher_flat - pair_teacher_flat.mean(
+                        dim=1, keepdim=True
+                    )
+                    centered_student = F.normalize(centered_student, dim=-1)
+                    centered_teacher = F.normalize(centered_teacher, dim=-1)
+                    centered_logits = torch.einsum(
+                        "bcd,bkd->bck", centered_student, centered_teacher
+                    ) / float(training.get("functional_centered_temperature", 0.07))
+                    centered_labels = torch.arange(count, device=centered_logits.device)
+                    centered_pair_losses.append(F.cross_entropy(
+                        centered_logits.reshape(count * count, count),
+                        centered_labels.repeat(count),
+                    ))
+                    centered_pair_accuracies.append(
+                        (
+                            centered_logits.argmax(dim=-1)
+                            == centered_labels[None]
+                        ).float().mean()
+                    )
         output_loss = torch.stack(output_losses).mean()
         cosine_loss = (1 - torch.stack(cosines)).mean()
         rms_loss = torch.stack(rms_losses).mean()
@@ -1055,6 +1084,14 @@ def train_offline_kvo_bootstrap(
         all_pair_magnitude_loss = (
             torch.stack(all_pair_magnitude_losses).mean()
             if all_pair_magnitude_losses else output_loss.new_zeros(())
+        )
+        centered_pair_loss = (
+            torch.stack(centered_pair_losses).mean()
+            if centered_pair_losses else output_loss.new_zeros(())
+        )
+        centered_pair_accuracy = (
+            torch.stack(centered_pair_accuracies).mean()
+            if centered_pair_accuracies else output_loss.new_zeros(())
         )
         contrastive_scale = 1.0
         if train:
@@ -1087,6 +1124,9 @@ def train_offline_kvo_bootstrap(
             + contrastive_scale
             * float(training.get("artist_token_contrastive_weight", 0.0))
             * artist_token_loss
+            + contrastive_scale
+            * float(training.get("functional_centered_all_pairs_weight", 0.0))
+            * centered_pair_loss
         )
         zero_mse = torch.stack(zero_mses).mean()
         student_mse = torch.stack(student_mses).mean()
@@ -1110,6 +1150,10 @@ def train_offline_kvo_bootstrap(
             ),
             "artist_token_contrastive_loss": float(artist_token_loss.detach()),
             "artist_token_contrastive_accuracy": float(artist_token_accuracy.detach()),
+            "functional_centered_all_pairs_loss": float(centered_pair_loss.detach()),
+            "functional_centered_all_pairs_accuracy": float(
+                centered_pair_accuracy.detach()
+            ),
             "zero_improvement": float((1 - student_mse / zero_mse.clamp_min(1e-12)).detach()),
             "teacher_rms": float(torch.stack(zero_mses).mean().sqrt().detach()),
             "student_rms": float(torch.stack(student_mses).mean().sqrt().detach()),
@@ -1306,6 +1350,8 @@ def train_offline_kvo_bootstrap(
                 f"{metrics['functional_contrastive_scale']:.2f} "
                 f"token={metrics['artist_token_contrastive_loss']:.3f}/"
                 f"{metrics['artist_token_contrastive_accuracy']:.3f} "
+                f"centered={metrics['functional_centered_all_pairs_loss']:.3f}/"
+                f"{metrics['functional_centered_all_pairs_accuracy']:.3f} "
                 f"teacher_rms={metrics['teacher_rms']:.6f} student_rms={metrics['student_rms']:.6f} "
                 f"step_s={metrics['step_s']:.3f} {grad_text}",
                 flush=True,
