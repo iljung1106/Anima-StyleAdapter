@@ -485,7 +485,13 @@ def train_offline_kvo_bootstrap(
 
     def loss_for(batch_rows: list[dict[str, Any]], *, train: bool) -> tuple[torch.Tensor, dict[str, float]]:
         tokens = encode(batch_rows)
-        contexts = adapter._block_context_tokens(tokens)
+        # Keep trainable parameters and optimizer state in FP32, but execute
+        # connector/native K/V/O projections and SDPA in BF16 like Anima.
+        # The cached native basis and query probes are BF16; autocast supplies
+        # a single consistent compute dtype without permanently downcasting
+        # the trainable connector weights.
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            contexts = adapter._block_context_tokens(tokens)
         output_losses = []
         cosines = []
         rms_losses = []
@@ -506,15 +512,16 @@ def train_offline_kvo_bootstrap(
                 with torch.no_grad():
                     teacher = _attention_output(q, ka, va, ow) - _attention_output(q, kc, vc, ow)
                 context = contexts[block][sample_index]
-                sk = F.linear(context, basis[f"block_{block:02d}.k_proj.weight"])
-                sv = F.linear(context, basis[f"block_{block:02d}.v_proj.weight"])
-                sk = sk + adapter.k_up[block](adapter.k_down[block](context))
-                sv = sv + adapter.v_up[block](adapter.v_down[block](context))
-                sk = _native_rms_norm(sk.reshape(-1, heads, head_dim).transpose(0, 1), basis.get(f"block_{block:02d}.k_norm.weight"))
-                sv = sv.reshape(-1, heads, head_dim).transpose(0, 1)
-                attended = F.scaled_dot_product_attention(q.unsqueeze(0), sk.unsqueeze(0), sv.unsqueeze(0)).squeeze(0)
-                attended = attended.transpose(0, 1).reshape(attended.shape[1], hidden)
-                student = F.linear(attended, ow) + adapter.o_up[block](adapter.o_down[block](attended))
+                with torch.autocast("cuda", dtype=torch.bfloat16):
+                    sk = F.linear(context, basis[f"block_{block:02d}.k_proj.weight"])
+                    sv = F.linear(context, basis[f"block_{block:02d}.v_proj.weight"])
+                    sk = sk + adapter.k_up[block](adapter.k_down[block](context))
+                    sv = sv + adapter.v_up[block](adapter.v_down[block](context))
+                    sk = _native_rms_norm(sk.reshape(-1, heads, head_dim).transpose(0, 1), basis.get(f"block_{block:02d}.k_norm.weight"))
+                    sv = sv.reshape(-1, heads, head_dim).transpose(0, 1)
+                    attended = F.scaled_dot_product_attention(q.unsqueeze(0), sk.unsqueeze(0), sv.unsqueeze(0)).squeeze(0)
+                    attended = attended.transpose(0, 1).reshape(attended.shape[1], hidden)
+                    student = F.linear(attended, ow) + adapter.o_up[block](adapter.o_down[block](attended))
                 scale = teacher.detach().float().square().mean().sqrt().clamp_min(1e-4)
                 output_losses.append(F.smooth_l1_loss(student.float() / scale, teacher.float() / scale, beta=0.1))
                 cosine = F.cosine_similarity(student.float().flatten(), teacher.float().flatten(), dim=0)
