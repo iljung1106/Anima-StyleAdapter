@@ -464,6 +464,7 @@ class SharedLowRankStyleAdapter(nn.Module):
         connector_heads: int = 16,
         connector_groups: int = 4,
         connector_group_layers: int = 0,
+        connector_summary_tokens: bool = False,
     ):
         super().__init__()
         self.style_dim = style_dim
@@ -514,6 +515,7 @@ class SharedLowRankStyleAdapter(nn.Module):
             raise ValueError("Anima blocks must divide evenly across connector groups")
         self.blocks_per_group = blocks // self.connector_groups
         self.connector_enabled = connector_layers > 0 or connector_group_layers > 0
+        self.connector_summary_tokens = bool(connector_summary_tokens)
         self.connector_trunk = nn.ModuleList(
             [ConnectorTransformerLayer(self.context_dim, connector_heads) for _ in range(connector_layers)]
         )
@@ -572,6 +574,21 @@ class SharedLowRankStyleAdapter(nn.Module):
         return tokens
 
     def _context_tokens(self, tokens: torch.Tensor) -> torch.Tensor:
+        if self.connector_summary_tokens:
+            # Preserve every spatial/style slot while exposing the two global
+            # statistics that proved artist-discriminative in the Resampler
+            # probe.  This adds no learned bottleneck and only two attention
+            # positions, so the connector can use artist identity without
+            # having to rediscover pooling through several residual layers.
+            normalized = F.layer_norm(tokens.float(), (tokens.shape[-1],)).to(tokens.dtype)
+            tokens = torch.cat(
+                (
+                    tokens,
+                    normalized.mean(dim=1, keepdim=True),
+                    normalized.std(dim=1, correction=0, keepdim=True),
+                ),
+                dim=1,
+            )
         if self.projection_mode == "pretrained_block_lora":
             return self.style_context_proj(tokens)
         return tokens
