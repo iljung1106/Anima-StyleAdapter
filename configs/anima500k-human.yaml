@@ -558,6 +558,7 @@ synthetic_teacher:
     # for the final content-disjoint meta-test.
     heldout_contents: [6, 7]
     image_validation_workers: 32
+    image_decode_samples: 128
     feature_reduction_device: cuda
     feature_reduction_batch_size: 64
   query_probes:

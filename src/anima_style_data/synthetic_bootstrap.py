@@ -142,16 +142,22 @@ def validate_synthetic_teacher_corpus(
     if len(female_contents) != int(cfg.get("female_contents", 7)):
         errors.append(f"expected {cfg.get('female_contents', 7)} 1girl contents, found {len(female_contents)}")
 
-    # WebP decode is independent and CPU-bound. Validate headers concurrently,
-    # while fully decoding a deterministic 1/64 sample to catch payload damage.
+    # C-RADIO extraction already decoded every WebP successfully and the exact
+    # ID-set check above proves full coverage. Reopening 8k NFS files would be
+    # a duplicate 10-20 minute pass, so stat every path and fully decode a
+    # deterministic sample here.
+    decode_stride = max(1, len(manifest) // int(bootstrap.get("image_decode_samples", 128)))
     def inspect_image(item: tuple[int, dict[str, Any]]) -> str | None:
         index, row = item
         try:
-            with Image.open(row["local_path"]) as image:
-                if index % 64 == 0:
+            path = Path(row["local_path"])
+            if not path.is_file() or path.stat().st_size == 0:
+                return f"missing or empty image: {row['id']}"
+            if index % decode_stride == 0:
+                with Image.open(path) as image:
                     image.load()
-                if image.size != (int(row["width"]), int(row["height"])):
-                    return f"image size mismatch: {row['id']}"
+                    if image.size != (int(row["width"]), int(row["height"])):
+                        return f"image size mismatch: {row['id']}"
         except Exception as error:
             return f"corrupt image {row['id']}: {error}"
         return None
@@ -161,7 +167,11 @@ def validate_synthetic_teacher_corpus(
         for error in executor.map(inspect_image, enumerate(manifest), chunksize=32):
             if error:
                 errors.append(error)
-    print(f"validated {len(manifest)} image headers with {image_workers} workers", flush=True)
+    print(
+        f"validated {len(manifest)} image paths and "
+        f"{math.ceil(len(manifest) / decode_stride)} decoded samples with {image_workers} workers",
+        flush=True,
+    )
 
     if errors:
         summary = {"valid": False, "errors": errors, "images": len(manifest)}
