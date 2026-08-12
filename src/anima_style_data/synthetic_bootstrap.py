@@ -844,6 +844,8 @@ def train_offline_kvo_bootstrap(
         zero_mses = []
         student_mses = []
         rank_losses = []
+        contrastive_losses = []
+        contrastive_accuracies = []
         block_count = int(training.get("blocks_per_step", 7)) if train else 28
         if train and block_count == adapter.blocks_per_group:
             group = generator.randrange(adapter.blocks // adapter.blocks_per_group)
@@ -885,7 +887,9 @@ def train_offline_kvo_bootstrap(
                     - _batched_attention_output(q, kc, vc, ow)
                 )
 
-            def student_output(context: torch.Tensor) -> torch.Tensor:
+            def student_output(
+                context: torch.Tensor, query: torch.Tensor = q
+            ) -> torch.Tensor:
                 with torch.autocast("cuda", dtype=torch.bfloat16):
                     sk = F.linear(context, kw) + adapter.k_up[block](adapter.k_down[block](context))
                     sv = F.linear(context, vw) + adapter.v_up[block](adapter.v_down[block](context))
@@ -894,7 +898,7 @@ def train_offline_kvo_bootstrap(
                         norm_weight,
                     )
                     sv = sv.reshape(context.shape[0], -1, heads, head_dim).transpose(1, 2)
-                    attended = F.scaled_dot_product_attention(q, sk, sv)
+                    attended = F.scaled_dot_product_attention(query, sk, sv)
                     attended = attended.transpose(1, 2).reshape(context.shape[0], attended.shape[2], hidden)
                     return F.linear(attended, ow) + adapter.o_up[block](adapter.o_down[block](attended))
 
@@ -923,16 +927,49 @@ def train_offline_kvo_bootstrap(
                     correct_distance - wrong_distance
                     + float(training.get("functional_rank_margin", 0.02))
                 ).unbind())
+            contrastive_weight = float(training.get("functional_contrastive_weight", 0.0))
+            if (
+                train and len(batch_rows) > 1 and contrastive_weight > 0
+                and block == blocks[0]
+            ):
+                count = len(batch_rows)
+                # Every target/query attends to every candidate reference.
+                # Keeping the query fixed across candidates prevents content
+                # or probe identity from solving the matching task.
+                candidate_contexts = contexts[block][None].expand(
+                    count, count, -1, -1
+                ).reshape(count * count, contexts[block].shape[1], -1)
+                candidate_queries = q[:, None].expand(
+                    count, count, -1, -1, -1
+                ).reshape(count * count, *q.shape[1:])
+                candidate_outputs = student_output(
+                    candidate_contexts, candidate_queries
+                ).float().reshape(count, count, *teacher_float.shape[1:])
+                distances = (
+                    (candidate_outputs - teacher_float[:, None])
+                    / scale[:, None]
+                ).square().mean(dim=(2, 3))
+                logits = -distances / float(
+                    training.get("functional_contrastive_temperature", 0.1)
+                )
+                labels = torch.arange(count, device=logits.device)
+                contrastive_losses.append(F.cross_entropy(logits, labels))
+                contrastive_accuracies.append((logits.argmax(dim=1) == labels).float().mean())
         output_loss = torch.stack(output_losses).mean()
         cosine_loss = (1 - torch.stack(cosines)).mean()
         rms_loss = torch.stack(rms_losses).mean()
         rank_loss = torch.stack(rank_losses).mean() if rank_losses else output_loss.new_zeros(())
+        contrastive_loss = (
+            torch.stack(contrastive_losses).mean()
+            if contrastive_losses else output_loss.new_zeros(())
+        )
         loss = (
             output_loss
             + float(training.get("direction_weight", 0.2)) * cosine_loss
             + float(training.get("magnitude_weight", 0.02)) * rms_loss
             + float(training.get("representation_drift_weight", 0.0)) * drift_loss
             + float(training.get("functional_rank_weight", 0.0)) * rank_loss
+            + float(training.get("functional_contrastive_weight", 0.0)) * contrastive_loss
         )
         zero_mse = torch.stack(zero_mses).mean()
         student_mse = torch.stack(student_mses).mean()
@@ -942,6 +979,11 @@ def train_offline_kvo_bootstrap(
             "rms_loss": float(rms_loss.detach()),
             "representation_drift": float(drift_loss.detach()),
             "functional_rank_loss": float(rank_loss.detach()),
+            "functional_contrastive_loss": float(contrastive_loss.detach()),
+            "functional_contrastive_accuracy": float(
+                torch.stack(contrastive_accuracies).mean().detach()
+                if contrastive_accuracies else 0.0
+            ),
             "zero_improvement": float((1 - student_mse / zero_mse.clamp_min(1e-12)).detach()),
             "teacher_rms": float(torch.stack(zero_mses).mean().sqrt().detach()),
             "student_rms": float(torch.stack(student_mses).mean().sqrt().detach()),

@@ -591,6 +591,8 @@ synthetic_teacher:
     magnitude_weight: 0.02
     functional_rank_weight: 0.10
     functional_rank_margin: 0.02
+    functional_contrastive_weight: 0.25
+    functional_contrastive_temperature: 0.10
     target_excluded_start_step: 250
     target_excluded_end_step: 1500
     exact_self_probability: 0.25
@@ -608,7 +610,7 @@ synthetic_teacher:
       name: offline-kvo-phase-a-exact512-vectorized
       id: offline-kvo-phase-a-exact512-vectorized-v3
   offline_phase_b:
-    output_directory: offline_kvo_phase_b_exact512
+    output_directory: offline_kvo_phase_b_exact512_contrastive
     phase_a_checkpoint: offline_kvo_bootstrap_exact512/checkpoints/best.pt
     local_feature_directory: /tmp/anima-style-bootstrap/style_features
     seed: 20260813
@@ -636,6 +638,8 @@ synthetic_teacher:
     representation_drift_weight: 0.03
     functional_rank_weight: 0.10
     functional_rank_margin: 0.02
+    functional_contrastive_weight: 0.50
+    functional_contrastive_temperature: 0.10
     target_excluded_start_step: 1
     target_excluded_end_step: 1
     exact_self_probability: 0.25
@@ -650,5 +654,5 @@ synthetic_teacher:
     wandb:
       enabled: true
       project: anima-style-adapter
-      name: offline-kvo-phase-b-exact512-vectorized
-      id: offline-kvo-phase-b-exact512-vectorized-v2
+      name: offline-kvo-phase-b-exact512-contrastive
+      id: offline-kvo-phase-b-exact512-contrastive-v1
