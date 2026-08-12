@@ -1193,6 +1193,34 @@ def _direction_anneal_multiplier(step: int, config: dict[str, Any]) -> float:
     )
 
 
+def _sample_flow_timesteps(
+    batch_size: int,
+    device: str | torch.device,
+    config: dict[str, Any],
+    generator: torch.Generator | None = None,
+) -> torch.Tensor:
+    """Draw continuous flow sigmas using Anima-compatible densities."""
+    mode = str(config.get("timestep_sampling", "uniform"))
+    if mode == "uniform":
+        return torch.rand(batch_size, device=device, dtype=torch.float32, generator=generator)
+    if mode not in {"sigmoid", "shift"}:
+        raise ValueError(f"Unsupported timestep_sampling: {mode}")
+    logits = torch.randn(
+        batch_size, device=device, dtype=torch.float32, generator=generator
+    )
+    logits = (
+        logits * float(config.get("sigmoid_scale", 1.0))
+        + float(config.get("sigmoid_bias", 0.0))
+    )
+    timesteps = logits.sigmoid()
+    if mode == "shift":
+        shift = float(config.get("discrete_flow_shift", 1.0))
+        if shift <= 0:
+            raise ValueError("discrete_flow_shift must be positive")
+        timesteps = (timesteps * shift) / (1 + (shift - 1) * timesteps)
+    return timesteps
+
+
 def _self_reference_curriculum_state(step: int, config: dict[str, Any]) -> dict[str, Any]:
     """Resolve the staged self-reference curriculum for one optimizer step."""
     if not config:
@@ -1466,7 +1494,9 @@ def _forward_flow_loss(
                 style_tokens,
             )
         noise = torch.randn(latents.shape, device=device, dtype=latents.dtype, generator=generator)
-        timesteps = torch.rand(latents.shape[0], device=device, dtype=torch.float32, generator=generator)
+        timesteps = _sample_flow_timesteps(
+            latents.shape[0], device, loss_config, generator
+        )
         sigma = timesteps[:, None, None, None].to(latents.dtype)
         noisy = (1 - sigma) * latents + sigma * noise
         padding_mask = torch.zeros(
@@ -1783,6 +1813,7 @@ def _forward_flow_loss(
         "oracle_distill_applied": oracle_distill_applied,
         "oracle_distill_loss": float(oracle_distill_loss.detach()),
         "style_auxiliary": auxiliary,
+        "timestep_mean": float(timesteps.mean().detach()),
         "style_magnitude_floor": magnitude_floor,
         "target_reference_probability": target_probability,
         "aggregator_trainable": any(

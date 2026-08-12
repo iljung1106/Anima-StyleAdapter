@@ -24,6 +24,7 @@ from anima_style_data.style_transfer import (
     _reference_flow_direction_loss,
     _reference_flow_rank_loss,
     _save_training_state,
+    _sample_flow_timesteps,
     _set_aggregator_trainable,
     _self_reference_curriculum_state,
     _set_adapter_trainable_stage,
@@ -83,6 +84,27 @@ def test_aggregator_can_remain_frozen_until_an_explicit_step():
     assert not _set_aggregator_trainable(
         adapter, step=101, start_step=100, gate_only=True
     )
+
+
+def test_shifted_timestep_sampling_matches_flow_transform():
+    generator = torch.Generator().manual_seed(123)
+    actual = _sample_flow_timesteps(
+        128,
+        "cpu",
+        {
+            "timestep_sampling": "shift",
+            "sigmoid_scale": 1.0,
+            "sigmoid_bias": 0.0,
+            "discrete_flow_shift": 3.0,
+        },
+        generator,
+    )
+    generator.manual_seed(123)
+    base = torch.randn(128, generator=generator).sigmoid()
+    expected = base * 3.0 / (1.0 + 2.0 * base)
+
+    assert torch.allclose(actual, expected)
+    assert 0.65 < float(actual.mean()) < 0.75
 
 
 def test_direction_loss_stays_enabled_without_an_explicit_anneal():
