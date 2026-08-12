@@ -500,12 +500,12 @@ class SharedLowRankStyleAdapter(nn.Module):
             self.shared_o = nn.Linear(hidden_dim, output_dim, bias=False)
             nn.init.zeros_(self.shared_o.weight)
         else:
-            # C-RADIO/Resampler tokens have the same width as Anima's post-LLM
-            # conditioning but not the same learned coordinate system. Start
-            # from an identity bridge, then let flow supervision align it while
-            # every block retains its own frozen pretrained K/V/O basis.
+            # C-RADIO/Resampler tokens do not initially share Anima's text
+            # conditioning coordinates. A zero bridge makes the complete style
+            # residual neutral even under Anima's large native gate_cross(t),
+            # then flow supervision learns the alignment directly.
             self.style_context_proj = nn.Linear(style_dim, self.context_dim, bias=False)
-            nn.init.eye_(self.style_context_proj.weight)
+            nn.init.zeros_(self.style_context_proj.weight)
         self.connector_groups = int(connector_groups)
         if blocks % self.connector_groups:
             raise ValueError("Anima blocks must divide evenly across connector groups")
@@ -3603,7 +3603,7 @@ def smoke_test_style_adapter(config: dict[str, Any], destination: Path) -> dict[
     # exact-zero gate-only self-reference, then frozen-oracle distillation with
     # the complete student path open.
     training["curriculum"] = {
-        "gate_only_steps": 1,
+        "gate_only_steps": 0,
         "self_reference_steps": 1,
         "target_anneal_end": 3,
         "oracle_distill_end": 3,

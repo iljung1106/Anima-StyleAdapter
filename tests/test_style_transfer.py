@@ -613,11 +613,11 @@ def test_pretrained_block_projection_starts_zero_then_trains_style_alignment():
 
     output = adapter.attend(0, query, cross, native_gate)
     assert output.shape == query.shape
-    assert torch.count_nonzero(output) > 0
-    output.square().mean().backward()
+    assert torch.count_nonzero(output) == 0
+    output.sum().backward()
     assert adapter.style_context_proj.weight.grad is not None
     assert adapter.style_context_proj.weight.grad.norm() > 0
-    assert adapter.k_up[0].weight.grad is not None
+    assert adapter.k_up[0].weight.grad is None or adapter.k_up[0].weight.grad.norm() == 0
     assert cross.k_proj.weight.grad is None
     assert cross.output_proj.weight.grad is None
 
