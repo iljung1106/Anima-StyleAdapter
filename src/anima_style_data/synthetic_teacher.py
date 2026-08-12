@@ -768,12 +768,25 @@ def build_real_artist_teacher_plan(
     ))
     references = []
     for artist in artists:
-        rows = by_artist[artist]
-        for reference_split, count in reference_counts.items():
-            candidates = [row for row in rows if str(row.get("split")) == reference_split]
-            candidates.sort(key=lambda row: hashlib.blake2b(
+        rows = sorted(
+            by_artist[artist],
+            key=lambda row: hashlib.blake2b(
                 f"{seed}:{row['id']}".encode(), digest_size=8
-            ).digest())
+            ).digest(),
+        )
+        # The source split is global and can leave an artist without any
+        # validation image. Build an explicit within-artist 80/10/10 split so
+        # both artist-disjoint and image-disjoint evaluation are guaranteed.
+        heldout = max(1, round(len(rows) * 0.1))
+        if len(rows) - 2 * heldout < int(reference_counts.get("train", 1)):
+            raise RuntimeError(f"Artist {artist!r} has too few images: {len(rows)}")
+        internal = {
+            "test": rows[:heldout],
+            "validation": rows[heldout : heldout * 2],
+            "train": rows[heldout * 2 :],
+        }
+        for reference_split, count in reference_counts.items():
+            candidates = internal[reference_split]
             if len(candidates) < int(count):
                 raise RuntimeError(
                     f"Artist {artist!r} has {len(candidates)} {reference_split} references; "
@@ -781,6 +794,7 @@ def build_real_artist_teacher_plan(
                 )
             references.extend({
                 **row,
+                "source_split": str(row.get("split")),
                 "artist_split": artist_splits[artist],
                 "reference_split": reference_split,
             } for row in candidates[:int(count)])
