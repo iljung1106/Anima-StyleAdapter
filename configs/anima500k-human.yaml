@@ -354,6 +354,7 @@ style_transfer:
     bridge_minimum_lr_ratio: 0.10
     bridge_adam_eps: 0.000001
     bridge_weight_decay: 0.0
+    adapter_adam_eps: 0.000001
     representation_learning_rate: 0.0012
     output_learning_rate: 0.0008
     # Retained for later stages; the negative start step below keeps this group

@@ -2899,7 +2899,12 @@ def overfit_exact_self_batch(config: dict[str, Any], destination: Path) -> dict[
         value for value in adapter.parameters() if id(value) not in special_ids
     ]
     weight_decay = float(overfit_cfg.get("weight_decay", 0.0))
-    optimizer = torch.optim.AdamW(
+    # The connector trunk and its low-rank K/V/O deltas also contain zero-init
+    # output matrices. AdamW normalizes their first sparse signal into an
+    # almost learning-rate-sized update per coordinate, which overwhelmed the
+    # native cross gate even during linear warmup. RAdam keeps those earliest
+    # steps SGD-like while its variance estimate is unreliable.
+    optimizer = torch.optim.RAdam(
         [
             {
                 "params": representation_parameters,
@@ -3223,7 +3228,7 @@ def train_style_adapter(config: dict[str, Any], destination: Path, *, steps_over
                 "name": "resampler",
             },
         ],
-        fused=device.startswith("cuda"),
+        eps=float(training.get("adapter_adam_eps", 1e-6)),
     )
     # The dense near-identity bridge gets its own optimizer. AdamW's
     # coordinate-wise normalization made its first update large even after a
@@ -3239,7 +3244,7 @@ def train_style_adapter(config: dict[str, Any], destination: Path, *, steps_over
     base_learning_rates = [float(group["lr"]) for group in optimizer.param_groups]
     bridge_base_learning_rate = bridge_lr
     print(
-        "style optimizer: FP32 trainable weights, BF16 autocast; "
+        "style optimizer: FP32 trainable weights, BF16 autocast; adapter=RAdam "
         f"bridge=RAdam(lr={bridge_lr:g},warmup={int(training.get('bridge_warmup_steps', 400))},"
         f"eps={float(training.get('bridge_adam_eps', 1e-6)):g}) "
         f"representation_lr={representation_lr:g} output_lr={output_lr:g} "
