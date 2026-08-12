@@ -607,15 +607,37 @@ def train_offline_kvo_bootstrap(
     generator = random.Random(seed)
     total_steps = int(steps_override or training.get("steps", 10000))
     token_rows, token_tensors = _load_resampler_token_cache(root)
-    adapter_parameters = [value for value in adapter.parameters() if value.requires_grad]
+    bridge_parameters = [value for value in adapter.bridge_parameters() if value.requires_grad]
+    connector_parameters = [
+        value for module in (adapter.connector_trunk, adapter.connector_branches)
+        for value in module.parameters() if value.requires_grad
+    ]
+    if adapter.block_embeddings is not None and adapter.block_embeddings.requires_grad:
+        connector_parameters.append(adapter.block_embeddings)
+    kvo_parameters = [
+        value for value in (adapter.kv_parameters() + adapter.output_parameters())
+        if value.requires_grad
+    ]
+    grouped_ids = {id(value) for value in bridge_parameters + connector_parameters + kvo_parameters}
+    remaining_parameters = [
+        value for value in adapter.parameters()
+        if value.requires_grad and id(value) not in grouped_ids
+    ]
+    # Aggregator/null tokens are frozen above, so every live adapter parameter
+    # must belong to a functional optimizer group.
+    if remaining_parameters:
+        raise RuntimeError(f"Unassigned adapter parameters: {len(remaining_parameters)}")
+    adapter_parameters = bridge_parameters + connector_parameters + kvo_parameters
     resampler_parameters = _enable_phase_b_resampler(resampler) if phase == "b" else []
     parameters = adapter_parameters + resampler_parameters
-    optimizer_groups: list[dict[str, Any]] = [{
-        "params": adapter_parameters, "lr": float(training.get("learning_rate", 1e-4)),
-    }]
+    optimizer_groups: list[dict[str, Any]] = [
+        {"params": bridge_parameters, "lr": float(training.get("bridge_learning_rate", 2e-6)), "name": "bridge"},
+        {"params": connector_parameters, "lr": float(training.get("connector_learning_rate", 5e-6)), "name": "connector"},
+        {"params": kvo_parameters, "lr": float(training.get("learning_rate", 2e-5)), "name": "kvo"},
+    ]
     if resampler_parameters:
         optimizer_groups.append({
-            "params": resampler_parameters,
+            "params": resampler_parameters, "name": "resampler",
             "lr": float(training.get("resampler_learning_rate", 1e-5)),
         })
     optimizer = torch.optim.AdamW(
@@ -848,22 +870,39 @@ def train_offline_kvo_bootstrap(
         optimizer.zero_grad(set_to_none=True)
         loss, metrics = loss_for(batch, train=True, reference_rows=reference_batch)
         loss.backward()
-        grad_norm = torch.nn.utils.clip_grad_norm_(parameters, float(training.get("max_grad_norm", 1.0)))
+        grad_norms = {
+            "bridge": torch.nn.utils.clip_grad_norm_(
+                bridge_parameters, float(training.get("bridge_max_grad_norm", 0.01))
+            ),
+            "connector": torch.nn.utils.clip_grad_norm_(
+                connector_parameters, float(training.get("connector_max_grad_norm", 0.1))
+            ),
+            "kvo": torch.nn.utils.clip_grad_norm_(
+                kvo_parameters, float(training.get("max_grad_norm", 1.0))
+            ),
+        }
+        if resampler_parameters:
+            grad_norms["resampler"] = torch.nn.utils.clip_grad_norm_(
+                resampler_parameters, float(training.get("resampler_max_grad_norm", 0.1))
+            )
         scale = lr_scale(step)
-        optimizer.param_groups[0]["lr"] = float(training.get("learning_rate", 1e-4)) * scale
-        if len(optimizer.param_groups) > 1:
-            optimizer.param_groups[1]["lr"] = float(training.get("resampler_learning_rate", 1e-5)) * scale
+        learning_rates = {
+            "bridge": float(training.get("bridge_learning_rate", 2e-6)),
+            "connector": float(training.get("connector_learning_rate", 5e-6)),
+            "kvo": float(training.get("learning_rate", 2e-5)),
+            "resampler": float(training.get("resampler_learning_rate", 1e-5)),
+        }
+        for group in optimizer.param_groups:
+            group["lr"] = learning_rates[str(group["name"])] * scale
         optimizer.step()
         if step % log_every == 0:
-            print(f"offline-kvo step={step}/{total_steps} loss={metrics['loss']:.4f} cos={metrics['cosine']:.4f} improve={metrics['zero_improvement']:.4f} grad={float(grad_norm):.3f}", flush=True)
+            grad_text = " ".join(f"g_{key}={float(value):.2f}" for key, value in grad_norms.items())
+            print(f"offline-kvo step={step}/{total_steps} loss={metrics['loss']:.4f} cos={metrics['cosine']:.4f} improve={metrics['zero_improvement']:.4f} {grad_text}", flush=True)
             if wandb_run is not None:
                 wandb_run.log({
                     **{f"train/{key}": value for key, value in metrics.items()},
-                    "train/grad_norm": float(grad_norm),
-                    "train/learning_rate": optimizer.param_groups[0]["lr"],
-                    "train/resampler_learning_rate": (
-                        optimizer.param_groups[1]["lr"] if len(optimizer.param_groups) > 1 else 0.0
-                    ),
+                    **{f"train/{key}_grad_norm": float(value) for key, value in grad_norms.items()},
+                    **{f"train/{group['name']}_learning_rate": group["lr"] for group in optimizer.param_groups},
                 }, step=step)
         if step % validation_every == 0 or step == total_steps:
             val = evaluate(validation_rows, int(training.get("validation_batches", 8)))

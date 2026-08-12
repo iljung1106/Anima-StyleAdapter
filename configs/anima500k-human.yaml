@@ -576,11 +576,15 @@ synthetic_teacher:
     steps: 10000
     batch_size: 2
     blocks_per_step: 7
-    learning_rate: 0.0001
-    warmup_steps: 500
+    learning_rate: 0.00002
+    connector_learning_rate: 0.000005
+    bridge_learning_rate: 0.000002
+    warmup_steps: 200
     minimum_lr_ratio: 0.1
     weight_decay: 0.01
     max_grad_norm: 1.0
+    connector_max_grad_norm: 0.1
+    bridge_max_grad_norm: 0.01
     direction_weight: 0.2
     magnitude_weight: 0.02
     log_every: 20
@@ -603,12 +607,17 @@ synthetic_teacher:
     steps: 6000
     batch_size: 2
     blocks_per_step: 7
-    learning_rate: 0.00005
+    learning_rate: 0.00001
+    connector_learning_rate: 0.000003
+    bridge_learning_rate: 0.000001
     resampler_learning_rate: 0.000005
     warmup_steps: 300
     minimum_lr_ratio: 0.1
     weight_decay: 0.01
     max_grad_norm: 1.0
+    connector_max_grad_norm: 0.1
+    bridge_max_grad_norm: 0.01
+    resampler_max_grad_norm: 0.1
     direction_weight: 0.2
     magnitude_weight: 0.02
     representation_drift_weight: 0.03
