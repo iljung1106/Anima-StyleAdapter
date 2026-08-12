@@ -884,3 +884,45 @@ loss를 사용하고 실제 batch에는 rectified-flow target과 style represent
 8. Resampler 점진 개방과 target-excluded curriculum
 9. Minimal Set Aggregator의 1/2/4/8-reference 학습
 10. 실제 Danbooru 혼합 본학습
+
+### 22.13 2026-08-13 Offline bootstrap 측정 결과와 용량 결정
+
+정확한 Anima `512` post-LLM token을 유지한 teacher로 Phase A를 다시 측정했다. GPU-resident
+small cache와 batch `16`에서 H100 사용률은 약 `81~90%`, VRAM은 약 `12.4GB`, 학습은
+약 `0.034 s/step`이었다. Phase A 3,000 step의 validation zero-output improvement는
+`0.5911`, unseen-artist meta-test는 `0.5161`이었다. 다만 correct/wrong-reference gap은
+각각 `-0.0010`, `-0.0171`로, 평균 artist-effect를 재현하면서 reference identity를 거의
+사용하지 않는 shortcut이 확인됐다.
+
+Phase B의 34.61GiB C-RADIO cache를 CPU RAM에만 상주시켰을 때는 큰 `index_select`와 H2D가
+병목이 되어 약 `1.8~1.9 s/step`, GPU 사용률 `0~1%`였다. 전체 cache를 H100 VRAM에 올리고
+8개 shard loader로 병렬 적재하자 약 `0.047~0.09 s/step`, GPU `90~94%`, VRAM
+`49~57GB`가 되었다. 따라서 현재 장비에서는 모델을 줄이지 않고도 데이터 공급 병목을
+해결할 수 있다.
+
+Frozen Resampler token `1,024`장의 mean+std descriptor를 직접 평가한 결과는 다음과 같다.
+
+- same-artist cosine: `0.8725`
+- different-artist cosine: `0.8575`
+- same-content/different-artist cosine: `0.9629`
+- 64-artist prototype top-1: `3.125%` (random `1.5625%`)
+
+즉 초기 Resampler는 artist 정보도 일부 보존하지만 content를 훨씬 강하게 표현한다. 마지막
+두 encoder block을 열고 같은 artist의 다른 content pair에 token InfoNCE를 적용하면 training
+matching accuracy가 batch-16 random `6.25%`에서 최대 `50%`까지 올랐다. 이는 약 120M
+Resampler의 용량이 부족하지 않다는 직접적인 증거다. 반면 connector의 held-out flow
+correct/wrong gap은 1,500 step에도 `0.0006` 부근으로, 정보가 connector 효과로 전달되지
+않았다.
+
+Batch의 16개 artist×content native teacher를 모두 계산하는 all-pairs loss와 공통
+artist-effect를 제거한 centered all-pairs loss도 비교했다. 강한 centered loss는 validation
+cosine gap을 일시적으로 `0.0306`까지 만들었지만 zero-output improvement를 `0.5908`에서
+`0.2747`로 훼손했고, 더 학습하면 gap도 사라졌다. 10배 약한 Pareto 설정 역시 최종
+validation/meta improvement가 약 `0.5296/0.4636`, gap `-0.0050/-0.0076`으로 Phase A보다
+나빴다.
+
+따라서 현 단계에서는 모델 폭·깊이 또는 총 step을 늘리지 않는다. 현재 Resampler
+`128×1024`, 내부 폭 `1536×3 block`, 약 120M과 connector 약 190M은 충분하다. 다음 변경은
+teacher의 공통 효과와 artist-specific 효과를 별도 head/단계로 분리하고, validation checkpoint
+선택도 평균 reconstruction과 reference discrimination의 Pareto 기준으로 수행해야 한다.
+단순 연장이나 용량 증설은 평균 artist-effect shortcut을 더 정교하게 만들 가능성이 높다.
