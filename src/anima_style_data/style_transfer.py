@@ -396,6 +396,7 @@ class SharedLowRankStyleAdapter(nn.Module):
         aggregator_slot_mixer_layers: int = 1,
         style_dropout: float = 0.12,
         gate_dim: int = 256,
+        initial_gate: float = 0.0,
         projection_mode: str = "learned_shared",
         context_dim: int | None = None,
     ):
@@ -455,7 +456,9 @@ class SharedLowRankStyleAdapter(nn.Module):
             nn.init.zeros_(layer.weight)
         self.gate = nn.Sequential(nn.Linear(hidden_dim, gate_dim), nn.SiLU(), nn.Linear(gate_dim, blocks))
         nn.init.zeros_(self.gate[-1].weight)
-        nn.init.zeros_(self.gate[-1].bias)
+        if not -1.0 < float(initial_gate) < 1.0:
+            raise ValueError("initial_gate must be strictly between -1 and 1")
+        nn.init.constant_(self.gate[-1].bias, math.atanh(float(initial_gate)))
         self._style_tokens: torch.Tensor | None = None
         self._runtime_gate_abs: dict[int, torch.Tensor] = {}
         self._runtime_residual_ratio: dict[int, torch.Tensor] = {}

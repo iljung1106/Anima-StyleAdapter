@@ -584,6 +584,18 @@ def test_pretrained_block_projection_starts_zero_then_trains_style_alignment():
     assert cross.output_proj.weight.grad is None
 
 
+def test_pretrained_block_projection_can_start_with_nonzero_gate():
+    adapter = SharedLowRankStyleAdapter(
+        style_dim=8, slots=2, hidden_dim=16, output_dim=16,
+        heads=4, blocks=28, rank=2,
+        aggregator_heads=2, aggregator_layers=1, style_dropout=0.0, gate_dim=4,
+        projection_mode="pretrained_block_lora", context_dim=8, initial_gate=0.25,
+    )
+    timestep = torch.randn(3, 1, 16)
+    gates = torch.tanh(adapter.gate(timestep))
+    assert torch.allclose(gates, torch.full_like(gates, 0.25), atol=1e-6)
+
+
 def test_attach_patches_all_28_blocks_without_copying_adapter():
     class Block(nn.Module):
         def __init__(self):
