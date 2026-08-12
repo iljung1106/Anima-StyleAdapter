@@ -27,18 +27,17 @@ class ArtistCenteredEffectHead(nn.Module):
 
     def __init__(
         self, style_dim: int = 1024, hidden_dim: int = 2048,
-        latent_dim: int = 512, blocks: int = 28,
+        latent_dim: int = 512, blocks: int = 28, heads: int = 8,
     ) -> None:
         super().__init__()
+        if latent_dim % heads:
+            raise ValueError("Centered-effect latent dim must divide its head count")
         self.style_dim = style_dim
         self.hidden_dim = hidden_dim
-        self.descriptor = nn.Sequential(
-            nn.Linear(style_dim * 2, latent_dim, bias=False),
-            nn.SiLU(),
-            nn.Linear(latent_dim, latent_dim, bias=False),
-        )
+        self.heads = heads
+        self.head_dim = latent_dim // heads
+        self.style_kv = nn.Linear(style_dim, latent_dim * 2, bias=False)
         self.query = nn.Linear(hidden_dim, latent_dim, bias=False)
-        self.modulation = nn.Linear(latent_dim, latent_dim * 2, bias=False)
         self.block_embedding = nn.Parameter(torch.zeros(blocks, latent_dim))
         self.output = nn.Sequential(
             nn.LayerNorm(latent_dim),
@@ -48,25 +47,30 @@ class ArtistCenteredEffectHead(nn.Module):
         )
         nn.init.zeros_(self.output[-1].weight)
 
-    def artist_latent(self, tokens: torch.Tensor) -> torch.Tensor:
-        normalized = F.layer_norm(tokens.float(), (tokens.shape[-1],)).to(tokens.dtype)
-        descriptor = torch.cat(
-            (normalized.mean(1), normalized.std(1, correction=0)), dim=-1
-        )
-        return self.descriptor(descriptor)
-
     def forward(
         self, tokens: torch.Tensor, queries: torch.Tensor, block: int
     ) -> torch.Tensor:
-        # queries: [B,H,Q,D] -> one query-conditioned residual per Q position.
+        # Preserve all 128 Resampler slots. Each native Anima query chooses the
+        # reference details useful for its own spatial position instead of
+        # receiving a single mean/std artist descriptor.
         batch, _, query_count, _ = queries.shape
         query = queries.transpose(1, 2).reshape(batch, query_count, self.hidden_dim)
-        latent = self.artist_latent(tokens)
-        scale, shift = self.modulation(latent).chunk(2, dim=-1)
-        values = self.query(F.layer_norm(query.float(), (self.hidden_dim,)).to(query.dtype))
-        values = values * (1 + 0.1 * torch.tanh(scale[:, None]))
-        values = values + shift[:, None] + self.block_embedding[block][None, None]
-        return self.output(values)
+        query = self.query(
+            F.layer_norm(query.float(), (self.hidden_dim,)).to(query.dtype)
+        ) + self.block_embedding[block][None, None]
+        style = F.layer_norm(tokens.float(), (tokens.shape[-1],)).to(tokens.dtype)
+        key, value = self.style_kv(style).chunk(2, dim=-1)
+
+        def split_heads(values: torch.Tensor) -> torch.Tensor:
+            return values.reshape(
+                batch, values.shape[1], self.heads, self.head_dim
+            ).transpose(1, 2)
+
+        attended = F.scaled_dot_product_attention(
+            split_heads(query), split_heads(key), split_heads(value)
+        )
+        attended = attended.transpose(1, 2).reshape(batch, query_count, -1)
+        return self.output(attended + query)
 
 
 def _root(config: dict[str, Any], destination: Path) -> Path:

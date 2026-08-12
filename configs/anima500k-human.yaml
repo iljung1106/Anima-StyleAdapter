@@ -613,7 +613,7 @@ synthetic_teacher:
       name: offline-kvo-phase-a-exact512-summary-tokens
       id: offline-kvo-phase-a-exact512-summary-tokens-v1
   offline_phase_b:
-    output_directory: offline_kvo_phase_b_exact512_centered_residual
+    output_directory: offline_kvo_phase_b_exact512_cross_attention_head
     phase_a_checkpoint: offline_kvo_bootstrap_exact512_summary_tokens/checkpoints/best.pt
     initial_checkpoint: offline_kvo_bootstrap_exact512_summary_tokens/checkpoints/best.pt
     resampler_initial_checkpoint: offline_kvo_phase_b_exact512_artist_tokens/checkpoints/step-0001500.pt
@@ -677,5 +677,5 @@ synthetic_teacher:
     wandb:
       enabled: true
       project: anima-style-adapter
-      name: offline-kvo-phase-b-exact512-centered-residual
-      id: offline-kvo-phase-b-exact512-centered-residual-v1
+      name: offline-kvo-phase-b-exact512-cross-attention-head
+      id: offline-kvo-phase-b-exact512-cross-attention-head-v1
