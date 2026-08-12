@@ -622,6 +622,9 @@ def _enable_phase_b_resampler(
 ) -> list[torch.nn.Parameter]:
     """Open the style boundary and a configurable number of final encoder blocks."""
     resampler.requires_grad_(False)
+    if encoder_layers == 0:
+        resampler.eval()
+        return []
     if not 1 <= encoder_layers <= len(resampler.encoder):
         raise ValueError(
             f"resampler_trainable_encoder_layers must be in [1, {len(resampler.encoder)}]"
@@ -678,7 +681,23 @@ def train_offline_kvo_bootstrap(
             initialization_checkpoint, map_location="cpu", weights_only=False
         )
         adapter.load_state_dict(state["adapter"])
-        if state.get("resampler") is not None:
+        resampler_initialization = training.get("resampler_initial_checkpoint")
+        if resampler_initialization:
+            resampler_state = torch.load(
+                root / str(resampler_initialization),
+                map_location="cpu",
+                weights_only=False,
+            )
+            if resampler_state.get("resampler") is None:
+                raise RuntimeError(
+                    f"Resampler checkpoint has no Resampler state: {resampler_initialization}"
+                )
+            resampler.load_state_dict(resampler_state["resampler"])
+            print(
+                f"initialized Phase B Resampler from {root / str(resampler_initialization)}",
+                flush=True,
+            )
+        elif state.get("resampler") is not None:
             resampler.load_state_dict(state["resampler"])
         print(f"initialized Phase B from {initialization_checkpoint}", flush=True)
     basis = load_file(root / "anima_kv_teacher" / "native_cross_attention.safetensors", device="cpu")

@@ -612,9 +612,10 @@ synthetic_teacher:
       name: offline-kvo-phase-a-exact512-vectorized
       id: offline-kvo-phase-a-exact512-vectorized-v3
   offline_phase_b:
-    output_directory: offline_kvo_phase_b_exact512_centered_pairs
+    output_directory: offline_kvo_phase_b_exact512_centered_pareto
     phase_a_checkpoint: offline_kvo_bootstrap_exact512/checkpoints/best.pt
-    initial_checkpoint: offline_kvo_phase_b_exact512_artist_tokens/checkpoints/step-0001500.pt
+    initial_checkpoint: offline_kvo_bootstrap_exact512/checkpoints/best.pt
+    resampler_initial_checkpoint: offline_kvo_phase_b_exact512_artist_tokens/checkpoints/step-0001500.pt
     local_feature_directory: /tmp/anima-style-bootstrap/style_features
     seed: 20260813
     steps: 3000
@@ -625,7 +626,7 @@ synthetic_teacher:
     gpu_resident_features: true
     feature_cache_load_workers: 8
     representation_warmup_steps: 0
-    resampler_trainable_encoder_layers: 2
+    resampler_trainable_encoder_layers: 0
     learning_rate: 0.00001
     connector_learning_rate: 0.000003
     bridge_learning_rate: 0.000001
@@ -645,12 +646,12 @@ synthetic_teacher:
     functional_contrastive_weight: 0.50
     functional_contrastive_temperature: 0.10
     functional_contrastive_start_step: 0
-    functional_contrastive_ramp_steps: 250
-    functional_all_pairs_weight: 0.50
+    functional_contrastive_ramp_steps: 1000
+    functional_all_pairs_weight: 0.05
     functional_all_pairs_magnitude_weight: 0.02
-    artist_token_contrastive_weight: 0.10
+    artist_token_contrastive_weight: 0.0
     artist_token_temperature: 0.07
-    functional_centered_all_pairs_weight: 0.50
+    functional_centered_all_pairs_weight: 0.05
     functional_centered_temperature: 0.07
     target_excluded_start_step: 1
     target_excluded_end_step: 1
@@ -666,5 +667,5 @@ synthetic_teacher:
     wandb:
       enabled: true
       project: anima-style-adapter
-      name: offline-kvo-phase-b-exact512-centered-pairs
-      id: offline-kvo-phase-b-exact512-centered-pairs-v1
+      name: offline-kvo-phase-b-exact512-centered-pareto
+      id: offline-kvo-phase-b-exact512-centered-pareto-v1
