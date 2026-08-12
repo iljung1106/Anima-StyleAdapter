@@ -378,6 +378,66 @@ class SlotSetAggregator(nn.Module):
         return F.layer_norm(pooled, (dim,))
 
 
+class MinimalSlotSetAggregator(nn.Module):
+    """Tiny reference-order-invariant pooling that preserves slot alignment."""
+
+    def __init__(self, slots: int = 128, dim: int = 1024, bottleneck: int = 256):
+        super().__init__()
+        self.slots = slots
+        self.dim = dim
+        self.score = nn.Sequential(
+            nn.Linear(dim, bottleneck), nn.SiLU(), nn.Linear(bottleneck, 1)
+        )
+        self.residual = nn.Sequential(
+            nn.Linear(dim, bottleneck), nn.SiLU(), nn.Linear(bottleneck, dim)
+        )
+
+    def forward(self, references: torch.Tensor, reference_mask: torch.Tensor) -> torch.Tensor:
+        if references.ndim != 4:
+            raise ValueError("references must have shape [batch, references, slots, dim]")
+        _, refs, slots, dim = references.shape
+        if (slots, dim) != (self.slots, self.dim):
+            raise ValueError(f"Expected slots/dim {(self.slots, self.dim)}, got {(slots, dim)}")
+        # Exact-self bootstrap bypasses every learned aggregation parameter.
+        if refs == 1:
+            return F.layer_norm(references[:, 0], (dim,))
+        scores = self.score(references).squeeze(-1)
+        scores = scores.masked_fill(~reference_mask[:, :, None], -torch.inf)
+        pooled = torch.einsum("brs,brsd->bsd", scores.softmax(dim=1), references)
+        return F.layer_norm(pooled + self.residual(pooled), (dim,))
+
+
+class ConnectorTransformerLayer(nn.Module):
+    """Pre-norm connector block with affine-free Q/K/V normalization."""
+
+    def __init__(self, dim: int, heads: int):
+        super().__init__()
+        if dim % heads:
+            raise ValueError("Connector width must be divisible by its head count")
+        self.heads = heads
+        self.head_dim = dim // heads
+        self.norm_attn = nn.LayerNorm(dim)
+        self.qkv = nn.Linear(dim, dim * 3, bias=False)
+        self.output = nn.Linear(dim, dim, bias=False)
+        self.norm_ff = nn.LayerNorm(dim)
+        self.ff = nn.Sequential(
+            nn.Linear(dim, dim * 4, bias=False),
+            nn.GELU(),
+            nn.Linear(dim * 4, dim, bias=False),
+        )
+
+    def forward(self, values: torch.Tensor) -> torch.Tensor:
+        batch, tokens, dim = values.shape
+        q, k, v = self.qkv(self.norm_attn(values)).chunk(3, dim=-1)
+        def heads(tensor: torch.Tensor) -> torch.Tensor:
+            tensor = tensor.reshape(batch, tokens, self.heads, self.head_dim).transpose(1, 2)
+            return F.layer_norm(tensor, (self.head_dim,))
+        attended = F.scaled_dot_product_attention(heads(q), heads(k), heads(v))
+        attended = attended.transpose(1, 2).reshape(batch, tokens, dim)
+        values = values + self.output(attended)
+        return values + self.ff(self.norm_ff(values))
+
+
 class SharedLowRankStyleAdapter(nn.Module):
     """Set aggregation plus either learned or pretrained block K/V/O projections."""
 
@@ -400,6 +460,12 @@ class SharedLowRankStyleAdapter(nn.Module):
         initial_gate: float = 0.0,
         projection_mode: str = "learned_shared",
         context_dim: int | None = None,
+        aggregator_mode: str = "transformer",
+        aggregator_bottleneck: int = 256,
+        connector_layers: int = 0,
+        connector_heads: int = 16,
+        connector_groups: int = 4,
+        connector_group_layers: int = 0,
     ):
         super().__init__()
         self.style_dim = style_dim
@@ -419,13 +485,16 @@ class SharedLowRankStyleAdapter(nn.Module):
             raise ValueError("Identity-initialized style context projection requires context_dim == style_dim")
         if self.projection_mode == "learned_shared" and self.context_dim != style_dim:
             raise ValueError("The learned shared projection mode requires context_dim == style_dim")
-        self.aggregator = SlotSetAggregator(
-            slots,
-            style_dim,
-            aggregator_heads,
-            aggregator_layers,
-            aggregator_slot_mixer_layers,
-        )
+        self.aggregator_mode = str(aggregator_mode)
+        if self.aggregator_mode == "minimal":
+            self.aggregator = MinimalSlotSetAggregator(slots, style_dim, aggregator_bottleneck)
+        elif self.aggregator_mode == "transformer":
+            self.aggregator = SlotSetAggregator(
+                slots, style_dim, aggregator_heads, aggregator_layers,
+                aggregator_slot_mixer_layers,
+            )
+        else:
+            raise ValueError(f"Unknown aggregator mode: {self.aggregator_mode}")
         self.null_tokens = nn.Parameter(torch.empty(1, slots, style_dim))
         nn.init.normal_(self.null_tokens, std=0.02)
         if self.projection_mode == "learned_shared":
@@ -440,6 +509,28 @@ class SharedLowRankStyleAdapter(nn.Module):
             # every block retains its own frozen pretrained K/V/O basis.
             self.style_context_proj = nn.Linear(style_dim, self.context_dim, bias=False)
             nn.init.eye_(self.style_context_proj.weight)
+        self.connector_groups = int(connector_groups)
+        if blocks % self.connector_groups:
+            raise ValueError("Anima blocks must divide evenly across connector groups")
+        self.blocks_per_group = blocks // self.connector_groups
+        self.connector_enabled = connector_layers > 0 or connector_group_layers > 0
+        self.connector_trunk = nn.ModuleList(
+            [ConnectorTransformerLayer(self.context_dim, connector_heads) for _ in range(connector_layers)]
+        )
+        self.connector_branches = nn.ModuleList(
+            [
+                nn.ModuleList(
+                    [ConnectorTransformerLayer(self.context_dim, connector_heads)
+                     for _ in range(connector_group_layers)]
+                )
+                for _ in range(self.connector_groups)
+            ]
+        )
+        if self.connector_enabled:
+            self.block_embeddings = nn.Parameter(torch.empty(blocks, self.context_dim))
+            nn.init.normal_(self.block_embeddings, std=0.02)
+        else:
+            self.register_parameter("block_embeddings", None)
         self.k_down = nn.ModuleList([nn.Linear(self.context_dim, rank, bias=False) for _ in range(blocks)])
         self.k_up = nn.ModuleList([nn.Linear(rank, hidden_dim, bias=False) for _ in range(blocks)])
         self.v_down = nn.ModuleList([nn.Linear(self.context_dim, rank, bias=False) for _ in range(blocks)])
@@ -461,6 +552,7 @@ class SharedLowRankStyleAdapter(nn.Module):
             raise ValueError("initial_gate must be strictly between -1 and 1")
         nn.init.constant_(self.gate[-1].bias, math.atanh(float(initial_gate)))
         self._style_tokens: torch.Tensor | None = None
+        self._style_block_tokens: list[torch.Tensor] | None = None
         self._runtime_gate_abs: dict[int, torch.Tensor] = {}
         self._runtime_residual_ratio: dict[int, torch.Tensor] = {}
 
@@ -482,6 +574,27 @@ class SharedLowRankStyleAdapter(nn.Module):
             return self.style_context_proj(tokens)
         return tokens
 
+    def _block_context_tokens(self, tokens: torch.Tensor) -> list[torch.Tensor]:
+        shared = self._context_tokens(tokens)
+        if not self.connector_enabled:
+            return [shared] * self.blocks
+        for layer in self.connector_trunk:
+            shared = layer(shared)
+        groups = []
+        for branch in self.connector_branches:
+            values = shared
+            for layer in branch:
+                values = layer(values)
+            groups.append(values)
+        return [
+            F.layer_norm(
+                groups[index // self.blocks_per_group]
+                + self.block_embeddings[index][None, None],
+                (self.context_dim,),
+            )
+            for index in range(self.blocks)
+        ]
+
     @staticmethod
     def _pretrained_kv(
         cross_attention: nn.Module, context: torch.Tensor
@@ -496,10 +609,10 @@ class SharedLowRankStyleAdapter(nn.Module):
         cross_attentions: list[nn.Module] | None = None,
     ) -> torch.Tensor:
         """Compact signature of the actual K/V tensors injected into all blocks."""
-        context = self._context_tokens(tokens)
+        block_contexts = self._block_context_tokens(tokens)
         if self.projection_mode == "learned_shared":
-            shared_k = self.shared_k(context)
-            shared_v = self.shared_v(context)
+            shared_k = self.shared_k(block_contexts[0])
+            shared_v = self.shared_v(block_contexts[0])
         elif cross_attentions is None or len(cross_attentions) != self.blocks:
             raise ValueError("Pretrained K/V signatures require every Anima cross-attention block")
         values = []
@@ -507,7 +620,8 @@ class SharedLowRankStyleAdapter(nn.Module):
             if self.projection_mode == "learned_shared":
                 base_k, base_v = shared_k, shared_v
             else:
-                base_k, base_v = self._pretrained_kv(cross_attentions[index], context)
+                base_k, base_v = self._pretrained_kv(cross_attentions[index], block_contexts[index])
+            context = block_contexts[index]
             key = base_k + self.k_up[index](self.k_down[index](context))
             value = base_v + self.v_up[index](self.v_down[index](context))
             values.extend((key.mean(1), value.mean(1)))
@@ -540,9 +654,15 @@ class SharedLowRankStyleAdapter(nn.Module):
 
     def set_style_tokens(self, tokens: torch.Tensor) -> None:
         self._style_tokens = tokens
+        # Cache the expensive high-capacity connector once per Anima forward.
+        # Legacy/no-connector mode retains its stateless behavior.
+        self._style_block_tokens = (
+            self._block_context_tokens(tokens) if self.connector_enabled else None
+        )
 
     def clear_style_tokens(self) -> None:
         self._style_tokens = None
+        self._style_block_tokens = None
 
     def reset_runtime_stats(self) -> None:
         self._runtime_gate_abs.clear()
@@ -574,7 +694,11 @@ class SharedLowRankStyleAdapter(nn.Module):
     ) -> torch.Tensor:
         if self._style_tokens is None:
             return torch.zeros_like(normalized_x)
-        style = self._context_tokens(self._style_tokens)
+        style = (
+            self._style_block_tokens[block_index]
+            if self._style_block_tokens is not None
+            else self._block_context_tokens(self._style_tokens)[block_index]
+        )
         q = cross_attention.q_proj(normalized_x)
         if self.projection_mode == "learned_shared":
             base_k, base_v = self.shared_k(style), self.shared_v(style)
@@ -3487,7 +3611,8 @@ def smoke_test_style_adapter(config: dict[str, Any], destination: Path) -> dict[
         "oracle_distill_end": 3,
     }
     training["oracle_distill_probability"] = 1.0
-    training["resampler_train_start_step"] = 1
+    if int(training.get("resampler_train_start_step", 0)) >= 0:
+        training["resampler_train_start_step"] = 1
     smoke_config["style_transfer"]["sampling"]["steps"] = 2
     return train_style_adapter(smoke_config, destination, steps_override=2)
 

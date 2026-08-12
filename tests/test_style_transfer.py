@@ -10,6 +10,7 @@ from torch import nn
 from anima_style_data.style_transfer import (
     ProductionStyleLoader,
     SharedLowRankStyleAdapter,
+    MinimalSlotSetAggregator,
     SlotSetAggregator,
     _archive_training_state,
     _clip_style_gradient_groups,
@@ -472,6 +473,45 @@ def test_slot_set_aggregator_is_reference_order_invariant():
     first = model(values, mask)
     second = model(values[:, permutation], mask[:, permutation])
     torch.testing.assert_close(first, second, atol=2e-6, rtol=2e-6)
+
+
+def test_minimal_aggregator_is_invariant_and_bypasses_single_reference():
+    torch.manual_seed(13)
+    model = MinimalSlotSetAggregator(slots=4, dim=16, bottleneck=4).eval()
+    values = torch.randn(2, 3, 4, 16)
+    mask = torch.tensor([[True, True, False], [True, True, True]])
+    permutation = torch.tensor([1, 2, 0])
+    first = model(values, mask)
+    second = model(values[:, permutation], mask[:, permutation])
+    torch.testing.assert_close(first, second, atol=2e-6, rtol=2e-6)
+
+    single = values[:, :1]
+    expected = torch.nn.functional.layer_norm(single[:, 0], (16,))
+    torch.testing.assert_close(model(single, torch.ones(2, 1, dtype=torch.bool)), expected)
+
+
+def test_high_capacity_connector_builds_distinct_block_contexts_and_gradients():
+    torch.manual_seed(19)
+    adapter = SharedLowRankStyleAdapter(
+        style_dim=16, slots=4, hidden_dim=32, output_dim=32,
+        heads=4, blocks=4, rank=4, projection_mode="pretrained_block_lora",
+        context_dim=16, aggregator_mode="minimal", aggregator_bottleneck=4,
+        connector_layers=2, connector_heads=4, connector_groups=2,
+        connector_group_layers=1, style_dropout=0.0, gate_dim=8,
+        initial_gate=0.25,
+    )
+    references = torch.randn(2, 1, 4, 16)
+    tokens = adapter.aggregate(references, torch.ones(2, 1, dtype=torch.bool))
+    adapter.set_style_tokens(tokens)
+    assert len(adapter._style_block_tokens) == 4
+    assert not torch.allclose(adapter._style_block_tokens[0], adapter._style_block_tokens[1])
+
+    cross = _FakeCrossAttention(32, context=16).requires_grad_(False)
+    result = adapter.attend(0, torch.randn(2, 5, 32), torch.randn(2, 1, 32), cross)
+    result.square().mean().backward()
+    assert adapter.connector_trunk[0].qkv.weight.grad is not None
+    assert adapter.connector_branches[0][0].qkv.weight.grad is not None
+    assert adapter.block_embeddings.grad is not None
 
 
 def test_cross_slot_mixer_couples_pooled_slots():
