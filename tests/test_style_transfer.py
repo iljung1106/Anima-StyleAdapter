@@ -389,7 +389,7 @@ def test_gate_only_stage_then_opens_entire_adapter():
         aggregator_heads=2, aggregator_layers=1, gate_dim=4,
     )
     _set_adapter_trainable_stage(adapter, gate_only=True)
-    assert all(parameter.requires_grad for parameter in adapter.gate.parameters())
+    assert adapter.gate_parameters() == []
     assert adapter.shared_o.weight.requires_grad
     assert all(parameter.requires_grad for parameter in adapter.o_up.parameters())
     assert not adapter.shared_k.weight.requires_grad
@@ -498,19 +498,20 @@ def test_high_capacity_connector_builds_distinct_block_contexts_and_gradients():
         context_dim=16, aggregator_mode="minimal", aggregator_bottleneck=4,
         connector_layers=2, connector_heads=4, connector_groups=2,
         connector_group_layers=1, style_dropout=0.0, gate_dim=8,
-        initial_gate=0.25,
     )
     references = torch.randn(2, 1, 4, 16)
     tokens = adapter.aggregate(references, torch.ones(2, 1, dtype=torch.bool))
     adapter.set_style_tokens(tokens)
     assert len(adapter._style_block_tokens) == 4
-    assert not torch.allclose(adapter._style_block_tokens[0], adapter._style_block_tokens[1])
+    # Zero residual initialization leaves every group/block on the shared
+    # identity path until its own output projection starts learning.
+    torch.testing.assert_close(adapter._style_block_tokens[0], adapter._style_block_tokens[1])
 
     cross = _FakeCrossAttention(32, context=16).requires_grad_(False)
-    result = adapter.attend(0, torch.randn(2, 5, 32), torch.randn(2, 1, 32), cross)
+    result = adapter.attend(0, torch.randn(2, 5, 32), cross, torch.ones(2, 5, 32))
     result.square().mean().backward()
-    assert adapter.connector_trunk[0].qkv.weight.grad is not None
-    assert adapter.connector_branches[0][0].qkv.weight.grad is not None
+    assert adapter.connector_trunk[0].output.weight.grad is not None
+    assert adapter.connector_branches[0][0].output.weight.grad is not None
     assert adapter.block_embeddings.grad is not None
 
 
@@ -576,12 +577,12 @@ def test_zero_output_projection_gets_direction_before_opening_kv_path():
     cross.requires_grad_(False)
     adapter.set_style_tokens(torch.randn(2, 2, 8))
     query = torch.randn(2, 5, 16)
-    timestep = torch.randn(2, 1, 16)
+    native_gate = torch.ones(2, 5, 16)
 
     # The full style residual is exactly neutral, but its output matrix gets an
     # informative gradient immediately instead of blocking the whole K/V path
     # behind a zero scalar gate.
-    initial = adapter.attend(0, query, timestep, cross)
+    initial = adapter.attend(0, query, cross, native_gate)
     assert torch.count_nonzero(initial) == 0
     initial.sum().backward()
     assert adapter.shared_o.weight.grad is not None
@@ -590,7 +591,7 @@ def test_zero_output_projection_gets_direction_before_opening_kv_path():
 
     adapter.zero_grad(set_to_none=True)
     nn.init.normal_(adapter.shared_o.weight, std=0.01)
-    output = adapter.attend(0, query, timestep, cross)
+    output = adapter.attend(0, query, cross, native_gate)
     assert output.shape == query.shape
     output.square().mean().backward()
     assert adapter.shared_k.weight.grad is not None
@@ -608,20 +609,9 @@ def test_pretrained_block_projection_starts_zero_then_trains_style_alignment():
     cross = _FakeCrossAttention(16, context=8).requires_grad_(False)
     adapter.set_style_tokens(torch.randn(2, 2, 8))
     query = torch.randn(2, 5, 16)
-    timestep = torch.randn(2, 1, 16)
+    native_gate = torch.ones(2, 5, 16)
 
-    initial = adapter.attend(0, query, timestep, cross)
-    assert torch.count_nonzero(initial) == 0
-    initial.sum().backward()
-    assert adapter.gate[-1].weight.grad is not None
-    assert adapter.gate[-1].weight.grad.norm() > 0
-    assert adapter.style_context_proj.weight.grad is not None
-    assert adapter.style_context_proj.weight.grad.norm() == 0
-
-    adapter.zero_grad(set_to_none=True)
-    with torch.no_grad():
-        adapter.gate[-1].bias.fill_(0.25)
-    output = adapter.attend(0, query, timestep, cross)
+    output = adapter.attend(0, query, cross, native_gate)
     assert output.shape == query.shape
     assert torch.count_nonzero(output) > 0
     output.square().mean().backward()
@@ -632,16 +622,19 @@ def test_pretrained_block_projection_starts_zero_then_trains_style_alignment():
     assert cross.output_proj.weight.grad is None
 
 
-def test_pretrained_block_projection_can_start_with_nonzero_gate():
+def test_pretrained_block_projection_reuses_native_cross_gate_exactly():
     adapter = SharedLowRankStyleAdapter(
         style_dim=8, slots=2, hidden_dim=16, output_dim=16,
         heads=4, blocks=28, rank=2,
         aggregator_heads=2, aggregator_layers=1, style_dropout=0.0, gate_dim=4,
-        projection_mode="pretrained_block_lora", context_dim=8, initial_gate=0.25,
+        projection_mode="pretrained_block_lora", context_dim=8,
     )
-    timestep = torch.randn(3, 1, 16)
-    gates = torch.tanh(adapter.gate(timestep))
-    assert torch.allclose(gates, torch.full_like(gates, 0.25), atol=1e-6)
+    cross = _FakeCrossAttention(16, context=8).requires_grad_(False)
+    adapter.set_style_tokens(torch.randn(3, 2, 8))
+    query = torch.randn(3, 5, 16)
+    full = adapter.attend(0, query, cross, torch.ones_like(query))
+    half = adapter.attend(0, query, cross, torch.full_like(query, 0.5))
+    torch.testing.assert_close(half, full * 0.5)
 
 
 def test_attach_patches_all_28_blocks_without_copying_adapter():

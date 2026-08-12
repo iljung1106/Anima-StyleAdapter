@@ -273,7 +273,7 @@ tap_resampler_experiment:
 # and batches targets by exact latent shape. `style-smoke` forces two steps and
 # writes to a separate smoke directory; `style-train` uses `training.steps`.
 style_transfer:
-  output_directory: style_transfer_high_capacity_connector_exactself_bootstrap_8000
+  output_directory: style_transfer_high_capacity_native_cross_gate_exactself_8000
   seed: 20260811
   loader:
     style_cache: style_features_l18_l24_siglip_l24
@@ -305,7 +305,6 @@ style_transfer:
     # The 0.02 stabilization scale left the learned intervention below the
     # numerical repeatability floor. 0.1 remains far below the unstable 1.0
     # trial while allowing the output map to learn at a useful functional rate.
-    output_scale: 0.1
     heads: 16
     blocks: 28
     rank: 128
@@ -323,10 +322,8 @@ style_transfer:
     aggregator_layers: 2
     aggregator_slot_mixer_layers: 1
     style_dropout: 0.0
-    gate_dim: 256
-    # Capacity ablation: avoid the zero-gate phase so flow gradients reach the
-    # Resampler, Aggregator and K/V/O paths from the first optimizer step.
-    initial_gate: 0.25
+    # Style attention directly reuses Anima's pretrained channel-wise
+    # gate_cross(t); there is no independent output scale or style gate.
   # Measure only the magnitude of Anima's native @artist intervention. Residual
   # directions are discarded. Weak artist tags and near-identical centered
   # residual signatures are removed before timestep-wise percentiles are made.
@@ -354,7 +351,6 @@ style_transfer:
     learning_rate: 0.0012
     representation_learning_rate: 0.0012
     output_learning_rate: 0.0008
-    gate_learning_rate: 0.0004
     # Retained for later stages; the negative start step below keeps this group
     # frozen throughout exact-self connector bootstrap.
     resampler_learning_rate: 0.00004
@@ -383,7 +379,6 @@ style_transfer:
     separate_gradient_clipping: true
     representation_max_grad_norm: 1.0
     output_max_grad_norm: 1.0
-    gate_max_grad_norm: 1.0
     # H100 80GB has ample headroom for the frozen Anima activations. Keeping
     # them avoids recomputing all 28 blocks during backward.
     gradient_checkpointing: false
@@ -459,8 +454,8 @@ style_transfer:
     wandb:
       enabled: true
       project: anima-style-adapter
-      name: anima-style-transfer-high-capacity-exactself-bootstrap-8000
-      id: anima-style-transfer-high-capacity-exactself-bootstrap-8000-v1
+      name: anima-style-transfer-high-capacity-native-cross-gate-8000
+      id: anima-style-transfer-high-capacity-native-cross-gate-8000-v1
   diagnostics:
     checkpoint: checkpoints/step-0000250.pt
     checkpoints:

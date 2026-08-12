@@ -448,7 +448,6 @@ class SharedLowRankStyleAdapter(nn.Module):
         slots: int = 16,
         hidden_dim: int = 2048,
         output_dim: int = 2048,
-        output_scale: float = 0.02,
         heads: int = 16,
         blocks: int = 28,
         rank: int = 16,
@@ -457,7 +456,6 @@ class SharedLowRankStyleAdapter(nn.Module):
         aggregator_slot_mixer_layers: int = 1,
         style_dropout: float = 0.12,
         gate_dim: int = 256,
-        initial_gate: float = 0.0,
         projection_mode: str = "learned_shared",
         context_dim: int | None = None,
         aggregator_mode: str = "transformer",
@@ -472,7 +470,6 @@ class SharedLowRankStyleAdapter(nn.Module):
         self.slots = slots
         self.hidden_dim = hidden_dim
         self.output_dim = output_dim
-        self.output_scale = float(output_scale)
         self.heads = heads
         self.head_dim = hidden_dim // heads
         self.blocks = blocks
@@ -527,10 +524,17 @@ class SharedLowRankStyleAdapter(nn.Module):
             ]
         )
         if self.connector_enabled:
-            self.block_embeddings = nn.Parameter(torch.empty(blocks, self.context_dim))
-            nn.init.normal_(self.block_embeddings, std=0.02)
+            self.block_embeddings = nn.Parameter(torch.zeros(blocks, self.context_dim))
         else:
             self.register_parameter("block_embeddings", None)
+        # Every connector block starts as an exact residual identity. The
+        # pretrained Anima cross-attention basis, not a random deep transform,
+        # defines the initial style path.
+        for layer in list(self.connector_trunk) + [
+            item for branch in self.connector_branches for item in branch
+        ]:
+            nn.init.zeros_(layer.output.weight)
+            nn.init.zeros_(layer.ff[-1].weight)
         self.k_down = nn.ModuleList([nn.Linear(self.context_dim, rank, bias=False) for _ in range(blocks)])
         self.k_up = nn.ModuleList([nn.Linear(rank, hidden_dim, bias=False) for _ in range(blocks)])
         self.v_down = nn.ModuleList([nn.Linear(self.context_dim, rank, bias=False) for _ in range(blocks)])
@@ -546,11 +550,6 @@ class SharedLowRankStyleAdapter(nn.Module):
                 nn.init.zeros_(layer.weight)
         for layer in self.o_up:
             nn.init.zeros_(layer.weight)
-        self.gate = nn.Sequential(nn.Linear(hidden_dim, gate_dim), nn.SiLU(), nn.Linear(gate_dim, blocks))
-        nn.init.zeros_(self.gate[-1].weight)
-        if not -1.0 < float(initial_gate) < 1.0:
-            raise ValueError("initial_gate must be strictly between -1 and 1")
-        nn.init.constant_(self.gate[-1].bias, math.atanh(float(initial_gate)))
         self._style_tokens: torch.Tensor | None = None
         self._style_block_tokens: list[torch.Tensor] | None = None
         self._runtime_gate_abs: dict[int, torch.Tensor] = {}
@@ -645,9 +644,11 @@ class SharedLowRankStyleAdapter(nn.Module):
         return list(self.style_context_proj.parameters()) + values
 
     def gate_bootstrap_parameters(self) -> list[nn.Parameter]:
-        if self.projection_mode == "pretrained_block_lora":
-            return list(self.gate.parameters())
-        return list(self.gate.parameters()) + self.output_parameters()
+        return self.output_parameters()
+
+    def gate_parameters(self) -> list[nn.Parameter]:
+        """Compatibility group: native Anima gate_cross has no adapter parameters."""
+        return []
 
     def unconditional(self, batch: int) -> torch.Tensor:
         return self.null_tokens.expand(batch, -1, -1)
@@ -689,8 +690,8 @@ class SharedLowRankStyleAdapter(nn.Module):
         self,
         block_index: int,
         normalized_x: torch.Tensor,
-        timestep_embedding: torch.Tensor,
         cross_attention: nn.Module,
+        cross_gate: torch.Tensor,
     ) -> torch.Tensor:
         if self._style_tokens is None:
             return torch.zeros_like(normalized_x)
@@ -719,17 +720,10 @@ class SharedLowRankStyleAdapter(nn.Module):
             attended = self.shared_o(attended) + output_delta
         else:
             attended = cross_attention.output_proj(attended) + output_delta
-        # Learned-shared mode starts through a zero output projection and a
-        # unit-centred gate. Pretrained-block mode already has a useful frozen
-        # K/V/O direction, so its zero gate preserves exact base-model output
-        # while receiving the first bootstrap gradient.
-        raw_gate = self.gate(timestep_embedding)[:, 0, block_index]
-        gate = (
-            torch.tanh(raw_gate)
-            if self.projection_mode == "pretrained_block_lora"
-            else 1.0 + torch.tanh(raw_gate)
-        )
-        result = attended * (self.output_scale * gate[:, None, None])
+        # Reuse Anima's pretrained channel-wise text cross-attention gate.
+        # There is no independent style scale or learnable timestep gate that
+        # can suppress the complete conditioning path as an optimization shortcut.
+        result = attended * cross_gate
         debug_label = self.__dict__.get("_debug_autograd_label")
         if block_index == 0 and debug_label:
             print(
@@ -738,14 +732,13 @@ class SharedLowRankStyleAdapter(nn.Module):
                 f"tokens_grad={self._style_tokens.requires_grad} "
                 f"context_grad={style.requires_grad} k_grad={k.requires_grad} "
                 f"v_grad={v.requires_grad} attended_grad={attended.requires_grad} "
-                f"gate_grad={gate.requires_grad} result_grad={result.requires_grad} "
+                f"gate_grad={cross_gate.requires_grad} result_grad={result.requires_grad} "
                 f"context_weight_trainable={self.style_context_proj.weight.requires_grad if self.projection_mode == 'pretrained_block_lora' else True} "
                 f"kv_trainable={self.k_up[block_index].weight.requires_grad} "
-                f"output_trainable={self.o_up[block_index].weight.requires_grad} "
-                f"gate_trainable={self.gate[-1].weight.requires_grad}",
+                f"output_trainable={self.o_up[block_index].weight.requires_grad}",
                 flush=True,
             )
-        self._runtime_gate_abs[block_index] = gate.detach().abs().mean()
+        self._runtime_gate_abs[block_index] = cross_gate.detach().abs().mean()
         self._runtime_residual_ratio[block_index] = (
             result.detach().float().square().mean().sqrt()
             / normalized_x.detach().float().square().mean().sqrt().clamp_min(1e-8)
@@ -815,8 +808,11 @@ def _style_block_forward(
     style_result = controller.attend(
         block.__dict__["_style_block_index"],
         rearrange(normalized_style, "b t h w d -> b (t h w) d"),
-        emb,
         block.cross_attn,
+        rearrange(
+            gate_cross.expand(batch, frames, height, width, -1),
+            "b t h w d -> b (t h w) d",
+        ),
     )
     x = x + rearrange(style_result, "b (t h w) d -> b t h w d", t=frames, h=height, w=width)
     normalized = block.layer_norm_mlp(x) * (1 + scale_mlp) + shift_mlp
@@ -2886,7 +2882,7 @@ def overfit_exact_self_batch(config: dict[str, Any], destination: Path) -> dict[
     adapter.style_dropout = 0.0
 
     output_parameters = adapter.output_parameters()
-    gate_parameters = list(adapter.gate.parameters())
+    gate_parameters = adapter.gate_parameters()
     special_ids = {id(value) for value in output_parameters + gate_parameters}
     representation_parameters = [
         value for value in adapter.parameters() if id(value) not in special_ids
@@ -3165,7 +3161,7 @@ def train_style_adapter(config: dict[str, Any], destination: Path, *, steps_over
     adapter = SharedLowRankStyleAdapter(**cfg["adapter"]).to(device)
     attach_style_adapter(anima, adapter)
     output_parameters = adapter.output_parameters()
-    gate_parameters = list(adapter.gate.parameters())
+    gate_parameters = adapter.gate_parameters()
     special_ids = {id(value) for value in output_parameters + gate_parameters}
     representation_parameters = [
         value for value in adapter.parameters() if id(value) not in special_ids
@@ -3442,7 +3438,7 @@ def train_style_adapter(config: dict[str, Any], destination: Path, *, steps_over
             "aggregator_grad": _parameter_grad_norm(adapter.aggregator.parameters()),
             "shared_kv_grad": _parameter_grad_norm(adapter.kv_parameters()),
             "style_output_grad": _parameter_grad_norm(adapter.output_parameters()),
-            "gate_grad": _parameter_grad_norm(adapter.gate.parameters()),
+            "gate_grad": _parameter_grad_norm(adapter.gate_parameters()),
             "resampler_grad": _parameter_grad_norm(resampler.parameters()),
             "resampler_grad_norm": float(resampler_grad_norm),
         }
