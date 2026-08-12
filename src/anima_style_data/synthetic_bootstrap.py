@@ -9,10 +9,64 @@ from typing import Any
 
 import torch
 import torch.nn.functional as F
+from torch import nn
 from PIL import Image
 from safetensors import safe_open
 
 from .io import read_records, write_json, write_records
+
+
+class ArtistCenteredEffectHead(nn.Module):
+    """Small query-conditioned residual head for reference-specific effects.
+
+    The large connector remains a frozen estimator of the population/common
+    artist effect.  This head sees an explicit mean/std descriptor of all
+    Resampler slots and is trained only on the remaining native-teacher error,
+    preventing reconstruction gradients from erasing reference identity.
+    """
+
+    def __init__(
+        self, style_dim: int = 1024, hidden_dim: int = 2048,
+        latent_dim: int = 512, blocks: int = 28,
+    ) -> None:
+        super().__init__()
+        self.style_dim = style_dim
+        self.hidden_dim = hidden_dim
+        self.descriptor = nn.Sequential(
+            nn.Linear(style_dim * 2, latent_dim, bias=False),
+            nn.SiLU(),
+            nn.Linear(latent_dim, latent_dim, bias=False),
+        )
+        self.query = nn.Linear(hidden_dim, latent_dim, bias=False)
+        self.modulation = nn.Linear(latent_dim, latent_dim * 2, bias=False)
+        self.block_embedding = nn.Parameter(torch.zeros(blocks, latent_dim))
+        self.output = nn.Sequential(
+            nn.LayerNorm(latent_dim),
+            nn.Linear(latent_dim, latent_dim * 2, bias=False),
+            nn.SiLU(),
+            nn.Linear(latent_dim * 2, hidden_dim, bias=False),
+        )
+        nn.init.zeros_(self.output[-1].weight)
+
+    def artist_latent(self, tokens: torch.Tensor) -> torch.Tensor:
+        normalized = F.layer_norm(tokens.float(), (tokens.shape[-1],)).to(tokens.dtype)
+        descriptor = torch.cat(
+            (normalized.mean(1), normalized.std(1, correction=0)), dim=-1
+        )
+        return self.descriptor(descriptor)
+
+    def forward(
+        self, tokens: torch.Tensor, queries: torch.Tensor, block: int
+    ) -> torch.Tensor:
+        # queries: [B,H,Q,D] -> one query-conditioned residual per Q position.
+        batch, _, query_count, _ = queries.shape
+        query = queries.transpose(1, 2).reshape(batch, query_count, self.hidden_dim)
+        latent = self.artist_latent(tokens)
+        scale, shift = self.modulation(latent).chunk(2, dim=-1)
+        values = self.query(F.layer_norm(query.float(), (self.hidden_dim,)).to(query.dtype))
+        values = values * (1 + 0.1 * torch.tanh(scale[:, None]))
+        values = values + shift[:, None] + self.block_embedding[block][None, None]
+        return self.output(values)
 
 
 def _root(config: dict[str, Any], destination: Path) -> Path:
@@ -672,6 +726,13 @@ def train_offline_kvo_bootstrap(
     adapter.aggregator.requires_grad_(False)
     adapter.null_tokens.requires_grad_(False)
     adapter.train()
+    centered_head = None
+    if bool(training.get("centered_effect_head", False)):
+        centered_head = ArtistCenteredEffectHead(
+            style_dim=int(resampler_cfg.get("style_dim", 1024)),
+            hidden_dim=int(config["style_transfer"]["adapter"]["hidden_dim"]),
+            latent_dim=int(training.get("centered_effect_latent_dim", 512)),
+        ).to(device)
     if phase == "b":
         initialization = training.get("initial_checkpoint") or training.get(
             "phase_a_checkpoint", "offline_kvo_bootstrap/checkpoints/best.pt"
@@ -681,6 +742,8 @@ def train_offline_kvo_bootstrap(
             initialization_checkpoint, map_location="cpu", weights_only=False
         )
         adapter.load_state_dict(state["adapter"])
+        if centered_head is not None and state.get("centered_head") is not None:
+            centered_head.load_state_dict(state["centered_head"])
         resampler_initialization = training.get("resampler_initial_checkpoint")
         if resampler_initialization:
             resampler_state = torch.load(
@@ -793,6 +856,12 @@ def train_offline_kvo_bootstrap(
     if remaining_parameters:
         raise RuntimeError(f"Unassigned adapter parameters: {len(remaining_parameters)}")
     adapter_parameters = bridge_parameters + connector_parameters + kvo_parameters
+    if centered_head is not None and bool(training.get("freeze_base_connector", True)):
+        adapter.requires_grad_(False)
+        bridge_parameters = []
+        connector_parameters = []
+        kvo_parameters = []
+        adapter_parameters = []
     resampler_parameters = (
         _enable_phase_b_resampler(
             resampler, int(training.get("resampler_trainable_encoder_layers", 1))
@@ -800,11 +869,20 @@ def train_offline_kvo_bootstrap(
         if phase == "b" else []
     )
     parameters = adapter_parameters + resampler_parameters
-    optimizer_groups: list[dict[str, Any]] = [
-        {"params": bridge_parameters, "lr": float(training.get("bridge_learning_rate", 2e-6)), "name": "bridge"},
-        {"params": connector_parameters, "lr": float(training.get("connector_learning_rate", 5e-6)), "name": "connector"},
-        {"params": kvo_parameters, "lr": float(training.get("learning_rate", 2e-5)), "name": "kvo"},
-    ]
+    optimizer_groups: list[dict[str, Any]] = []
+    for name, values, rate in (
+        ("bridge", bridge_parameters, float(training.get("bridge_learning_rate", 2e-6))),
+        ("connector", connector_parameters, float(training.get("connector_learning_rate", 5e-6))),
+        ("kvo", kvo_parameters, float(training.get("learning_rate", 2e-5))),
+    ):
+        if values:
+            optimizer_groups.append({"params": values, "lr": rate, "name": name})
+    if centered_head is not None:
+        optimizer_groups.append({
+            "params": list(centered_head.parameters()),
+            "lr": float(training.get("centered_effect_learning_rate", 1e-4)),
+            "name": "centered_head",
+        })
     if resampler_parameters:
         optimizer_groups.append({
             "params": resampler_parameters, "name": "resampler",
@@ -986,7 +1064,8 @@ def train_offline_kvo_bootstrap(
                     )
 
             def student_output(
-                context: torch.Tensor, query: torch.Tensor = q
+                context: torch.Tensor, query: torch.Tensor = q,
+                source_tokens: torch.Tensor = tokens,
             ) -> torch.Tensor:
                 with torch.autocast("cuda", dtype=torch.bfloat16):
                     sk = F.linear(context, kw) + adapter.k_up[block](adapter.k_down[block](context))
@@ -998,7 +1077,10 @@ def train_offline_kvo_bootstrap(
                     sv = sv.reshape(context.shape[0], -1, heads, head_dim).transpose(1, 2)
                     attended = F.scaled_dot_product_attention(query, sk, sv)
                     attended = attended.transpose(1, 2).reshape(context.shape[0], attended.shape[2], hidden)
-                    return F.linear(attended, ow) + adapter.o_up[block](adapter.o_down[block](attended))
+                    output = F.linear(attended, ow) + adapter.o_up[block](adapter.o_down[block](attended))
+                    if centered_head is not None:
+                        output = output + centered_head(source_tokens, query, block)
+                    return output
 
             student = student_output(contexts[block])
             use_rank = train and len(batch_rows) > 1 and float(training.get("functional_rank_weight", 0.0)) > 0
@@ -1052,7 +1134,10 @@ def train_offline_kvo_bootstrap(
                     count, count, -1, -1, -1
                 ).reshape(count * count, *q.shape[1:])
                 candidate_outputs = student_output(
-                    candidate_contexts, candidate_queries
+                    candidate_contexts, candidate_queries,
+                    tokens[None].expand(count, count, -1, -1).reshape(
+                        count * count, tokens.shape[1], tokens.shape[2]
+                    ),
                 ).float().reshape(count, count, *teacher_float.shape[1:])
                 candidate_directions = F.normalize(candidate_outputs.flatten(2), dim=-1)
                 teacher_directions = F.normalize(teacher_float.flatten(1), dim=-1)
@@ -1386,6 +1471,11 @@ def train_offline_kvo_bootstrap(
                 kvo_parameters, float(training.get("max_grad_norm", 1.0))
             ),
         }
+        if centered_head is not None:
+            grad_norms["centered_head"] = torch.nn.utils.clip_grad_norm_(
+                centered_head.parameters(),
+                float(training.get("centered_effect_max_grad_norm", 1.0)),
+            )
         if resampler_parameters:
             grad_norms["resampler"] = torch.nn.utils.clip_grad_norm_(
                 resampler_parameters, float(training.get("resampler_max_grad_norm", 0.1))
@@ -1396,6 +1486,7 @@ def train_offline_kvo_bootstrap(
             "connector": float(training.get("connector_learning_rate", 5e-6)),
             "kvo": float(training.get("learning_rate", 2e-5)),
             "resampler": float(training.get("resampler_learning_rate", 1e-5)),
+            "centered_head": float(training.get("centered_effect_learning_rate", 1e-4)),
         }
         for group in optimizer.param_groups:
             group_scale = 0.0 if (
@@ -1440,6 +1531,7 @@ def train_offline_kvo_bootstrap(
                 state = {
                     "phase": phase, "step": step, "adapter": adapter.state_dict(),
                     "resampler": resampler.state_dict() if phase == "b" else None,
+                    "centered_head": centered_head.state_dict() if centered_head is not None else None,
                     "config": training, "validation": val,
                 }
                 torch.save(state, checkpoint_dir / "best.tmp")
@@ -1458,6 +1550,7 @@ def train_offline_kvo_bootstrap(
             state = {
                 "phase": phase, "step": step, "adapter": adapter.state_dict(),
                 "resampler": resampler.state_dict() if phase == "b" else None,
+                "centered_head": centered_head.state_dict() if centered_head is not None else None,
                 "optimizer": optimizer.state_dict(), "config": training,
                 "random_state": generator.getstate(),
             }
@@ -1474,6 +1567,8 @@ def train_offline_kvo_bootstrap(
     adapter.load_state_dict(best["adapter"])
     if phase == "b" and best.get("resampler") is not None:
         resampler.load_state_dict(best["resampler"])
+    if centered_head is not None and best.get("centered_head") is not None:
+        centered_head.load_state_dict(best["centered_head"])
     final_validation = evaluate(validation_rows, int(training.get("validation_batches", 8)))
     # Meta-test is deliberately touched once, only after validation selected
     # the checkpoint.  It never participates in early stopping or tuning.
