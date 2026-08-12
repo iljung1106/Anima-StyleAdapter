@@ -438,6 +438,54 @@ class ConnectorTransformerLayer(nn.Module):
         return values + self.ff(self.norm_ff(values))
 
 
+class QueryConditionedReferenceHead(nn.Module):
+    """Read all style slots with the native Anima query at each block."""
+
+    def __init__(
+        self, style_dim: int = 1024, hidden_dim: int = 2048,
+        latent_dim: int = 512, blocks: int = 28, heads: int = 8,
+    ) -> None:
+        super().__init__()
+        if latent_dim % heads:
+            raise ValueError("Reference-head latent dim must divide its head count")
+        self.style_dim = style_dim
+        self.hidden_dim = hidden_dim
+        self.heads = heads
+        self.head_dim = latent_dim // heads
+        self.style_kv = nn.Linear(style_dim, latent_dim * 2, bias=False)
+        self.query = nn.Linear(hidden_dim, latent_dim, bias=False)
+        self.block_embedding = nn.Parameter(torch.zeros(blocks, latent_dim))
+        self.output = nn.Sequential(
+            nn.LayerNorm(latent_dim),
+            nn.Linear(latent_dim, latent_dim * 2, bias=False),
+            nn.SiLU(),
+            nn.Linear(latent_dim * 2, hidden_dim, bias=False),
+        )
+        nn.init.zeros_(self.output[-1].weight)
+
+    def forward(
+        self, tokens: torch.Tensor, queries: torch.Tensor, block: int
+    ) -> torch.Tensor:
+        batch, _, query_count, _ = queries.shape
+        query = queries.transpose(1, 2).reshape(batch, query_count, self.hidden_dim)
+        query = self.query(
+            F.layer_norm(query.float(), (self.hidden_dim,)).to(query.dtype)
+        ) + self.block_embedding[block][None, None]
+        style = F.layer_norm(tokens.float(), (tokens.shape[-1],)).to(tokens.dtype)
+        key, value = self.style_kv(style).chunk(2, dim=-1)
+
+        def split_heads(values: torch.Tensor) -> torch.Tensor:
+            return values.reshape(
+                batch, values.shape[1], self.heads, self.head_dim
+            ).transpose(1, 2)
+
+        attended = F.scaled_dot_product_attention(
+            split_heads(query), split_heads(key), split_heads(value)
+        )
+        attended = attended.transpose(1, 2).reshape(batch, query_count, -1)
+        return self.output(attended)
+
+
 class SharedLowRankStyleAdapter(nn.Module):
     """Set aggregation plus either learned or pretrained block K/V/O projections."""
 
@@ -465,6 +513,9 @@ class SharedLowRankStyleAdapter(nn.Module):
         connector_groups: int = 4,
         connector_group_layers: int = 0,
         connector_summary_tokens: bool = False,
+        reference_effect_head: bool = False,
+        reference_effect_latent_dim: int = 512,
+        reference_effect_heads: int = 8,
     ):
         super().__init__()
         self.style_dim = style_dim
@@ -555,6 +606,16 @@ class SharedLowRankStyleAdapter(nn.Module):
                 nn.init.zeros_(layer.weight)
         for layer in self.o_up:
             nn.init.zeros_(layer.weight)
+        self.reference_effect_head = (
+            QueryConditionedReferenceHead(
+                style_dim=style_dim,
+                hidden_dim=hidden_dim,
+                latent_dim=reference_effect_latent_dim,
+                blocks=blocks,
+                heads=reference_effect_heads,
+            )
+            if reference_effect_head else None
+        )
         self._style_tokens: torch.Tensor | None = None
         self._style_block_tokens: list[torch.Tensor] | None = None
         self._runtime_gate_abs: dict[int, torch.Tensor] = {}
@@ -769,6 +830,10 @@ class SharedLowRankStyleAdapter(nn.Module):
             attended = self.shared_o(attended) + output_delta
         else:
             attended = cross_attention.output_proj(attended) + output_delta
+        if self.reference_effect_head is not None:
+            attended = attended + self.reference_effect_head(
+                self._style_tokens, q, block_index
+            )
         # Reuse Anima's pretrained channel-wise text cross-attention gate.
         # There is no independent style scale or learnable timestep gate that
         # can suppress the complete conditioning path as an optimization shortcut.

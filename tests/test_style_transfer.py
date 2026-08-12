@@ -9,6 +9,7 @@ from torch import nn
 
 from anima_style_data.style_transfer import (
     ProductionStyleLoader,
+    QueryConditionedReferenceHead,
     SharedLowRankStyleAdapter,
     MinimalSlotSetAggregator,
     SlotSetAggregator,
@@ -38,6 +39,20 @@ from anima_style_data.style_transfer import (
     _uncached_no_grad_autocast,
     attach_style_adapter,
 )
+
+
+def test_query_conditioned_reference_head_preserves_query_positions():
+    head = QueryConditionedReferenceHead(
+        style_dim=16, hidden_dim=32, latent_dim=16, blocks=2, heads=4
+    )
+    with torch.no_grad():
+        head.output[-1].weight.normal_(std=0.01)
+    tokens = torch.randn(3, 8, 16)
+    queries = torch.randn(3, 4, 5, 8)
+    result = head(tokens, queries, block=1)
+
+    assert result.shape == (3, 5, 32)
+    assert torch.isfinite(result).all()
 
 
 def test_learning_rate_warmup_and_cosine_decay():

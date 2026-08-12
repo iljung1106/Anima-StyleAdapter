@@ -16,66 +16,6 @@ from safetensors import safe_open
 from .io import read_records, write_json, write_records
 
 
-class ArtistCenteredEffectHead(nn.Module):
-    """Small query-conditioned residual head for reference-specific effects.
-
-    The large connector remains a frozen estimator of the population/common
-    artist effect.  This head sees an explicit mean/std descriptor of all
-    Resampler slots and is trained only on the remaining native-teacher error,
-    preventing reconstruction gradients from erasing reference identity.
-    """
-
-    def __init__(
-        self, style_dim: int = 1024, hidden_dim: int = 2048,
-        latent_dim: int = 512, blocks: int = 28, heads: int = 8,
-    ) -> None:
-        super().__init__()
-        if latent_dim % heads:
-            raise ValueError("Centered-effect latent dim must divide its head count")
-        self.style_dim = style_dim
-        self.hidden_dim = hidden_dim
-        self.heads = heads
-        self.head_dim = latent_dim // heads
-        self.style_kv = nn.Linear(style_dim, latent_dim * 2, bias=False)
-        self.query = nn.Linear(hidden_dim, latent_dim, bias=False)
-        self.block_embedding = nn.Parameter(torch.zeros(blocks, latent_dim))
-        self.output = nn.Sequential(
-            nn.LayerNorm(latent_dim),
-            nn.Linear(latent_dim, latent_dim * 2, bias=False),
-            nn.SiLU(),
-            nn.Linear(latent_dim * 2, hidden_dim, bias=False),
-        )
-        nn.init.zeros_(self.output[-1].weight)
-
-    def forward(
-        self, tokens: torch.Tensor, queries: torch.Tensor, block: int
-    ) -> torch.Tensor:
-        # Preserve all 128 Resampler slots. Each native Anima query chooses the
-        # reference details useful for its own spatial position instead of
-        # receiving a single mean/std artist descriptor.
-        batch, _, query_count, _ = queries.shape
-        query = queries.transpose(1, 2).reshape(batch, query_count, self.hidden_dim)
-        query = self.query(
-            F.layer_norm(query.float(), (self.hidden_dim,)).to(query.dtype)
-        ) + self.block_embedding[block][None, None]
-        style = F.layer_norm(tokens.float(), (tokens.shape[-1],)).to(tokens.dtype)
-        key, value = self.style_kv(style).chunk(2, dim=-1)
-
-        def split_heads(values: torch.Tensor) -> torch.Tensor:
-            return values.reshape(
-                batch, values.shape[1], self.heads, self.head_dim
-            ).transpose(1, 2)
-
-        attended = F.scaled_dot_product_attention(
-            split_heads(query), split_heads(key), split_heads(value)
-        )
-        attended = attended.transpose(1, 2).reshape(batch, query_count, -1)
-        # Do not add the query as an output residual: that would let the head
-        # predict a reference-independent correction while completely ignoring
-        # style values. The query may only select which style slots are read.
-        return self.output(attended)
-
-
 def _root(config: dict[str, Any], destination: Path) -> Path:
     name = config["synthetic_teacher"].get("output_directory", "synthetic_teacher")
     return destination / str(name)
@@ -839,7 +779,11 @@ def train_offline_kvo_bootstrap(
     """Distill native artist attention effects without running Anima's transformer."""
     from safetensors.torch import load_file
 
-    from .style_transfer import SharedLowRankStyleAdapter, load_per_reference_resampler
+    from .style_transfer import (
+        QueryConditionedReferenceHead,
+        SharedLowRankStyleAdapter,
+        load_per_reference_resampler,
+    )
     from .tap_resampler import _load_feature_batch
 
     cfg = config["synthetic_teacher"]
@@ -921,7 +865,7 @@ def train_offline_kvo_bootstrap(
     adapter.train()
     centered_head = None
     if bool(training.get("centered_effect_head", False)):
-        centered_head = ArtistCenteredEffectHead(
+        centered_head = QueryConditionedReferenceHead(
             style_dim=int(resampler_cfg.get("style_dim", 1024)),
             hidden_dim=int(config["style_transfer"]["adapter"]["hidden_dim"]),
             latent_dim=int(training.get("centered_effect_latent_dim", 512)),
