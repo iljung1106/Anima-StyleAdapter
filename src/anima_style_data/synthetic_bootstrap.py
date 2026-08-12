@@ -684,6 +684,12 @@ def train_offline_kvo_bootstrap(
     for row in probe_rows:
         probe_keys[(int(row["content_index"]), int(row["block"]))].append(str(row["key"]))
     text_rows = {int(row["condition_id"]): row for row in read_records(root / "text" / "manifest.parquet")}
+    artist_content_condition: dict[tuple[str, int], int] = {}
+    for row in rows:
+        artist_content_condition.setdefault(
+            (str(row["artist"]), int(row["content_index"])),
+            int(row["artist_condition_id"]),
+        )
     text_cache: dict[str, torch.Tensor] = {}
     for name in sorted({str(row["cache_shard"]) for row in text_rows.values()}):
         text_cache[name] = load_file(root / "text" / name, device="cpu")[
@@ -847,6 +853,8 @@ def train_offline_kvo_bootstrap(
         rank_losses = []
         contrastive_losses = []
         contrastive_accuracies = []
+        all_pair_direction_losses = []
+        all_pair_magnitude_losses = []
         block_count = int(training.get("blocks_per_step", 7)) if train else 28
         if train and block_count == adapter.blocks_per_group:
             group = generator.randrange(adapter.blocks // adapter.blocks_per_group)
@@ -957,6 +965,41 @@ def train_offline_kvo_bootstrap(
                 labels = torch.arange(count, device=logits.device)
                 contrastive_losses.append(F.cross_entropy(logits, labels))
                 contrastive_accuracies.append((logits.argmax(dim=1) == labels).float().mean())
+                if float(training.get("functional_all_pairs_weight", 0.0)) > 0:
+                    pair_conditions = torch.stack([
+                        text(artist_content_condition[
+                            (str(reference["artist"]), int(target["content_index"]))
+                        ])
+                        for target in batch_rows
+                        for reference in reference_rows
+                    ])
+                    pair_content = content_contexts[:, None].expand(
+                        count, count, -1, -1
+                    ).reshape(count * count, *content_contexts.shape[1:])
+                    pair_q = q[:, None].expand(
+                        count, count, -1, -1, -1
+                    ).reshape(count * count, *q.shape[1:])
+                    with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
+                        pair_ka, pair_va = native_kv(pair_conditions)
+                        pair_kc, pair_vc = native_kv(pair_content)
+                        pair_teacher = (
+                            _batched_attention_output(pair_q, pair_ka, pair_va, ow)
+                            - _batched_attention_output(pair_q, pair_kc, pair_vc, ow)
+                        ).float().reshape_as(candidate_outputs)
+                    pair_student_flat = candidate_outputs.flatten(2)
+                    pair_teacher_flat = pair_teacher.flatten(2)
+                    all_pair_direction_losses.append(
+                        (1 - F.cosine_similarity(
+                            pair_student_flat, pair_teacher_flat, dim=-1
+                        )).mean()
+                    )
+                    pair_student_rms = pair_student_flat.square().mean(-1).sqrt().clamp_min(1e-6)
+                    pair_teacher_rms = pair_teacher_flat.square().mean(-1).sqrt().clamp_min(1e-6)
+                    all_pair_magnitude_losses.append(F.smooth_l1_loss(
+                        torch.log(pair_student_rms),
+                        torch.log(pair_teacher_rms),
+                        beta=0.5,
+                    ))
         output_loss = torch.stack(output_losses).mean()
         cosine_loss = (1 - torch.stack(cosines)).mean()
         rms_loss = torch.stack(rms_losses).mean()
@@ -964,6 +1007,14 @@ def train_offline_kvo_bootstrap(
         contrastive_loss = (
             torch.stack(contrastive_losses).mean()
             if contrastive_losses else output_loss.new_zeros(())
+        )
+        all_pair_direction_loss = (
+            torch.stack(all_pair_direction_losses).mean()
+            if all_pair_direction_losses else output_loss.new_zeros(())
+        )
+        all_pair_magnitude_loss = (
+            torch.stack(all_pair_magnitude_losses).mean()
+            if all_pair_magnitude_losses else output_loss.new_zeros(())
         )
         contrastive_scale = 1.0
         if train:
@@ -986,6 +1037,13 @@ def train_offline_kvo_bootstrap(
             + contrastive_scale
             * float(training.get("functional_contrastive_weight", 0.0))
             * contrastive_loss
+            + contrastive_scale
+            * float(training.get("functional_all_pairs_weight", 0.0))
+            * (
+                all_pair_direction_loss
+                + float(training.get("functional_all_pairs_magnitude_weight", 0.02))
+                * all_pair_magnitude_loss
+            )
         )
         zero_mse = torch.stack(zero_mses).mean()
         student_mse = torch.stack(student_mses).mean()
@@ -1001,6 +1059,12 @@ def train_offline_kvo_bootstrap(
                 if contrastive_accuracies else 0.0
             ),
             "functional_contrastive_scale": float(contrastive_scale),
+            "functional_all_pairs_direction_loss": float(
+                all_pair_direction_loss.detach()
+            ),
+            "functional_all_pairs_magnitude_loss": float(
+                all_pair_magnitude_loss.detach()
+            ),
             "zero_improvement": float((1 - student_mse / zero_mse.clamp_min(1e-12)).detach()),
             "teacher_rms": float(torch.stack(zero_mses).mean().sqrt().detach()),
             "student_rms": float(torch.stack(student_mses).mean().sqrt().detach()),
