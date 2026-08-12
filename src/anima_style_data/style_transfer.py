@@ -3600,7 +3600,9 @@ def smoke_test_style_adapter(config: dict[str, Any], destination: Path) -> dict[
     training["validation_every"] = 1
     training["validation_batches"] = 1
     training["checkpoint_every"] = 1
-    training["sample_every"] = 1
+    # The smoke contract is forward/backward/checkpoint validity. Full image
+    # sampling is substantially slower and is tested by style-sample itself.
+    training["sample_every"] = int(training.get("smoke_sample_every", 0))
     # Exercise both sides of the new production transition in two real steps:
     # exact-zero gate-only self-reference, then frozen-oracle distillation with
     # the complete student path open.
