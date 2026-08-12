@@ -231,6 +231,87 @@ def cache_synthetic_teacher_text(
     return summary
 
 
+def cache_synthetic_teacher_kv_basis(
+    config: dict[str, Any], destination: Path, prompts: list[dict[str, Any]]
+) -> dict[str, Any]:
+    """Cache a lossless compact factorization of native artist K/V targets."""
+    from safetensors import safe_open
+    from safetensors.torch import load_file, save_file
+
+    cfg = config["synthetic_teacher"]
+    root = destination / str(cfg.get("output_directory", "synthetic_teacher"))
+    output = root / "anima_kv_teacher"
+    output.mkdir(parents=True, exist_ok=True)
+    manifest_path = output / "manifest.parquet"
+    projection_path = output / "native_cross_attention.safetensors"
+    artist_prompts = [row for row in prompts if row["kind"] == "artist"]
+    if manifest_path.exists() and projection_path.exists():
+        existing = read_records(manifest_path)
+        if len(existing) == len(artist_prompts):
+            return {
+                "conditions": len(existing), "reused": len(existing),
+                "projection_bytes": projection_path.stat().st_size,
+                "representation": "post_llm_pair_plus_frozen_kvo",
+            }
+
+    text_root = root / "text"
+    text_rows = read_records(text_root / "manifest.parquet")
+    by_id = {int(row["condition_id"]): row for row in text_rows}
+    shard_cache: dict[str, Any] = {}
+
+    def cached_condition(condition_id: int):
+        row = by_id[condition_id]
+        name = str(row["cache_shard"])
+        if name not in shard_cache:
+            shard_cache[name] = load_file(text_root / name, device="cpu")["conditioning"]
+        return shard_cache[name][int(row["row_index"])]
+
+    base_lengths: dict[int, int] = {}
+    for row in prompts:
+        if row["kind"] == "content":
+            value = cached_condition(int(row["condition_id"]))
+            base_lengths[int(row["condition_id"])] = int(value.abs().amax(dim=-1).ne(0).sum())
+    records = []
+    for row in artist_prompts:
+        artist_id = int(row["condition_id"])
+        content_id = int(row["content_index"])
+        value = cached_condition(artist_id)
+        records.append({
+            **row,
+            "artist_condition_id": artist_id,
+            "content_condition_id": content_id,
+            "artist_token_length": int(value.abs().amax(dim=-1).ne(0).sum()),
+            "content_token_length": base_lengths[content_id],
+        })
+    write_records(manifest_path, records)
+    del shard_cache
+
+    models = _resolve_model_files(config["anima_cache"]["models"], destination)
+    selected: dict[str, Any] = {}
+    wanted = ("k_proj.weight", "v_proj.weight", "output_proj.weight", "k_norm.weight", "v_norm.weight")
+    with safe_open(models["dit"], framework="pt", device="cpu") as handle:
+        keys = set(handle.keys())
+        for block in range(28):
+            prefix = f"net.blocks.{block}.cross_attn."
+            for suffix in wanted:
+                source = prefix + suffix
+                if source in keys:
+                    selected[f"block_{block:02d}.{suffix}"] = handle.get_tensor(source).contiguous()
+    projection_weights = sum(key.endswith("proj.weight") for key in selected)
+    if projection_weights != 28 * 3:
+        raise RuntimeError(f"Expected 84 native K/V/O projections, found {projection_weights}")
+    save_file(selected, projection_path)
+    summary = {
+        "conditions": len(records), "content_conditions": len(base_lengths), "blocks": 28,
+        "projection_tensors": len(selected), "projection_bytes": projection_path.stat().st_size,
+        "representation": "post_llm_pair_plus_frozen_kvo",
+        "exact_reconstruction": "project artist and content separately, then apply native per-head normalization",
+        "full_kv_materialization_avoided": True,
+    }
+    write_json(output / "summary.json", summary)
+    return summary
+
+
 def _save_webp(path: Path, pixels, quality: int) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     image = Image.fromarray(pixels)
@@ -571,6 +652,7 @@ def generate_synthetic_teacher_images(
 def build_synthetic_teacher_cache(config: dict[str, Any], destination: Path) -> dict[str, Any]:
     plan, prompts = build_synthetic_teacher_plan(config, destination)
     text = cache_synthetic_teacher_text(config, destination, prompts)
+    kv_teacher = cache_synthetic_teacher_kv_basis(config, destination, prompts)
     generation = generate_synthetic_teacher_images(config, destination, plan)
     cfg = config["synthetic_teacher"]
     root = destination / str(cfg.get("output_directory", "synthetic_teacher"))
@@ -581,7 +663,7 @@ def build_synthetic_teacher_cache(config: dict[str, Any], destination: Path) -> 
         "model_cache_directory": str(destination / "cradio_model_cache"),
     })
     features = extract_selected_style_features(feature_config, destination)
-    result = {"plan": len(plan), "text": text, "generation": generation, "features": features}
+    result = {"plan": len(plan), "text": text, "kv_teacher": kv_teacher, "generation": generation, "features": features}
     write_json(root / "summary.json", result)
     return result
 
@@ -594,3 +676,10 @@ def benchmark_synthetic_teacher_cache(config: dict[str, Any], destination: Path)
         config, destination, plan, benchmark_only=True
     )
     return {"plan": len(plan), "text": text, "benchmark": benchmark}
+
+
+def build_synthetic_teacher_kv_cache(config: dict[str, Any], destination: Path) -> dict[str, Any]:
+    _, prompts = build_synthetic_teacher_plan(config, destination)
+    text = cache_synthetic_teacher_text(config, destination, prompts)
+    teacher = cache_synthetic_teacher_kv_basis(config, destination, prompts)
+    return {"text": text, "kv_teacher": teacher}

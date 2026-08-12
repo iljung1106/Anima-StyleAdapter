@@ -676,3 +676,21 @@ encoder, VAE decode와 C-RADIO는 batch 실행한다. Anima sampling은 SageAtte
 SPEED를 비교하고, VAE batch 1과 후보 batch의 decode 결과가 정상·유한하며 실제 처리량이
 증가하는지 확인한다. 목표 wall time은 H100 한 장에서 4시간 이내이며, 최초 benchmark의 실측
 처리량으로 전체 ETA를 갱신한다.
+
+### Compact native K/V/O teacher cache
+
+Connector bootstrap에는 4,000개 artist+content 조건과 8개 content-only 조건의 post-LLM
+tensor를 보존한다. 28블록의 512-token K/V를 조건마다 직접 저장하면 약 0.9TB가 되고,
+student의 128 style slot과 token-wise 대응도 성립하지 않는다. 대신 다음의 손실 없는
+factorization을 저장한다.
+
+- 이미 캐시된 artist/content post-LLM condition과 각 유효 token 길이
+- frozen Anima 28블록의 `k_proj`, `v_proj`, `output_proj` 및 K/V norm 파라미터 한 벌
+- artist condition과 짝을 이루는 content-only condition ID
+
+K/V projection 이전 좌표를 보존하므로 bootstrap 시 Anima 전체 transformer 없이 native
+artist/content K/V를 정확히 재구성할 수 있다. Normalization은 artist와 content를 각각
+projection한 뒤 원래 head 단위로 적용한다. Raw K/V 원소 MSE보다는 probe Q에 대한
+attention-logit/output loss를 주목표로 쓰며, frozen `output_proj`가 native O 좌표를
+제공한다. Noisy latent와 timestep에 의존하는 실제 block O 및 velocity residual은 정적
+캐시하지 않고 이후 제한된 online Anima distillation에서 계산한다.

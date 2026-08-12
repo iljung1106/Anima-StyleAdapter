@@ -86,6 +86,7 @@ def build_parser() -> argparse.ArgumentParser:
         ("style-calibrate", "Measure empirical Anima artist-tag velocity effect ranges"),
         ("synthetic-teacher", "Generate and fully cache artist-tag teacher images"),
         ("synthetic-teacher-benchmark", "Validate SPEED and batched VAE before production"),
+        ("synthetic-teacher-kv", "Cache factorized native Anima K/V/O teacher targets"),
         ("prepare", "Run selection, download, and duplicate removal"),
         ("all", "Run every stage, including tagger and C-RADIO models"),
     ):
@@ -181,6 +182,10 @@ def main() -> None:
         from .synthetic_teacher import benchmark_synthetic_teacher_cache
 
         _run(benchmark_synthetic_teacher_cache, config, destination)
+    elif args.command == "synthetic-teacher-kv":
+        from .synthetic_teacher import build_synthetic_teacher_kv_cache
+
+        _run(build_synthetic_teacher_kv_cache, config, destination)
     elif args.command in {"prepare", "all"}:
         for stage in (select_candidates, download_candidates, deduplicate):
             _run(stage, config, destination)
