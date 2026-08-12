@@ -88,6 +88,7 @@ def build_parser() -> argparse.ArgumentParser:
         ("synthetic-teacher-benchmark", "Validate SPEED and batched VAE before production"),
         ("synthetic-teacher-kv", "Cache factorized native Anima K/V/O teacher targets"),
         ("real-artist-teacher-kv", "Cache 5k real-artist text and native K/V/O teacher targets"),
+        ("real-artist-style-tokens", "Cache Resampler tokens for fixed 5k-artist references"),
         ("synthetic-validate", "Validate synthetic corpus, artist effects, and fixed splits"),
         ("synthetic-query-probes", "Capture native Anima query probe bank"),
         ("synthetic-style-tokens", "Cache frozen per-reference Resampler tokens"),
@@ -198,6 +199,10 @@ def main() -> None:
         from .synthetic_teacher import build_real_artist_teacher_kv_cache
 
         _run(build_real_artist_teacher_kv_cache, config, destination)
+    elif args.command == "real-artist-style-tokens":
+        from .synthetic_bootstrap import cache_real_artist_resampler_tokens
+
+        _run(cache_real_artist_resampler_tokens, config, destination)
     elif args.command == "synthetic-validate":
         from .synthetic_bootstrap import validate_synthetic_teacher_corpus
 

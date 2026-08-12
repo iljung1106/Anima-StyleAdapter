@@ -552,6 +552,113 @@ def cache_synthetic_resampler_tokens(
     return summary
 
 
+def cache_real_artist_resampler_tokens(
+    config: dict[str, Any], destination: Path
+) -> dict[str, Any]:
+    """Cache frozen Resampler tokens for the fixed 5k-artist references."""
+    from safetensors import safe_open
+    from safetensors.torch import save_file
+
+    from .style_transfer import load_per_reference_resampler
+
+    cfg = config["real_artist_teacher"]
+    root = destination / str(cfg.get("output_directory", "real_artist_teacher_5000"))
+    output = root / str(cfg.get("style_token_directory", "resampler_tokens"))
+    output.mkdir(parents=True, exist_ok=True)
+    final_manifest = output / "manifest.parquet"
+    summary_path = output / "summary.json"
+    if final_manifest.exists() and summary_path.exists():
+        rows = read_records(final_manifest)
+        return {
+            "images": len(rows),
+            "shards": len({row["token_shard"] for row in rows}),
+            "storage_bytes": sum(
+                path.stat().st_size for path in output.glob("part-*.safetensors")
+            ),
+            "reused": len(rows),
+        }
+    references = read_records(root / "references.parquet")
+    feature_root = destination / str(cfg.get("feature_directory", "style_features"))
+    feature_rows = {
+        int(row["id"]): row for row in read_records(feature_root / "manifest.parquet")
+    }
+    rows = [{**row, **feature_rows[int(row["id"])]} for row in references]
+    grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for row in rows:
+        grouped[str(row["feature_shard"])].append(row)
+    device = str(config["synthetic_teacher"].get("device", "cuda"))
+    resampler_cfg = config["style_transfer"]["resampler"]
+    resampler = load_per_reference_resampler(
+        destination, resampler_cfg, device, trainable=False
+    )
+    batch_size = int(cfg.get("style_token_batch_size", 32))
+    records = []
+    for shard_index, (feature_shard, shard_rows) in enumerate(sorted(grouped.items())):
+        token_name = f"part-{shard_index:05d}.safetensors"
+        token_path = output / token_name
+        row_path = output / f"part-{shard_index:05d}.parquet"
+        if token_path.exists() and row_path.exists():
+            records.extend(read_records(row_path))
+            continue
+        token_parts = []
+        with safe_open(feature_root / feature_shard, framework="pt", device="cpu") as handle:
+            for offset in range(0, len(shard_rows), batch_size):
+                part = shard_rows[offset : offset + batch_size]
+                ids = [int(row["id"]) for row in part]
+                features = {
+                    layer: torch.stack([
+                        handle.get_tensor(f"{image_id}.layer_{layer:02d}_spatial")
+                        for image_id in ids
+                    ]).to(device, non_blocking=True)
+                    for layer in (18, 24)
+                }
+                counts = torch.tensor(
+                    [int(row["spatial_tokens"]) for row in part], device=device
+                )
+                mask = torch.arange(features[18].shape[1], device=device)[None] < counts[:, None]
+                global_feature = torch.stack([
+                    handle.get_tensor(f"{image_id}.layer_24_siglip_cls")
+                    for image_id in ids
+                ]).to(device, non_blocking=True)
+                with torch.inference_mode(), torch.autocast(
+                    "cuda", dtype=torch.bfloat16, enabled=device.startswith("cuda")
+                ):
+                    _, tokens = resampler.encode(features, mask, global_feature)
+                token_parts.append(tokens.cpu().to(torch.bfloat16).contiguous())
+        tokens = torch.cat(token_parts)
+        if tuple(tokens.shape[1:]) != (128, 1024) or not torch.isfinite(tokens).all():
+            raise RuntimeError(f"Invalid real-reference token shard: {tuple(tokens.shape)}")
+        temporary = token_path.with_suffix(".safetensors.tmp")
+        save_file({"tokens": tokens}, temporary)
+        temporary.replace(token_path)
+        shard_records = [{
+            "id": int(row["id"]), "artist": str(row["artist"]),
+            "artist_split": str(row["artist_split"]),
+            "reference_split": str(row["reference_split"]),
+            "token_shard": token_name, "token_row": index,
+            "slots": 128, "style_dim": 1024,
+        } for index, row in enumerate(shard_rows)]
+        write_records(row_path, shard_records)
+        records.extend(shard_records)
+        print(
+            f"cached real-artist token shard {shard_index + 1}/{len(grouped)} "
+            f"({len(records)}/{len(rows)} images)", flush=True,
+        )
+    if {int(row["id"]) for row in records} != {int(row["id"]) for row in rows}:
+        raise RuntimeError("Real-artist token cache ID set mismatch")
+    write_records(final_manifest, sorted(records, key=lambda row: int(row["id"])))
+    summary = {
+        "images": len(records), "shards": len(grouped),
+        "artists": len({row["artist"] for row in records}),
+        "slots": 128, "style_dim": 1024, "dtype": "bfloat16",
+        "storage_bytes": sum(
+            path.stat().st_size for path in output.glob("part-*.safetensors")
+        ),
+    }
+    write_json(summary_path, summary)
+    return summary
+
+
 def _native_rms_norm(value: torch.Tensor, weight: torch.Tensor | None) -> torch.Tensor:
     normalized = value * torch.rsqrt(value.float().square().mean(dim=-1, keepdim=True) + 1e-6).to(value.dtype)
     return normalized if weight is None else normalized * weight

@@ -685,6 +685,7 @@ synthetic_teacher:
 real_artist_teacher:
   output_directory: real_artist_teacher_5000
   feature_manifest: style_features/manifest.parquet
+  feature_directory: style_features
   content_source_directory: synthetic_teacher_500x16
   artist_count: 5000
   validation_artists: 250
@@ -696,3 +697,5 @@ real_artist_teacher:
   seed: 20260813
   text_batch_size: 512
   text_shard_rows: 512
+  style_token_directory: resampler_tokens
+  style_token_batch_size: 32
