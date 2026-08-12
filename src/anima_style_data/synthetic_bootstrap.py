@@ -999,6 +999,9 @@ def train_offline_kvo_bootstrap(
         all_pair_magnitude_losses = []
         centered_pair_losses = []
         centered_pair_accuracies = []
+        centered_residual_losses = []
+        centered_residual_cosines = []
+        centered_residual_mean_losses = []
         reference_teacher_cosines = []
         reference_teacher_relative_distances = []
         block_count = int(training.get("blocks_per_step", 7)) if train else 28
@@ -1063,10 +1066,10 @@ def train_offline_kvo_bootstrap(
                         - _batched_attention_output(q, kc, vc, ow)
                     )
 
-            def student_output(
+            def student_components(
                 context: torch.Tensor, query: torch.Tensor = q,
                 source_tokens: torch.Tensor = tokens,
-            ) -> torch.Tensor:
+            ) -> tuple[torch.Tensor, torch.Tensor]:
                 with torch.autocast("cuda", dtype=torch.bfloat16):
                     sk = F.linear(context, kw) + adapter.k_up[block](adapter.k_down[block](context))
                     sv = F.linear(context, vw) + adapter.v_up[block](adapter.v_down[block](context))
@@ -1077,10 +1080,21 @@ def train_offline_kvo_bootstrap(
                     sv = sv.reshape(context.shape[0], -1, heads, head_dim).transpose(1, 2)
                     attended = F.scaled_dot_product_attention(query, sk, sv)
                     attended = attended.transpose(1, 2).reshape(context.shape[0], attended.shape[2], hidden)
-                    output = F.linear(attended, ow) + adapter.o_up[block](adapter.o_down[block](attended))
-                    if centered_head is not None:
-                        output = output + centered_head(source_tokens, query, block)
-                    return output
+                    base_output = F.linear(attended, ow) + adapter.o_up[block](adapter.o_down[block](attended))
+                    correction = (
+                        centered_head(source_tokens, query, block)
+                        if centered_head is not None else torch.zeros_like(base_output)
+                    )
+                    return base_output, correction
+
+            def student_output(
+                context: torch.Tensor, query: torch.Tensor = q,
+                source_tokens: torch.Tensor = tokens,
+            ) -> torch.Tensor:
+                base_output, correction = student_components(
+                    context, query, source_tokens
+                )
+                return base_output + correction
 
             student = student_output(contexts[block])
             use_rank = train and len(batch_rows) > 1 and float(training.get("functional_rank_weight", 0.0)) > 0
@@ -1133,12 +1147,19 @@ def train_offline_kvo_bootstrap(
                 candidate_queries = q[:, None].expand(
                     count, count, -1, -1, -1
                 ).reshape(count * count, *q.shape[1:])
-                candidate_outputs = student_output(
+                candidate_base, candidate_correction = student_components(
                     candidate_contexts, candidate_queries,
                     tokens[None].expand(count, count, -1, -1).reshape(
                         count * count, tokens.shape[1], tokens.shape[2]
                     ),
-                ).float().reshape(count, count, *teacher_float.shape[1:])
+                )
+                candidate_base = candidate_base.float().reshape(
+                    count, count, *teacher_float.shape[1:]
+                )
+                candidate_correction = candidate_correction.float().reshape_as(
+                    candidate_base
+                )
+                candidate_outputs = candidate_base + candidate_correction
                 candidate_directions = F.normalize(candidate_outputs.flatten(2), dim=-1)
                 teacher_directions = F.normalize(teacher_float.flatten(1), dim=-1)
                 similarities = torch.einsum(
@@ -1167,10 +1188,34 @@ def train_offline_kvo_bootstrap(
                     with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
                         pair_ka, pair_va = native_kv(pair_conditions)
                         pair_kc, pair_vc = native_kv(pair_content)
-                        pair_teacher = (
+                    pair_teacher = (
                             _batched_attention_output(pair_q, pair_ka, pair_va, ow)
                             - _batched_attention_output(pair_q, pair_kc, pair_vc, ow)
-                        ).float().reshape_as(candidate_outputs)
+                    ).float().reshape_as(candidate_outputs)
+                    if centered_head is not None:
+                        residual_target = pair_teacher - candidate_base.detach()
+                        centered_target = residual_target - residual_target.mean(
+                            dim=1, keepdim=True
+                        )
+                        centered_prediction = candidate_correction - candidate_correction.mean(
+                            dim=1, keepdim=True
+                        )
+                        residual_scale = pair_teacher.square().mean(
+                            dim=(-2, -1), keepdim=True
+                        ).sqrt().clamp_min(1e-4)
+                        centered_residual_losses.append(F.smooth_l1_loss(
+                            centered_prediction / residual_scale,
+                            centered_target / residual_scale,
+                            beta=0.1,
+                        ))
+                        centered_residual_cosines.append(F.cosine_similarity(
+                            centered_prediction.flatten(2),
+                            centered_target.flatten(2), dim=-1,
+                        ).mean())
+                        centered_residual_mean_losses.append(
+                            (candidate_correction.mean(dim=1) / residual_scale[:, 0])
+                            .square().mean()
+                        )
                     pair_student_flat = candidate_outputs.flatten(2)
                     pair_teacher_flat = pair_teacher.flatten(2)
                     all_pair_direction_losses.append(
@@ -1231,6 +1276,18 @@ def train_offline_kvo_bootstrap(
             torch.stack(centered_pair_accuracies).mean()
             if centered_pair_accuracies else output_loss.new_zeros(())
         )
+        centered_residual_loss = (
+            torch.stack(centered_residual_losses).mean()
+            if centered_residual_losses else output_loss.new_zeros(())
+        )
+        centered_residual_cosine = (
+            torch.stack(centered_residual_cosines).mean()
+            if centered_residual_cosines else output_loss.new_zeros(())
+        )
+        centered_residual_mean_loss = (
+            torch.stack(centered_residual_mean_losses).mean()
+            if centered_residual_mean_losses else output_loss.new_zeros(())
+        )
         contrastive_scale = 1.0
         if train:
             contrastive_start = int(
@@ -1243,10 +1300,13 @@ def train_offline_kvo_bootstrap(
                 1.0,
                 max(0.0, (current_step - contrastive_start) / max(contrastive_ramp, 1)),
             )
+        primary_weight = float(training.get("primary_effect_weight", 1.0))
         loss = (
-            output_loss
-            + float(training.get("direction_weight", 0.2)) * cosine_loss
-            + float(training.get("magnitude_weight", 0.02)) * rms_loss
+            primary_weight * (
+                output_loss
+                + float(training.get("direction_weight", 0.2)) * cosine_loss
+                + float(training.get("magnitude_weight", 0.02)) * rms_loss
+            )
             + float(training.get("representation_drift_weight", 0.0)) * drift_loss
             + float(training.get("functional_rank_weight", 0.0)) * rank_loss
             + contrastive_scale
@@ -1265,6 +1325,12 @@ def train_offline_kvo_bootstrap(
             + contrastive_scale
             * float(training.get("functional_centered_all_pairs_weight", 0.0))
             * centered_pair_loss
+            + contrastive_scale
+            * float(training.get("centered_effect_residual_weight", 0.0))
+            * centered_residual_loss
+            + contrastive_scale
+            * float(training.get("centered_effect_zero_mean_weight", 0.0))
+            * centered_residual_mean_loss
         )
         zero_mse = torch.stack(zero_mses).mean()
         student_mse = torch.stack(student_mses).mean()
@@ -1291,6 +1357,11 @@ def train_offline_kvo_bootstrap(
             "functional_centered_all_pairs_loss": float(centered_pair_loss.detach()),
             "functional_centered_all_pairs_accuracy": float(
                 centered_pair_accuracy.detach()
+            ),
+            "centered_effect_residual_loss": float(centered_residual_loss.detach()),
+            "centered_effect_residual_cosine": float(centered_residual_cosine.detach()),
+            "centered_effect_zero_mean_loss": float(
+                centered_residual_mean_loss.detach()
             ),
             "reference_teacher_cosine": float(
                 torch.stack(reference_teacher_cosines).mean().detach()

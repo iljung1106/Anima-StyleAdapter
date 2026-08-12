@@ -613,7 +613,7 @@ synthetic_teacher:
       name: offline-kvo-phase-a-exact512-summary-tokens
       id: offline-kvo-phase-a-exact512-summary-tokens-v1
   offline_phase_b:
-    output_directory: offline_kvo_phase_b_exact512_centered_head_joint
+    output_directory: offline_kvo_phase_b_exact512_centered_residual
     phase_a_checkpoint: offline_kvo_bootstrap_exact512_summary_tokens/checkpoints/best.pt
     initial_checkpoint: offline_kvo_bootstrap_exact512_summary_tokens/checkpoints/best.pt
     resampler_initial_checkpoint: offline_kvo_phase_b_exact512_artist_tokens/checkpoints/step-0001500.pt
@@ -633,7 +633,10 @@ synthetic_teacher:
     centered_effect_latent_dim: 512
     centered_effect_learning_rate: 0.0001
     centered_effect_max_grad_norm: 1.0
+    centered_effect_residual_weight: 1.0
+    centered_effect_zero_mean_weight: 0.10
     freeze_base_connector: true
+    primary_effect_weight: 0.10
     learning_rate: 0.00001
     connector_learning_rate: 0.000003
     bridge_learning_rate: 0.000001
@@ -654,11 +657,11 @@ synthetic_teacher:
     functional_contrastive_temperature: 0.10
     functional_contrastive_start_step: 0
     functional_contrastive_ramp_steps: 1000
-    functional_all_pairs_weight: 0.10
+    functional_all_pairs_weight: 0.02
     functional_all_pairs_magnitude_weight: 0.02
     artist_token_contrastive_weight: 0.20
     artist_token_temperature: 0.07
-    functional_centered_all_pairs_weight: 0.25
+    functional_centered_all_pairs_weight: 0.05
     functional_centered_temperature: 0.07
     target_excluded_start_step: 1
     target_excluded_end_step: 1
@@ -674,5 +677,5 @@ synthetic_teacher:
     wandb:
       enabled: true
       project: anima-style-adapter
-      name: offline-kvo-phase-b-exact512-centered-head-joint
-      id: offline-kvo-phase-b-exact512-centered-head-joint-v1
+      name: offline-kvo-phase-b-exact512-centered-residual
+      id: offline-kvo-phase-b-exact512-centered-residual-v1
