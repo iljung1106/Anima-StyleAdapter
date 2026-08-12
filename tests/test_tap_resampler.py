@@ -67,7 +67,12 @@ def test_resampler_contract_and_prototype_loss():
     assert decoded[2].shape == decoded[4].shape == (4, 6, 12)
     assert torch.equal(decoded_mask, mask)
     assert embedding.shape == (4, 8)
-    assert torch.allclose(embedding.norm(dim=-1), torch.ones(4), atol=1e-5)
+    assert torch.allclose(
+        embedding.float().mean(dim=-1), torch.zeros(4), atol=1e-5
+    )
+    assert torch.allclose(
+        embedding.float().square().mean(dim=-1), torch.ones(4), atol=1e-4
+    )
     assert torch.isfinite(_prototype_loss(embedding, 2, 2, 0.07))
 
 

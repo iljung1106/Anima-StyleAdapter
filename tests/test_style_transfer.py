@@ -16,6 +16,7 @@ from anima_style_data.style_transfer import (
     _episode_resampler_prototype_losses,
     _direction_anneal_multiplier,
     _flow_direction_loss,
+    _learning_rate_multiplier,
     _optimize_frozen_anima,
     _pad_text_conditions,
     _per_sample_condition_comparison,
@@ -36,6 +37,12 @@ from anima_style_data.style_transfer import (
     _uncached_no_grad_autocast,
     attach_style_adapter,
 )
+
+
+def test_learning_rate_warmup_and_cosine_decay():
+    assert _learning_rate_multiplier(1, 2000, 100, 0.1) == pytest.approx(0.01)
+    assert _learning_rate_multiplier(100, 2000, 100, 0.1) == pytest.approx(1.0)
+    assert _learning_rate_multiplier(2000, 2000, 100, 0.1) == pytest.approx(0.1)
 
 
 def test_style_gradient_groups_are_clipped_independently():
@@ -513,6 +520,7 @@ class _FakeCrossAttention(nn.Module):
         self.v_proj = nn.Linear(context, hidden, bias=False)
         self.q_norm = nn.Identity()
         self.k_norm = nn.Identity()
+        self.v_norm = nn.Identity()
         self.output_proj = nn.Linear(hidden, hidden, bias=False)
         self.output_dropout = nn.Identity()
 

@@ -374,7 +374,8 @@ class SlotSetAggregator(nn.Module):
         slot_padding = torch.zeros(batch, slots, dtype=torch.bool, device=pooled.device)
         for mixer in self.slot_mixers:
             pooled = mixer(pooled, slot_padding)
-        return pooled
+        # Fixed final normalization removes the gate/value scale degeneracy.
+        return F.layer_norm(pooled, (dim,))
 
 
 class SharedLowRankStyleAdapter(nn.Module):
@@ -586,6 +587,7 @@ class SharedLowRankStyleAdapter(nn.Module):
         v = v.reshape(v.shape[0], v.shape[1], self.heads, self.head_dim).transpose(1, 2)
         q = cross_attention.q_norm(q)
         k = cross_attention.k_norm(k)
+        v = cross_attention.v_norm(v)
         attended = F.scaled_dot_product_attention(q, k, v)
         attended = attended.transpose(1, 2).reshape(normalized_x.shape[0], normalized_x.shape[1], self.hidden_dim)
         output_delta = self.o_up[block_index](self.o_down[block_index](attended))
@@ -1231,6 +1233,21 @@ def _sample_flow_timesteps(
             raise ValueError("discrete_flow_shift must be positive")
         timesteps = (timesteps * shift) / (1 + (shift - 1) * timesteps)
     return timesteps
+
+
+def _learning_rate_multiplier(
+    step: int, total_steps: int, warmup_steps: int, minimum_ratio: float
+) -> float:
+    """Linear warmup followed by cosine decay to a nonzero LR floor."""
+    if not 0.0 <= minimum_ratio <= 1.0:
+        raise ValueError("minimum_lr_ratio must be between 0 and 1")
+    warmup_steps = max(0, min(int(warmup_steps), int(total_steps)))
+    if warmup_steps and step <= warmup_steps:
+        return max(1, int(step)) / warmup_steps
+    decay_steps = max(1, int(total_steps) - warmup_steps)
+    progress = min(1.0, max(0.0, (int(step) - warmup_steps) / decay_steps))
+    cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+    return minimum_ratio + (1.0 - minimum_ratio) * cosine
 
 
 def _self_reference_curriculum_state(step: int, config: dict[str, Any]) -> dict[str, Any]:
@@ -3068,6 +3085,7 @@ def train_style_adapter(config: dict[str, Any], destination: Path, *, steps_over
         ],
         fused=device.startswith("cuda"),
     )
+    base_learning_rates = [float(group["lr"]) for group in optimizer.param_groups]
     print(
         "style optimizer: FP32 trainable weights, BF16 autocast; "
         f"representation_lr={representation_lr:g} output_lr={output_lr:g} "
@@ -3208,6 +3226,16 @@ def train_style_adapter(config: dict[str, Any], destination: Path, *, steps_over
             )
     for zero_based_step in range(start_step, steps):
         step = zero_based_step + 1
+        lr_multiplier = _learning_rate_multiplier(
+            step,
+            steps,
+            int(training.get("warmup_steps", 0)),
+            float(training.get("minimum_lr_ratio", 1.0)),
+        )
+        for group, base_lr in zip(
+            optimizer.param_groups, base_learning_rates, strict=True
+        ):
+            group["lr"] = base_lr * lr_multiplier
         curriculum = _self_reference_curriculum_state(step, curriculum_cfg)
         _set_adapter_trainable_stage(adapter, gate_only=bool(curriculum["gate_only"]))
         _set_aggregator_trainable(
@@ -3299,6 +3327,11 @@ def train_style_adapter(config: dict[str, Any], destination: Path, *, steps_over
             "step": step, "loss": accumulated_loss, "grad_norm": float(grad_norm),
             "step_s": elapsed, "data_wait_s": data_wait,
             "gradient_accumulation_steps": accumulation_steps,
+            "lr_multiplier": lr_multiplier,
+            "representation_lr": optimizer.param_groups[0]["lr"],
+            "output_lr": optimizer.param_groups[1]["lr"],
+            "gate_lr": optimizer.param_groups[2]["lr"],
+            "resampler_lr": optimizer.param_groups[3]["lr"],
             "peak_vram_gib": torch.cuda.max_memory_allocated() / (1024**3) if device.startswith("cuda") else 0.0,
             **details, **group_grads,
         }

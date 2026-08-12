@@ -540,7 +540,9 @@ def build_tap_resampler_model(
                 if self.direct_style_tokens
                 else F.normalize(self.style_head(latent.mean(dim=1)), dim=-1)
             )
-            return latent, representation
+            # A fixed, non-affine LayerNorm prevents flow-only fine-tuning from
+            # hiding unbounded token scale in learned normalization weights.
+            return latent, F.layer_norm(representation, (style_dim,))
 
         def decode(self, latent, shapes, max_tokens):
             queries = latent.new_zeros((latent.shape[0], max_tokens, latent.shape[-1]))
