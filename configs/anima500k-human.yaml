@@ -694,5 +694,5 @@ real_artist_teacher:
     validation: 1
     test: 1
   seed: 20260813
-  text_batch_size: 128
-  text_shard_rows: 128
+  text_batch_size: 512
+  text_shard_rows: 512
