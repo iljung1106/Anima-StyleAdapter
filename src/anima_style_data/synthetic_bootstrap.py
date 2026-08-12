@@ -797,6 +797,8 @@ def train_offline_kvo_bootstrap(
         training = cfg.get("offline_bootstrap" if phase == "a" else "offline_phase_b", {})
         root = _root(config, destination)
     output = root / str(training.get("output_directory", "offline_kvo_bootstrap"))
+    if steps_override is not None:
+        output = output / f"smoke-{steps_override}-steps"
     output.mkdir(parents=True, exist_ok=True)
     if real_artist:
         references = read_records(root / "references.parquet")
