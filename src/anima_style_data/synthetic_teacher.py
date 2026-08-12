@@ -257,34 +257,45 @@ def cache_synthetic_teacher_kv_basis(
     text_root = root / "text"
     text_rows = read_records(text_root / "manifest.parquet")
     by_id = {int(row["condition_id"]): row for row in text_rows}
-    shard_cache: dict[str, Any] = {}
-
-    def cached_condition(condition_id: int):
-        row = by_id[condition_id]
-        name = str(row["cache_shard"])
-        if name not in shard_cache:
-            shard_cache[name] = load_file(text_root / name, device="cpu")["conditioning"]
-        return shard_cache[name][int(row["row_index"])]
+    # Compute all sequence lengths in one vectorized reduction per shard.
+    # Calling a 512x1024 reduction separately for 40k conditions repeatedly
+    # starts the CPU thread pool and can take hours on large hosts.
+    rows_by_shard: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for row in text_rows:
+        rows_by_shard[str(row["cache_shard"])].append(row)
+    token_lengths: dict[int, int] = {}
+    for shard_index, (name, shard_rows) in enumerate(
+        sorted(rows_by_shard.items()), start=1
+    ):
+        values = load_file(text_root / name, device="cpu")["conditioning"]
+        lengths = values.abs().amax(dim=-1).ne(0).sum(dim=-1).tolist()
+        for row in shard_rows:
+            token_lengths[int(row["condition_id"])] = int(
+                lengths[int(row["row_index"])]
+            )
+        print(
+            f"indexed teacher text shard {shard_index}/{len(rows_by_shard)}",
+            flush=True,
+        )
 
     base_lengths: dict[int, int] = {}
     for row in prompts:
         if row["kind"] == "content":
-            value = cached_condition(int(row["condition_id"]))
-            base_lengths[int(row["condition_id"])] = int(value.abs().amax(dim=-1).ne(0).sum())
+            condition_id = int(row["condition_id"])
+            base_lengths[condition_id] = token_lengths[condition_id]
     records = []
     for row in artist_prompts:
         artist_id = int(row["condition_id"])
         content_id = int(row["content_index"])
-        value = cached_condition(artist_id)
         records.append({
             **row,
             "artist_condition_id": artist_id,
             "content_condition_id": content_id,
-            "artist_token_length": int(value.abs().amax(dim=-1).ne(0).sum()),
+            "artist_token_length": token_lengths[artist_id],
             "content_token_length": base_lengths[content_id],
         })
     write_records(manifest_path, records)
-    del shard_cache
+    del token_lengths
 
     models = _resolve_model_files(config["anima_cache"]["models"], destination)
     selected: dict[str, Any] = {}
