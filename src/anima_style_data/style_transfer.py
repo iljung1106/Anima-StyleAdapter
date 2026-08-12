@@ -1548,6 +1548,34 @@ def _set_adapter_trainable_stage(
             parameter.requires_grad_(True)
 
 
+def _load_adapter_checkpoint(
+    adapter: SharedLowRankStyleAdapter, state: dict[str, Any]
+) -> None:
+    """Load ordinary or offline-bootstrap adapter/reference-head checkpoints."""
+    result = adapter.load_state_dict(state["adapter"], strict=False)
+    missing = set(result.missing_keys)
+    unexpected = set(result.unexpected_keys)
+    allowed_missing = {
+        key for key in missing if key.startswith("reference_effect_head.")
+    }
+    if missing != allowed_missing or unexpected:
+        raise RuntimeError(
+            f"Incompatible adapter checkpoint; missing={sorted(missing)} "
+            f"unexpected={sorted(unexpected)}"
+        )
+    centered = state.get("centered_head")
+    if centered is not None:
+        if adapter.reference_effect_head is None:
+            raise RuntimeError(
+                "Checkpoint contains a reference head but adapter.reference_effect_head is disabled"
+            )
+        adapter.reference_effect_head.load_state_dict(centered)
+    elif allowed_missing:
+        raise RuntimeError(
+            "Adapter enables reference_effect_head but checkpoint contains no trained head"
+        )
+
+
 def _set_aggregator_trainable(
     adapter: SharedLowRankStyleAdapter,
     *,
@@ -2481,7 +2509,7 @@ def sample_style_checkpoint(config: dict[str, Any], destination: Path) -> dict[s
     if not checkpoint_path.is_absolute():
         checkpoint_path = output / checkpoint_path
     state = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-    adapter.load_state_dict(state["adapter"])
+    _load_adapter_checkpoint(adapter, state)
     if "resampler" in state:
         resampler.load_state_dict(state["resampler"])
     step = int(state["step"])
@@ -2719,7 +2747,7 @@ def diagnose_style_reference_dependence(
             output_candidate if output_candidate.exists() else destination / checkpoint_path
         )
     state = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-    adapter.load_state_dict(state["adapter"])
+    _load_adapter_checkpoint(adapter, state)
     if "resampler" in state:
         resampler.load_state_dict(state["resampler"])
 
@@ -2995,7 +3023,7 @@ def overfit_exact_self_batch(config: dict[str, Any], destination: Path) -> dict[
     if not checkpoint.is_absolute():
         checkpoint = source_output / checkpoint
     state = torch.load(checkpoint, map_location="cpu", weights_only=False)
-    adapter.load_state_dict(state["adapter"])
+    _load_adapter_checkpoint(adapter, state)
     if "resampler" in state:
         resampler.load_state_dict(state["resampler"])
     adapter.style_dropout = 0.0
@@ -3373,7 +3401,7 @@ def train_style_adapter(config: dict[str, Any], destination: Path, *, steps_over
     resume = bool(training.get("resume", True)) and steps_override is None
     if resume and checkpoint_path.exists():
         state = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-        adapter.load_state_dict(state["adapter"])
+        _load_adapter_checkpoint(adapter, state)
         if "resampler" in state:
             resampler.load_state_dict(state["resampler"])
         optimizer.load_state_dict(state["optimizer"])
@@ -3390,7 +3418,7 @@ def train_style_adapter(config: dict[str, Any], destination: Path, *, steps_over
         if not initial_path.is_absolute():
             initial_path = destination / initial_path
         initial_state = torch.load(initial_path, map_location="cpu", weights_only=False)
-        adapter.load_state_dict(initial_state["adapter"])
+        _load_adapter_checkpoint(adapter, initial_state)
         if "resampler" in initial_state:
             resampler.load_state_dict(initial_state["resampler"])
         print(

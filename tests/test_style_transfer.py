@@ -19,6 +19,7 @@ from anima_style_data.style_transfer import (
     _direction_anneal_multiplier,
     _flow_direction_loss,
     _learning_rate_multiplier,
+    _load_adapter_checkpoint,
     _optimize_frozen_anima,
     _pad_text_conditions,
     _per_sample_condition_comparison,
@@ -53,6 +54,29 @@ def test_query_conditioned_reference_head_preserves_query_positions():
 
     assert result.shape == (3, 5, 32)
     assert torch.isfinite(result).all()
+
+
+def test_offline_reference_head_checkpoint_loads_into_runtime_adapter():
+    kwargs = dict(
+        style_dim=16, slots=8, hidden_dim=32, output_dim=32, heads=4,
+        blocks=2, rank=4, projection_mode="pretrained_block_lora",
+        context_dim=16, connector_groups=1, aggregator_mode="minimal",
+        reference_effect_latent_dim=16, reference_effect_heads=4,
+    )
+    offline = SharedLowRankStyleAdapter(**kwargs)
+    runtime = SharedLowRankStyleAdapter(**kwargs, reference_effect_head=True)
+    head = QueryConditionedReferenceHead(
+        style_dim=16, hidden_dim=32, latent_dim=16, blocks=2, heads=4
+    )
+    with torch.no_grad():
+        head.block_embedding.fill_(0.25)
+
+    _load_adapter_checkpoint(runtime, {
+        "adapter": offline.state_dict(), "centered_head": head.state_dict()
+    })
+
+    assert runtime.reference_effect_head is not None
+    assert torch.all(runtime.reference_effect_head.block_embedding == 0.25)
 
 
 def test_learning_rate_warmup_and_cosine_decay():
