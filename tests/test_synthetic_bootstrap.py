@@ -1,4 +1,8 @@
-from anima_style_data.synthetic_bootstrap import assign_bootstrap_splits, classify_artist_effects
+from anima_style_data.synthetic_bootstrap import (
+    _bootstrap_eligible,
+    assign_bootstrap_splits,
+    classify_artist_effects,
+)
 
 
 def test_bootstrap_artist_splits_are_disjoint_and_sized():
@@ -18,3 +22,10 @@ def test_artist_effect_filter_removes_only_severe_tail():
     labels = classify_artist_effects(rows)
     assert labels["a0"].startswith("excluded")
     assert sum(value.startswith("excluded") for value in labels.values()) <= 2
+
+
+def test_bootstrap_eligibility_matches_validated_manifest_contract():
+    assert _bootstrap_eligible({"kind": "artist", "artist_split": "train"})
+    assert _bootstrap_eligible({"kind": "artist", "artist_split": "validation"})
+    assert not _bootstrap_eligible({"kind": "artist", "artist_split": "excluded"})
+    assert not _bootstrap_eligible({"kind": "content_control", "artist_split": "control"})

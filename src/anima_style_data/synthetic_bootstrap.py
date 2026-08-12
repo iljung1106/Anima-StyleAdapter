@@ -95,6 +95,10 @@ def assign_bootstrap_splits(
     }
 
 
+def _bootstrap_eligible(row: dict[str, Any]) -> bool:
+    return row.get("kind") == "artist" and row.get("artist_split") != "excluded"
+
+
 def validate_synthetic_teacher_corpus(
     config: dict[str, Any], destination: Path
 ) -> dict[str, Any]:
@@ -402,7 +406,7 @@ def train_offline_kvo_bootstrap(
     root = _root(config, destination)
     output = root / str(training.get("output_directory", "offline_kvo_bootstrap"))
     output.mkdir(parents=True, exist_ok=True)
-    validated = [row for row in read_records(root / "validated_manifest.parquet") if row.get("bootstrap_eligible")]
+    validated = [row for row in read_records(root / "validated_manifest.parquet") if _bootstrap_eligible(row)]
     feature_rows = {int(row["id"]): row for row in read_records(root / "style_features" / "manifest.parquet")}
     rows = [{**row, **feature_rows[int(row["id"])]} for row in validated]
     by_split = {name: [row for row in rows if row["artist_split"] == name] for name in ("train", "validation", "meta_test")}
