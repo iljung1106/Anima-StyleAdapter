@@ -613,7 +613,7 @@ synthetic_teacher:
       name: offline-kvo-phase-a-exact512-summary-tokens
       id: offline-kvo-phase-a-exact512-summary-tokens-v1
   offline_phase_b:
-    output_directory: offline_kvo_phase_b_exact512_style_only_head
+    output_directory: offline_kvo_phase_b_exact512_style_only_curriculum
     phase_a_checkpoint: offline_kvo_bootstrap_exact512_summary_tokens/checkpoints/best.pt
     initial_checkpoint: offline_kvo_bootstrap_exact512_summary_tokens/checkpoints/best.pt
     resampler_initial_checkpoint: offline_kvo_phase_b_exact512_artist_tokens/checkpoints/step-0001500.pt
@@ -627,7 +627,7 @@ synthetic_teacher:
     ram_resident_features: true
     gpu_resident_features: true
     feature_cache_load_workers: 8
-    representation_warmup_steps: 0
+    representation_warmup_steps: 750
     resampler_trainable_encoder_layers: 2
     centered_effect_head: true
     centered_effect_latent_dim: 512
@@ -655,17 +655,18 @@ synthetic_teacher:
     functional_rank_margin: 0.02
     functional_contrastive_weight: 0.10
     functional_contrastive_temperature: 0.10
-    functional_contrastive_start_step: 0
-    functional_contrastive_ramp_steps: 1000
+    functional_contrastive_start_step: 500
+    functional_contrastive_ramp_steps: 1500
     functional_all_pairs_weight: 0.02
     functional_all_pairs_magnitude_weight: 0.02
     artist_token_contrastive_weight: 0.20
     artist_token_temperature: 0.07
     functional_centered_all_pairs_weight: 0.05
     functional_centered_temperature: 0.07
-    target_excluded_start_step: 1
-    target_excluded_end_step: 1
-    exact_self_probability: 0.25
+    target_excluded_start_step: 500
+    target_excluded_end_step: 2000
+    exact_self_probability: 0.0
+    checkpoint_discrimination_weight: 1.0
     log_every: 20
     validation_every: 250
     validation_batches: 32
@@ -677,5 +678,5 @@ synthetic_teacher:
     wandb:
       enabled: true
       project: anima-style-adapter
-      name: offline-kvo-phase-b-exact512-style-only-head
-      id: offline-kvo-phase-b-exact512-style-only-head-v1
+      name: offline-kvo-phase-b-exact512-style-only-curriculum
+      id: offline-kvo-phase-b-exact512-style-only-curriculum-v1

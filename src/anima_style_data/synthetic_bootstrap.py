@@ -961,6 +961,7 @@ def train_offline_kvo_bootstrap(
     ) -> tuple[torch.Tensor, dict[str, float]]:
         reference_rows = batch_rows if reference_rows is None else reference_rows
         tokens, drift_loss = encode(reference_rows)
+        representation_tokens = tokens.detach() if detach_representation else tokens
         artist_token_loss = tokens.new_zeros(())
         artist_token_accuracy = tokens.new_zeros(())
         if train and positive_reference_rows is not None:
@@ -1025,7 +1026,7 @@ def train_offline_kvo_bootstrap(
             if train else []
         )
         with torch.autocast("cuda", dtype=torch.bfloat16):
-            contexts = adapter.selected_block_context_tokens(tokens, blocks)
+            contexts = adapter.selected_block_context_tokens(representation_tokens, blocks)
         if detach_representation:
             contexts = {index: value.detach() for index, value in contexts.items()}
         artist_contexts = torch.stack([text(int(row["artist_condition_id"])) for row in batch_rows])
@@ -1075,7 +1076,7 @@ def train_offline_kvo_bootstrap(
 
             def student_components(
                 context: torch.Tensor, query: torch.Tensor = q,
-                source_tokens: torch.Tensor = tokens,
+                source_tokens: torch.Tensor = representation_tokens,
             ) -> tuple[torch.Tensor, torch.Tensor]:
                 with torch.autocast("cuda", dtype=torch.bfloat16):
                     sk = F.linear(context, kw) + adapter.k_up[block](adapter.k_down[block](context))
@@ -1096,7 +1097,7 @@ def train_offline_kvo_bootstrap(
 
             def student_output(
                 context: torch.Tensor, query: torch.Tensor = q,
-                source_tokens: torch.Tensor = tokens,
+                source_tokens: torch.Tensor = representation_tokens,
             ) -> torch.Tensor:
                 base_output, correction = student_components(
                     context, query, source_tokens
@@ -1156,8 +1157,9 @@ def train_offline_kvo_bootstrap(
                 ).reshape(count * count, *q.shape[1:])
                 candidate_base, candidate_correction = student_components(
                     candidate_contexts, candidate_queries,
-                    tokens[None].expand(count, count, -1, -1).reshape(
-                        count * count, tokens.shape[1], tokens.shape[2]
+                    representation_tokens[None].expand(count, count, -1, -1).reshape(
+                        count * count,
+                        representation_tokens.shape[1], representation_tokens.shape[2]
                     ),
                 )
                 candidate_base = candidate_base.float().reshape(
@@ -1453,7 +1455,11 @@ def train_offline_kvo_bootstrap(
         score = (
             float(value["zero_improvement"])
             + 0.1 * float(value["cosine"])
-            + 0.05 * float(value.get("correct_wrong_cosine_gap", 0.0))
+            + float(training.get("checkpoint_discrimination_weight", 0.05))
+            * (
+                float(value.get("correct_wrong_cosine_gap", 0.0))
+                + float(value.get("correct_wrong_improvement_gap", 0.0))
+            )
         )
         if score > best_score:
             best_score, best_step = score, int(record["step"])
@@ -1602,7 +1608,11 @@ def train_offline_kvo_bootstrap(
             write_json(output / "evaluation.json", {"history": history, "latest": record})
             score = (
                 val["zero_improvement"] + 0.1 * val["cosine"]
-                + 0.05 * val["correct_wrong_cosine_gap"]
+                + float(training.get("checkpoint_discrimination_weight", 0.05))
+                * (
+                    val["correct_wrong_cosine_gap"]
+                    + val["correct_wrong_improvement_gap"]
+                )
             )
             if score > best_score:
                 best_score, best_step, stale_validations = score, step, 0
