@@ -721,9 +721,12 @@ def train_offline_kvo_bootstrap(
     rows = [{**row, **feature_rows[int(row["id"])]} for row in validated]
     by_split = {name: [row for row in rows if row["artist_split"] == name] for name in ("train", "validation", "meta_test")}
     train_rows = [row for row in by_split["train"] if row["content_split"] == "train"]
+    train_heldout_rows = [
+        row for row in by_split["train"] if row["content_split"] == "validation"
+    ]
     validation_rows = [row for row in by_split["validation"] if row["content_split"] == "validation"]
     meta_rows = [row for row in by_split["meta_test"] if row["content_split"] == "test"]
-    if not train_rows or not validation_rows or not meta_rows:
+    if not train_rows or not train_heldout_rows or not validation_rows or not meta_rows:
         raise RuntimeError("Offline bootstrap split is empty")
 
     device = str(cfg.get("device", "cuda"))
@@ -1600,6 +1603,8 @@ def train_offline_kvo_bootstrap(
                 f"{metrics['artist_token_contrastive_accuracy']:.3f} "
                 f"centered={metrics['functional_centered_all_pairs_loss']:.3f}/"
                 f"{metrics['functional_centered_all_pairs_accuracy']:.3f} "
+                f"residual={metrics['centered_effect_residual_loss']:.3f}/"
+                f"{metrics['centered_effect_residual_cosine']:.3f} "
                 f"teacher_rms={metrics['teacher_rms']:.6f} student_rms={metrics['student_rms']:.6f} "
                 f"step_s={metrics['step_s']:.3f} {grad_text}",
                 flush=True,
@@ -1667,12 +1672,16 @@ def train_offline_kvo_bootstrap(
     if centered_head is not None and best.get("centered_head") is not None:
         centered_head.load_state_dict(best["centered_head"])
     final_validation = evaluate(validation_rows, int(training.get("validation_batches", 8)))
+    final_train_heldout = evaluate(
+        train_heldout_rows, int(training.get("train_heldout_batches", 16))
+    )
     # Meta-test is deliberately touched once, only after validation selected
     # the checkpoint.  It never participates in early stopping or tuning.
     final_meta = evaluate(meta_rows, int(training.get("meta_test_batches", 8)))
     summary = {
         "phase": phase, "steps": last_step, "best_step": best_step,
         "checkpoint": str((checkpoint_dir / "best.pt").resolve()),
+        "train_artist_heldout_content": final_train_heldout,
         "validation": final_validation, "meta_test": final_meta,
     }
     write_json(output / "summary.json", summary)
