@@ -677,7 +677,12 @@ def train_offline_kvo_bootstrap(
             artist_id = int(row["artist_condition_id"])
             artist_context, content_context = text(artist_id), text(content_id)
             for block in blocks:
-                query_key = generator.choice(probe_keys[(int(row["content_index"]), block)])
+                available_queries = probe_keys[(int(row["content_index"]), block)]
+                query_key = (
+                    generator.choice(available_queries)
+                    if train
+                    else available_queries[(int(row["id"]) + block) % len(available_queries)]
+                )
                 q = probe_values[query_key].to(device=device, dtype=torch.bfloat16).transpose(0, 1)
                 ka, va = projected(artist_context, block)
                 kc, vc = projected(content_context, block)
@@ -776,17 +781,58 @@ def train_offline_kvo_bootstrap(
     checkpoint_every = int(training.get("checkpoint_every", 500))
     checkpoint_dir = output / "checkpoints"
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
-    history = []
+    evaluation_path = output / "evaluation.json"
+    if evaluation_path.exists():
+        history = list(__import__("json").loads(evaluation_path.read_text(encoding="utf-8")).get("history", []))
+    else:
+        history = []
     best_score = -float("inf")
     best_step = 0
+    for record in history:
+        value = record["validation"]
+        score = (
+            float(value["zero_improvement"])
+            + 0.1 * float(value["cosine"])
+            + 0.05 * float(value.get("correct_wrong_cosine_gap", 0.0))
+        )
+        if score > best_score:
+            best_score, best_step = score, int(record["step"])
     stale_validations = 0
     minimum_steps = int(training.get("minimum_steps", 0))
     early_stop_patience = int(training.get("early_stop_patience", 0))
     by_train_artist: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for row in train_rows:
         by_train_artist[str(row["artist"])].append(row)
-    last_step = 0
-    for step in range(1, total_steps + 1):
+    start_step = 1
+    if bool(training.get("resume", True)):
+        candidates = sorted(checkpoint_dir.glob("step-*.pt"))
+        if candidates:
+            resume_state = torch.load(candidates[-1], map_location="cpu", weights_only=False)
+            adapter.load_state_dict(resume_state["adapter"])
+            if phase == "b" and resume_state.get("resampler") is not None:
+                resampler.load_state_dict(resume_state["resampler"])
+            optimizer.load_state_dict(resume_state["optimizer"])
+            if "random_state" in resume_state:
+                generator.setstate(resume_state["random_state"])
+            start_step = int(resume_state["step"]) + 1
+            print(f"resumed offline-kvo phase={phase} at step={start_step}", flush=True)
+
+    wandb_run = None
+    wandb_cfg = dict(training.get("wandb", {}))
+    if bool(wandb_cfg.get("enabled", False)) and steps_override is None:
+        import wandb
+
+        wandb_run = wandb.init(
+            project=str(wandb_cfg.get("project", "anima-style-adapter")),
+            entity=wandb_cfg.get("entity"),
+            name=str(wandb_cfg.get("name", f"offline-kvo-phase-{phase}")),
+            id=str(wandb_cfg.get("id", f"offline-kvo-phase-{phase}-v1")),
+            resume="allow",
+            config={"phase": phase, **training},
+        )
+
+    last_step = start_step - 1
+    for step in range(start_step, total_steps + 1):
         last_step = step
         batch = generator.sample(train_rows, batch_size)
         reference_batch = batch
@@ -810,12 +856,24 @@ def train_offline_kvo_bootstrap(
         optimizer.step()
         if step % log_every == 0:
             print(f"offline-kvo step={step}/{total_steps} loss={metrics['loss']:.4f} cos={metrics['cosine']:.4f} improve={metrics['zero_improvement']:.4f} grad={float(grad_norm):.3f}", flush=True)
+            if wandb_run is not None:
+                wandb_run.log({
+                    **{f"train/{key}": value for key, value in metrics.items()},
+                    "train/grad_norm": float(grad_norm),
+                    "train/learning_rate": optimizer.param_groups[0]["lr"],
+                    "train/resampler_learning_rate": (
+                        optimizer.param_groups[1]["lr"] if len(optimizer.param_groups) > 1 else 0.0
+                    ),
+                }, step=step)
         if step % validation_every == 0 or step == total_steps:
             val = evaluate(validation_rows, int(training.get("validation_batches", 8)))
             record = {"step": step, "validation": val}
             history.append(record)
             write_json(output / "evaluation.json", {"history": history, "latest": record})
-            score = val["zero_improvement"] + 0.1 * val["cosine"]
+            score = (
+                val["zero_improvement"] + 0.1 * val["cosine"]
+                + 0.05 * val["correct_wrong_cosine_gap"]
+            )
             if score > best_score:
                 best_score, best_step, stale_validations = score, step, 0
                 state = {
@@ -833,11 +891,14 @@ def train_offline_kvo_bootstrap(
                 f"wrong_cos={val['wrong_cosine']:.4f} gap={val['correct_wrong_cosine_gap']:.4f} "
                 f"best={best_step}", flush=True,
             )
+            if wandb_run is not None:
+                wandb_run.log({f"validation/{key}": value for key, value in val.items()}, step=step)
         if step % checkpoint_every == 0 or step == total_steps:
             state = {
                 "phase": phase, "step": step, "adapter": adapter.state_dict(),
                 "resampler": resampler.state_dict() if phase == "b" else None,
                 "optimizer": optimizer.state_dict(), "config": training,
+                "random_state": generator.getstate(),
             }
             temporary = checkpoint_dir / f"step-{step:07d}.tmp"
             torch.save(state, temporary)
@@ -862,6 +923,9 @@ def train_offline_kvo_bootstrap(
         "validation": final_validation, "meta_test": final_meta,
     }
     write_json(output / "summary.json", summary)
+    if wandb_run is not None:
+        wandb_run.log({f"meta_test/{key}": value for key, value in final_meta.items()}, step=best_step)
+        wandb_run.finish()
     return summary
 
 
