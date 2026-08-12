@@ -588,12 +588,15 @@ class SharedLowRankStyleAdapter(nn.Module):
             for layer in branch:
                 values = layer(values)
             groups.append(values)
+        # The aggregator already provides normalized style tokens.  Preserve
+        # the magnitude selected by style_context_proj here: a final
+        # LayerNorm would turn the intentionally tiny 1e-4 identity bridge
+        # back into an O(1) context and make the initial style residual dwarf
+        # the native artist delta.  Connector layers are pre-norm internally,
+        # so removing this redundant terminal norm does not destabilize them.
         return [
-            F.layer_norm(
-                groups[index // self.blocks_per_group]
-                + self.block_embeddings[index][None, None],
-                (self.context_dim,),
-            )
+            groups[index // self.blocks_per_group]
+            + self.block_embeddings[index][None, None]
             for index in range(self.blocks)
         ]
 

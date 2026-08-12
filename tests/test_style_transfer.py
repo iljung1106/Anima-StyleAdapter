@@ -521,6 +521,21 @@ def test_high_capacity_connector_builds_distinct_block_contexts_and_gradients():
     assert adapter.block_embeddings.grad is not None
 
 
+def test_connector_preserves_tiny_context_bridge_initialization():
+    adapter = SharedLowRankStyleAdapter(
+        style_dim=16, slots=4, hidden_dim=32, output_dim=32,
+        heads=4, blocks=4, rank=4, projection_mode="pretrained_block_lora",
+        context_dim=16, aggregator_mode="minimal", aggregator_bottleneck=4,
+        connector_layers=2, connector_heads=4, connector_groups=2,
+        connector_group_layers=1, style_dropout=0.0, gate_dim=8,
+    ).eval()
+    tokens = torch.nn.functional.layer_norm(torch.randn(2, 4, 16), (16,))
+    contexts = adapter._block_context_tokens(tokens)
+    expected = tokens * 1e-4
+    for context in contexts:
+        torch.testing.assert_close(context, expected, atol=2e-7, rtol=2e-3)
+
+
 def test_cross_slot_mixer_couples_pooled_slots():
     torch.manual_seed(11)
     model = SlotSetAggregator(
