@@ -692,6 +692,7 @@ def train_offline_kvo_bootstrap(
         rms_losses = []
         zero_mses = []
         student_mses = []
+        rank_losses = []
         block_count = int(training.get("blocks_per_step", 7)) if train else 28
         blocks = generator.sample(range(28), block_count) if block_count < 28 else list(range(28))
         for sample_index, row in enumerate(batch_rows):
@@ -711,17 +712,28 @@ def train_offline_kvo_bootstrap(
                 ow = basis[f"block_{block:02d}.output_proj.weight"]
                 with torch.no_grad():
                     teacher = _attention_output(q, ka, va, ow) - _attention_output(q, kc, vc, ow)
+                def student_output(context: torch.Tensor) -> torch.Tensor:
+                    with torch.autocast("cuda", dtype=torch.bfloat16):
+                        sk = F.linear(context, basis[f"block_{block:02d}.k_proj.weight"])
+                        sv = F.linear(context, basis[f"block_{block:02d}.v_proj.weight"])
+                        sk = sk + adapter.k_up[block](adapter.k_down[block](context))
+                        sv = sv + adapter.v_up[block](adapter.v_down[block](context))
+                        sk = _native_rms_norm(
+                            sk.reshape(-1, heads, head_dim).transpose(0, 1),
+                            basis.get(f"block_{block:02d}.k_norm.weight"),
+                        )
+                        sv = sv.reshape(-1, heads, head_dim).transpose(0, 1)
+                        attended = F.scaled_dot_product_attention(
+                            q.unsqueeze(0), sk.unsqueeze(0), sv.unsqueeze(0)
+                        ).squeeze(0)
+                        attended = attended.transpose(0, 1).reshape(attended.shape[1], hidden)
+                        return F.linear(attended, ow) + adapter.o_up[block](adapter.o_down[block](attended))
+
                 context = contexts[block][sample_index]
-                with torch.autocast("cuda", dtype=torch.bfloat16):
-                    sk = F.linear(context, basis[f"block_{block:02d}.k_proj.weight"])
-                    sv = F.linear(context, basis[f"block_{block:02d}.v_proj.weight"])
-                    sk = sk + adapter.k_up[block](adapter.k_down[block](context))
-                    sv = sv + adapter.v_up[block](adapter.v_down[block](context))
-                    sk = _native_rms_norm(sk.reshape(-1, heads, head_dim).transpose(0, 1), basis.get(f"block_{block:02d}.k_norm.weight"))
-                    sv = sv.reshape(-1, heads, head_dim).transpose(0, 1)
-                    attended = F.scaled_dot_product_attention(q.unsqueeze(0), sk.unsqueeze(0), sv.unsqueeze(0)).squeeze(0)
-                    attended = attended.transpose(0, 1).reshape(attended.shape[1], hidden)
-                    student = F.linear(attended, ow) + adapter.o_up[block](adapter.o_down[block](attended))
+                student = student_output(context)
+                if train and len(batch_rows) > 1 and float(training.get("functional_rank_weight", 0.0)) > 0:
+                    wrong_context = contexts[block][(sample_index + 1) % len(batch_rows)]
+                    wrong_student = student_output(wrong_context)
                 scale = teacher.detach().float().square().mean().sqrt().clamp_min(1e-4)
                 output_losses.append(F.smooth_l1_loss(student.float() / scale, teacher.float() / scale, beta=0.1))
                 cosine = F.cosine_similarity(student.float().flatten(), teacher.float().flatten(), dim=0)
@@ -729,14 +741,23 @@ def train_offline_kvo_bootstrap(
                 rms_losses.append((torch.log(student.float().square().mean().sqrt().clamp_min(1e-6)) - torch.log(scale)).square())
                 student_mses.append(F.mse_loss(student.float(), teacher.float()))
                 zero_mses.append(teacher.float().square().mean())
+                if train and len(batch_rows) > 1 and float(training.get("functional_rank_weight", 0.0)) > 0:
+                    correct_distance = (student.float() / scale - teacher.float() / scale).square().mean()
+                    wrong_distance = (wrong_student.float() / scale - teacher.float() / scale).square().mean()
+                    rank_losses.append(F.relu(
+                        correct_distance - wrong_distance
+                        + float(training.get("functional_rank_margin", 0.02))
+                    ))
         output_loss = torch.stack(output_losses).mean()
         cosine_loss = (1 - torch.stack(cosines)).mean()
         rms_loss = torch.stack(rms_losses).mean()
+        rank_loss = torch.stack(rank_losses).mean() if rank_losses else output_loss.new_zeros(())
         loss = (
             output_loss
             + float(training.get("direction_weight", 0.2)) * cosine_loss
             + float(training.get("magnitude_weight", 0.02)) * rms_loss
             + float(training.get("representation_drift_weight", 0.0)) * drift_loss
+            + float(training.get("functional_rank_weight", 0.0)) * rank_loss
         )
         zero_mse = torch.stack(zero_mses).mean()
         student_mse = torch.stack(student_mses).mean()
@@ -745,6 +766,7 @@ def train_offline_kvo_bootstrap(
             "cosine": float(torch.stack(cosines).mean().detach()),
             "rms_loss": float(rms_loss.detach()),
             "representation_drift": float(drift_loss.detach()),
+            "functional_rank_loss": float(rank_loss.detach()),
             "zero_improvement": float((1 - student_mse / zero_mse.clamp_min(1e-12)).detach()),
         }
 
@@ -856,10 +878,21 @@ def train_offline_kvo_bootstrap(
     last_step = start_step - 1
     for step in range(start_step, total_steps + 1):
         last_step = step
-        batch = generator.sample(train_rows, batch_size)
+        # Artist-balanced batches make the rolled wrong-reference branch a
+        # guaranteed different artist rather than occasionally another image
+        # from the same artist.
+        batch_artists = generator.sample(list(by_train_artist), batch_size)
+        batch = [generator.choice(by_train_artist[artist]) for artist in batch_artists]
         reference_batch = batch
-        if phase == "b":
-            exact_probability = float(training.get("exact_self_probability", 0.25))
+        target_excluded_start = int(training.get("target_excluded_start_step", total_steps + 1))
+        target_excluded_end = int(training.get("target_excluded_end_step", target_excluded_start))
+        final_exact_probability = float(training.get("exact_self_probability", 1.0))
+        if step >= target_excluded_start:
+            progress = min(
+                1.0,
+                (step - target_excluded_start) / max(target_excluded_end - target_excluded_start, 1),
+            )
+            exact_probability = 1.0 + progress * (final_exact_probability - 1.0)
             reference_batch = [
                 target if generator.random() < exact_probability else generator.choice([
                     row for row in by_train_artist[str(target["artist"])]
