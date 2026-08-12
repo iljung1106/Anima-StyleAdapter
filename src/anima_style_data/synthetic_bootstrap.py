@@ -944,3 +944,17 @@ def smoke_offline_kvo_bootstrap(config: dict[str, Any], destination: Path) -> di
 
 def train_offline_kvo_phase_b(config: dict[str, Any], destination: Path) -> dict[str, Any]:
     return train_offline_kvo_bootstrap(config, destination, phase="b")
+
+
+def smoke_offline_kvo_phase_b(config: dict[str, Any], destination: Path) -> dict[str, Any]:
+    copied = dict(config)
+    copied["synthetic_teacher"] = dict(config["synthetic_teacher"])
+    copied["synthetic_teacher"]["offline_phase_b"] = dict(config["synthetic_teacher"]["offline_phase_b"])
+    copied["synthetic_teacher"]["offline_phase_b"]["output_directory"] = "offline_kvo_phase_b_smoke"
+    copied["synthetic_teacher"]["offline_phase_b"]["validation_every"] = 2
+    copied["synthetic_teacher"]["offline_phase_b"]["checkpoint_every"] = 2
+    copied["synthetic_teacher"]["offline_phase_b"]["validation_batches"] = 1
+    copied["synthetic_teacher"]["offline_phase_b"]["meta_test_batches"] = 1
+    copied["synthetic_teacher"]["offline_phase_b"]["blocks_per_step"] = 2
+    copied["synthetic_teacher"]["offline_phase_b"].setdefault("wandb", {})["enabled"] = False
+    return train_offline_kvo_bootstrap(copied, destination, steps_override=2, phase="b")
