@@ -530,7 +530,11 @@ def _load_resampler_token_cache(
 
 
 def _load_resident_feature_cache(
-    rows: list[dict[str, Any]], feature_root: Path, taps: list[int], global_layer: int
+    rows: list[dict[str, Any]],
+    feature_root: Path,
+    taps: list[int],
+    global_layer: int,
+    device: str = "cpu",
 ) -> dict[str, Any]:
     """Materialize C-RADIO shards into contiguous system-RAM tensors once.
 
@@ -578,7 +582,12 @@ def _load_resident_feature_cache(
         sum(value.numel() * value.element_size() for value in features.values())
         + global_values.numel() * global_values.element_size()
     ) / (1024**3)
-    print(f"resident C-RADIO cache ready: {gib:.2f} GiB system RAM", flush=True)
+    if device != "cpu":
+        print(f"moving {gib:.2f} GiB C-RADIO cache to {device}", flush=True)
+        features = {layer: value.to(device) for layer, value in features.items()}
+        global_values = global_values.to(device)
+        token_counts = token_counts.to(device)
+    print(f"resident C-RADIO cache ready: {gib:.2f} GiB on {device}", flush=True)
     return {
         "id_to_index": id_to_index,
         "features": features,
@@ -696,7 +705,12 @@ def train_offline_kvo_bootstrap(
             if configured_feature_root and Path(str(configured_feature_root)).is_dir()
             else root / "style_features"
         )
-        resident_features = _load_resident_feature_cache(rows, feature_root, [18, 24], 24)
+        feature_cache_device = (
+            device if bool(training.get("gpu_resident_features", False)) else "cpu"
+        )
+        resident_features = _load_resident_feature_cache(
+            rows, feature_root, [18, 24], 24, feature_cache_device
+        )
     bridge_parameters = [value for value in adapter.bridge_parameters() if value.requires_grad]
     connector_parameters = [
         value for module in (adapter.connector_trunk, adapter.connector_branches)
@@ -755,9 +769,11 @@ def train_offline_kvo_bootstrap(
         if phase == "a":
             return baseline, baseline.new_zeros(())
         if resident_features is not None:
+            cache_device = resident_features["features"][18].device
             indices = torch.tensor(
                 [resident_features["id_to_index"][int(row["id"])] for row in batch_rows],
                 dtype=torch.long,
+                device=cache_device,
             )
             features = {
                 layer: value.index_select(0, indices).to(device, non_blocking=True)

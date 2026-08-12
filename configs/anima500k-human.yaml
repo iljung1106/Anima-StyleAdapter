@@ -617,6 +617,7 @@ synthetic_teacher:
     blocks_per_step: 7
     gpu_resident_small_caches: true
     ram_resident_features: true
+    gpu_resident_features: true
     representation_warmup_steps: 250
     learning_rate: 0.00001
     connector_learning_rate: 0.000003
