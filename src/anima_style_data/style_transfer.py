@@ -797,7 +797,12 @@ def _encode_reference_tokens_trainable(
 
 
 def _encode_target_tokens_trainable(
-    model, batch: dict[str, Any], device: str, *, huber_weight: float
+    model,
+    batch: dict[str, Any],
+    device: str,
+    *,
+    huber_weight: float,
+    reconstruct: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     non_blocking = device.startswith("cuda")
     features = {
@@ -811,15 +816,19 @@ def _encode_target_tokens_trainable(
     with torch.autocast(
         device_type="cuda", dtype=torch.bfloat16, enabled=non_blocking
     ):
-        decoded, decoded_mask, tokens = model(
-            features,
-            mask,
-            batch["target_feature_shapes"],
-            global_features,
-        )
-        reconstruction = _reconstruction_loss(
-            decoded, features, decoded_mask, huber_weight
-        )
+        if reconstruct:
+            decoded, decoded_mask, tokens = model(
+                features,
+                mask,
+                batch["target_feature_shapes"],
+                global_features,
+            )
+            reconstruction = _reconstruction_loss(
+                decoded, features, decoded_mask, huber_weight
+            )
+        else:
+            _, tokens = model.encode(features, mask, global_features)
+            reconstruction = tokens.new_zeros((), dtype=torch.float32)
     return tokens, reconstruction
 
 
@@ -1405,40 +1414,53 @@ def _forward_flow_loss(
             float(loss_config.get(key, 0.0)) > 0
             for key in ("style_token_contrastive_weight", "style_kv_contrastive_weight")
         )
+        resampler_auxiliary_weight = float(
+            loss_config.get("resampler_auxiliary_weight", 0.0)
+        )
         resampler_reconstruction = latents.new_zeros((), dtype=torch.float32)
         resampler_joint_prototype = latents.new_zeros((), dtype=torch.float32)
         resampler_slot_prototype = latents.new_zeros((), dtype=torch.float32)
         resampler_diversity = latents.new_zeros((), dtype=torch.float32)
         if resampler_trainable:
-            references, flat_reference_tokens = _encode_reference_tokens_trainable(
-                resampler, batch, device
+            needs_episode_references = (
+                not curriculum["target_only"]
+                or needs_reference_contrastive
+                or resampler_auxiliary_weight > 0
             )
+            if needs_episode_references:
+                references, flat_reference_tokens = _encode_reference_tokens_trainable(
+                    resampler, batch, device
+                )
+                reference_mask = batch["reference_mask"].to(
+                    device, non_blocking=True
+                )
+                episode_reference_tokens = references
+                episode_reference_mask = reference_mask
             target_style_tokens, resampler_reconstruction = (
                 _encode_target_tokens_trainable(
                     resampler,
                     batch,
                     device,
                     huber_weight=float(loss_config.get("resampler_huber_weight", 0.10)),
+                    reconstruct=resampler_auxiliary_weight > 0,
                 )
             )
-            reference_mask = batch["reference_mask"].to(device, non_blocking=True)
-            reference_tokens_for_aux = references
-            episode_reference_tokens = references
-            episode_reference_mask = reference_mask
-            (
-                resampler_joint_prototype,
-                resampler_slot_prototype,
-            ) = _episode_resampler_prototype_losses(
-                references,
-                reference_mask,
-                target_style_tokens,
-                float(loss_config.get("resampler_prototype_temperature", 0.07)),
-                [str(item.style_id) for item in batch["episodes"]],
-            )
-            resampler_diversity = _slot_variation_diversity_loss(
-                torch.cat((flat_reference_tokens, target_style_tokens), dim=0),
-                float(loss_config.get("resampler_diversity_margin", 0.20)),
-            )
+            if resampler_auxiliary_weight > 0:
+                reference_tokens_for_aux = references
+                (
+                    resampler_joint_prototype,
+                    resampler_slot_prototype,
+                ) = _episode_resampler_prototype_losses(
+                    references,
+                    reference_mask,
+                    target_style_tokens,
+                    float(loss_config.get("resampler_prototype_temperature", 0.07)),
+                    [str(item.style_id) for item in batch["episodes"]],
+                )
+                resampler_diversity = _slot_variation_diversity_loss(
+                    torch.cat((flat_reference_tokens, target_style_tokens), dim=0),
+                    float(loss_config.get("resampler_diversity_margin", 0.20)),
+                )
         elif target_probability > 0 or curriculum["oracle_required"] or any(
             float(loss_config.get(key, 0.0)) > 0
             for key in ("style_token_contrastive_weight", "style_kv_contrastive_weight")
@@ -1780,7 +1802,7 @@ def _forward_flow_loss(
             + reference_direction_weight * reference_direction_loss
             + token_weight * token_contrastive
             + kv_weight * kv_contrastive
-            + float(loss_config.get("resampler_auxiliary_weight", 0.0))
+            + resampler_auxiliary_weight
             * (
                 resampler_reconstruction
                 + float(loss_config.get("resampler_joint_prototype_weight", 0.13))

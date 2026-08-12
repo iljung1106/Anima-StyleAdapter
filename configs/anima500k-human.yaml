@@ -265,7 +265,7 @@ tap_resampler_experiment:
 # and batches targets by exact latent shape. `style-smoke` forces two steps and
 # writes to a separate smoke directory; `style-train` uses `training.steps`.
 style_transfer:
-  output_directory: style_transfer_l18_l24_siglip_l24_32x1024_pretrained_kvo_lora_shift3_from_frozenagg500_250
+  output_directory: style_transfer_exactself_unfrozen_resampler_noaux_lr4x_from_scratch_2000
   seed: 20260811
   loader:
     style_cache: style_features_l18_l24_siglip_l24
@@ -304,7 +304,7 @@ style_transfer:
     aggregator_heads: 16
     aggregator_layers: 2
     aggregator_slot_mixer_layers: 1
-    style_dropout: 0.12
+    style_dropout: 0.0
     gate_dim: 256
   # Measure only the magnitude of Anima's native @artist intervention. Residual
   # directions are discarded. Weak artist tags and near-identical centered
@@ -324,35 +324,29 @@ style_transfer:
     maximum_artist_similarity: 0.95
   training:
     device: cuda
-    # Exact-self contrastive supervision prevented collapse but can preserve
-    # image content rather than artist identity. Restart from the last neutral
-    # checkpoint and contrast same-artist heldout references against each
-    # target while strengthening the flow-MSE ranking margin.
-    steps: 250
-    initial_checkpoint: style_transfer_l18_l24_siglip_l24_32x1024_pretrained_kvo_lora_frozenagg_from_contrast_1000/checkpoints/step-0000500.pt
+    # Capacity diagnostic: start a fresh Adapter (while still reusing frozen
+    # Anima block K/V/O), feed only the exact target as its own reference, and
+    # let ordinary flow supervision update the complete style-token encoder.
+    steps: 2000
     # Trainable adapter weights and Adam moments stay FP32. Representation
     # modules need a higher LR than the stabilized zero-output path.
-    learning_rate: 0.0003
-    representation_learning_rate: 0.0003
-    output_learning_rate: 0.0002
-    gate_learning_rate: 0.0001
-    # The pretrained Resampler already separates held-out artists. Joint flow
-    # updates collapsed that space in two independent pilots, so keep it frozen
-    # until the downstream adapter demonstrably uses reference identity.
-    resampler_learning_rate: 0.00001
-    resampler_max_grad_norm: 0.25
-    resampler_train_start_step: -1
-    # The initialized 50M-parameter Set Aggregator already preserves heldout
-    # artist identity. Freeze it while the much smaller downstream K/V/O/gate
-    # path receives enough flow exposures to learn how to use those tokens.
-    aggregator_train_start_step: -1
-    # Continue the pretraining objectives at a gentle overall scale while flow
-    # gradients adapt the tokens to Anima. Reconstruction is computed only for
-    # rotating targets; prototype/diversity use target and reference tokens.
-    resampler_auxiliary_weight: 0.10
-    resampler_joint_prototype_weight: 0.13
-    resampler_slot_prototype_weight: 0.02
-    resampler_diversity_weight: 0.01
+    learning_rate: 0.0012
+    representation_learning_rate: 0.0012
+    output_learning_rate: 0.0008
+    gate_learning_rate: 0.0004
+    # Open the complete pretrained Resampler from step one. Its LR is exactly
+    # four times the previous 1e-5 setting.
+    resampler_learning_rate: 0.00004
+    resampler_max_grad_norm: 1.0
+    resampler_train_start_step: 0
+    # The freshly initialized Set Aggregator is also open from step one.
+    aggregator_train_start_step: 0
+    # Disable every Resampler auxiliary. In this ablation its encoder and style
+    # slots learn exclusively through Anima's exact-self flow objective.
+    resampler_auxiliary_weight: 0.0
+    resampler_joint_prototype_weight: 0.0
+    resampler_slot_prototype_weight: 0.0
+    resampler_diversity_weight: 0.0
     resampler_diversity_margin: 0.20
     resampler_prototype_temperature: 0.07
     resampler_huber_weight: 0.10
@@ -400,10 +394,9 @@ style_transfer:
     style_direction_epsilon: 0.01
     style_direction_anneal_start: 500
     style_direction_anneal_end: 2000
-    # The Aggregator itself is frozen in this run. Keep only the weaker
-    # same-artist constraint after the actual 28-block K/V projections.
+    # Remove representation constraints so this is a pure flow-capacity test.
     style_token_contrastive_weight: 0.0
-    style_kv_contrastive_weight: 0.01
+    style_kv_contrastive_weight: 0.0
     style_contrastive_temperature: 0.10
     # The stronger live rank objective failed its controlled ablation, so keep
     # its schedule here but disable the expensive wrong-reference branch.
@@ -427,28 +420,21 @@ style_transfer:
     style_interval_huber_beta: 0.01
     style_guided_effect_scale: 1.0
     style_effect_upper_scale: 1.5
-    # 1) target-only standard flow bootstrap; 2) initially train only the
-    # exact-zero gate, then open K/V and the set aggregator; 3) freeze the
-    # end-of-bootstrap adapter as a target-reference oracle; 4) gradually
-    # remove target references while weakly distilling on a subset of steps;
-    # 5) finish with target-excluded multi-reference episodes only.
+    # Keep exact-target self-reference for all 2,000 optimizer steps.
     curriculum:
-      # This run starts from a checkpoint whose gate and K/V/O path are
-      # already open. Re-entering the zero-init gate bootstrap would freeze
-      # the only active continuation path and leave the loss without a graph.
       gate_only_steps: 0
-      self_reference_steps: 8000
-      target_anneal_end: 20000
-      oracle_distill_end: 20000
-    oracle_distill_weight: 0.02
+      self_reference_steps: 2000
+      target_anneal_end: 2001
+      oracle_distill_end: 2000
+    oracle_distill_weight: 0.0
     oracle_distill_probability: 0.25
     oracle_distill_scale_floor: 0.02
     oracle_distill_huber_beta: 0.1
     wandb:
       enabled: true
       project: anima-style-adapter
-      name: anima-style-transfer-l18-l24-32x1024-pretrained-kvo-lora-shift3-from-frozenagg500-250
-      id: anima-style-transfer-l18-l24-32x1024-pretrained-kvo-lora-shift3-from-frozenagg500-250
+      name: anima-style-transfer-exactself-unfrozen-resampler-noaux-lr4x-scratch-2000
+      id: anima-style-transfer-exactself-unfrozen-resampler-noaux-lr4x-scratch-2000
   diagnostics:
     checkpoint: checkpoints/step-0000250.pt
     checkpoints:
