@@ -1251,6 +1251,19 @@ def _set_adapter_trainable_stage(
             parameter.requires_grad_(True)
 
 
+def _set_aggregator_trainable(
+    adapter: SharedLowRankStyleAdapter,
+    *,
+    step: int,
+    start_step: int,
+    gate_only: bool,
+) -> bool:
+    trainable = not gate_only and start_step >= 0 and step >= start_step
+    for parameter in adapter.aggregator.parameters():
+        parameter.requires_grad_(trainable)
+    return trainable
+
+
 @contextmanager
 def _use_style_controller(anima: nn.Module, adapter: SharedLowRankStyleAdapter):
     previous = [block.__dict__["_style_controller"] for block in anima.blocks]
@@ -1772,6 +1785,9 @@ def _forward_flow_loss(
         "style_auxiliary": auxiliary,
         "style_magnitude_floor": magnitude_floor,
         "target_reference_probability": target_probability,
+        "aggregator_trainable": any(
+            parameter.requires_grad for parameter in adapter.aggregator.parameters()
+        ),
         "resampler_trainable": resampler_trainable,
         "resampler_reconstruction": float(resampler_reconstruction.detach()),
         "resampler_joint_prototype": float(resampler_joint_prototype.detach()),
@@ -3138,6 +3154,12 @@ def train_style_adapter(config: dict[str, Any], destination: Path, *, steps_over
         step = zero_based_step + 1
         curriculum = _self_reference_curriculum_state(step, curriculum_cfg)
         _set_adapter_trainable_stage(adapter, gate_only=bool(curriculum["gate_only"]))
+        _set_aggregator_trainable(
+            adapter,
+            step=step,
+            start_step=int(training.get("aggregator_train_start_step", 0)),
+            gate_only=bool(curriculum["gate_only"]),
+        )
         if curriculum["oracle_required"] and oracle_adapter is None:
             if step != self_reference_steps + 1:
                 raise RuntimeError(

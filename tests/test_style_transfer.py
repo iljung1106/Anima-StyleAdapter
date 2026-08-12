@@ -24,6 +24,7 @@ from anima_style_data.style_transfer import (
     _reference_flow_direction_loss,
     _reference_flow_rank_loss,
     _save_training_state,
+    _set_aggregator_trainable,
     _self_reference_curriculum_state,
     _set_adapter_trainable_stage,
     _style_bootstrap_state,
@@ -61,6 +62,27 @@ def test_style_gradient_groups_are_clipped_independently():
     assert representation.grad.norm() == pytest.approx(1.0)
     assert output.grad.norm() == pytest.approx(2.0)
     assert gate.grad.norm() == pytest.approx(4.0)
+
+
+def test_aggregator_can_remain_frozen_until_an_explicit_step():
+    adapter = SharedLowRankStyleAdapter(
+        style_dim=8, slots=2, hidden_dim=16, output_dim=16,
+        heads=4, blocks=28, rank=2,
+        aggregator_heads=2, aggregator_layers=1, style_dropout=0.0, gate_dim=4,
+    )
+
+    assert not _set_aggregator_trainable(
+        adapter, step=100, start_step=-1, gate_only=False
+    )
+    assert not any(parameter.requires_grad for parameter in adapter.aggregator.parameters())
+
+    assert _set_aggregator_trainable(
+        adapter, step=100, start_step=100, gate_only=False
+    )
+    assert all(parameter.requires_grad for parameter in adapter.aggregator.parameters())
+    assert not _set_aggregator_trainable(
+        adapter, step=101, start_step=100, gate_only=True
+    )
 
 
 def test_direction_loss_stays_enabled_without_an_explicit_anneal():

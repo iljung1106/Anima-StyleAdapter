@@ -265,7 +265,7 @@ tap_resampler_experiment:
 # and batches targets by exact latent shape. `style-smoke` forces two steps and
 # writes to a separate smoke directory; `style-train` uses `training.steps`.
 style_transfer:
-  output_directory: style_transfer_l18_l24_siglip_l24_32x1024_pretrained_kvo_lora_direction05_groupclip_from250_250
+  output_directory: style_transfer_l18_l24_siglip_l24_32x1024_pretrained_kvo_lora_frozenagg_from_contrast_1000
   seed: 20260811
   loader:
     style_cache: style_features_l18_l24_siglip_l24
@@ -328,8 +328,8 @@ style_transfer:
     # image content rather than artist identity. Restart from the last neutral
     # checkpoint and contrast same-artist heldout references against each
     # target while strengthening the flow-MSE ranking margin.
-    steps: 250
-    initial_checkpoint: style_transfer_l18_l24_siglip_l24_32x1024_pretrained_kvo_lora_rankdir_from500_500/checkpoints/step-0000250.pt
+    steps: 1000
+    initial_checkpoint: style_transfer_l18_l24_siglip_l24_32x1024_pretrained_kvo_lora_liverank_contrast_from250_250/checkpoints/step-0000250.pt
     # Trainable adapter weights and Adam moments stay FP32. Representation
     # modules need a higher LR than the stabilized zero-output path.
     learning_rate: 0.0003
@@ -342,6 +342,10 @@ style_transfer:
     resampler_learning_rate: 0.00001
     resampler_max_grad_norm: 0.25
     resampler_train_start_step: -1
+    # The initialized 50M-parameter Set Aggregator already preserves heldout
+    # artist identity. Freeze it while the much smaller downstream K/V/O/gate
+    # path receives enough flow exposures to learn how to use those tokens.
+    aggregator_train_start_step: -1
     # Continue the pretraining objectives at a gentle overall scale while flow
     # gradients adapt the tokens to Anima. Reconstruction is computed only for
     # rotating targets; prototype/diversity use target and reference tokens.
@@ -383,17 +387,16 @@ style_transfer:
     # magnitude auxiliaries. Direction normalization is strongest during the
     # bootstrap, then fades as ordinary flow MSE takes over.
     style_flow_loss_weight: 4.0
-    # At 0.05 this term stayed near 0.95 while rank loss did not improve the
-    # correct-reference flow margin. Give residual direction comparable weight
-    # to the weighted flow MSE during the exact-self bootstrap.
-    style_flow_direction_weight: 0.5
+    # The 0.5 ablation increased intervention magnitude but made validation
+    # worse. Retain only the gentle direction tie-breaker used by the best
+    # representation-preserving checkpoint.
+    style_flow_direction_weight: 0.05
     style_direction_epsilon: 0.01
     style_direction_anneal_start: 500
     style_direction_anneal_end: 2000
-    # Anchor the trainable Aggregator to frozen per-reference slots, then apply
-    # a weaker constraint after the actual 28-block K/V projections. This
-    # prevents the high-capacity flow path from erasing artist distinctions.
-    style_token_contrastive_weight: 0.05
+    # The Aggregator itself is frozen in this run. Keep only the weaker
+    # same-artist constraint after the actual 28-block K/V projections.
+    style_token_contrastive_weight: 0.0
     style_kv_contrastive_weight: 0.01
     style_contrastive_temperature: 0.10
     # The stronger live rank objective failed its controlled ablation, so keep
@@ -438,8 +441,8 @@ style_transfer:
     wandb:
       enabled: true
       project: anima-style-adapter
-      name: anima-style-transfer-l18-l24-32x1024-pretrained-kvo-lora-direction05-groupclip-from250-250
-      id: anima-style-transfer-l18-l24-32x1024-pretrained-kvo-lora-direction05-groupclip-from250-250
+      name: anima-style-transfer-l18-l24-32x1024-pretrained-kvo-lora-frozenagg-from-contrast-1000
+      id: anima-style-transfer-l18-l24-32x1024-pretrained-kvo-lora-frozenagg-from-contrast-1000
   diagnostics:
     checkpoint: checkpoints/step-0000250.pt
     checkpoints:
