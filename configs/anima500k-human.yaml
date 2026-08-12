@@ -684,8 +684,10 @@ synthetic_teacher:
 
 real_artist_teacher:
   output_directory: real_artist_teacher_5000
-  feature_manifest: style_features/manifest.parquet
-  feature_directory: style_features
+  # This is the production cache matching the current Resampler inputs.
+  # The older style_features cache contains L20/L24/L8 statistics only.
+  feature_manifest: style_features_l18_l24_siglip_l24/manifest.parquet
+  feature_directory: style_features_l18_l24_siglip_l24
   content_source_directory: synthetic_teacher_500x16
   artist_count: 5000
   validation_artists: 250
