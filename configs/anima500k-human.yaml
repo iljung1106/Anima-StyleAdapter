@@ -265,7 +265,7 @@ tap_resampler_experiment:
 # and batches targets by exact latent shape. `style-smoke` forces two steps and
 # writes to a separate smoke directory; `style-train` uses `training.steps`.
 style_transfer:
-  output_directory: style_transfer_l18_l24_siglip_l24_32x1024_pretrained_kvo_lora_liverank_contrast_from250_250
+  output_directory: style_transfer_l18_l24_siglip_l24_32x1024_pretrained_kvo_lora_heldoutcontrast_rank2_from250_250
   seed: 20260811
   loader:
     style_cache: style_features_l18_l24_siglip_l24
@@ -324,10 +324,10 @@ style_transfer:
     maximum_artist_similarity: 0.95
   training:
     device: cuda
-    # Live MSE ranking alone raised the Aggregator pairwise cosine from 0.561
-    # to 0.791 and reduced centered RMS from 3.98 to 2.45. Restart from the
-    # last non-collapsed checkpoint, freeze its Resampler representation, and
-    # preserve identity through token/KV contrastive supervision.
+    # Exact-self contrastive supervision prevented collapse but can preserve
+    # image content rather than artist identity. Restart from the last neutral
+    # checkpoint and contrast same-artist heldout references against each
+    # target while strengthening the flow-MSE ranking margin.
     steps: 250
     initial_checkpoint: style_transfer_l18_l24_siglip_l24_32x1024_pretrained_kvo_lora_rankdir_from500_500/checkpoints/step-0000250.pt
     # Trainable adapter weights and Adam moments stay FP32. Representation
@@ -383,14 +383,14 @@ style_transfer:
     # Anchor the trainable Aggregator to frozen per-reference slots, then apply
     # a weaker constraint after the actual 28-block K/V projections. This
     # prevents the high-capacity flow path from erasing artist distinctions.
-    style_token_contrastive_weight: 0.10
-    style_kv_contrastive_weight: 0.02
+    style_token_contrastive_weight: 0.05
+    style_kv_contrastive_weight: 0.01
     style_contrastive_temperature: 0.10
     # Each shuffled style is also a positive for another target in the cyclic
     # batch permutation. Differentiating both sides makes this a contrastive
     # margin: common residuals cancel and persistent wrong-only damage cannot
     # solve all pairings.
-    style_reference_rank_weight: 0.25
+    style_reference_rank_weight: 2.0
     style_reference_rank_margin: 0.005
     style_reference_rank_probability: 1.0
     style_reference_rank_start_step: 1
@@ -431,8 +431,8 @@ style_transfer:
     wandb:
       enabled: true
       project: anima-style-adapter
-      name: anima-style-transfer-l18-l24-32x1024-pretrained-kvo-lora-liverank-contrast-from250-250
-      id: anima-style-transfer-l18-l24-32x1024-pretrained-kvo-lora-liverank-contrast-from250-250
+      name: anima-style-transfer-l18-l24-32x1024-pretrained-kvo-lora-heldoutcontrast-rank2-from250-250
+      id: anima-style-transfer-l18-l24-32x1024-pretrained-kvo-lora-heldoutcontrast-rank2-from250-250
   diagnostics:
     checkpoint: checkpoints/step-0000250.pt
     checkpoints:

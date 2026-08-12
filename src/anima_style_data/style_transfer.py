@@ -1326,6 +1326,12 @@ def _forward_flow_loss(
     with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=device.startswith("cuda")):
         target_style_tokens = None
         reference_tokens_for_aux = None
+        episode_reference_tokens = None
+        episode_reference_mask = None
+        needs_reference_contrastive = any(
+            float(loss_config.get(key, 0.0)) > 0
+            for key in ("style_token_contrastive_weight", "style_kv_contrastive_weight")
+        )
         resampler_reconstruction = latents.new_zeros((), dtype=torch.float32)
         resampler_joint_prototype = latents.new_zeros((), dtype=torch.float32)
         resampler_slot_prototype = latents.new_zeros((), dtype=torch.float32)
@@ -1344,6 +1350,8 @@ def _forward_flow_loss(
             )
             reference_mask = batch["reference_mask"].to(device, non_blocking=True)
             reference_tokens_for_aux = references
+            episode_reference_tokens = references
+            episode_reference_mask = reference_mask
             (
                 resampler_joint_prototype,
                 resampler_slot_prototype,
@@ -1363,6 +1371,11 @@ def _forward_flow_loss(
             for key in ("style_token_contrastive_weight", "style_kv_contrastive_weight")
         ):
             target_style_tokens = _encode_target_tokens(resampler, batch, device)
+        if needs_reference_contrastive and episode_reference_tokens is None:
+            episode_reference_tokens = _encode_reference_tokens(resampler, batch, device)
+            episode_reference_mask = batch["reference_mask"].to(
+                device, non_blocking=True
+            )
         if curriculum["target_only"]:
             references = target_style_tokens[:, None]
             reference_mask = torch.ones(
@@ -1370,7 +1383,11 @@ def _forward_flow_loss(
             )
         else:
             if not resampler_trainable:
-                references = _encode_reference_tokens(resampler, batch, device)
+                references = (
+                    episode_reference_tokens
+                    if episode_reference_tokens is not None
+                    else _encode_reference_tokens(resampler, batch, device)
+                )
                 reference_mask = batch["reference_mask"].to(device, non_blocking=True)
             if target_probability > 0:
                 include_target = (
@@ -1382,6 +1399,17 @@ def _forward_flow_loss(
         raw_style_tokens = adapter.aggregate(
             references, reference_mask, apply_dropout=False
         )
+        contrastive_style_tokens = raw_style_tokens
+        if needs_reference_contrastive and curriculum["target_only"]:
+            # Flow bootstrap uses the exact target as its reference, but the
+            # representation objective must not learn an image-identity
+            # shortcut. Match the other images from the same artist to the
+            # held-out target instead.
+            contrastive_style_tokens = adapter.aggregate(
+                episode_reference_tokens,
+                episode_reference_mask,
+                apply_dropout=False,
+            )
         style_tokens = raw_style_tokens
         if adapter.training and adapter.style_dropout > 0:
             dropped = torch.rand(
@@ -1654,12 +1682,12 @@ def _forward_flow_loss(
             temperature = float(loss_config.get("style_contrastive_temperature", 0.07))
             if token_weight > 0:
                 token_contrastive = _symmetric_style_contrastive_loss(
-                    raw_style_tokens, target_style_tokens, temperature
+                    contrastive_style_tokens, target_style_tokens, temperature
                 )
             if kv_weight > 0:
                 cross_attentions = [block.cross_attn for block in anima.blocks]
                 reference_signature = adapter.projected_signature(
-                    raw_style_tokens, cross_attentions
+                    contrastive_style_tokens, cross_attentions
                 )
                 target_signature = adapter.projected_signature(
                     target_style_tokens, cross_attentions
