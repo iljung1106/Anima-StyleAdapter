@@ -921,6 +921,8 @@ def train_offline_kvo_bootstrap(
         all_pair_magnitude_losses = []
         centered_pair_losses = []
         centered_pair_accuracies = []
+        reference_teacher_cosines = []
+        reference_teacher_relative_distances = []
         block_count = int(training.get("blocks_per_step", 7)) if train else 28
         if train and block_count == adapter.blocks_per_group:
             group = generator.randrange(adapter.blocks // adapter.blocks_per_group)
@@ -940,6 +942,14 @@ def train_offline_kvo_bootstrap(
             contexts = {index: value.detach() for index, value in contexts.items()}
         artist_contexts = torch.stack([text(int(row["artist_condition_id"])) for row in batch_rows])
         content_contexts = torch.stack([text(int(row["content_condition_id"])) for row in batch_rows])
+        reference_artist_contexts = None
+        if not train:
+            reference_artist_contexts = torch.stack([
+                text(artist_content_condition[
+                    (str(reference["artist"]), int(target["content_index"]))
+                ])
+                for target, reference in zip(batch_rows, reference_rows, strict=True)
+            ])
         for block in blocks:
             queries = []
             for row in batch_rows:
@@ -968,6 +978,12 @@ def train_offline_kvo_bootstrap(
                     _batched_attention_output(q, ka, va, ow)
                     - _batched_attention_output(q, kc, vc, ow)
                 )
+                if reference_artist_contexts is not None:
+                    kr, vr = native_kv(reference_artist_contexts)
+                    reference_teacher = (
+                        _batched_attention_output(q, kr, vr, ow)
+                        - _batched_attention_output(q, kc, vc, ow)
+                    )
 
             def student_output(
                 context: torch.Tensor, query: torch.Tensor = q
@@ -988,6 +1004,17 @@ def train_offline_kvo_bootstrap(
             use_rank = train and len(batch_rows) > 1 and float(training.get("functional_rank_weight", 0.0)) > 0
             wrong_student = student_output(contexts[block].roll(1, dims=0)) if use_rank else None
             teacher_float, student_float = teacher.float(), student.float()
+            if reference_artist_contexts is not None:
+                reference_teacher_float = reference_teacher.float()
+                teacher_flat = teacher_float.flatten(1)
+                reference_teacher_flat = reference_teacher_float.flatten(1)
+                reference_teacher_cosines.extend(F.cosine_similarity(
+                    teacher_flat, reference_teacher_flat, dim=1
+                ).unbind())
+                reference_teacher_relative_distances.extend((
+                    (teacher_flat - reference_teacher_flat).square().mean(1).sqrt()
+                    / teacher_flat.square().mean(1).sqrt().clamp_min(1e-6)
+                ).unbind())
             scale = teacher_float.square().mean(dim=(1, 2), keepdim=True).sqrt().clamp_min(1e-4)
             per_sample_output = F.smooth_l1_loss(
                 student_float / scale, teacher_float / scale, beta=0.1, reduction="none"
@@ -1180,6 +1207,14 @@ def train_offline_kvo_bootstrap(
             "functional_centered_all_pairs_accuracy": float(
                 centered_pair_accuracy.detach()
             ),
+            "reference_teacher_cosine": float(
+                torch.stack(reference_teacher_cosines).mean().detach()
+                if reference_teacher_cosines else 1.0
+            ),
+            "reference_teacher_relative_distance": float(
+                torch.stack(reference_teacher_relative_distances).mean().detach()
+                if reference_teacher_relative_distances else 0.0
+            ),
             "zero_improvement": float((1 - student_mse / zero_mse.clamp_min(1e-12)).detach()),
             "teacher_rms": float(torch.stack(zero_mses).mean().sqrt().detach()),
             "student_rms": float(torch.stack(student_mses).mean().sqrt().detach()),
@@ -1229,7 +1264,10 @@ def train_offline_kvo_bootstrap(
         if phase == "b":
             resampler.train()
         result = {key: sum(item[key] for item in metrics) / len(metrics) for key in metrics[0]}
-        for key in ("cosine", "zero_improvement", "output_loss"):
+        for key in (
+            "cosine", "zero_improvement", "output_loss",
+            "reference_teacher_cosine", "reference_teacher_relative_distance",
+        ):
             result[f"wrong_{key}"] = sum(item[key] for item in wrong_metrics) / len(wrong_metrics)
         result["correct_wrong_cosine_gap"] = result["cosine"] - result["wrong_cosine"]
         result["correct_wrong_improvement_gap"] = result["zero_improvement"] - result["wrong_zero_improvement"]
