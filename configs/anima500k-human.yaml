@@ -350,6 +350,10 @@ style_transfer:
     # modules need a higher LR than the stabilized zero-output path.
     learning_rate: 0.0012
     bridge_learning_rate: 0.00001
+    bridge_warmup_steps: 400
+    bridge_minimum_lr_ratio: 0.10
+    bridge_adam_eps: 0.000001
+    bridge_weight_decay: 0.0
     representation_learning_rate: 0.0012
     output_learning_rate: 0.0008
     # Retained for later stages; the negative start step below keeps this group

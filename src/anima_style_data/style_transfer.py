@@ -644,7 +644,12 @@ class SharedLowRankStyleAdapter(nn.Module):
         )
         if self.projection_mode == "learned_shared":
             return list(self.shared_k.parameters()) + list(self.shared_v.parameters()) + values
-        return list(self.style_context_proj.parameters()) + values
+        return values
+
+    def bridge_parameters(self) -> list[nn.Parameter]:
+        if self.projection_mode == "pretrained_block_lora":
+            return list(self.style_context_proj.parameters())
+        return []
 
     def gate_bootstrap_parameters(self) -> list[nn.Parameter]:
         return self.output_parameters()
@@ -3069,12 +3074,16 @@ def _save_training_state(
     optimizer: torch.optim.Optimizer,
     cfg: dict[str, Any],
     resampler: nn.Module | None = None,
+    extra_optimizers: dict[str, torch.optim.Optimizer] | None = None,
 ) -> None:
     temporary = path.with_suffix(path.suffix + ".tmp")
     state = {
         "step": step,
         "adapter": adapter.state_dict(),
         "optimizer": optimizer.state_dict(),
+        "extra_optimizers": {
+            name: value.state_dict() for name, value in (extra_optimizers or {}).items()
+        },
         "config": cfg,
         "python_rng": random.getstate(),
         "torch_rng": torch.get_rng_state(),
@@ -3168,11 +3177,7 @@ def train_style_adapter(config: dict[str, Any], destination: Path, *, steps_over
     attach_style_adapter(anima, adapter)
     output_parameters = adapter.output_parameters()
     gate_parameters = adapter.gate_parameters()
-    bridge_parameters = (
-        list(adapter.style_context_proj.parameters())
-        if adapter.projection_mode == "pretrained_block_lora"
-        else []
-    )
+    bridge_parameters = adapter.bridge_parameters()
     special_ids = {
         id(value) for value in bridge_parameters + output_parameters + gate_parameters
     }
@@ -3193,12 +3198,6 @@ def train_style_adapter(config: dict[str, Any], destination: Path, *, steps_over
     weight_decay = float(training.get("weight_decay", 0.01))
     optimizer = torch.optim.AdamW(
         [
-            {
-                "params": bridge_parameters,
-                "lr": bridge_lr,
-                "weight_decay": weight_decay,
-                "name": "bridge",
-            },
             {
                 "params": representation_parameters,
                 "lr": representation_lr,
@@ -3226,10 +3225,24 @@ def train_style_adapter(config: dict[str, Any], destination: Path, *, steps_over
         ],
         fused=device.startswith("cuda"),
     )
+    # The dense near-identity bridge gets its own optimizer. AdamW's
+    # coordinate-wise normalization made its first update large even after a
+    # small global-norm clip. RAdam behaves like a conservative SGD update
+    # while its moments are immature, then gains Adam-style adaptivity.
+    bridge_optimizer = torch.optim.RAdam(
+        bridge_parameters,
+        lr=bridge_lr,
+        betas=tuple(training.get("bridge_betas", (0.9, 0.999))),
+        eps=float(training.get("bridge_adam_eps", 1e-6)),
+        weight_decay=float(training.get("bridge_weight_decay", 0.0)),
+    )
     base_learning_rates = [float(group["lr"]) for group in optimizer.param_groups]
+    bridge_base_learning_rate = bridge_lr
     print(
         "style optimizer: FP32 trainable weights, BF16 autocast; "
-        f"bridge_lr={bridge_lr:g} representation_lr={representation_lr:g} output_lr={output_lr:g} "
+        f"bridge=RAdam(lr={bridge_lr:g},warmup={int(training.get('bridge_warmup_steps', 400))},"
+        f"eps={float(training.get('bridge_adam_eps', 1e-6)):g}) "
+        f"representation_lr={representation_lr:g} output_lr={output_lr:g} "
         f"gate_lr={gate_lr:g} resampler_lr={resampler_lr:g}",
         flush=True,
     )
@@ -3250,6 +3263,8 @@ def train_style_adapter(config: dict[str, Any], destination: Path, *, steps_over
         if "resampler" in state:
             resampler.load_state_dict(state["resampler"])
         optimizer.load_state_dict(state["optimizer"])
+        if "bridge" in state.get("extra_optimizers", {}):
+            bridge_optimizer.load_state_dict(state["extra_optimizers"]["bridge"])
         start_step = int(state["step"])
         random.setstate(state["python_rng"])
         torch.set_rng_state(state["torch_rng"])
@@ -3377,6 +3392,14 @@ def train_style_adapter(config: dict[str, Any], destination: Path, *, steps_over
             optimizer.param_groups, base_learning_rates, strict=True
         ):
             group["lr"] = base_lr * lr_multiplier
+        bridge_lr_multiplier = _learning_rate_multiplier(
+            step,
+            steps,
+            int(training.get("bridge_warmup_steps", 400)),
+            float(training.get("bridge_minimum_lr_ratio", training.get("minimum_lr_ratio", 1.0))),
+        )
+        for group in bridge_optimizer.param_groups:
+            group["lr"] = bridge_base_learning_rate * bridge_lr_multiplier
         curriculum = _self_reference_curriculum_state(step, curriculum_cfg)
         _set_adapter_trainable_stage(adapter, gate_only=bool(curriculum["gate_only"]))
         _set_aggregator_trainable(
@@ -3399,6 +3422,7 @@ def train_style_adapter(config: dict[str, Any], destination: Path, *, steps_over
             )
         data_ready = time.perf_counter()
         optimizer.zero_grad(set_to_none=True)
+        bridge_optimizer.zero_grad(set_to_none=True)
         data_wait = 0.0
         accumulated_loss = 0.0
         details = None
@@ -3464,18 +3488,39 @@ def train_style_adapter(config: dict[str, Any], destination: Path, *, steps_over
             "resampler_grad": _parameter_grad_norm(resampler.parameters()),
             "resampler_grad_norm": float(resampler_grad_norm),
         }
+        bridge_weights_before = [value.detach().clone() for value in bridge_parameters]
+        bridge_weight_norm_before = math.sqrt(
+            sum(float(value.detach().float().square().sum()) for value in bridge_parameters)
+        )
         optimizer.step()
+        bridge_optimizer.step()
+        bridge_update_norm = math.sqrt(
+            sum(
+                float((value.detach().float() - before.float()).square().sum())
+                for value, before in zip(bridge_parameters, bridge_weights_before, strict=True)
+            )
+        )
+        bridge_weight_norm = math.sqrt(
+            sum(float(value.detach().float().square().sum()) for value in bridge_parameters)
+        )
+        bridge_update_to_weight_ratio = bridge_update_norm / max(
+            bridge_weight_norm_before, 1e-12
+        )
         elapsed = time.perf_counter() - data_ready
         row = {
             "step": step, "loss": accumulated_loss, "grad_norm": float(grad_norm),
             "step_s": elapsed, "data_wait_s": data_wait,
             "gradient_accumulation_steps": accumulation_steps,
             "lr_multiplier": lr_multiplier,
-            "bridge_lr": optimizer.param_groups[0]["lr"],
-            "representation_lr": optimizer.param_groups[1]["lr"],
-            "output_lr": optimizer.param_groups[2]["lr"],
-            "gate_lr": optimizer.param_groups[3]["lr"],
-            "resampler_lr": optimizer.param_groups[4]["lr"],
+            "bridge_lr_multiplier": bridge_lr_multiplier,
+            "bridge_lr": bridge_optimizer.param_groups[0]["lr"],
+            "bridge_weight_norm": bridge_weight_norm,
+            "bridge_update_norm": bridge_update_norm,
+            "bridge_update_to_weight_ratio": bridge_update_to_weight_ratio,
+            "representation_lr": optimizer.param_groups[0]["lr"],
+            "output_lr": optimizer.param_groups[1]["lr"],
+            "gate_lr": optimizer.param_groups[2]["lr"],
+            "resampler_lr": optimizer.param_groups[3]["lr"],
             "peak_vram_gib": torch.cuda.max_memory_allocated() / (1024**3) if device.startswith("cuda") else 0.0,
             **details, **group_grads,
         }
@@ -3494,6 +3539,8 @@ def train_style_adapter(config: dict[str, Any], destination: Path, *, steps_over
                 f"oracle={row['oracle_distill_loss']:.5f}/{int(row['oracle_distill_applied'])} "
                 f"gate={row['style_gate_abs_mean']:.4f} "
                 f"block_res={row['style_block_residual_ratio_mean']:.4f} "
+                f"bridge=grad:{row['bridge_grad_norm']:.4g}/"
+                f"update:{row['bridge_update_norm']:.3g}/rel:{row['bridge_update_to_weight_ratio']:.3g} "
                 f"grads=agg:{row['aggregator_grad']:.4g}/kv:{row['shared_kv_grad']:.4g}/"
                 f"o:{row['style_output_grad']:.4g}/gate:{row['gate_grad']:.4g}/"
                 f"res:{row['resampler_grad']:.4g} "
@@ -3593,14 +3640,18 @@ def train_style_adapter(config: dict[str, Any], destination: Path, *, steps_over
                 )
         if checkpoint_every and step % checkpoint_every == 0:
             _save_training_state(
-                checkpoint_path, step, adapter, optimizer, cfg, resampler
+                checkpoint_path, step, adapter, optimizer, cfg, resampler,
+                {"bridge": bridge_optimizer},
             )
             _archive_training_state(
                 checkpoint_path, checkpoint_dir / f"step-{step:07d}.pt"
             )
 
     checkpoint = output / "checkpoint.pt"
-    _save_training_state(checkpoint_path, steps, adapter, optimizer, cfg, resampler)
+    _save_training_state(
+        checkpoint_path, steps, adapter, optimizer, cfg, resampler,
+        {"bridge": bridge_optimizer},
+    )
     _archive_training_state(checkpoint_path, checkpoint)
     summary = {
         "steps": steps, "metrics": metrics, "elapsed_s": time.perf_counter() - started,
