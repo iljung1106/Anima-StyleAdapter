@@ -89,6 +89,7 @@ def build_parser() -> argparse.ArgumentParser:
         ("synthetic-teacher-kv", "Cache factorized native Anima K/V/O teacher targets"),
         ("synthetic-validate", "Validate synthetic corpus, artist effects, and fixed splits"),
         ("synthetic-query-probes", "Capture native Anima query probe bank"),
+        ("synthetic-style-tokens", "Cache frozen per-reference Resampler tokens"),
         ("offline-kvo-smoke", "Run two offline K/V/O bootstrap steps"),
         ("offline-kvo-train", "Train and validate offline K/V/O connector bootstrap"),
         ("prepare", "Run selection, download, and duplicate removal"),
@@ -198,6 +199,10 @@ def main() -> None:
         from .synthetic_bootstrap import build_anima_query_probe_bank
 
         _run(build_anima_query_probe_bank, config, destination)
+    elif args.command == "synthetic-style-tokens":
+        from .synthetic_bootstrap import cache_synthetic_resampler_tokens
+
+        _run(cache_synthetic_resampler_tokens, config, destination)
     elif args.command in {"offline-kvo-smoke", "offline-kvo-train"}:
         from .synthetic_bootstrap import smoke_offline_kvo_bootstrap, train_offline_kvo_bootstrap
 

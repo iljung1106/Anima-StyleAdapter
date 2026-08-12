@@ -567,6 +567,9 @@ synthetic_teacher:
     trajectories_per_content: 8
     timesteps: [0.15, 0.35, 0.65, 0.85]
     queries_per_block: 32
+  style_token_cache:
+    output_directory: resampler_tokens
+    batch_size: 16
   offline_bootstrap:
     output_directory: offline_kvo_bootstrap
     seed: 20260812

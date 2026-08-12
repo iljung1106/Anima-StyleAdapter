@@ -381,6 +381,116 @@ def build_anima_query_probe_bank(config: dict[str, Any], destination: Path) -> d
     return summary
 
 
+def cache_synthetic_resampler_tokens(
+    config: dict[str, Any], destination: Path
+) -> dict[str, Any]:
+    """Materialize the frozen 128x1024 Resampler output for Phase A."""
+    from safetensors import safe_open
+    from safetensors.torch import save_file
+
+    from .style_transfer import load_per_reference_resampler
+
+    cfg = config["synthetic_teacher"]
+    cache_cfg = cfg.get("style_token_cache", {})
+    root = _root(config, destination)
+    output = root / str(cache_cfg.get("output_directory", "resampler_tokens"))
+    output.mkdir(parents=True, exist_ok=True)
+    final_manifest = output / "manifest.parquet"
+    summary_path = output / "summary.json"
+    if final_manifest.exists() and summary_path.exists():
+        rows = read_records(final_manifest)
+        summary = {
+            "images": len(rows), "shards": len({row["token_shard"] for row in rows}),
+            "storage_bytes": sum(path.stat().st_size for path in output.glob("part-*.safetensors")),
+            "reused": len(rows),
+        }
+        return summary
+
+    validated = [
+        row for row in read_records(root / "validated_manifest.parquet")
+        if _bootstrap_eligible(row)
+    ]
+    feature_rows = {
+        int(row["id"]): row for row in read_records(root / "style_features" / "manifest.parquet")
+    }
+    rows = [{**row, **feature_rows[int(row["id"])]} for row in validated]
+    grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for row in rows:
+        grouped[str(row["feature_shard"])].append(row)
+
+    device = str(cfg.get("device", "cuda"))
+    resampler_cfg = config["style_transfer"]["resampler"]
+    resampler = load_per_reference_resampler(destination, resampler_cfg, device, trainable=False)
+    batch_size = int(cache_cfg.get("batch_size", 16))
+    taps = [18, 24]
+    records: list[dict[str, Any]] = []
+    for shard_index, (feature_shard, shard_rows) in enumerate(sorted(grouped.items())):
+        token_name = f"part-{shard_index:05d}.safetensors"
+        token_path = output / token_name
+        row_path = output / f"part-{shard_index:05d}.parquet"
+        if token_path.exists() and row_path.exists():
+            records.extend(read_records(row_path))
+            print(f"reused Resampler token shard {shard_index + 1}/{len(grouped)}", flush=True)
+            continue
+        token_parts = []
+        with safe_open(root / "style_features" / feature_shard, framework="pt", device="cpu") as handle:
+            for offset in range(0, len(shard_rows), batch_size):
+                part = shard_rows[offset : offset + batch_size]
+                image_ids = [int(row["id"]) for row in part]
+                features = {
+                    layer: torch.stack([
+                        handle.get_tensor(f"{image_id}.layer_{layer:02d}_spatial")
+                        for image_id in image_ids
+                    ]).to(device, non_blocking=True)
+                    for layer in taps
+                }
+                spatial_tokens = torch.tensor(
+                    [int(row["spatial_tokens"]) for row in part], device=device
+                )
+                mask = torch.arange(features[18].shape[1], device=device)[None] < spatial_tokens[:, None]
+                global_feature = torch.stack([
+                    handle.get_tensor(f"{image_id}.layer_24_siglip_cls") for image_id in image_ids
+                ]).to(device, non_blocking=True)
+                with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
+                    _, tokens = resampler.encode(features, mask, global_feature)
+                token_parts.append(tokens.to(device="cpu", dtype=torch.bfloat16).contiguous())
+        tokens = torch.cat(token_parts)
+        expected = (len(shard_rows), 128, 1024)
+        if tuple(tokens.shape) != expected or not torch.isfinite(tokens).all():
+            raise RuntimeError(f"Invalid Resampler token shard {feature_shard}: {tuple(tokens.shape)}")
+        temporary = token_path.with_suffix(".safetensors.tmp")
+        save_file({"tokens": tokens}, temporary)
+        temporary.replace(token_path)
+        shard_records = [
+            {
+                "id": int(row["id"]), "artist": str(row["artist"]),
+                "artist_split": str(row["artist_split"]),
+                "content_split": str(row["content_split"]),
+                "content_index": int(row["content_index"]),
+                "seed_index": int(row["seed_index"]),
+                "token_shard": token_name, "token_row": index,
+                "slots": int(tokens.shape[1]), "style_dim": int(tokens.shape[2]),
+            }
+            for index, row in enumerate(shard_rows)
+        ]
+        write_records(row_path, shard_records)
+        records.extend(shard_records)
+        print(
+            f"cached Resampler token shard {shard_index + 1}/{len(grouped)} "
+            f"({len(records)}/{len(rows)} images)", flush=True,
+        )
+    if {int(row["id"]) for row in records} != {int(row["id"]) for row in rows}:
+        raise RuntimeError("Resampler token cache ID set does not match eligible synthetic references")
+    write_records(final_manifest, sorted(records, key=lambda row: int(row["id"])))
+    summary = {
+        "images": len(records), "shards": len(grouped), "slots": 128, "style_dim": 1024,
+        "dtype": "bfloat16",
+        "storage_bytes": sum(path.stat().st_size for path in output.glob("part-*.safetensors")),
+    }
+    write_json(summary_path, summary)
+    return summary
+
+
 def _native_rms_norm(value: torch.Tensor, weight: torch.Tensor | None) -> torch.Tensor:
     normalized = value * torch.rsqrt(value.float().square().mean(dim=-1, keepdim=True) + 1e-6).to(value.dtype)
     return normalized if weight is None else normalized * weight
