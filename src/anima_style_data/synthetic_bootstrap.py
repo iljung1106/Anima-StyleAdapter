@@ -605,16 +605,22 @@ def cache_real_artist_resampler_tokens(
             for offset in range(0, len(shard_rows), batch_size):
                 part = shard_rows[offset : offset + batch_size]
                 ids = [int(row["id"]) for row in part]
-                features = {
-                    layer: torch.stack([
+                feature_lists = {
+                    layer: [
                         handle.get_tensor(f"{image_id}.layer_{layer:02d}_spatial")
                         for image_id in ids
-                    ]).to(device, non_blocking=True)
+                    ]
                     for layer in (18, 24)
                 }
                 counts = torch.tensor(
-                    [int(row["spatial_tokens"]) for row in part], device=device
+                    [value.shape[0] for value in feature_lists[18]], device=device
                 )
+                features = {
+                    layer: torch.nn.utils.rnn.pad_sequence(
+                        values, batch_first=True
+                    ).to(device, non_blocking=True)
+                    for layer, values in feature_lists.items()
+                }
                 mask = torch.arange(features[18].shape[1], device=device)[None] < counts[:, None]
                 global_feature = torch.stack([
                     handle.get_tensor(f"{image_id}.layer_24_siglip_cls")

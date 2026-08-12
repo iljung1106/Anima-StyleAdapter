@@ -1,4 +1,5 @@
 import torch
+from torch.nn.utils.rnn import pad_sequence
 
 from anima_style_data.synthetic_bootstrap import (
     _attention_output,
@@ -7,6 +8,16 @@ from anima_style_data.synthetic_bootstrap import (
     assign_bootstrap_splits,
     classify_artist_effects,
 )
+
+
+def test_variable_spatial_tokens_use_batch_local_padding():
+    values = [torch.ones(7, 3), torch.ones(5, 3)]
+    padded = pad_sequence(values, batch_first=True)
+    counts = torch.tensor([value.shape[0] for value in values])
+    mask = torch.arange(padded.shape[1])[None] < counts[:, None]
+
+    assert padded.shape == (2, 7, 3)
+    assert mask.sum(1).tolist() == [7, 5]
 
 
 def test_bootstrap_artist_splits_are_disjoint_and_sized():
