@@ -30,6 +30,7 @@ features = [
   "einops>=0.8",
   "opencv-python-headless>=4.10",
   "safetensors>=0.4",
+  "scipy>=1.13",
   "sentencepiece>=0.2",
   "timm>=1.0",
   "torch>=2.1",
