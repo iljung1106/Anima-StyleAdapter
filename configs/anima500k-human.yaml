@@ -192,7 +192,7 @@ cradio_probe:
     max_pixels: 262144
 
 tap_resampler_experiment:
-  output_directory: per_reference_resampler_l18_l24_siglip_l24_32x1024_joint_global_ln
+  output_directory: per_reference_resampler_l18_l24_siglip_l24_128x1024_w1536
   seed: 20260810
   selected_variant: l18_l24_native_siglip_l24
   source_split: train
@@ -203,6 +203,9 @@ tap_resampler_experiment:
   reconstruction_taps: [18, 24]
   reference_counts: [1, 2, 4, 8]
   features:
+    # Reuse the fixed 1000-artist experiment split/manifest and production
+    # cache; only this model's runs are written below the new output directory.
+    manifest_source_directory: per_reference_resampler_l18_l24_siglip_l24_32x1024_joint_global_ln
     source_directory: style_features_l18_l24_siglip_l24
     local_cache_directory: /tmp/anima-style-resampler-l18-l24-siglip-l24
     local_shard_rows: 512
@@ -216,26 +219,31 @@ tap_resampler_experiment:
       max_pixels: 262144
   training:
     device: cuda
-    model_dim: 1024
-    latent_tokens: 32
-    heads: 16
-    resampler_layers: 4
+    # High-capacity reconstruction-first encoder from plan section 20. Each
+    # tap is projected independently before fusion; only the final style-token
+    # boundary narrows the 1536-D latent to 1024-D.
+    model_dim: 1536
+    latent_tokens: 128
+    heads: 24
+    resampler_layers: 3
     decoder_layers: 2
     style_dim: 1024
-    spatial_fusion: concat_mlp
+    spatial_fusion: projected_sum
     direct_style_tokens: true
-    artists_per_batch: 8
-    images_per_artist: 4
+    prototype_pool: attention
+    artists_per_batch: 4
+    images_per_artist: 2
     steps: 8000
-    learning_rate: 0.0002
+    learning_rate: 0.0001
+    warmup_steps: 400
+    min_lr_ratio: 0.10
     weight_decay: 0.01
-    # Preserve all ordered slots in a joint 32768-D descriptor. The small
-    # slot-wise term provides alignment without forcing every slot to become
-    # an independent artist classifier. Total artist supervision is 0.15,
-    # half of the previous 0.30.
-    joint_prototype_weight: 0.13
-    slot_prototype_weight: 0.02
-    slot_diversity_weight: 0.01
+    # Reconstruction remains primary. Artist supervision acts on an
+    # attention-pooled whole-set descriptor; per-slot classification is only a
+    # very weak alignment term and cannot dominate the 128 information slots.
+    joint_prototype_weight: 0.03
+    slot_prototype_weight: 0.001
+    slot_diversity_weight: 0.0075
     slot_diversity_margin: 0.20
     prototype_ramp: 0.20
     temperature: 0.07
@@ -252,8 +260,8 @@ tap_resampler_experiment:
     wandb:
       enabled: true
       project: anima-style-adapter
-      name: per-reference-l18-l24-siglip-l24-32x1024-joint
-      id: per-reference-l18-l24-siglip-l24-32x1024-joint-v2
+      name: per-reference-l18-l24-siglip-l24-128x1024-w1536
+      id: per-reference-l18-l24-siglip-l24-128x1024-w1536-v1
     log_every: 20
     checkpoint_every: 500
     force: false

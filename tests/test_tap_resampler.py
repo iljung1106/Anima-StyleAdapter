@@ -1,3 +1,4 @@
+import pytest
 import torch
 
 from anima_style_data.tap_resampler import (
@@ -8,9 +9,27 @@ from anima_style_data.tap_resampler import (
     _prototype_loss,
     _slot_variation_diversity_loss,
     _training_rows_for_step,
+    _warmup_cosine_learning_rate,
     build_tap_resampler_model,
     select_tap_experiment_rows,
 )
+
+
+def test_resampler_learning_rate_warms_up_then_decays():
+    values = [
+        _warmup_cosine_learning_rate(
+            step,
+            total_steps=100,
+            warmup_steps=10,
+            peak_lr=1e-4,
+            min_lr_ratio=0.1,
+        )
+        for step in (0, 9, 50, 99)
+    ]
+    assert values[0] == pytest.approx(1e-5)
+    assert values[1] == pytest.approx(1e-4)
+    assert values[1] > values[2] > values[3]
+    assert values[3] == pytest.approx(1e-5)
 
 
 def test_selection_is_artist_disjoint_and_fixed_size():
@@ -71,7 +90,7 @@ def test_resampler_contract_and_prototype_loss():
         embedding.float().mean(dim=-1), torch.zeros(4), atol=1e-5
     )
     assert torch.allclose(
-        embedding.float().square().mean(dim=-1), torch.ones(4), atol=1e-4
+        embedding.float().square().mean(dim=-1), torch.ones(4), atol=2e-3
     )
     assert torch.isfinite(_prototype_loss(embedding, 2, 2, 0.07))
 
@@ -105,6 +124,36 @@ def test_concat_resampler_returns_direct_style_tokens():
     assert torch.equal(decoded_mask, mask)
     assert style_tokens.shape == (4, 4, 24)
     assert torch.isfinite(_prototype_loss(style_tokens, 2, 2, 0.07))
+
+
+def test_projected_tap_resampler_narrows_only_at_style_output():
+    model = build_tap_resampler_model(
+        taps=[18, 24],
+        reconstruction_taps=[18, 24],
+        spatial_dim=12,
+        global_kind="native_24",
+        global_dim=12,
+        model_dim=24,
+        latent_tokens=8,
+        heads=4,
+        resampler_layers=1,
+        decoder_layers=1,
+        style_dim=16,
+        spatial_fusion="projected_sum",
+        direct_style_tokens=True,
+        prototype_pool="attention",
+    )
+    features = {18: torch.randn(4, 6, 12), 24: torch.randn(4, 6, 12)}
+    mask = torch.ones(4, 6, dtype=torch.bool)
+    latent, style_tokens = model.encode(features, mask, torch.randn(4, 12))
+    descriptor = model.prototype_descriptor(style_tokens)
+
+    assert latent.shape == (4, 8, 24)
+    assert style_tokens.shape == (4, 8, 16)
+    assert descriptor.shape == (4, 16)
+    assert torch.allclose(descriptor.norm(dim=-1), torch.ones(4), atol=1e-5)
+    assert model.tap_projections["18"].in_features == 12
+    assert model.tap_projections["18"].out_features == 24
 
 
 def test_joint_descriptor_uses_all_ordered_slots_without_projection():

@@ -384,6 +384,11 @@ def _feature_storage_dir(
     return destination / str(source_directory) if source_directory else root / "features"
 
 
+def _feature_manifest_dir(destination: Path, root: Path, feature_cfg: dict[str, Any]) -> Path:
+    source_directory = feature_cfg.get("manifest_source_directory")
+    return destination / str(source_directory) / "features" if source_directory else root / "features"
+
+
 def _positional_grid(height: int, width: int, dim: int, device):
     import torch
 
@@ -423,6 +428,7 @@ def build_tap_resampler_model(
     style_dim: int,
     spatial_fusion: str = "weighted_sum",
     direct_style_tokens: bool = False,
+    prototype_pool: str = "joint_flatten",
 ):
     import torch
     import torch.nn.functional as F
@@ -481,9 +487,18 @@ def build_tap_resampler_model(
                 )
                 self.shared_spatial_projection = None
                 self.tap_weights = None
+                self.tap_projections = None
             elif spatial_fusion == "weighted_sum":
                 self.spatial_projection = None
                 self.shared_spatial_projection = nn.Linear(spatial_dim, model_dim)
+                self.tap_weights = nn.Parameter(torch.zeros(len(taps)))
+                self.tap_projections = None
+            elif spatial_fusion == "projected_sum":
+                self.spatial_projection = None
+                self.shared_spatial_projection = None
+                self.tap_projections = nn.ModuleDict(
+                    {str(layer): nn.Linear(spatial_dim, model_dim) for layer in taps}
+                )
                 self.tap_weights = nn.Parameter(torch.zeros(len(taps)))
             else:
                 raise ValueError(f"Unknown spatial fusion: {spatial_fusion}")
@@ -513,11 +528,32 @@ def build_tap_resampler_model(
                     nn.Linear(model_dim, style_dim),
                 )
             )
+            self.style_projection = (
+                nn.Identity()
+                if direct_style_tokens and model_dim == style_dim
+                else nn.Linear(model_dim, style_dim, bias=False)
+                if direct_style_tokens
+                else None
+            )
+            self.prototype_pool = prototype_pool
+            if prototype_pool == "attention":
+                self.prototype_query = nn.Parameter(torch.empty(style_dim))
+                nn.init.normal_(self.prototype_query, std=style_dim**-0.5)
+            elif prototype_pool == "joint_flatten":
+                self.prototype_query = None
+            else:
+                raise ValueError(f"Unknown prototype pooling: {prototype_pool}")
 
         def encode(self, features, mask, global_feature=None):
             normalized = [self.tap_norms[str(layer)](features[layer]) for layer in self.taps]
             if self.spatial_fusion == "concat_mlp":
                 context = self.spatial_projection(torch.cat(normalized, dim=-1))
+            elif self.spatial_fusion == "projected_sum":
+                weights = self.tap_weights.softmax(dim=0)
+                context = sum(
+                    weight * self.tap_projections[str(layer)](value)
+                    for layer, weight, value in zip(self.taps, weights, normalized)
+                )
             else:
                 weights = self.tap_weights.softmax(dim=0)
                 context = sum(
@@ -536,13 +572,25 @@ def build_tap_resampler_model(
             for block in self.encoder:
                 latent = block(latent, context, context_mask)
             representation = (
-                latent
+                self.style_projection(latent)
                 if self.direct_style_tokens
                 else F.normalize(self.style_head(latent.mean(dim=1)), dim=-1)
             )
             # A fixed, non-affine LayerNorm prevents flow-only fine-tuning from
             # hiding unbounded token scale in learned normalization weights.
             return latent, F.layer_norm(representation, (style_dim,))
+
+        def prototype_descriptor(self, representation):
+            if representation.ndim != 3 or self.prototype_query is None:
+                return _joint_token_descriptor(representation)
+            normalized = F.layer_norm(
+                representation.float(), (representation.shape[-1],)
+            )
+            scores = torch.einsum(
+                "bnd,d->bn", normalized, self.prototype_query.float()
+            ) / math.sqrt(normalized.shape[-1])
+            pooled = torch.einsum("bn,bnd->bd", scores.softmax(dim=1), normalized)
+            return F.normalize(pooled, dim=-1)
 
         def decode(self, latent, shapes, max_tokens):
             queries = latent.new_zeros((latent.shape[0], max_tokens, latent.shape[-1]))
@@ -788,8 +836,24 @@ def _slot_variation_diversity_loss(style_tokens, margin: float = 0.20):
     return F.relu(similarities[off_diagonal].abs() - margin).square().mean()
 
 
-def _evaluation_descriptor(representation):
-    return _joint_token_descriptor(representation)
+def _evaluation_descriptor(model, representation):
+    return model.prototype_descriptor(representation)
+
+
+def _warmup_cosine_learning_rate(
+    step: int,
+    *,
+    total_steps: int,
+    warmup_steps: int,
+    peak_lr: float,
+    min_lr_ratio: float,
+) -> float:
+    if warmup_steps > 0 and step < warmup_steps:
+        return peak_lr * float(step + 1) / warmup_steps
+    progress = (step - warmup_steps) / max(1, total_steps - warmup_steps - 1)
+    progress = min(1.0, max(0.0, progress))
+    cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+    return peak_lr * (min_lr_ratio + (1.0 - min_lr_ratio) * cosine)
 
 
 def _training_rows_for_step(
@@ -923,8 +987,8 @@ def _evaluate_fixed_episodes(
                     float(training["temperature"]),
                 )
                 joint = (
-                    _joint_token_prototype_loss(
-                        representation,
+                    _prototype_loss(
+                        model.prototype_descriptor(representation),
                         artists_per_batch,
                         images_per_artist,
                         float(training["temperature"]),
@@ -1010,7 +1074,7 @@ def _evaluate_model(
                     decoded, decoded_mask, representation = model(
                         features, mask, shapes, global_feature
                     )
-                embeddings.append(_evaluation_descriptor(representation).cpu())
+                embeddings.append(_evaluation_descriptor(model, representation).cpu())
                 for layer, prediction in decoded.items():
                     similarity = F.cosine_similarity(
                         prediction[decoded_mask].float(),
@@ -1079,7 +1143,7 @@ def train_tap_resampler_variants(config: dict[str, Any], destination: Path) -> d
     cfg = config["tap_resampler_experiment"]
     training = cfg["training"]
     root = _experiment_dir(destination, cfg)
-    manifest_dir = root / "features"
+    manifest_dir = _feature_manifest_dir(destination, root, cfg["features"])
     feature_dir = _feature_storage_dir(destination, root, cfg["features"])
     rows = read_records(manifest_dir / "manifest.parquet")
     train_by_style: dict[str, list[dict[str, Any]]] = defaultdict(list)
@@ -1145,6 +1209,7 @@ def train_tap_resampler_variants(config: dict[str, Any], destination: Path) -> d
             style_dim=int(training["style_dim"]),
             spatial_fusion=str(training.get("spatial_fusion", "weighted_sum")),
             direct_style_tokens=bool(training.get("direct_style_tokens", False)),
+            prototype_pool=str(training.get("prototype_pool", "joint_flatten")),
         ).to(device)
         optimizer = torch.optim.AdamW(
             model.parameters(),
@@ -1250,6 +1315,15 @@ def train_tap_resampler_variants(config: dict[str, Any], destination: Path) -> d
                 mask = current["mask"]
                 shapes = current["shapes"]
                 global_feature = current["global"]
+                current_lr = _warmup_cosine_learning_rate(
+                    step,
+                    total_steps=steps,
+                    warmup_steps=int(training.get("warmup_steps", 0)),
+                    peak_lr=float(training["learning_rate"]),
+                    min_lr_ratio=float(training.get("min_lr_ratio", 1.0)),
+                )
+                for parameter_group in optimizer.param_groups:
+                    parameter_group["lr"] = current_lr
                 optimizer.zero_grad(set_to_none=True)
                 with torch.autocast(
                     device_type="cuda", dtype=amp_dtype, enabled=device.startswith("cuda")
@@ -1267,8 +1341,8 @@ def train_tap_resampler_variants(config: dict[str, Any], destination: Path) -> d
                         float(training["temperature"]),
                     )
                     joint_proto_loss = (
-                        _joint_token_prototype_loss(
-                            representation,
+                        _prototype_loss(
+                            model.prototype_descriptor(representation),
                             artists_per_batch,
                             images_per_artist,
                             float(training["temperature"]),
@@ -1534,7 +1608,7 @@ def evaluate_selected_tap_variant(
     if validation_row is None:
         raise RuntimeError(f"Selected variant has no validation result: {selected_name}")
 
-    manifest_dir = root / "features"
+    manifest_dir = _feature_manifest_dir(destination, root, cfg["features"])
     feature_dir = _feature_storage_dir(destination, root, cfg["features"])
     rows = read_records(manifest_dir / "manifest.parquet")
     test_rows = [row for row in rows if row["experiment_split"] == "meta_test"]
@@ -1569,6 +1643,7 @@ def evaluate_selected_tap_variant(
         style_dim=int(training["style_dim"]),
         spatial_fusion=str(training.get("spatial_fusion", "weighted_sum")),
         direct_style_tokens=bool(training.get("direct_style_tokens", False)),
+        prototype_pool=str(training.get("prototype_pool", "joint_flatten")),
     ).to(device)
     checkpoint_path = root / "runs" / selected_name / "checkpoint.pt"
     if not checkpoint_path.exists():

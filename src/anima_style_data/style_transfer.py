@@ -740,6 +740,7 @@ def load_per_reference_resampler(
         style_dim=int(training["style_dim"]),
         spatial_fusion=str(training["spatial_fusion"]),
         direct_style_tokens=bool(training["direct_style_tokens"]),
+        prototype_pool=str(training.get("prototype_pool", "joint_flatten")),
     )
     model.load_state_dict(checkpoint["model"])
     model.requires_grad_(trainable).to(device)

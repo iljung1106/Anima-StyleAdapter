@@ -557,3 +557,65 @@ Validation은 전 단계에서 target-excluded reference만 사용한다. 따라
 선택한다. Oracle은 초기 image-conditioning 경로를 전달하는 임시 teacher이며 최종 추론에는
 포함되지 않는다. Content 복사 여부는 고정 seed sample과 correct/null/bypass 진단으로 함께
 확인한다.
+
+## 20. 차세대 고용량 구조안
+
+현재 구조는 추론용 Resampler 약 77M, Set Aggregator 약 50M, Anima 직접 연결부 약 12M으로
+용량이 reference 전처리에 치우쳐 있다. 또한 수백~수천 spatial token을 `32×1024`로 강하게
+압축한다. 다음 구조에서는 정보 병목을 완화하고 대부분의 추가 용량을 Anima block별 해석에
+배치한다.
+
+### Per-reference Resampler
+
+- 출력: `128×1024` style token
+- 내부 폭: 1536, 24 heads, FFN 6144
+- 깊이: cross/self-attention block 3층
+- L18/L24 특징은 tap별 projection 후 1536차원에서 결합한다. 초반에 `3072→1024`로 바로
+  줄이지 않는다.
+- L24 SigLIP CLS는 별도 global token으로 projection해 spatial context에 추가한다.
+- 마지막 `1536→1024` projection 뒤 affine-free LayerNorm을 적용한다.
+- 목표 추론 크기: 약 120M. Reconstruction decoder는 사전학습 전용이며 배포 크기에서
+  분리한다.
+
+사전학습은 L18/L24 feature reconstruction을 주목표로 둔다. Prototype loss는 128개 slot
+각각에 강제하지 않고 전체 token set을 attention-pool한 artist descriptor에만 `0.02~0.05`
+수준으로 약하게 적용한다. Slot prototype은 끄거나 최대 `0.002`, diversity/whitening은
+`0.005~0.01`만 사용한다.
+
+### Minimal multi-reference aggregator
+
+기존 50M Transformer Aggregator는 제거한다. 각 slot에서 reference별 score를 만드는
+`1024→256→1` MLP와 가중합, 작은 residual `1024→256→1024` FFN, affine-free LayerNorm만
+사용한다. 목표 크기는 약 0.5~1.5M이며 reference 순서 불변성과 slot 위치를 유지한다.
+단일 reference exact-self 단계에서는 Aggregator를 완전히 우회한다.
+
+### Anima connector
+
+- 입력: `128×1024`
+- shared width-1024 Transformer trunk 4층
+- Anima 28개 block을 7개씩 네 그룹으로 나누고, 그룹별 width-1024 branch Transformer
+  2층을 둔다.
+- 각 block은 pretrained Anima K/V/O를 재사용하되 독립적인 rank-128 K/V delta와 O delta,
+  timestep-conditioned gate를 갖는다.
+- 주 표현 경로는 계속 1024차원을 유지한다. Rank 128은 pretrained projection의 delta에만
+  사용하고 style token 자체를 128차원으로 압축하지 않는다.
+- 목표 크기: 약 190~205M.
+
+최종 추론용 추가 모델 예산은 Resampler 약 120M, Aggregator 약 1M, Anima connector 약
+200M으로 총 310~325M이다. 이 수치는 목표가 아니라 용량 배분 기준이며, exact-self
+reconstruction과 heldout generalization ablation으로 조정한다.
+
+### 학습 순서
+
+1. 새 128-token Resampler를 reconstruction 중심으로 사전학습한다.
+2. Resampler를 동결하고 Aggregator를 우회한 채 새 connector가 exact-target reference로
+   입력 이미지를 재현할 수 있는지 먼저 검증한다.
+3. 재현 신호가 확인되면 Resampler 상단 1개 block부터 낮은 LR로 열고 필요할 때만 전체를
+   연다.
+4. Target 포함률을 점진적으로 낮춰 same-artist heldout reference 학습으로 전환한다.
+5. 마지막에만 tiny Aggregator를 열어 1/2/4/8장 multi-reference와 reference dropout을
+   학습한다.
+
+중간 activation에는 Q/K/V normalization, Resampler/Aggregator 최종 LayerNorm, LR warmup과
+decay를 유지한다. Exact-self조차 재현하지 못한 상태에서는 prototype 분리 성능이나
+multi-reference 성능보다 정보 보존과 block별 flow 개선을 우선한다.
