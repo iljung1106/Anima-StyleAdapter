@@ -47,27 +47,33 @@ def test_learning_rate_warmup_and_cosine_decay():
 
 
 def test_style_gradient_groups_are_clipped_independently():
+    bridge = nn.Parameter(torch.zeros(1))
     representation = nn.Parameter(torch.zeros(2))
     output = nn.Parameter(torch.zeros(1))
     gate = nn.Parameter(torch.zeros(1))
+    bridge.grad = torch.tensor([2.0])
     representation.grad = torch.tensor([3.0, 4.0])
     output.grad = torch.tensor([6.0])
     gate.grad = torch.tensor([8.0])
 
     norms = _clip_style_gradient_groups(
+        [bridge],
         [representation],
         [output],
         [gate],
         {
+            "bridge_max_grad_norm": 0.5,
             "representation_max_grad_norm": 1.0,
             "output_max_grad_norm": 2.0,
             "gate_max_grad_norm": 4.0,
         },
     )
 
+    assert norms["bridge"] == pytest.approx(2.0)
     assert norms["representation"] == pytest.approx(5.0)
     assert norms["output"] == pytest.approx(6.0)
     assert norms["gate"] == pytest.approx(8.0)
+    assert bridge.grad.norm() == pytest.approx(0.5)
     assert representation.grad.norm() == pytest.approx(1.0)
     assert output.grad.norm() == pytest.approx(2.0)
     assert gate.grad.norm() == pytest.approx(4.0)
@@ -613,11 +619,12 @@ def test_pretrained_block_projection_starts_zero_then_trains_style_alignment():
 
     output = adapter.attend(0, query, cross, native_gate)
     assert output.shape == query.shape
-    assert torch.count_nonzero(output) == 0
-    output.sum().backward()
+    assert torch.count_nonzero(output) > 0
+    output.square().mean().backward()
     assert adapter.style_context_proj.weight.grad is not None
     assert adapter.style_context_proj.weight.grad.norm() > 0
-    assert adapter.k_up[0].weight.grad is None or adapter.k_up[0].weight.grad.norm() == 0
+    assert adapter.k_up[0].weight.grad is not None
+    assert adapter.k_up[0].weight.grad.norm() < 1e-12
     assert cross.k_proj.weight.grad is None
     assert cross.output_proj.weight.grad is None
 

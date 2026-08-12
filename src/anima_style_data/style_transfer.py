@@ -501,11 +501,14 @@ class SharedLowRankStyleAdapter(nn.Module):
             nn.init.zeros_(self.shared_o.weight)
         else:
             # C-RADIO/Resampler tokens do not initially share Anima's text
-            # conditioning coordinates. A zero bridge makes the complete style
-            # residual neutral even under Anima's large native gate_cross(t),
-            # then flow supervision learns the alignment directly.
+            # conditioning coordinates. A tiny scaled identity keeps a live
+            # direction signal without letting Anima's large native
+            # gate_cross(t) immediately amplify an unaligned full-strength path.
             self.style_context_proj = nn.Linear(style_dim, self.context_dim, bias=False)
-            nn.init.zeros_(self.style_context_proj.weight)
+            with torch.no_grad():
+                self.style_context_proj.weight.copy_(
+                    torch.eye(self.context_dim, style_dim) * 1e-4
+                )
         self.connector_groups = int(connector_groups)
         if blocks % self.connector_groups:
             raise ValueError("Anima blocks must divide evenly across connector groups")
@@ -1227,6 +1230,7 @@ def _parameter_grad_norm(parameters) -> float:
 
 
 def _clip_style_gradient_groups(
+    bridge_parameters: list[nn.Parameter],
     representation_parameters: list[nn.Parameter],
     output_parameters: list[nn.Parameter],
     gate_parameters: list[nn.Parameter],
@@ -1241,11 +1245,13 @@ def _clip_style_gradient_groups(
     """
     default = float(training.get("max_grad_norm", 1.0))
     groups = {
+        "bridge": bridge_parameters,
         "representation": representation_parameters,
         "output": output_parameters,
         "gate": gate_parameters,
     }
     limits = {
+        "bridge": float(training.get("bridge_max_grad_norm", 0.05)),
         "representation": float(training.get("representation_max_grad_norm", default)),
         "output": float(training.get("output_max_grad_norm", default)),
         "gate": float(training.get("gate_max_grad_norm", default)),
@@ -3162,16 +3168,24 @@ def train_style_adapter(config: dict[str, Any], destination: Path, *, steps_over
     attach_style_adapter(anima, adapter)
     output_parameters = adapter.output_parameters()
     gate_parameters = adapter.gate_parameters()
-    special_ids = {id(value) for value in output_parameters + gate_parameters}
+    bridge_parameters = (
+        list(adapter.style_context_proj.parameters())
+        if adapter.projection_mode == "pretrained_block_lora"
+        else []
+    )
+    special_ids = {
+        id(value) for value in bridge_parameters + output_parameters + gate_parameters
+    }
     representation_parameters = [
         value for value in adapter.parameters() if id(value) not in special_ids
     ]
-    parameters = representation_parameters + output_parameters + gate_parameters
+    parameters = bridge_parameters + representation_parameters + output_parameters + gate_parameters
     if len({id(value) for value in parameters}) != len(list(adapter.parameters())):
         raise RuntimeError("Style optimizer parameter groups do not cover the adapter exactly once")
     representation_lr = float(
         training.get("representation_learning_rate", training.get("learning_rate", 1e-4))
     )
+    bridge_lr = float(training.get("bridge_learning_rate", 1e-5))
     output_lr = float(training.get("output_learning_rate", representation_lr))
     gate_lr = float(training.get("gate_learning_rate", output_lr))
     resampler_lr = float(training.get("resampler_learning_rate", representation_lr * 0.1))
@@ -3179,6 +3193,12 @@ def train_style_adapter(config: dict[str, Any], destination: Path, *, steps_over
     weight_decay = float(training.get("weight_decay", 0.01))
     optimizer = torch.optim.AdamW(
         [
+            {
+                "params": bridge_parameters,
+                "lr": bridge_lr,
+                "weight_decay": weight_decay,
+                "name": "bridge",
+            },
             {
                 "params": representation_parameters,
                 "lr": representation_lr,
@@ -3209,7 +3229,7 @@ def train_style_adapter(config: dict[str, Any], destination: Path, *, steps_over
     base_learning_rates = [float(group["lr"]) for group in optimizer.param_groups]
     print(
         "style optimizer: FP32 trainable weights, BF16 autocast; "
-        f"representation_lr={representation_lr:g} output_lr={output_lr:g} "
+        f"bridge_lr={bridge_lr:g} representation_lr={representation_lr:g} output_lr={output_lr:g} "
         f"gate_lr={gate_lr:g} resampler_lr={resampler_lr:g}",
         flush=True,
     )
@@ -3411,6 +3431,7 @@ def train_style_adapter(config: dict[str, Any], destination: Path, *, steps_over
         details.update(boolean_detail_any)
         if bool(training.get("separate_gradient_clipping", False)):
             clipped_norms = _clip_style_gradient_groups(
+                bridge_parameters,
                 representation_parameters,
                 output_parameters,
                 gate_parameters,
@@ -3432,6 +3453,7 @@ def train_style_adapter(config: dict[str, Any], destination: Path, *, steps_over
             float(training.get("resampler_max_grad_norm", 0.25)),
         )
         group_grads = {
+            "bridge_grad_norm": clipped_norms.get("bridge", float("nan")),
             "representation_grad_norm": clipped_norms["representation"],
             "output_grad_norm": clipped_norms["output"],
             "gate_grad_norm": clipped_norms["gate"],
@@ -3449,10 +3471,11 @@ def train_style_adapter(config: dict[str, Any], destination: Path, *, steps_over
             "step_s": elapsed, "data_wait_s": data_wait,
             "gradient_accumulation_steps": accumulation_steps,
             "lr_multiplier": lr_multiplier,
-            "representation_lr": optimizer.param_groups[0]["lr"],
-            "output_lr": optimizer.param_groups[1]["lr"],
-            "gate_lr": optimizer.param_groups[2]["lr"],
-            "resampler_lr": optimizer.param_groups[3]["lr"],
+            "bridge_lr": optimizer.param_groups[0]["lr"],
+            "representation_lr": optimizer.param_groups[1]["lr"],
+            "output_lr": optimizer.param_groups[2]["lr"],
+            "gate_lr": optimizer.param_groups[3]["lr"],
+            "resampler_lr": optimizer.param_groups[4]["lr"],
             "peak_vram_gib": torch.cuda.max_memory_allocated() / (1024**3) if device.startswith("cuda") else 0.0,
             **details, **group_grads,
         }

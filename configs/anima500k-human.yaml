@@ -349,6 +349,7 @@ style_transfer:
     # Trainable adapter weights and Adam moments stay FP32. Representation
     # modules need a higher LR than the stabilized zero-output path.
     learning_rate: 0.0012
+    bridge_learning_rate: 0.00001
     representation_learning_rate: 0.0012
     output_learning_rate: 0.0008
     # Retained for later stages; the negative start step below keeps this group
@@ -377,6 +378,7 @@ style_transfer:
     # paths. A global clip consequently shrank Aggregator/K/V/O updates by the
     # gate norm. Bound each functional path independently for this ablation.
     separate_gradient_clipping: true
+    bridge_max_grad_norm: 0.05
     representation_max_grad_norm: 1.0
     output_max_grad_norm: 1.0
     # H100 80GB has ample headroom for the frozen Anima activations. Keeping
