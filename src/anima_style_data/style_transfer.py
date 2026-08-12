@@ -3246,7 +3246,8 @@ def train_style_adapter(config: dict[str, Any], destination: Path, *, steps_over
         f"gate_lr={gate_lr:g} resampler_lr={resampler_lr:g}",
         flush=True,
     )
-    steps = int(steps_override if steps_override is not None else training["steps"])
+    schedule_steps = int(training["steps"])
+    steps = int(steps_override if steps_override is not None else schedule_steps)
     output = destination / str(cfg.get("output_directory", "style_transfer_training"))
     if steps_override is not None:
         output = output / f"smoke-{steps_override}-steps"
@@ -3384,7 +3385,7 @@ def train_style_adapter(config: dict[str, Any], destination: Path, *, steps_over
         step = zero_based_step + 1
         lr_multiplier = _learning_rate_multiplier(
             step,
-            steps,
+            schedule_steps,
             int(training.get("warmup_steps", 0)),
             float(training.get("minimum_lr_ratio", 1.0)),
         )
@@ -3394,7 +3395,7 @@ def train_style_adapter(config: dict[str, Any], destination: Path, *, steps_over
             group["lr"] = base_lr * lr_multiplier
         bridge_lr_multiplier = _learning_rate_multiplier(
             step,
-            steps,
+            schedule_steps,
             int(training.get("bridge_warmup_steps", 400)),
             float(training.get("bridge_minimum_lr_ratio", training.get("minimum_lr_ratio", 1.0))),
         )
@@ -3673,18 +3674,9 @@ def smoke_test_style_adapter(config: dict[str, Any], destination: Path) -> dict[
     # The smoke contract is forward/backward/checkpoint validity. Full image
     # sampling is substantially slower and is tested by style-sample itself.
     training["sample_every"] = int(training.get("smoke_sample_every", 0))
-    # Exercise both sides of the new production transition in two real steps:
-    # exact-zero gate-only self-reference, then frozen-oracle distillation with
-    # the complete student path open.
-    training["curriculum"] = {
-        "gate_only_steps": 0,
-        "self_reference_steps": 1,
-        "target_anneal_end": 3,
-        "oracle_distill_end": 3,
-    }
-    training["oracle_distill_probability"] = 1.0
-    if int(training.get("resampler_train_start_step", 0)) >= 0:
-        training["resampler_train_start_step"] = 1
+    # Keep the production LR and curriculum clocks. Compressing an 8000-step
+    # schedule into two steps makes step 1 use half the peak LR and turns this
+    # safety check into an artificial first-update explosion test.
     smoke_config["style_transfer"]["sampling"]["steps"] = 2
     return train_style_adapter(smoke_config, destination, steps_override=2)
 
