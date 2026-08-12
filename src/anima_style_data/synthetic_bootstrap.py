@@ -830,6 +830,7 @@ def train_offline_kvo_bootstrap(
         batch_rows: list[dict[str, Any]], *, train: bool,
         reference_rows: list[dict[str, Any]] | None = None,
         detach_representation: bool = False,
+        current_step: int = 0,
     ) -> tuple[torch.Tensor, dict[str, float]]:
         reference_rows = batch_rows if reference_rows is None else reference_rows
         tokens, drift_loss = encode(reference_rows)
@@ -945,11 +946,12 @@ def train_offline_kvo_bootstrap(
                 candidate_outputs = student_output(
                     candidate_contexts, candidate_queries
                 ).float().reshape(count, count, *teacher_float.shape[1:])
-                distances = (
-                    (candidate_outputs - teacher_float[:, None])
-                    / scale[:, None]
-                ).square().mean(dim=(2, 3))
-                logits = -distances / float(
+                candidate_directions = F.normalize(candidate_outputs.flatten(2), dim=-1)
+                teacher_directions = F.normalize(teacher_float.flatten(1), dim=-1)
+                similarities = torch.einsum(
+                    "bcd,bd->bc", candidate_directions, teacher_directions
+                )
+                logits = similarities / float(
                     training.get("functional_contrastive_temperature", 0.1)
                 )
                 labels = torch.arange(count, device=logits.device)
@@ -963,13 +965,27 @@ def train_offline_kvo_bootstrap(
             torch.stack(contrastive_losses).mean()
             if contrastive_losses else output_loss.new_zeros(())
         )
+        contrastive_scale = 1.0
+        if train:
+            contrastive_start = int(
+                training.get("functional_contrastive_start_step", 0)
+            )
+            contrastive_ramp = int(
+                training.get("functional_contrastive_ramp_steps", 0)
+            )
+            contrastive_scale = min(
+                1.0,
+                max(0.0, (current_step - contrastive_start) / max(contrastive_ramp, 1)),
+            )
         loss = (
             output_loss
             + float(training.get("direction_weight", 0.2)) * cosine_loss
             + float(training.get("magnitude_weight", 0.02)) * rms_loss
             + float(training.get("representation_drift_weight", 0.0)) * drift_loss
             + float(training.get("functional_rank_weight", 0.0)) * rank_loss
-            + float(training.get("functional_contrastive_weight", 0.0)) * contrastive_loss
+            + contrastive_scale
+            * float(training.get("functional_contrastive_weight", 0.0))
+            * contrastive_loss
         )
         zero_mse = torch.stack(zero_mses).mean()
         student_mse = torch.stack(student_mses).mean()
@@ -984,6 +1000,7 @@ def train_offline_kvo_bootstrap(
                 torch.stack(contrastive_accuracies).mean().detach()
                 if contrastive_accuracies else 0.0
             ),
+            "functional_contrastive_scale": float(contrastive_scale),
             "zero_improvement": float((1 - student_mse / zero_mse.clamp_min(1e-12)).detach()),
             "teacher_rms": float(torch.stack(zero_mses).mean().sqrt().detach()),
             "student_rms": float(torch.stack(student_mses).mean().sqrt().detach()),
@@ -1127,6 +1144,7 @@ def train_offline_kvo_bootstrap(
             train=True,
             reference_rows=reference_batch,
             detach_representation=step <= representation_warmup,
+            current_step=step,
         )
         loss.backward()
         grad_norms = {
@@ -1163,6 +1181,9 @@ def train_offline_kvo_bootstrap(
             print(
                 f"offline-kvo step={step}/{total_steps} loss={metrics['loss']:.4f} "
                 f"cos={metrics['cosine']:.4f} improve={metrics['zero_improvement']:.4f} "
+                f"contrast={metrics['functional_contrastive_loss']:.3f}/"
+                f"{metrics['functional_contrastive_accuracy']:.3f}/"
+                f"{metrics['functional_contrastive_scale']:.2f} "
                 f"teacher_rms={metrics['teacher_rms']:.6f} student_rms={metrics['student_rms']:.6f} "
                 f"step_s={metrics['step_s']:.3f} {grad_text}",
                 flush=True,
