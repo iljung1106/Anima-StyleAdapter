@@ -635,10 +635,6 @@ synthetic_teacher:
     centered_effect_max_grad_norm: 1.0
     centered_effect_residual_weight: 1.0
     centered_effect_zero_mean_weight: 0.10
-    # Unlike classification/ranking, this is supervised regression to the
-    # native artist-specific residual and should shape the head from the start.
-    centered_effect_residual_start_step: 0
-    centered_effect_residual_ramp_steps: 100
     freeze_base_connector: true
     primary_effect_initial_weight: 1.0
     primary_effect_weight: 0.10
@@ -733,6 +729,10 @@ real_artist_teacher:
     centered_effect_max_grad_norm: 1.0
     centered_effect_residual_weight: 1.0
     centered_effect_zero_mean_weight: 0.10
+    # Unlike classification/ranking, this is supervised regression to the
+    # native artist-specific residual and should shape the head from the start.
+    centered_effect_residual_start_step: 0
+    centered_effect_residual_ramp_steps: 100
     # Native artist effects below this RMS are weak-query noise and must not
     # receive an inverse-scale weight larger than meaningful interventions.
     effect_scale_floor: 0.001
