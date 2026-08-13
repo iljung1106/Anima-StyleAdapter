@@ -518,6 +518,31 @@ style_transfer:
     sample_height: 512
     sample_steps: 30
     sample_seed: 2026081201
+  exact_self_generalization:
+    output_name: exact_self_generalization_96_train_24_validation_v1
+    seed: 20260815
+    batch_size: 3
+    train_batches: 32
+    validation_batches: 8
+    steps: 8000
+    representation_learning_rate: 0.0001
+    output_learning_rate: 0.0001
+    gate_learning_rate: 0.0
+    max_grad_norm: 1.0
+    flow_loss_weight: 0.25
+    residual_weight: 1.0
+    residual_direction_weight: 0.20
+    residual_log_rms_weight: 0.05
+    residual_scale_floor: 0.001
+    x0_weight: 1.0
+    validation_every: 250
+    checkpoint_every: 500
+    sample_every: 500
+    sample_width: 512
+    sample_height: 512
+    sample_steps: 30
+    sample_style_cfg: 1.0
+    sample_seed: 2026081501
   sampling:
     episode: 0
     # Qualitative 1MP checkpoint evaluation across artist-disjoint validation

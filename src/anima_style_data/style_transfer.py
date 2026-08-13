@@ -2426,6 +2426,8 @@ def _sample_style_adapter(
     *,
     reference_mode: str = "heldout",
     episode_index: int | None = None,
+    batch_override: dict[str, Any] | None = None,
+    batch_row: int = 0,
 ) -> tuple[Path, nn.Module, float]:
     sample_cfg = config["style_transfer"]["sampling"]
     started = time.perf_counter()
@@ -2439,7 +2441,11 @@ def _sample_style_adapter(
         if episode_index is None
         else int(episode_index)
     )
-    batch = loader.load_step(episode_number)
+    batch = (
+        loader.load_step(episode_number)
+        if batch_override is None
+        else _slice_exact_self_batch(batch_override, batch_row)
+    )
     episode = batch["episodes"][0]
     sheet_sources: list[tuple[str, int]] = [("target", episode.target_id)]
     if reference_mode == "self":
@@ -3108,6 +3114,52 @@ def _roll_exact_target_features(batch: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _slice_exact_self_batch(batch: dict[str, Any], index: int) -> dict[str, Any]:
+    """Keep one target row; exact-self sampling never consumes episode references."""
+    return {
+        **batch,
+        "episodes": [batch["episodes"][index]],
+        "latents": batch["latents"][index : index + 1],
+        "conditioning": batch["conditioning"][index : index + 1],
+        "target_features": {
+            layer: values[index : index + 1]
+            for layer, values in batch["target_features"].items()
+        },
+        "target_feature_mask": batch["target_feature_mask"][index : index + 1],
+        "target_feature_shapes": [batch["target_feature_shapes"][index]],
+        "target_global_features": batch["target_global_features"][index : index + 1],
+    }
+
+
+def _exact_self_batch_only(batch: dict[str, Any]) -> dict[str, Any]:
+    """Drop held-out reference tensors unused by target-only flow training."""
+    keys = (
+        "episodes", "latents", "conditioning", "target_features",
+        "target_feature_mask", "target_feature_shapes", "target_global_features",
+    )
+    return {key: batch[key] for key in keys}
+
+
+def _collect_disjoint_exact_self_batches(
+    loader: ProductionStyleLoader, *, train_batches: int, validation_batches: int,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Materialize fixed, target-disjoint RAM pools for a small generalization test."""
+    selected: list[dict[str, Any]] = []
+    used: set[int] = set()
+    step = 0
+    required = train_batches + validation_batches
+    while len(selected) < required and step < required * 100:
+        batch = loader.load_step(step)
+        ids = {int(item.target_id) for item in batch["episodes"]}
+        if not ids & used:
+            selected.append(_exact_self_batch_only(batch))
+            used.update(ids)
+        step += 1
+    if len(selected) != required:
+        raise RuntimeError(f"Could collect only {len(selected)}/{required} disjoint batches")
+    return selected[:train_batches], selected[train_batches:]
+
+
 def overfit_exact_self_batch(config: dict[str, Any], destination: Path) -> dict[str, Any]:
     """Test whether the adapter can memorize a fixed exact-self flow problem."""
     cfg = config["style_transfer"]
@@ -3311,15 +3363,17 @@ def overfit_exact_self_batch(config: dict[str, Any], destination: Path) -> dict[
         },
         checkpoint_output,
     )
-    final_samples = {"style_cfg_1": str(_sample_style_adapter(
-        anima, adapter, resampler, loader, sample_config, destination,
-        output, device, steps, vae, reference_mode="self",
-    )[0])}
-    sample_config["style_transfer"]["sampling"]["style_cfg"] = 4.0
-    final_samples["style_cfg_4"] = str(_sample_style_adapter(
-        anima, adapter, resampler, loader, sample_config, destination,
-        output, device, steps, vae, reference_mode="self",
-    )[0])
+    final_samples = {}
+    for batch_row, episode in enumerate(fixed_batch["episodes"]):
+        for style_cfg in (1.0, 4.0):
+            sample_config["style_transfer"]["sampling"]["style_cfg"] = style_cfg
+            key = f"target_{episode.target_id}_style_cfg_{style_cfg:g}"
+            final_samples[key] = str(_sample_style_adapter(
+                anima, adapter, resampler, loader, sample_config, destination,
+                output, device, steps, vae, reference_mode="self",
+                episode_index=int(episode.target_id),
+                batch_override=fixed_batch, batch_row=batch_row,
+            )[0])
     randomized_evaluation: dict[str, dict[str, dict[str, float]]] = {}
     randomized_records: dict[str, dict[str, list[float]]] = defaultdict(
         lambda: defaultdict(list)
@@ -3363,6 +3417,213 @@ def overfit_exact_self_batch(config: dict[str, Any], destination: Path) -> dict[
         "checkpoint": str(checkpoint_output),
         "initial_sample": str(initial_sample),
         "final_samples": final_samples,
+        "elapsed_s": time.perf_counter() - started,
+    }
+    write_json(output / "summary.json", result)
+    return result
+
+
+def sample_exact_self_overfit_checkpoint(
+    config: dict[str, Any], destination: Path
+) -> dict[str, Any]:
+    """Render every memorized target from a completed exact-self checkpoint."""
+    cfg = config["style_transfer"]
+    overfit_cfg = dict(cfg.get("overfit", {}))
+    device = str(cfg["training"].get("device", "cuda"))
+    loader_cfg = {
+        **cfg["loader"], "split": "train",
+        "batch_size": int(overfit_cfg.get("batch_size", 3)),
+        "seed": int(overfit_cfg.get("seed", 20260812)),
+    }
+    loader = ProductionStyleLoader(destination, loader_cfg)
+    fixed_batch = loader.load_step(int(overfit_cfg.get("episode", 0)))
+    resampler = load_per_reference_resampler(destination, cfg["resampler"], device)
+    anima = _resolve_anima_model(config, destination, device).requires_grad_(False).eval()
+    adapter = SharedLowRankStyleAdapter(**cfg["adapter"]).to(device, dtype=torch.bfloat16)
+    attach_style_adapter(anima, adapter)
+    output = (
+        destination / str(cfg.get("output_directory", "style_transfer_training"))
+        / str(overfit_cfg.get("output_name", "overfit_exact_self"))
+    )
+    checkpoint = output / "overfit_state.pt"
+    state = torch.load(checkpoint, map_location="cpu", weights_only=False)
+    _load_adapter_checkpoint(adapter, state)
+    resampler.load_state_dict(state["resampler"])
+    sample_config = copy.deepcopy(config)
+    sample_config["style_transfer"]["sampling"].update({
+        "width": int(overfit_cfg.get("sample_width", 512)),
+        "height": int(overfit_cfg.get("sample_height", 512)),
+        "steps": int(overfit_cfg.get("sample_steps", 30)),
+        "seed": int(overfit_cfg.get("sample_seed", overfit_cfg.get("noise_seed", 0))),
+    })
+    vae = None
+    samples = {}
+    for batch_row, episode in enumerate(fixed_batch["episodes"]):
+        for style_cfg in (1.0, 4.0):
+            sample_config["style_transfer"]["sampling"]["style_cfg"] = style_cfg
+            sheet, vae, _ = _sample_style_adapter(
+                anima, adapter, resampler, loader, sample_config, destination,
+                output, device, int(state["step"]), vae, reference_mode="self",
+                episode_index=int(episode.target_id),
+                batch_override=fixed_batch, batch_row=batch_row,
+            )
+            samples[f"target_{episode.target_id}_style_cfg_{style_cfg:g}"] = str(sheet)
+    result = {"checkpoint": str(checkpoint), "step": int(state["step"]), "samples": samples}
+    write_json(output / "all_target_samples.json", result)
+    return result
+
+
+def train_exact_self_generalization(
+    config: dict[str, Any], destination: Path
+) -> dict[str, Any]:
+    """Learn exact-self flow on a small image pool and validate on disjoint targets."""
+    cfg = config["style_transfer"]
+    run_cfg = dict(cfg.get("exact_self_generalization", {}))
+    training_cfg = dict(cfg["training"])
+    device = str(training_cfg.get("device", "cuda"))
+    seed = int(run_cfg.get("seed", 20260815))
+    random.seed(seed)
+    torch.manual_seed(seed)
+    loader_cfg = {
+        **cfg["loader"], "split": "train",
+        "batch_size": int(run_cfg.get("batch_size", 3)), "seed": seed,
+    }
+    loader = ProductionStyleLoader(destination, loader_cfg)
+    train_batches, validation_batches = _collect_disjoint_exact_self_batches(
+        loader,
+        train_batches=int(run_cfg.get("train_batches", 32)),
+        validation_batches=int(run_cfg.get("validation_batches", 8)),
+    )
+    train_ids = [item.target_id for batch in train_batches for item in batch["episodes"]]
+    validation_ids = [
+        item.target_id for batch in validation_batches for item in batch["episodes"]
+    ]
+    if set(train_ids) & set(validation_ids):
+        raise RuntimeError("Exact-self train and validation targets overlap")
+
+    resampler = load_per_reference_resampler(destination, cfg["resampler"], device)
+    resampler.requires_grad_(False).eval()
+    anima = _resolve_anima_model(config, destination, device).requires_grad_(False).train()
+    _optimize_frozen_anima(
+        anima,
+        low_precision_rmsnorm=bool(training_cfg.get("low_precision_rmsnorm", False)),
+        fuse_attention_projections=bool(training_cfg.get("fuse_attention_projections", False)),
+    )
+    adapter = SharedLowRankStyleAdapter(**cfg["adapter"]).to(device)
+    attach_style_adapter(anima, adapter)
+    adapter.style_dropout = 0.0
+    output_parameters = adapter.output_parameters()
+    gate_parameters = adapter.gate_parameters()
+    special = {id(value) for value in output_parameters + gate_parameters}
+    representation_parameters = [
+        value for value in adapter.parameters() if id(value) not in special
+    ]
+    optimizer = torch.optim.RAdam([
+        {"params": representation_parameters, "lr": float(run_cfg.get("representation_learning_rate", 1e-4))},
+        {"params": output_parameters, "lr": float(run_cfg.get("output_learning_rate", 1e-4))},
+        {"params": gate_parameters, "lr": float(run_cfg.get("gate_learning_rate", 0.0))},
+    ])
+    steps = int(run_cfg.get("steps", 8000))
+    loss_config = {
+        **training_cfg,
+        "measure_bypass": True,
+        "resampler_train_start_step": -1,
+        "resampler_auxiliary_weight": 0.0,
+        "style_magnitude_weight": 0.0,
+        "style_flow_loss_weight": float(run_cfg.get("flow_loss_weight", 0.25)),
+        "style_flow_direction_weight": 0.0,
+        "style_token_contrastive_weight": 0.0,
+        "style_kv_contrastive_weight": 0.0,
+        "exact_self_residual_weight": float(run_cfg.get("residual_weight", 1.0)),
+        "exact_self_direction_weight": float(run_cfg.get("residual_direction_weight", 0.2)),
+        "exact_self_log_rms_weight": float(run_cfg.get("residual_log_rms_weight", 0.05)),
+        "exact_self_x0_weight": float(run_cfg.get("x0_weight", 1.0)),
+        "exact_self_scale_floor": float(run_cfg.get("residual_scale_floor", 1e-3)),
+        "curriculum": {
+            "gate_only_steps": 0, "self_reference_steps": steps + 1,
+            "target_anneal_end": steps + 2, "oracle_distill_end": steps + 1,
+        },
+        "oracle_distill_weight": 0.0,
+    }
+    output = (
+        destination / str(cfg.get("output_directory", "style_transfer_training"))
+        / str(run_cfg.get("output_name", "exact_self_generalization"))
+    )
+    output.mkdir(parents=True, exist_ok=True)
+    write_json(output / "split.json", {
+        "train_ids": train_ids, "validation_ids": validation_ids,
+    })
+
+    metric_keys = (
+        "flow_loss", "base_flow_loss", "paired_flow_improvement",
+        "style_output_ratio", "style_flow_direction_cosine",
+        "style_flow_delta_to_desired_ratio", "exact_self_residual_loss",
+        "predicted_x0_loss",
+    )
+    def evaluate_pool(pool: list[dict[str, Any]], evaluation_seed: int) -> dict[str, float]:
+        anima.eval(); adapter.eval()
+        records = []
+        with torch.no_grad():
+            for index, batch in enumerate(pool):
+                generator = torch.Generator(device=device).manual_seed(
+                    evaluation_seed + index * 97
+                )
+                _, metrics = _forward_flow_loss(
+                    anima, adapter, resampler, batch, device,
+                    generator=generator, loss_config=loss_config, step=1,
+                )
+                records.append(metrics)
+        return {key: sum(float(row[key]) for row in records) / len(records) for key in metric_keys}
+
+    sample_config = copy.deepcopy(config)
+    sample_config["style_transfer"]["sampling"].update({
+        "width": int(run_cfg.get("sample_width", 512)),
+        "height": int(run_cfg.get("sample_height", 512)),
+        "steps": int(run_cfg.get("sample_steps", 30)),
+        "seed": int(run_cfg.get("sample_seed", seed ^ 0x5151)),
+        "style_cfg": float(run_cfg.get("sample_style_cfg", 1.0)),
+    })
+    validation_every = int(run_cfg.get("validation_every", 250))
+    sample_every = int(run_cfg.get("sample_every", 500))
+    checkpoint_every = int(run_cfg.get("checkpoint_every", 500))
+    max_grad_norm = float(run_cfg.get("max_grad_norm", 1.0))
+    history = []
+    vae = None
+    started = time.perf_counter()
+    for step in range(1, steps + 1):
+        anima.train(); adapter.train(); optimizer.zero_grad(set_to_none=True)
+        batch = train_batches[(step - 1) % len(train_batches)]
+        generator = torch.Generator(device=device).manual_seed(seed + step * 10_007)
+        loss, metrics = _forward_flow_loss(
+            anima, adapter, resampler, batch, device,
+            generator=generator, loss_config=loss_config, step=step,
+        )
+        loss.backward()
+        grad_norm = torch.nn.utils.clip_grad_norm_(adapter.parameters(), max_grad_norm)
+        optimizer.step()
+        if step % validation_every == 0 or step == steps:
+            validation = evaluate_pool(validation_batches, seed ^ 0xA11CE)
+            train_probe = evaluate_pool(train_batches[:4], seed ^ 0xBEEF)
+            row = {"step": step, "train_loss": float(loss.detach()),
+                   "grad_norm": float(grad_norm), "train_probe": train_probe,
+                   "validation": validation}
+            history.append(row); write_json(output / "history.json", history)
+            print(f"exact-self generalization step={step} metrics={row}", flush=True)
+        if step % checkpoint_every == 0 or step == steps:
+            torch.save({"step": step, "adapter": adapter.state_dict(),
+                        "resampler": resampler.state_dict(), "config": run_cfg},
+                       output / f"checkpoint-{step:07d}.pt")
+        if step % sample_every == 0 or step == steps:
+            sheet, vae, _ = _sample_style_adapter(
+                anima, adapter, resampler, loader, sample_config, destination,
+                output, device, step, vae, reference_mode="self",
+                episode_index=int(validation_batches[0]["episodes"][0].target_id),
+                batch_override=validation_batches[0], batch_row=0,
+            )
+            print(f"exact-self generalization sample={sheet}", flush=True)
+    result = {
+        "steps": steps, "train_images": len(train_ids),
+        "validation_images": len(validation_ids), "final": history[-1],
         "elapsed_s": time.perf_counter() - started,
     }
     write_json(output / "summary.json", result)

@@ -83,6 +83,8 @@ def build_parser() -> argparse.ArgumentParser:
         ("style-sample", "Render frozen-base and styled controls from the current checkpoint"),
         ("style-diagnose", "Measure correct, shuffled, null, and bypass style conditioning"),
         ("style-overfit", "Overfit a fixed exact-self batch to diagnose style-flow capacity"),
+        ("style-overfit-sample", "Render every target from the completed exact-self overfit"),
+        ("style-exact-self-generalize", "Train 96 targets and validate exact-self on 24 unseen targets"),
         ("style-calibrate", "Measure empirical Anima artist-tag velocity effect ranges"),
         ("synthetic-teacher", "Generate and fully cache artist-tag teacher images"),
         ("synthetic-teacher-benchmark", "Validate SPEED and batched VAE before production"),
@@ -163,7 +165,7 @@ def main() -> None:
         _run(validate_anima_caches, config, destination)
     elif args.command in {
         "style-train", "style-smoke", "style-benchmark", "style-sample", "style-diagnose",
-        "style-overfit",
+        "style-overfit", "style-overfit-sample", "style-exact-self-generalize",
         "style-calibrate",
     }:
         # Keep torch/sd-scripts optional for metadata-only commands.
@@ -171,6 +173,8 @@ def main() -> None:
             benchmark_style_batches,
             diagnose_style_reference_dependence,
             overfit_exact_self_batch,
+            sample_exact_self_overfit_checkpoint,
+            train_exact_self_generalization,
             sample_style_checkpoint,
             smoke_test_style_adapter,
             train_style_adapter,
@@ -184,6 +188,8 @@ def main() -> None:
             "style-sample": sample_style_checkpoint,
             "style-diagnose": diagnose_style_reference_dependence,
             "style-overfit": overfit_exact_self_batch,
+            "style-overfit-sample": sample_exact_self_overfit_checkpoint,
+            "style-exact-self-generalize": train_exact_self_generalization,
             "style-calibrate": calibrate_artist_tag_velocity,
         }[args.command]
         _run(stage, config, destination)
