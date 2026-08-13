@@ -3187,7 +3187,6 @@ def overfit_exact_self_batch(config: dict[str, Any], destination: Path) -> dict[
                 "weight_decay": 0.0,
             },
         ],
-        fused=True,
     )
     loss_config = {
         **training_cfg,
