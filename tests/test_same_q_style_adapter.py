@@ -3,7 +3,10 @@ import torch.nn.functional as F
 from torch import nn
 
 from anima_style_data.same_q_style_adapter import SameQFullRankStyleAdapter
-from anima_style_data.style_transfer import _apply_adapter_freeze_policy
+from anima_style_data.style_transfer import (
+    _adaptive_reference_loss_config,
+    _apply_adapter_freeze_policy,
+)
 
 
 class _CountingLinear(nn.Linear):
@@ -96,6 +99,49 @@ def test_native_kv_are_copied_and_alpha_is_small_nonzero():
     torch.testing.assert_close(adapter.alpha, torch.full((2,), 0.01))
     assert not hasattr(adapter, "o_down")
     assert not hasattr(adapter, "o_up")
+    assert not any(parameter.requires_grad for parameter in adapter.kv_base_parameters())
+    assert all(parameter.requires_grad for parameter in adapter.kv_parameters())
+
+
+def test_alpha_calibration_matches_measured_raw_attention_ratio():
+    torch.manual_seed(7)
+    anima = _Anima().requires_grad_(False)
+    adapter = _adapter(connector_layers=0)
+    adapter.initialize_from_anima(anima)
+    adapter.set_style_tokens(torch.randn(2, 3, 6))
+    cross = anima.blocks[0].cross_attn
+
+    adapter.begin_alpha_calibration()
+    adapter.merged_cross_attention(
+        0, torch.randn(2, 5, 8), torch.randn(2, 4, 6), cross, None
+    )
+    # Exercise every configured block; production calibration observes all 28.
+    adapter.merged_cross_attention(
+        1, torch.randn(2, 5, 8), torch.randn(2, 4, 6), anima.blocks[1].cross_attn, None
+    )
+    result = adapter.finish_alpha_calibration(0.02, maximum_alpha=1.0)
+
+    for alpha, raw_ratio in zip(result["alpha"], result["raw_style_to_text_ratio"], strict=True):
+        assert abs(alpha * raw_ratio - 0.02) < 1e-6
+
+
+def test_reference_direction_ramp_stays_zero_until_activation():
+    training = {
+        "exact_self_direction_target_weight": 0.1,
+        "style_reference_direction_target_weight": 0.2,
+        "reference_loss_ramp_steps": 100,
+    }
+    inactive = _adaptive_reference_loss_config(
+        training, {"activation_step": None}, 500
+    )
+    midpoint = _adaptive_reference_loss_config(
+        training, {"activation_step": 500}, 550
+    )
+
+    assert inactive["exact_self_direction_weight"] == 0
+    assert inactive["style_reference_direction_weight"] == 0
+    assert midpoint["exact_self_direction_weight"] == 0.05
+    assert midpoint["style_reference_direction_weight"] == 0.1
 
 
 def test_native_kv_copy_supports_production_fused_projection():
@@ -144,10 +190,14 @@ def test_text_and_style_share_one_q_and_merge_before_one_native_output_projectio
     assert adapter.bridge.projection.weight.grad.norm() > 0
     assert adapter.bridge.connector[0].qkv.weight.grad is not None
     assert adapter.bridge.connector[0].qkv.weight.grad.norm() > 0
-    assert adapter.style_k[0].weight.grad is not None
-    assert adapter.style_k[0].weight.grad.norm() > 0
-    assert adapter.style_v[0].weight.grad is not None
-    assert adapter.style_v[0].weight.grad.norm() > 0
+    # Full-rank native K/V remain immutable. Zero-init low-rank up matrices
+    # receive the first update; their down matrices become live thereafter.
+    assert adapter.style_k[0].weight.grad is None
+    assert adapter.style_v[0].weight.grad is None
+    assert adapter.style_k_up[0].weight.grad is not None
+    assert adapter.style_k_up[0].weight.grad.norm() > 0
+    assert adapter.style_v_up[0].weight.grad is not None
+    assert adapter.style_v_up[0].weight.grad.norm() > 0
     assert cross.output_proj.weight.grad is None
 
 
@@ -199,3 +249,18 @@ def test_phase_a_freezes_native_kv_and_alpha_but_keeps_bridge_trainable():
     assert not adapter.alpha.requires_grad
     assert all(parameter.requires_grad for parameter in adapter.bridge_parameters())
     assert adapter.null_tokens.requires_grad
+
+
+def test_delta_only_policy_refreezes_native_kv_after_stage_transition():
+    anima = _Anima().requires_grad_(False)
+    adapter = _adapter()
+    adapter.initialize_from_anima(anima)
+    adapter.requires_grad_(True)  # curriculum stage transition opens everything
+
+    counts = _apply_adapter_freeze_policy(
+        adapter, {"freeze_style_kv": False, "freeze_style_alpha": True}
+    )
+
+    assert counts["style_kv_base"] > 0
+    assert not any(parameter.requires_grad for parameter in adapter.kv_base_parameters())
+    assert all(parameter.requires_grad for parameter in adapter.kv_parameters())

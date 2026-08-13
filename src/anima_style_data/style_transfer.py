@@ -1961,6 +1961,10 @@ def _apply_adapter_freeze_policy(
     solution than aligning the visual tokens to Anima's context space.
     """
     groups: dict[str, list[nn.Parameter]] = {}
+    if hasattr(adapter, "kv_base_parameters"):
+        # Same-Q A2.1 adapts the native context basis only through explicit
+        # low-rank deltas. The full-rank copies are immutable teacher weights.
+        groups["style_kv_base"] = list(adapter.kv_base_parameters())
     if bool(training.get("freeze_style_kv", False)):
         groups["style_kv"] = list(adapter.kv_parameters())
     if bool(training.get("freeze_style_alpha", False)):
@@ -1972,6 +1976,97 @@ def _apply_adapter_freeze_policy(
         name: sum(parameter.numel() for parameter in parameters)
         for name, parameters in groups.items()
     }
+
+
+def _adaptive_reference_loss_config(
+    training: dict[str, Any],
+    state: dict[str, Any],
+    step: int,
+) -> dict[str, Any]:
+    """Keep discrimination losses off until absolute flow improves.
+
+    Direction-only objectives can increase reference-dependent output without
+    reducing frozen Anima's error. A2.1 therefore unlocks them only after
+    fixed self-reference validation is positive for consecutive evaluations.
+    """
+    config = dict(training)
+    activation_step = state.get("activation_step")
+    ramp_steps = max(1, int(training.get("reference_loss_ramp_steps", 750)))
+    progress = (
+        0.0
+        if activation_step is None
+        else min(1.0, max(0.0, (step - int(activation_step)) / ramp_steps))
+    )
+    config["exact_self_direction_weight"] = progress * float(
+        training.get("exact_self_direction_target_weight", 0.0)
+    )
+    config["style_reference_direction_weight"] = progress * float(
+        training.get("style_reference_direction_target_weight", 0.0)
+    )
+    config["_reference_loss_progress"] = progress
+    return config
+
+
+@torch.no_grad()
+def _calibrate_same_q_alpha(
+    anima: nn.Module,
+    adapter: nn.Module,
+    resampler: nn.Module,
+    loader: ProductionStyleLoader,
+    device: str,
+    training: dict[str, Any],
+    *,
+    batches: int,
+    seed: int,
+) -> dict[str, Any]:
+    """Set each alpha from measured raw style/text attention RMS.
+
+    Calibration runs with alpha exactly zero, so it observes every block but
+    leaves frozen Anima's activations unperturbed. The resulting per-block
+    alpha makes the *actual* pre-O attention contribution start at a common
+    target ratio despite different token counts and V statistics.
+    """
+    if not hasattr(adapter, "begin_alpha_calibration"):
+        raise TypeError("Configured alpha RMS calibration requires the same-Q adapter")
+    anima.eval()
+    adapter.eval()
+    adapter.begin_alpha_calibration()
+    try:
+        calibration_loss_config = {
+            **training,
+            "curriculum": {"gate_only_steps": 0, "self_reference_steps": 1},
+            "timestep_sampling": "uniform",
+            "style_flow_loss_weight": 1.0,
+            "exact_self_residual_weight": 0.0,
+            "exact_self_direction_weight": 0.0,
+            "style_reference_direction_weight": 0.0,
+            "style_reference_rank_weight": 0.0,
+            "style_magnitude_weight": 0.0,
+        }
+        for index in range(max(1, batches)):
+            batch = loader.load_step(index)
+            generator = torch.Generator(device=device).manual_seed(seed + index)
+            _forward_flow_loss(
+                anima,
+                adapter,
+                resampler,
+                batch,
+                device,
+                generator=generator,
+                loss_config=calibration_loss_config,
+                step=1,
+                collect_details=False,
+            )
+            adapter.clear_style_tokens()
+        return adapter.finish_alpha_calibration(
+            float(training.get("alpha_target_style_to_text_ratio", 0.02)),
+            minimum_alpha=float(training.get("alpha_minimum", 1e-6)),
+            maximum_alpha=float(training.get("alpha_maximum", 0.01)),
+        )
+    finally:
+        adapter.clear_style_tokens()
+        anima.train()
+        adapter.train()
 
 
 def _load_adapter_checkpoint(
@@ -4491,6 +4586,7 @@ def _save_training_state(
     cfg: dict[str, Any],
     resampler: nn.Module | None = None,
     extra_optimizers: dict[str, torch.optim.Optimizer] | None = None,
+    extra_state: dict[str, Any] | None = None,
 ) -> None:
     temporary = path.with_suffix(path.suffix + ".tmp")
     state = {
@@ -4500,6 +4596,7 @@ def _save_training_state(
         "extra_optimizers": {
             name: value.state_dict() for name, value in (extra_optimizers or {}).items()
         },
+        "extra_state": dict(extra_state or {}),
         "config": cfg,
         "python_rng": random.getstate(),
         "torch_rng": torch.get_rng_state(),
@@ -4760,6 +4857,10 @@ def train_style_adapter(config: dict[str, Any], destination: Path, *, steps_over
     checkpoint_dir = output / "checkpoints"
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     start_step = 0
+    adaptive_reference_state: dict[str, Any] = {
+        "positive_validations": 0,
+        "activation_step": None,
+    }
     resume = bool(training.get("resume", True)) and steps_override is None
     if resume and checkpoint_path.exists():
         state = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
@@ -4770,6 +4871,9 @@ def train_style_adapter(config: dict[str, Any], destination: Path, *, steps_over
         if "bridge" in state.get("extra_optimizers", {}):
             bridge_optimizer.load_state_dict(state["extra_optimizers"]["bridge"])
         start_step = int(state["step"])
+        adaptive_reference_state.update(
+            state.get("extra_state", {}).get("adaptive_reference", {})
+        )
         random.setstate(state["python_rng"])
         torch.set_rng_state(state["torch_rng"])
         if state.get("cuda_rng") is not None:
@@ -4786,6 +4890,29 @@ def train_style_adapter(config: dict[str, Any], destination: Path, *, steps_over
         print(
             f"initialized style adapter from {initial_path} at source step "
             f"{int(initial_state.get('step', -1))}",
+            flush=True,
+        )
+    if (
+        start_step == 0
+        and bool(training.get("calibrate_alpha_from_attention_rms", False))
+    ):
+        alpha_calibration = _calibrate_same_q_alpha(
+            anima,
+            adapter,
+            resampler,
+            validation_loader,
+            device,
+            training,
+            batches=int(training.get("alpha_calibration_batches", 4)),
+            seed=seed ^ 0xA17A,
+        )
+        write_json(output / "alpha_calibration.json", alpha_calibration)
+        print(
+            "calibrated block alpha from raw style/text RMS: "
+            f"target={alpha_calibration['target_style_to_text_ratio']:.4f} "
+            f"raw_mean={sum(alpha_calibration['raw_style_to_text_ratio']) / len(alpha_calibration['raw_style_to_text_ratio']):.4f} "
+            f"alpha_min={min(alpha_calibration['alpha']):.6g} "
+            f"alpha_max={max(alpha_calibration['alpha']):.6g}",
             flush=True,
         )
     if start_step >= steps:
@@ -4870,6 +4997,9 @@ def train_style_adapter(config: dict[str, Any], destination: Path, *, steps_over
     log_every = int(training.get("log_every", 10))
     vae = None
     if start_step == 0 and steps_override is None:
+        baseline_loss_config = _adaptive_reference_loss_config(
+            training, adaptive_reference_state, 0
+        )
         baseline = _validate_style_adapter(
             anima,
             adapter,
@@ -4878,7 +5008,7 @@ def train_style_adapter(config: dict[str, Any], destination: Path, *, steps_over
             device,
             batches=validation_batches,
             seed=seed ^ 0xA11CE,
-            loss_config={**training, "timestep_sampling": "uniform"},
+            loss_config={**baseline_loss_config, "timestep_sampling": "uniform"},
         )
         print(
             f"validation step=0 loss={baseline['loss']:.6f} "
@@ -4900,6 +5030,9 @@ def train_style_adapter(config: dict[str, Any], destination: Path, *, steps_over
             )
     for zero_based_step in range(start_step, steps):
         step = zero_based_step + 1
+        active_loss_config = _adaptive_reference_loss_config(
+            training, adaptive_reference_state, step
+        )
         lr_multiplier = _learning_rate_multiplier(
             step,
             schedule_steps,
@@ -4961,7 +5094,7 @@ def train_style_adapter(config: dict[str, Any], destination: Path, *, steps_over
             data_wait += time.perf_counter() - wait_started
             loss, details = _forward_flow_loss(
                 anima, adapter, resampler, batch, device,
-                loss_config=training, step=step, oracle_adapter=oracle_adapter,
+                loss_config=active_loss_config, step=step, oracle_adapter=oracle_adapter,
                 collect_details=collect_step_details,
             )
             if collect_step_details:
@@ -5069,6 +5202,15 @@ def train_style_adapter(config: dict[str, Any], destination: Path, *, steps_over
             "bridge_weight_norm": bridge_weight_norm,
             "bridge_update_norm": bridge_update_norm,
             "bridge_update_to_weight_ratio": bridge_update_to_weight_ratio,
+            "reference_loss_progress": float(
+                active_loss_config.get("_reference_loss_progress", 0.0)
+            ),
+            "active_exact_self_direction_weight": float(
+                active_loss_config.get("exact_self_direction_weight", 0.0)
+            ),
+            "active_reference_direction_weight": float(
+                active_loss_config.get("style_reference_direction_weight", 0.0)
+            ),
             **{
                 f"{group['name']}_lr": float(group["lr"])
                 for group in optimizer.param_groups
@@ -5124,7 +5266,7 @@ def train_style_adapter(config: dict[str, Any], destination: Path, *, steps_over
             heldout_validation = _validate_style_adapter(
                 anima, adapter, resampler, validation_loader, device,
                 batches=current_validation_batches, seed=seed ^ 0xA11CE,
-                loss_config={**training, "timestep_sampling": "uniform"},
+                loss_config={**active_loss_config, "timestep_sampling": "uniform"},
                 reference_mode="heldout",
             )
             self_validation = _validate_style_adapter(
@@ -5140,7 +5282,7 @@ def train_style_adapter(config: dict[str, Any], destination: Path, *, steps_over
                 # uniform validation distribution, regardless of the training
                 # timestep sampler. Only the curriculum/reference mode should
                 # differ between these paired reports.
-                loss_config={**training, "timestep_sampling": "uniform"},
+                loss_config={**active_loss_config, "timestep_sampling": "uniform"},
                 reference_mode="self",
             )
             print(
@@ -5159,6 +5301,54 @@ def train_style_adapter(config: dict[str, Any], destination: Path, *, steps_over
                 f"elapsed_s={heldout_validation['elapsed_s']:.2f}",
                 flush=True,
             )
+            if bool(training.get("adaptive_reference_loss", False)):
+                threshold = float(
+                    training.get("reference_loss_activation_paired_threshold", 0.0)
+                )
+                lower_confidence_bound = (
+                    self_validation["paired_improvement"]
+                    - self_validation["paired_improvement_ci95"]
+                )
+                minimum_positive_fraction = float(
+                    training.get(
+                        "reference_loss_activation_positive_fraction", 0.75
+                    )
+                )
+                validation_qualifies = (
+                    lower_confidence_bound > threshold
+                    and self_validation["paired_positive_fraction"]
+                    >= minimum_positive_fraction
+                )
+                if validation_qualifies:
+                    adaptive_reference_state["positive_validations"] = int(
+                        adaptive_reference_state.get("positive_validations", 0)
+                    ) + 1
+                else:
+                    adaptive_reference_state["positive_validations"] = 0
+                required = max(
+                    1,
+                    int(training.get("reference_loss_activation_validations", 4)),
+                )
+                if (
+                    adaptive_reference_state.get("activation_step") is None
+                    and adaptive_reference_state["positive_validations"] >= required
+                ):
+                    adaptive_reference_state["activation_step"] = step
+                    print(
+                        "activated direction/reference loss ramp at "
+                        f"step={step} after {required} statistically positive "
+                        "self validations",
+                        flush=True,
+                    )
+                print(
+                    "reference-loss gate "
+                    f"qualified={int(validation_qualifies)} "
+                    f"streak={adaptive_reference_state['positive_validations']}/{required} "
+                    f"self_lcb95={lower_confidence_bound:.6f} "
+                    f"positive={self_validation['paired_positive_fraction']:.3f} "
+                    f"activation_step={adaptive_reference_state.get('activation_step')}",
+                    flush=True,
+                )
             print(
                 f"validation[self] step={step} loss={self_validation['loss']:.6f} "
                 f"base={self_validation['base_loss']:.6f} "
@@ -5186,6 +5376,16 @@ def train_style_adapter(config: dict[str, Any], destination: Path, *, steps_over
                             f"validation_self/{key}": value
                             for key, value in self_validation.items()
                         },
+                        "curriculum/reference_validation_qualified": int(
+                            bool(training.get("adaptive_reference_loss", False))
+                            and validation_qualifies
+                        ),
+                        "curriculum/reference_positive_streak": int(
+                            adaptive_reference_state.get("positive_validations", 0)
+                        ),
+                        "curriculum/reference_activation_step": int(
+                            adaptive_reference_state.get("activation_step") or 0
+                        ),
                     },
                     step=step,
                 )
@@ -5270,6 +5470,7 @@ def train_style_adapter(config: dict[str, Any], destination: Path, *, steps_over
                 checkpoint_path, step, adapter, optimizer, cfg,
                 resampler if resampler_parameters else None,
                 {"bridge": bridge_optimizer},
+                {"adaptive_reference": adaptive_reference_state},
             )
             _archive_training_state(
                 checkpoint_path, checkpoint_dir / f"step-{step:07d}.pt"
@@ -5280,6 +5481,7 @@ def train_style_adapter(config: dict[str, Any], destination: Path, *, steps_over
         checkpoint_path, steps, adapter, optimizer, cfg,
         resampler if resampler_parameters else None,
         {"bridge": bridge_optimizer},
+        {"adaptive_reference": adaptive_reference_state},
     )
     _save_final_model(checkpoint, steps, adapter, resampler, cfg)
     summary = {

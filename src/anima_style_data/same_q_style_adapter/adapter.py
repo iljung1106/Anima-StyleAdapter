@@ -188,6 +188,7 @@ class SameQFullRankStyleAdapter(nn.Module):
         connector_layers: int = 2,
         connector_heads: int = 16,
         bridge_init: str = "xavier",
+        style_kv_delta_rank: int = 32,
     ) -> None:
         super().__init__()
         if style_dim <= 0 or context_dim <= 0 or slots <= 0 or blocks <= 0:
@@ -200,6 +201,9 @@ class SameQFullRankStyleAdapter(nn.Module):
         self.heads = int(heads)
         self.blocks = int(blocks)
         self.style_dropout = float(style_dropout)
+        self.style_kv_delta_rank = int(style_kv_delta_rank)
+        if self.style_kv_delta_rank <= 0:
+            raise ValueError("style_kv_delta_rank must be positive")
 
         if aggregator_mode == "minimal":
             self.aggregator = MinimalSlotSetAggregator(
@@ -227,11 +231,18 @@ class SameQFullRankStyleAdapter(nn.Module):
         # Populated from the real Anima blocks by initialize_from_anima().
         self.style_k = nn.ModuleList()
         self.style_v = nn.ModuleList()
+        self.style_k_down = nn.ModuleList()
+        self.style_k_up = nn.ModuleList()
+        self.style_v_down = nn.ModuleList()
+        self.style_v_up = nn.ModuleList()
         self.reference_effect_head = None
         self._initialized = False
         self._style_tokens: torch.Tensor | None = None
         self._style_context: torch.Tensor | None = None
         self._runtime_ratio: dict[int, torch.Tensor] = {}
+        self._runtime_raw_ratio: dict[int, torch.Tensor] = {}
+        self._alpha_calibration_sums: list[torch.Tensor] | None = None
+        self._alpha_calibration_counts: list[int] | None = None
 
     def initialize_from_anima(self, anima: nn.Module) -> None:
         """Create trainable full-rank K/V copies from all native Anima blocks."""
@@ -241,6 +252,10 @@ class SameQFullRankStyleAdapter(nn.Module):
             return
         keys: list[nn.Linear] = []
         values: list[nn.Linear] = []
+        key_down: list[nn.Linear] = []
+        key_up: list[nn.Linear] = []
+        value_down: list[nn.Linear] = []
+        value_up: list[nn.Linear] = []
         parameter = self.bridge.projection.weight
         for index, block in enumerate(anima.blocks):
             cross_attention = block.cross_attn
@@ -268,8 +283,32 @@ class SameQFullRankStyleAdapter(nn.Module):
             values.append(
                 _copy_linear(native_v, device=parameter.device, dtype=parameter.dtype)
             )
+            key_down.append(nn.Linear(
+                self.context_dim, self.style_kv_delta_rank, bias=False,
+                device=parameter.device, dtype=parameter.dtype,
+            ))
+            key_up.append(nn.Linear(
+                self.style_kv_delta_rank, expected_output, bias=False,
+                device=parameter.device, dtype=parameter.dtype,
+            ))
+            value_down.append(nn.Linear(
+                self.context_dim, self.style_kv_delta_rank, bias=False,
+                device=parameter.device, dtype=parameter.dtype,
+            ))
+            value_up.append(nn.Linear(
+                self.style_kv_delta_rank, expected_output, bias=False,
+                device=parameter.device, dtype=parameter.dtype,
+            ))
+            nn.init.zeros_(key_up[-1].weight)
+            nn.init.zeros_(value_up[-1].weight)
         self.style_k = nn.ModuleList(keys)
         self.style_v = nn.ModuleList(values)
+        self.style_k.requires_grad_(False)
+        self.style_v.requires_grad_(False)
+        self.style_k_down = nn.ModuleList(key_down)
+        self.style_k_up = nn.ModuleList(key_up)
+        self.style_v_down = nn.ModuleList(value_down)
+        self.style_v_up = nn.ModuleList(value_up)
         self._initialized = True
 
     def aggregate(
@@ -303,6 +342,15 @@ class SameQFullRankStyleAdapter(nn.Module):
         return list(self.bridge.parameters())
 
     def kv_parameters(self) -> list[nn.Parameter]:
+        return (
+            list(self.style_k_down.parameters())
+            + list(self.style_k_up.parameters())
+            + list(self.style_v_down.parameters())
+            + list(self.style_v_up.parameters())
+        )
+
+    def kv_base_parameters(self) -> list[nn.Parameter]:
+        """Frozen native K/V copies that define Anima's context coordinates."""
         return list(self.style_k.parameters()) + list(self.style_v.parameters())
 
     def alpha_parameters(self) -> list[nn.Parameter]:
@@ -321,6 +369,7 @@ class SameQFullRankStyleAdapter(nn.Module):
 
     def reset_runtime_stats(self) -> None:
         self._runtime_ratio.clear()
+        self._runtime_raw_ratio.clear()
 
     def runtime_stats(self) -> dict[str, float]:
         ratios = (
@@ -333,7 +382,51 @@ class SameQFullRankStyleAdapter(nn.Module):
             "style_gate_abs_max": float(alpha.max()),
             "style_block_residual_ratio_mean": float(ratios.mean()),
             "style_block_residual_ratio_max": float(ratios.max()),
+            "style_block_raw_ratio_mean": float(
+                torch.stack(list(self._runtime_raw_ratio.values())).float().mean()
+            ) if self._runtime_raw_ratio else 0.0,
         }
+
+    def begin_alpha_calibration(self) -> None:
+        """Collect unscaled style/text RMS ratios without perturbing Anima."""
+        device = self.alpha.device
+        self._alpha_calibration_sums = [torch.zeros((), device=device) for _ in range(self.blocks)]
+        self._alpha_calibration_counts = [0 for _ in range(self.blocks)]
+        with torch.no_grad():
+            self.alpha.zero_()
+
+    def finish_alpha_calibration(
+        self,
+        target_ratio: float,
+        *,
+        minimum_alpha: float = 1e-6,
+        maximum_alpha: float = 0.01,
+    ) -> dict[str, list[float] | float]:
+        if self._alpha_calibration_sums is None or self._alpha_calibration_counts is None:
+            raise RuntimeError("Alpha calibration was not started")
+        if any(count == 0 for count in self._alpha_calibration_counts):
+            raise RuntimeError("Alpha calibration did not observe every Anima block")
+        raw = torch.stack([
+            total / count
+            for total, count in zip(
+                self._alpha_calibration_sums,
+                self._alpha_calibration_counts,
+                strict=True,
+            )
+        ]).clamp_min(1e-8)
+        calibrated = (float(target_ratio) / raw).clamp(
+            min=float(minimum_alpha), max=float(maximum_alpha)
+        )
+        with torch.no_grad():
+            self.alpha.copy_(calibrated.to(self.alpha))
+        result = {
+            "target_style_to_text_ratio": float(target_ratio),
+            "raw_style_to_text_ratio": raw.detach().float().cpu().tolist(),
+            "alpha": calibrated.detach().float().cpu().tolist(),
+        }
+        self._alpha_calibration_sums = None
+        self._alpha_calibration_counts = None
+        return result
 
     def projected_signature(
         self,
@@ -346,8 +439,14 @@ class SameQFullRankStyleAdapter(nn.Module):
             raise RuntimeError("Adapter must be initialized from Anima before use")
         context = self.bridge(tokens)
         values = []
-        for key, value in zip(self.style_k, self.style_v, strict=True):
-            values.extend((key(context).mean(1), value(context).mean(1)))
+        for index, (key, value) in enumerate(zip(self.style_k, self.style_v, strict=True)):
+            projected_key = key(context) + self.style_k_up[index](
+                self.style_k_down[index](context)
+            )
+            projected_value = value(context) + self.style_v_up[index](
+                self.style_v_down[index](context)
+            )
+            values.extend((projected_key.mean(1), projected_value.mean(1)))
         return torch.cat(values, dim=-1)
 
     def _style_kv(
@@ -358,8 +457,12 @@ class SameQFullRankStyleAdapter(nn.Module):
         if self._style_context is None:
             raise RuntimeError("No style tokens are active")
         context = self._style_context
-        key = self.style_k[block_index](context)
-        value = self.style_v[block_index](context)
+        key = self.style_k[block_index](context) + self.style_k_up[block_index](
+            self.style_k_down[block_index](context)
+        )
+        value = self.style_v[block_index](context) + self.style_v_up[block_index](
+            self.style_v_down[block_index](context)
+        )
         key = rearrange(
             key, "b ... (h d) -> b ... h d", h=cross_attention.n_heads,
             d=cross_attention.head_dim,
@@ -399,6 +502,25 @@ class SameQFullRankStyleAdapter(nn.Module):
         style_attended = _run_attention(
             cross_attention, query, style_key, style_value, attn_params
         )
+        if self._alpha_calibration_sums is not None:
+            # The native O projection can amplify text and visual directions
+            # differently even though it is shared. Measure the actual branch
+            # outputs during the short calibration pass, not merely attention
+            # head coordinates. Runtime uses the cheap pre-O proxy below.
+            text_for_ratio = cross_attention.output_proj(text_attended)
+            style_for_ratio = cross_attention.output_proj(style_attended)
+        else:
+            text_for_ratio = text_attended
+            style_for_ratio = style_attended
+        raw_ratio = (
+            style_for_ratio.detach().float().square().mean().sqrt()
+            / text_for_ratio.detach().float().square().mean().sqrt().clamp_min(1e-8)
+        )
+        self._runtime_raw_ratio[block_index] = raw_ratio
+        if self._alpha_calibration_sums is not None:
+            self._alpha_calibration_sums[block_index].add_(raw_ratio)
+            assert self._alpha_calibration_counts is not None
+            self._alpha_calibration_counts[block_index] += 1
         style_delta = self.alpha[block_index].to(style_attended.dtype) * style_attended
         merged = text_attended + style_delta
         self._runtime_ratio[block_index] = (
