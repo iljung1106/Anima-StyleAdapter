@@ -703,7 +703,7 @@ real_artist_teacher:
   style_token_batch_size: 32
   style_token_prefetch_shards: 4
   offline_bootstrap:
-    output_directory: offline_kvo_reference_head_scaled_v1
+    output_directory: offline_kvo_reference_head_two_stage_v1
     # Reuse the frozen common-effect connector learned on exact synthetic
     # teacher images. Only the reference-conditioned head is updated here.
     initial_checkpoint: ../synthetic_teacher_500x16/offline_kvo_bootstrap_exact512_summary_tokens/checkpoints/best.pt
@@ -733,7 +733,7 @@ real_artist_teacher:
     # receive an inverse-scale weight larger than meaningful interventions.
     effect_scale_floor: 0.001
     freeze_base_connector: true
-    primary_effect_initial_weight: 0.10
+    primary_effect_initial_weight: 1.0
     primary_effect_weight: 0.10
     warmup_steps: 400
     minimum_lr_ratio: 0.1
@@ -744,8 +744,8 @@ real_artist_teacher:
     functional_rank_margin: 0.02
     functional_contrastive_weight: 0.20
     functional_contrastive_temperature: 0.10
-    functional_contrastive_start_step: 0
-    functional_contrastive_ramp_steps: 500
+    functional_contrastive_start_step: 500
+    functional_contrastive_ramp_steps: 1000
     functional_all_pairs_weight: 0.10
     functional_all_pairs_magnitude_weight: 0.02
     functional_centered_all_pairs_weight: 0.10
@@ -765,5 +765,5 @@ real_artist_teacher:
     wandb:
       enabled: true
       project: anima-style-adapter
-      name: real-artist-5000-reference-head-scaled
-      id: real-artist-5000-reference-head-scaled-v1
+      name: real-artist-5000-reference-head-two-stage
+      id: real-artist-5000-reference-head-two-stage-v1
