@@ -636,17 +636,19 @@ class SharedLowRankStyleAdapter(nn.Module):
             ]
         )
         if self.connector_enabled:
-            self.block_embeddings = nn.Parameter(torch.zeros(blocks, self.context_dim))
+            self.block_embeddings = nn.Parameter(torch.empty(blocks, self.context_dim))
+            nn.init.normal_(self.block_embeddings, std=1e-6)
         else:
             self.register_parameter("block_embeddings", None)
-        # Every connector block starts as an exact residual identity. The
-        # pretrained Anima cross-attention basis, not a random deep transform,
-        # defines the initial style path.
+        # The terminal o_up is the sole exact-zero boundary. Keep connector
+        # residuals live but tiny so every connector parameter can receive a
+        # gradient as soon as the terminal opens, without rotating the
+        # pretrained Anima conditioning coordinates at initialization.
         for layer in list(self.connector_trunk) + [
             item for branch in self.connector_branches for item in branch
         ]:
-            nn.init.zeros_(layer.output.weight)
-            nn.init.zeros_(layer.ff[-1].weight)
+            nn.init.normal_(layer.output.weight, std=1e-7)
+            nn.init.normal_(layer.ff[-1].weight, std=1e-7)
         self.k_down = nn.ModuleList([nn.Linear(self.context_dim, rank, bias=False) for _ in range(blocks)])
         self.k_up = nn.ModuleList([nn.Linear(rank, hidden_dim, bias=False) for _ in range(blocks)])
         self.v_down = nn.ModuleList([nn.Linear(self.context_dim, rank, bias=False) for _ in range(blocks)])
@@ -657,9 +659,12 @@ class SharedLowRankStyleAdapter(nn.Module):
         self.o_up = nn.ModuleList(
             [nn.Linear(rank, output_dim, bias=False) for _ in range(blocks)]
         )
+        # K/V deltas also remain live. Their small nonzero up projections keep
+        # the copied native K/V basis dominant while avoiding another staged
+        # zero-init boundary behind the terminal output map.
         for modules in (self.k_up, self.v_up):
             for layer in modules:
-                nn.init.zeros_(layer.weight)
+                nn.init.normal_(layer.weight, std=1e-3)
         for layer in self.o_up:
             nn.init.zeros_(layer.weight)
         self.reference_effect_head = (

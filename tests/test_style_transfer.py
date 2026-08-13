@@ -602,9 +602,9 @@ def test_high_capacity_connector_builds_distinct_block_contexts_and_gradients():
     tokens = adapter.aggregate(references, torch.ones(2, 1, dtype=torch.bool))
     adapter.set_style_tokens(tokens)
     assert len(adapter._style_block_tokens) == 4
-    # Zero residual initialization leaves every group/block on the shared
-    # identity path until its own output projection starts learning.
-    torch.testing.assert_close(adapter._style_block_tokens[0], adapter._style_block_tokens[1])
+    # Connector branches are live from initialization; only the final o_up is
+    # exactly zero, so different block groups already expose distinct context.
+    assert not torch.equal(adapter._style_block_tokens[0], adapter._style_block_tokens[2])
 
     cross = _FakeCrossAttention(32, context=16).requires_grad_(False)
     result = adapter.attend(0, torch.randn(2, 5, 32), cross, torch.ones(2, 5, 32))
@@ -614,7 +614,7 @@ def test_high_capacity_connector_builds_distinct_block_contexts_and_gradients():
     assert adapter.block_embeddings.grad is not None
 
 
-def test_connector_preserves_tiny_context_bridge_initialization():
+def test_connector_starts_live_behind_the_zero_terminal():
     adapter = SharedLowRankStyleAdapter(
         style_dim=16, slots=4, hidden_dim=32, output_dim=32,
         heads=4, blocks=4, rank=4, projection_mode="pretrained_block_lora",
@@ -625,8 +625,11 @@ def test_connector_preserves_tiny_context_bridge_initialization():
     tokens = torch.nn.functional.layer_norm(torch.randn(2, 4, 16), (16,))
     contexts = adapter._block_context_tokens(tokens)
     expected = tokens * 1e-4
-    for context in contexts:
-        torch.testing.assert_close(context, expected, atol=2e-7, rtol=2e-3)
+    assert any(not torch.equal(context, expected) for context in contexts)
+    assert all(torch.isfinite(context).all() for context in contexts)
+    assert all(layer.weight.count_nonzero() > 0 for layer in adapter.k_up)
+    assert all(layer.weight.count_nonzero() > 0 for layer in adapter.v_up)
+    assert all(layer.weight.count_nonzero() == 0 for layer in adapter.o_up)
 
     selected = adapter.selected_block_context_tokens(tokens, [0, 3])
     torch.testing.assert_close(selected[0], contexts[0])
