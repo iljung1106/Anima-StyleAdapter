@@ -885,6 +885,7 @@ def train_offline_kvo_bootstrap(
             selected_heldout = [
                 row for row in train_heldout_rows if str(row["artist"]) in selected
             ]
+            train_heldout_rows = selected_heldout
             if bool(training.get("validate_on_training_artists", False)):
                 # Capacity diagnostic: same artists, but disjoint reference
                 # images and held-out content. This measures learnability
