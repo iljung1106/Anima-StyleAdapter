@@ -1950,6 +1950,30 @@ def _set_adapter_trainable_stage(
             parameter.requires_grad_(True)
 
 
+def _apply_adapter_freeze_policy(
+    adapter: nn.Module, training: dict[str, Any]
+) -> dict[str, int]:
+    """Reapply immutable phase-level freezes after curriculum stage changes.
+
+    The curriculum setter intentionally opens the complete adapter after a
+    gate-only stage. Phase A instead needs fixed native K/V copies and fixed
+    nonzero alpha for its entire run, otherwise minimizing alpha is an easier
+    solution than aligning the visual tokens to Anima's context space.
+    """
+    groups: dict[str, list[nn.Parameter]] = {}
+    if bool(training.get("freeze_style_kv", False)):
+        groups["style_kv"] = list(adapter.kv_parameters())
+    if bool(training.get("freeze_style_alpha", False)):
+        groups["style_alpha"] = list(adapter.output_parameters())
+    for parameters in groups.values():
+        for parameter in parameters:
+            parameter.requires_grad_(False)
+    return {
+        name: sum(parameter.numel() for parameter in parameters)
+        for name, parameters in groups.items()
+    }
+
+
 def _load_adapter_checkpoint(
     adapter: SharedLowRankStyleAdapter, state: dict[str, Any]
 ) -> None:
@@ -2515,6 +2539,7 @@ def _forward_flow_loss(
         flow_direction_cosine = flow_loss.new_full((), float("nan"))
         flow_desired_projection = flow_loss.new_full((), float("nan"))
         flow_delta_to_desired_ratio = flow_loss.new_full((), float("nan"))
+        flow_orthogonal_to_desired_ratio = flow_loss.new_full((), float("nan"))
         if bypass_prediction is not None:
             dimensions = tuple(range(1, prediction.ndim))
             difference_rms = (
@@ -2538,6 +2563,9 @@ def _forward_flow_loss(
                     residual_metrics["delta_rms"]
                     / residual_metrics["desired_rms"].clamp_min(1e-8)
                 ).mean()
+                flow_orthogonal_to_desired_ratio = residual_metrics[
+                    "orthogonal_to_desired_ratio"
+                ].mean()
                 calibration = loss_config.get("_style_effect_calibration")
                 if calibration is None:
                     magnitude_loss = F.relu(magnitude_floor - ratios[valid]).square().mean()
@@ -2669,6 +2697,9 @@ def _forward_flow_loss(
         "style_flow_delta_to_desired_ratio": float(
             flow_delta_to_desired_ratio.detach()
         ),
+        "style_flow_orthogonal_to_desired_ratio": float(
+            flow_orthogonal_to_desired_ratio.detach()
+        ),
         "style_magnitude_loss": float(magnitude_loss.detach()),
         "style_flow_direction_multiplier": direction_multiplier,
         "style_flow_direction_loss": float(direction_loss.detach()),
@@ -2703,6 +2734,8 @@ def _validate_style_adapter(
     base_losses = []
     paired_improvements = []
     output_ratios = []
+    alignment_samples: dict[str, list[float]] = defaultdict(list)
+    timestep_alignment: list[tuple[float, dict[str, float]]] = []
     started = time.perf_counter()
     try:
         for index in range(batches):
@@ -2731,6 +2764,19 @@ def _validate_style_adapter(
             base_losses.append(details["base_flow_loss"])
             paired_improvements.append(details["paired_flow_improvement"])
             output_ratios.append(details["style_output_ratio"])
+            alignment = {
+                key: float(details[key])
+                for key in (
+                    "style_flow_direction_cosine",
+                    "style_flow_desired_projection",
+                    "style_flow_delta_to_desired_ratio",
+                    "style_flow_orthogonal_to_desired_ratio",
+                )
+            }
+            for key, value in alignment.items():
+                if math.isfinite(value):
+                    alignment_samples[key].append(value)
+            timestep_alignment.append((float(details["timestep_mean"]), alignment))
             adapter.clear_style_tokens()
     finally:
         adapter.clear_style_tokens()
@@ -2744,7 +2790,7 @@ def _validate_style_adapter(
         paired_ci95 = 1.96 * math.sqrt(paired_variance / len(paired_improvements))
     else:
         paired_ci95 = 0.0
-    return {
+    summary = {
         "loss": sum(losses) / len(losses),
         "base_loss": sum(base_losses) / len(base_losses),
         "paired_improvement": paired_mean,
@@ -2756,6 +2802,25 @@ def _validate_style_adapter(
         "mean_references": sum(references) / len(references),
         "elapsed_s": time.perf_counter() - started,
     }
+    for key, values in alignment_samples.items():
+        summary[key] = sum(values) / len(values)
+    edges = list((loss_config or {}).get(
+        "validation_timestep_edges", [0.0, 0.2, 0.4, 0.6, 0.8, 1.0]
+    ))
+    for lower, upper in zip(edges[:-1], edges[1:], strict=True):
+        selected = [
+            metrics for timestep, metrics in timestep_alignment
+            if lower <= timestep < upper or (upper == edges[-1] and timestep == upper)
+        ]
+        if not selected:
+            continue
+        label = f"t{lower:.1f}_{upper:.1f}".replace(".", "p")
+        for key in alignment_samples:
+            values = [metrics[key] for metrics in selected if math.isfinite(metrics[key])]
+            if values:
+                summary[f"{label}/{key}"] = sum(values) / len(values)
+        summary[f"{label}/samples"] = float(len(selected))
+    return summary
 
 
 def _load_sampling_vae(config: dict[str, Any], destination: Path):
@@ -3329,12 +3394,21 @@ def _per_sample_flow_residual_metrics(
     desired_rms = base_mse.sqrt()
     dot = (delta * desired).mean(dim=dimensions)
     cosine = dot / (delta_rms * desired_rms).clamp_min(1e-12)
+    projection = dot / base_mse
+    # Decompose delta into its signed desired-axis projection and orthogonal
+    # remainder. Both are normalized by desired RMS, so paired improvement is
+    # exactly 2 * projection - projection**2 - orthogonal**2 per sample.
+    delta_to_desired = delta_rms / desired_rms
+    orthogonal_to_desired = (
+        delta_to_desired.square() - projection.square()
+    ).clamp_min(0).sqrt()
     return {
         "loss": condition_mse,
         "paired_improvement": (base_mse - condition_mse) / base_mse,
         "delta_to_base_ratio": delta_rms / bypass_rms,
         "direction_cosine": cosine,
-        "desired_projection": dot / base_mse,
+        "desired_projection": projection,
+        "orthogonal_to_desired_ratio": orthogonal_to_desired,
         "delta_rms": delta_rms,
         "desired_rms": desired_rms,
     }
@@ -4554,6 +4628,17 @@ def train_style_adapter(config: dict[str, Any], destination: Path, *, steps_over
     # nonzero K/V and Aggregator weights otherwise round to exactly zero.
     # Autocast still executes the expensive attention/linear kernels in BF16.
     adapter = _create_and_attach_style_adapter(anima, cfg["adapter"], device)
+    # Establish immutable phase-level freezes before optimizer construction.
+    # The same policy is reapplied after every curriculum transition below.
+    _set_aggregator_trainable(
+        adapter,
+        step=0,
+        start_step=int(training.get("aggregator_train_start_step", 0)),
+        gate_only=False,
+    )
+    frozen_groups = _apply_adapter_freeze_policy(adapter, training)
+    if frozen_groups:
+        print(f"immutable style freeze policy: {frozen_groups}", flush=True)
     output_parameters = adapter.output_parameters()
     gate_parameters = adapter.gate_parameters()
     bridge_parameters = adapter.bridge_parameters()
@@ -4807,6 +4892,7 @@ def train_style_adapter(config: dict[str, Any], destination: Path, *, steps_over
             start_step=int(training.get("aggregator_train_start_step", 0)),
             gate_only=bool(curriculum["gate_only"]),
         )
+        _apply_adapter_freeze_policy(adapter, training)
         if curriculum["oracle_required"] and oracle_adapter is None:
             if step != self_reference_steps + 1:
                 raise RuntimeError(
@@ -4970,6 +5056,9 @@ def train_style_adapter(config: dict[str, Any], destination: Path, *, steps_over
                 f"phase={row['curriculum_phase']} "
                 f"refs={row['references']} shape={tuple(row['latent_shape'])} step_s={elapsed:.2f} "
                 f"data_wait_s={data_wait:.3f} output_ratio={row['style_output_ratio']:.4f} "
+                f"align=proj:{row['style_flow_desired_projection']:.4f}/"
+                f"cos:{row['style_flow_direction_cosine']:.4f}/"
+                f"orth:{row['style_flow_orthogonal_to_desired_ratio']:.4f} "
                 f"mag={row['style_magnitude_loss']:.5f} dir={row['style_flow_direction_loss']:.5f} "
                 f"rank={row['style_reference_rank_loss']:.5f}/"
                 f"{row['style_reference_rank_advantage']:.5f} "
@@ -5024,6 +5113,9 @@ def train_style_adapter(config: dict[str, Any], destination: Path, *, steps_over
                 f"ci95=±{heldout_validation['paired_improvement_ci95']:.6f} "
                 f"positive={heldout_validation['paired_positive_fraction']:.3f} "
                 f"output_ratio={heldout_validation['style_output_ratio']:.6f} "
+                f"projection={heldout_validation['style_flow_desired_projection']:.6f} "
+                f"cosine={heldout_validation['style_flow_direction_cosine']:.6f} "
+                f"orthogonal={heldout_validation['style_flow_orthogonal_to_desired_ratio']:.6f} "
                 f"batches={current_validation_batches} "
                 f"elapsed_s={heldout_validation['elapsed_s']:.2f}",
                 flush=True,
@@ -5035,6 +5127,9 @@ def train_style_adapter(config: dict[str, Any], destination: Path, *, steps_over
                 f"ci95=±{self_validation['paired_improvement_ci95']:.6f} "
                 f"positive={self_validation['paired_positive_fraction']:.3f} "
                 f"output_ratio={self_validation['style_output_ratio']:.6f} "
+                f"projection={self_validation['style_flow_desired_projection']:.6f} "
+                f"cosine={self_validation['style_flow_direction_cosine']:.6f} "
+                f"orthogonal={self_validation['style_flow_orthogonal_to_desired_ratio']:.6f} "
                 f"batches={current_validation_batches} "
                 f"elapsed_s={self_validation['elapsed_s']:.2f}",
                 flush=True,
@@ -5151,6 +5246,7 @@ def train_style_adapter(config: dict[str, Any], destination: Path, *, steps_over
         "checkpoint": str(checkpoint.resolve()),
         "trainable_parameters": sum(
             value.numel() for value in parameters + resampler_parameters
+            if value.requires_grad
         ),
         "resampler_checkpoint": str(cfg["resampler"]["checkpoint"]),
     }

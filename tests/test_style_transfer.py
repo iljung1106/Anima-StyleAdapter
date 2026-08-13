@@ -15,6 +15,7 @@ from anima_style_data.style_transfer import (
     MinimalSlotSetAggregator,
     SlotSetAggregator,
     _archive_training_state,
+    _apply_adapter_freeze_policy,
     _clip_style_gradient_groups,
     _episode_resampler_prototype_losses,
     _direction_anneal_multiplier,
@@ -253,7 +254,21 @@ def test_flow_residual_diagnostics_separate_magnitude_direction_and_improvement(
 
     torch.testing.assert_close(metrics["direction_cosine"], torch.ones(2))
     torch.testing.assert_close(metrics["desired_projection"], torch.full((2,), 0.5))
+    torch.testing.assert_close(
+        metrics["orthogonal_to_desired_ratio"], torch.zeros(2)
+    )
     torch.testing.assert_close(metrics["paired_improvement"], torch.full((2,), 0.75))
+
+    orthogonal_prediction = bypass + torch.tensor(
+        [[[[1.0, 1.0]]], [[[2.0, 2.0]]]]
+    )
+    orthogonal = _per_sample_flow_residual_metrics(
+        orthogonal_prediction, bypass, target
+    )
+    torch.testing.assert_close(orthogonal["desired_projection"], torch.zeros(2))
+    torch.testing.assert_close(
+        orthogonal["orthogonal_to_desired_ratio"], torch.ones(2)
+    )
 
 
 def test_condition_delta_cosine_and_summary_report_common_or_opposite_outputs():

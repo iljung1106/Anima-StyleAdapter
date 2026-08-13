@@ -3,6 +3,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from anima_style_data.same_q_style_adapter import SameQFullRankStyleAdapter
+from anima_style_data.style_transfer import _apply_adapter_freeze_policy
 
 
 class _CountingLinear(nn.Linear):
@@ -181,3 +182,20 @@ def test_no_active_style_preserves_native_cross_attention_path():
     actual = adapter.merged_cross_attention(0, hidden, text, cross, None)
 
     torch.testing.assert_close(actual, expected)
+
+
+def test_phase_a_freezes_native_kv_and_alpha_but_keeps_bridge_trainable():
+    anima = _Anima().requires_grad_(False)
+    adapter = _adapter()
+    adapter.initialize_from_anima(anima)
+
+    counts = _apply_adapter_freeze_policy(
+        adapter, {"freeze_style_kv": True, "freeze_style_alpha": True}
+    )
+
+    assert counts["style_kv"] > 0
+    assert counts["style_alpha"] == 2
+    assert not any(parameter.requires_grad for parameter in adapter.kv_parameters())
+    assert not adapter.alpha.requires_grad
+    assert all(parameter.requires_grad for parameter in adapter.bridge_parameters())
+    assert adapter.null_tokens.requires_grad
