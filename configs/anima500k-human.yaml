@@ -725,10 +725,13 @@ real_artist_teacher:
     representation_warmup_steps: 0
     centered_effect_head: true
     centered_effect_latent_dim: 512
-    centered_effect_learning_rate: 0.0001
+    centered_effect_learning_rate: 0.00005
     centered_effect_max_grad_norm: 1.0
     centered_effect_residual_weight: 1.0
     centered_effect_zero_mean_weight: 0.10
+    # Native artist effects below this RMS are weak-query noise and must not
+    # receive an inverse-scale weight larger than meaningful interventions.
+    effect_scale_floor: 0.001
     freeze_base_connector: true
     primary_effect_initial_weight: 0.10
     primary_effect_weight: 0.10
@@ -762,5 +765,5 @@ real_artist_teacher:
     wandb:
       enabled: true
       project: anima-style-adapter
-      name: real-artist-5000-reference-head-b8
-      id: real-artist-5000-reference-head-b8-v1
+      name: real-artist-5000-reference-head-scaled
+      id: real-artist-5000-reference-head-scaled-v1

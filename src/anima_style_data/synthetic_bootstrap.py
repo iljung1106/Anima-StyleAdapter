@@ -1275,7 +1275,10 @@ def train_offline_kvo_bootstrap(
                     (teacher_flat - reference_teacher_flat).square().mean(1).sqrt()
                     / teacher_flat.square().mean(1).sqrt().clamp_min(1e-6)
                 ).unbind())
-            scale = teacher_float.square().mean(dim=(1, 2), keepdim=True).sqrt().clamp_min(1e-4)
+            effect_scale_floor = float(training.get("effect_scale_floor", 1e-4))
+            scale = teacher_float.square().mean(
+                dim=(1, 2), keepdim=True
+            ).sqrt().clamp_min(effect_scale_floor)
             per_sample_output = F.smooth_l1_loss(
                 student_float / scale, teacher_float / scale, beta=0.1, reduction="none"
             ).mean(dim=(1, 2))
@@ -1388,7 +1391,7 @@ def train_offline_kvo_bootstrap(
                         )
                         residual_scale = pair_teacher.square().mean(
                             dim=(-2, -1), keepdim=True
-                        ).sqrt().clamp_min(1e-4)
+                        ).sqrt().clamp_min(effect_scale_floor)
                         centered_residual_losses.append(F.smooth_l1_loss(
                             centered_prediction / residual_scale,
                             centered_target / residual_scale,
