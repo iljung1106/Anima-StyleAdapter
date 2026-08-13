@@ -300,9 +300,9 @@ style_transfer:
   resampler:
     checkpoint: per_reference_resampler_artist_specific_stage_r_v1/runs/l18_l24_native_siglip_l24/checkpoint.pt
   adapter:
-    # Project Resampler tokens into Anima's post-LLM condition space, then use
-    # every block's frozen pretrained K/V/O as the full-rank base. Only the
-    # style-only rank-32 deltas and the shared alignment projector are learned.
+    # Project Resampler tokens into Anima's post-LLM condition space and reuse
+    # every block's frozen Q/K/V/O coordinates. Native O is never added
+    # directly: the zero-init rank-128 terminal is the sole style residual.
     projection_mode: pretrained_block_lora
     context_dim: 1024
     style_dim: 1024
@@ -320,15 +320,15 @@ style_transfer:
     aggregator_mode: minimal
     aggregator_bottleneck: 256
     # Shared interpretation followed by four seven-block-specific branches.
-    # The resulting connector (including rank-128 K/V/O deltas) is ~190M.
+    # K/V use rank-128 deltas; the rank-128 O path is the strict terminal.
     connector_layers: 4
     connector_heads: 16
     connector_groups: 4
     connector_group_layers: 2
     connector_summary_tokens: true
-    # Offline native K/V/O distillation selected a query-conditioned head at
-    # step 1250. Runtime loads its separate centered_head state into this path.
-    reference_effect_head: true
+    # Keep a single identifiable K/V attention path. Query-conditioned direct
+    # residual heads are excluded from the production architecture.
+    reference_effect_head: false
     reference_effect_latent_dim: 512
     reference_effect_heads: 8
     aggregator_heads: 16
@@ -519,7 +519,7 @@ style_transfer:
     sample_steps: 30
     sample_seed: 2026081201
   exact_self_generalization:
-    output_name: exact_self_generalization_96_train_24_validation_v1
+    output_name: exact_self_generalization_96_train_24_strict_low_rank_v2
     seed: 20260815
     batch_size: 3
     train_batches: 32
@@ -546,8 +546,8 @@ style_transfer:
     wandb:
       enabled: true
       project: anima-style-adapter
-      name: exact-self-generalization-96-train-24-validation-v1
-      id: exact-self-generalization-96-train-24-validation-v1
+      name: exact-self-generalization-96-train-24-strict-low-rank-v2
+      id: exact-self-generalization-96-train-24-strict-low-rank-v2
   sampling:
     episode: 0
     # Qualitative 1MP checkpoint evaluation across artist-disjoint validation

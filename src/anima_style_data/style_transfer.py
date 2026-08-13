@@ -543,7 +543,7 @@ class QueryConditionedReferenceHead(nn.Module):
 
 
 class SharedLowRankStyleAdapter(nn.Module):
-    """Set aggregation plus either learned or pretrained block K/V/O projections."""
+    """Set aggregation plus learned or pretrained-coordinate style attention."""
 
     def __init__(
         self,
@@ -886,11 +886,16 @@ class SharedLowRankStyleAdapter(nn.Module):
         v = cross_attention.v_norm(v)
         attended = F.scaled_dot_product_attention(q, k, v)
         attended = attended.transpose(1, 2).reshape(normalized_x.shape[0], normalized_x.shape[1], self.hidden_dim)
-        output_delta = self.o_up[block_index](self.o_down[block_index](attended))
         if self.projection_mode == "learned_shared":
+            output_delta = self.o_up[block_index](self.o_down[block_index](attended))
             attended = self.shared_o(attended) + output_delta
         else:
-            attended = cross_attention.output_proj(attended) + output_delta
+            # Preserve Anima's pretrained output coordinates, but never add
+            # that full-rank result directly.  The rank-limited terminal is
+            # the sole style residual and its zero-initialized up projection
+            # makes the first forward exactly identical to frozen Anima.
+            native_output = cross_attention.output_proj(attended)
+            attended = self.o_up[block_index](self.o_down[block_index](native_output))
         if self.reference_effect_head is not None:
             attended = attended + self.reference_effect_head(
                 self._style_tokens, q, block_index
@@ -977,7 +982,8 @@ def _style_block_forward(
     x = x + gate_cross * result
 
     # Separate style attention, immediately after text attention. It reuses the
-    # frozen text-attention Q projection, Q norm, and output projection.
+    # frozen text-attention Q and its K/V/O coordinate system; pretrained mode
+    # still emits only through the zero-init rank-limited terminal.
     normalized_style = block.layer_norm_cross_attn(x) * (1 + scale_cross) + shift_cross
     controller = block.__dict__["_style_controller"]()
     style_result = controller.attend(
