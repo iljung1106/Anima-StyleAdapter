@@ -100,6 +100,17 @@ def _bootstrap_eligible(row: dict[str, Any]) -> bool:
     return row.get("kind") == "artist" and row.get("artist_split") != "excluded"
 
 
+def _functional_curriculum_scale(
+    training: dict[str, Any], *, train: bool, current_step: int
+) -> float:
+    """Ramp every reference-discrimination objective after teacher regression."""
+    if not train:
+        return 1.0
+    start = int(training.get("functional_contrastive_start_step", 0))
+    ramp = int(training.get("functional_contrastive_ramp_steps", 0))
+    return min(1.0, max(0.0, (current_step - start) / max(ramp, 1)))
+
+
 def validate_synthetic_teacher_corpus(
     config: dict[str, Any], destination: Path
 ) -> dict[str, Any]:
@@ -1097,6 +1108,9 @@ def train_offline_kvo_bootstrap(
         current_step: int = 0,
     ) -> tuple[torch.Tensor, dict[str, float]]:
         reference_rows = batch_rows if reference_rows is None else reference_rows
+        contrastive_scale = _functional_curriculum_scale(
+            training, train=train, current_step=current_step
+        )
         tokens, drift_loss = encode(reference_rows)
         representation_tokens = tokens.detach() if detach_representation else tokens
         # A trainable Resampler must not shift the frozen Phase-A common
@@ -1261,8 +1275,19 @@ def train_offline_kvo_bootstrap(
                 return base_output + correction
 
             student = student_output(contexts[block])
-            use_rank = train and len(batch_rows) > 1 and float(training.get("functional_rank_weight", 0.0)) > 0
-            wrong_student = student_output(contexts[block].roll(1, dims=0)) if use_rank else None
+            use_rank = (
+                train
+                and contrastive_scale > 0
+                and len(batch_rows) > 1
+                and float(training.get("functional_rank_weight", 0.0)) > 0
+            )
+            wrong_student = (
+                student_output(
+                    contexts[block].roll(1, dims=0),
+                    source_tokens=representation_tokens.roll(1, dims=0),
+                )
+                if use_rank else None
+            )
             teacher_float, student_float = teacher.float(), student.float()
             if reference_artist_contexts is not None:
                 reference_teacher_float = reference_teacher.float()
@@ -1477,18 +1502,6 @@ def train_offline_kvo_bootstrap(
             torch.stack(centered_residual_mean_losses).mean()
             if centered_residual_mean_losses else output_loss.new_zeros(())
         )
-        contrastive_scale = 1.0
-        if train:
-            contrastive_start = int(
-                training.get("functional_contrastive_start_step", 0)
-            )
-            contrastive_ramp = int(
-                training.get("functional_contrastive_ramp_steps", 0)
-            )
-            contrastive_scale = min(
-                1.0,
-                max(0.0, (current_step - contrastive_start) / max(contrastive_ramp, 1)),
-            )
         primary_weight_final = float(training.get("primary_effect_weight", 1.0))
         primary_weight_initial = float(
             training.get("primary_effect_initial_weight", primary_weight_final)
@@ -1504,7 +1517,8 @@ def train_offline_kvo_bootstrap(
                 + float(training.get("magnitude_weight", 0.02)) * rms_loss
             )
             + float(training.get("representation_drift_weight", 0.0)) * drift_loss
-            + float(training.get("functional_rank_weight", 0.0)) * rank_loss
+            + contrastive_scale
+            * float(training.get("functional_rank_weight", 0.0)) * rank_loss
             + contrastive_scale
             * float(training.get("functional_contrastive_weight", 0.0))
             * contrastive_loss

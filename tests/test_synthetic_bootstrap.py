@@ -5,9 +5,21 @@ from anima_style_data.synthetic_bootstrap import (
     _attention_output,
     _batched_attention_output,
     _bootstrap_eligible,
+    _functional_curriculum_scale,
     assign_bootstrap_splits,
     classify_artist_effects,
 )
+
+
+def test_reference_discrimination_curriculum_is_off_then_ramps_together():
+    training = {
+        "functional_contrastive_start_step": 500,
+        "functional_contrastive_ramp_steps": 1000,
+    }
+    assert _functional_curriculum_scale(training, train=True, current_step=500) == 0.0
+    assert _functional_curriculum_scale(training, train=True, current_step=1000) == 0.5
+    assert _functional_curriculum_scale(training, train=True, current_step=1500) == 1.0
+    assert _functional_curriculum_scale(training, train=False, current_step=0) == 1.0
 
 
 def test_variable_spatial_tokens_use_batch_local_padding():
