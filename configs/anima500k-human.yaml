@@ -519,7 +519,7 @@ style_transfer:
     sample_steps: 30
     sample_seed: 2026081201
   exact_self_generalization:
-    output_name: exact_self_generalization_96_train_24_strict_low_rank_v2
+    output_name: exact_self_generalization_96_train_24_strict_low_rank_v3
     seed: 20260815
     batch_size: 3
     train_batches: 32
@@ -546,8 +546,8 @@ style_transfer:
     wandb:
       enabled: true
       project: anima-style-adapter
-      name: exact-self-generalization-96-train-24-strict-low-rank-v2
-      id: exact-self-generalization-96-train-24-strict-low-rank-v2
+      name: exact-self-generalization-96-train-24-strict-low-rank-v3
+      id: exact-self-generalization-96-train-24-strict-low-rank-v3
   sampling:
     episode: 0
     # Qualitative 1MP checkpoint evaluation across artist-disjoint validation
