@@ -236,7 +236,7 @@ tap_resampler_experiment:
     prototype_pool: attention
     artists_per_batch: 4
     images_per_artist: 2
-    steps: 8000
+    steps: 2000
     learning_rate: 0.0001
     warmup_steps: 400
     min_lr_ratio: 0.10
@@ -464,9 +464,9 @@ style_transfer:
     # the one-reference Minimal Aggregator path an exact parameter-free bypass.
     curriculum:
       gate_only_steps: 0
-      self_reference_steps: 8000
-      target_anneal_end: 8001
-      oracle_distill_end: 8000
+      self_reference_steps: 2000
+      target_anneal_end: 2001
+      oracle_distill_end: 2000
     oracle_distill_weight: 0.0
     oracle_distill_probability: 0.25
     oracle_distill_scale_floor: 0.02
@@ -474,8 +474,8 @@ style_transfer:
     wandb:
       enabled: true
       project: anima-style-adapter
-      name: anima-style-transfer-high-capacity-native-cross-gate-8000
-      id: anima-style-transfer-high-capacity-native-cross-gate-8000-v1
+      name: anima-style-transfer-offline-head-exact-self-2000
+      id: anima-style-transfer-offline-head-exact-self-2000-v1
   diagnostics:
     checkpoint: smoke-2-steps/checkpoint.pt
     checkpoints:
