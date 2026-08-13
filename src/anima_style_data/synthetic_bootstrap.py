@@ -657,7 +657,7 @@ def _load_resampler_token_cache(
     rows = read_records(cache_root / "manifest.parquet")
     row_by_id = {int(row["id"]): row for row in rows}
     tensors = {
-        name: load_file(cache_root / name, device="cpu")["tokens"].clone().to(device)
+        name: load_file(cache_root / name, device="cpu")["tokens"].to(device)
         for name in sorted({str(row["token_shard"]) for row in rows})
     }
     return row_by_id, tensors
@@ -1571,6 +1571,8 @@ def train_offline_kvo_bootstrap(
         ]
 
     def evaluate(source: list[dict[str, Any]], batches: int) -> dict[str, float]:
+        if steps_override is not None:
+            batches = 1
         adapter.eval()
         resampler.eval()
         metrics: list[dict[str, float]] = []
