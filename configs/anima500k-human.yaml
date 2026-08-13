@@ -481,7 +481,9 @@ style_transfer:
     style_reference_wrong_grad_samples: 1
     adaptive_reference_loss: true
     reference_loss_activation_validations: 4
-    reference_loss_activation_paired_threshold: 0.0
+    # Require at least 0.1% normalized flow-error reduction, not merely a
+    # floating-point-positive result, before counting one qualifying check.
+    reference_loss_activation_paired_threshold: 0.001
     reference_loss_activation_positive_fraction: 0.75
     reference_loss_ramp_steps: 750
     # Softly match the timestep-conditioned magnitude of Anima's native artist
