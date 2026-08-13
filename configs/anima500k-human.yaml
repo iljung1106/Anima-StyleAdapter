@@ -602,7 +602,7 @@ synthetic_teacher:
     representation_warmup_steps: 0
     centered_effect_head: true
     centered_effect_latent_dim: 512
-    centered_effect_learning_rate: 0.00005
+    centered_effect_learning_rate: 0.0001
     centered_effect_max_grad_norm: 0.50
     centered_effect_residual_weight: 1.0
     centered_effect_direction_weight: 0.20
@@ -629,8 +629,11 @@ synthetic_teacher:
     functional_rank_margin: 0.02
     functional_contrastive_weight: 0.0
     functional_contrastive_temperature: 0.10
-    functional_contrastive_start_step: 1000
-    functional_contrastive_ramp_steps: 1000
+    # The 64-artist capacity probe reached 13.67% held-content all-pairs
+    # accuracy (6.25% random) from direct regression. Introduce same-content
+    # hard negatives early enough to shape unseen-artist generalization.
+    functional_contrastive_start_step: 250
+    functional_contrastive_ramp_steps: 750
     functional_all_pairs_weight: 0.0
     functional_centered_all_pairs_weight: 0.20
     functional_centered_temperature: 0.07
