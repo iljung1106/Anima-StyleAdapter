@@ -799,7 +799,7 @@ def _enable_phase_b_resampler(
 
 def train_offline_kvo_bootstrap(
     config: dict[str, Any], destination: Path, *, steps_override: int | None = None,
-    phase: str = "a", real_artist: bool = False,
+    phase: str = "a", real_artist: bool = False, capacity_probe: bool = False,
 ) -> dict[str, Any]:
     """Distill native artist attention effects without running Anima's transformer."""
     from safetensors.torch import load_file
@@ -816,7 +816,9 @@ def train_offline_kvo_bootstrap(
         raise ValueError(f"Unknown offline bootstrap phase: {phase}")
     if real_artist:
         real_cfg = config["real_artist_teacher"]
-        training = real_cfg.get("offline_bootstrap", {})
+        training = dict(real_cfg.get("offline_bootstrap", {}))
+        if capacity_probe:
+            training.update(training.get("capacity_probe", {}))
         root = destination / str(real_cfg.get("output_directory", "real_artist_teacher_5000"))
     else:
         training = cfg.get("offline_bootstrap" if phase == "a" else "offline_phase_b", {})
@@ -869,6 +871,25 @@ def train_offline_kvo_bootstrap(
             and row["reference_split"] == "test"
             and row["content_split"] == "test"
         ]
+        training_artist_count = int(training.get("training_artist_count", 0))
+        if training_artist_count:
+            available = sorted({str(row["artist"]) for row in train_rows})
+            if training_artist_count < 2 or training_artist_count > len(available):
+                raise ValueError(
+                    f"training_artist_count must be in [2, {len(available)}]"
+                )
+            selected = set(random.Random(int(training.get("seed", 0))).sample(
+                available, training_artist_count
+            ))
+            train_rows = [row for row in train_rows if str(row["artist"]) in selected]
+            selected_heldout = [
+                row for row in train_heldout_rows if str(row["artist"]) in selected
+            ]
+            if bool(training.get("validate_on_training_artists", False)):
+                # Capacity diagnostic: same artists, but disjoint reference
+                # images and held-out content. This measures learnability
+                # without claiming unseen-artist generalization.
+                validation_rows = selected_heldout
     else:
         validated = [row for row in read_records(root / "validated_manifest.parquet") if _bootstrap_eligible(row)]
         feature_rows = {int(row["id"]): row for row in read_records(root / "style_features" / "manifest.parquet")}
@@ -1934,7 +1955,11 @@ def train_offline_kvo_bootstrap(
     )
     # Meta-test is deliberately touched once, only after validation selected
     # the checkpoint.  It never participates in early stopping or tuning.
-    final_meta = evaluate(meta_rows, int(training.get("meta_test_batches", 8)))
+    final_meta = (
+        {}
+        if bool(training.get("skip_meta_test", False))
+        else evaluate(meta_rows, int(training.get("meta_test_batches", 8)))
+    )
     summary = {
         "phase": phase, "real_artist": real_artist,
         "steps": last_step, "best_step": best_step,
@@ -1943,8 +1968,9 @@ def train_offline_kvo_bootstrap(
         "validation": final_validation, "meta_test": final_meta,
     }
     write_json(output / "summary.json", summary)
-    if wandb_run is not None:
+    if wandb_run is not None and final_meta:
         wandb_run.log({f"meta_test/{key}": value for key, value in final_meta.items()}, step=best_step)
+    if wandb_run is not None:
         wandb_run.finish()
     return summary
 

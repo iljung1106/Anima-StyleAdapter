@@ -90,6 +90,7 @@ def build_parser() -> argparse.ArgumentParser:
         ("real-artist-teacher-kv", "Cache 5k real-artist text and native K/V/O teacher targets"),
         ("real-artist-style-tokens", "Cache Resampler tokens for fixed 5k-artist references"),
         ("real-artist-offline-kvo", "Train reference-discriminative K/V/O head on 5k real artists"),
+        ("real-artist-capacity-probe", "Overexpose 64 train artists to diagnose head capacity"),
         ("real-artist-offline-smoke", "Run two 5k real-artist offline training steps"),
         ("synthetic-validate", "Validate synthetic corpus, artist effects, and fixed splits"),
         ("synthetic-query-probes", "Capture native Anima query probe bank"),
@@ -205,7 +206,10 @@ def main() -> None:
         from .synthetic_bootstrap import cache_real_artist_resampler_tokens
 
         _run(cache_real_artist_resampler_tokens, config, destination)
-    elif args.command in {"real-artist-offline-kvo", "real-artist-offline-smoke"}:
+    elif args.command in {
+        "real-artist-offline-kvo", "real-artist-offline-smoke",
+        "real-artist-capacity-probe",
+    }:
         from .synthetic_bootstrap import train_offline_kvo_bootstrap
 
         _run(
@@ -214,6 +218,7 @@ def main() -> None:
                 out,
                 phase="b",
                 real_artist=True,
+                capacity_probe=args.command == "real-artist-capacity-probe",
                 steps_override=(
                     2 if args.command == "real-artist-offline-smoke" else None
                 ),

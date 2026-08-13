@@ -770,6 +770,25 @@ real_artist_teacher:
     minimum_steps: 2000
     early_stop_patience: 8
     resume: true
+    capacity_probe:
+      output_directory: offline_kvo_reference_head_capacity_64_v1
+      training_artist_count: 64
+      validate_on_training_artists: true
+      skip_meta_test: true
+      steps: 2000
+      minimum_steps: 2000
+      early_stop_patience: 0
+      checkpoint_every: 500
+      validation_every: 250
+      validation_batches: 8
+      train_heldout_batches: 8
+      functional_contrastive_start_step: 750
+      functional_contrastive_ramp_steps: 500
+      wandb:
+        enabled: true
+        project: anima-style-adapter
+        name: real-artist-reference-head-capacity-64
+        id: real-artist-reference-head-capacity-64-v1
     wandb:
       enabled: true
       project: anima-style-adapter
