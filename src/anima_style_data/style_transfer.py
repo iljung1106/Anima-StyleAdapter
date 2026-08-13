@@ -3673,6 +3673,117 @@ def train_exact_self_generalization(
     return result
 
 
+def sample_exact_self_generalization_checkpoint(
+    config: dict[str, Any], destination: Path
+) -> dict[str, Any]:
+    """Render evenly spaced train and unseen targets from a fixed checkpoint."""
+    cfg = config["style_transfer"]
+    run_cfg = dict(cfg.get("exact_self_generalization", {}))
+    training_cfg = dict(cfg["training"])
+    device = str(training_cfg.get("device", "cuda"))
+    seed = int(run_cfg.get("seed", 20260815))
+    random.seed(seed)
+    torch.manual_seed(seed)
+    loader_cfg = {
+        **cfg["loader"], "split": "train",
+        "batch_size": int(run_cfg.get("batch_size", 3)), "seed": seed,
+    }
+    loader = ProductionStyleLoader(destination, loader_cfg)
+    train_batches, validation_batches = _collect_disjoint_exact_self_batches(
+        loader,
+        train_batches=int(run_cfg.get("train_batches", 32)),
+        validation_batches=int(run_cfg.get("validation_batches", 8)),
+    )
+    source = (
+        destination / str(cfg.get("output_directory", "style_transfer_training"))
+        / str(run_cfg.get("output_name", "exact_self_generalization"))
+    )
+    split_path = source / "split.json"
+    split = json.loads(split_path.read_text(encoding="utf-8"))
+    actual_train = [item.target_id for batch in train_batches for item in batch["episodes"]]
+    actual_validation = [
+        item.target_id for batch in validation_batches for item in batch["episodes"]
+    ]
+    if actual_train != split["train_ids"] or actual_validation != split["validation_ids"]:
+        raise RuntimeError("Reconstructed exact-self pools do not match checkpoint split.json")
+
+    checkpoint_step = int(run_cfg.get("sample_checkpoint_step", 2000))
+    checkpoint = source / f"checkpoint-{checkpoint_step:07d}.pt"
+    state = torch.load(checkpoint, map_location="cpu", weights_only=False)
+    if int(state["step"]) != checkpoint_step:
+        raise RuntimeError(f"Checkpoint step mismatch: {state['step']} != {checkpoint_step}")
+    resampler = load_per_reference_resampler(destination, cfg["resampler"], device)
+    resampler.requires_grad_(False).eval()
+    if "resampler" in state:
+        resampler.load_state_dict(state["resampler"])
+    anima = _resolve_anima_model(config, destination, device).requires_grad_(False).eval()
+    _optimize_frozen_anima(
+        anima,
+        low_precision_rmsnorm=bool(training_cfg.get("low_precision_rmsnorm", False)),
+        fuse_attention_projections=bool(training_cfg.get("fuse_attention_projections", False)),
+    )
+    adapter = SharedLowRankStyleAdapter(**cfg["adapter"]).to(
+        device=device, dtype=torch.bfloat16
+    )
+    _load_adapter_checkpoint(adapter, state)
+    adapter.requires_grad_(False).eval()
+    attach_style_adapter(anima, adapter)
+
+    sample_config = copy.deepcopy(config)
+    sample_cfg = sample_config["style_transfer"]["sampling"]
+    sample_cfg.update({
+        "width": int(run_cfg.get("sample_width", 512)),
+        "height": int(run_cfg.get("sample_height", 512)),
+        "steps": int(run_cfg.get("sample_steps", 30)),
+        "style_cfg": float(run_cfg.get("sample_style_cfg", 1.0)),
+    })
+    evaluation = source / f"evaluation-step-{checkpoint_step:07d}"
+    base_seed = int(run_cfg.get("sample_seed", seed ^ 0x5151))
+    vae = None
+    samples: dict[str, list[dict[str, Any]]] = {"train": [], "unseen": []}
+
+    def evenly_spaced_indices(total: int, count: int) -> list[int]:
+        count = max(1, min(count, total))
+        if count == 1:
+            return [total // 2]
+        return [round(index * (total - 1) / (count - 1)) for index in range(count)]
+
+    for group, batches, count in (
+        ("train", train_batches, int(run_cfg.get("train_sample_count", 6))),
+        ("unseen", validation_batches, int(run_cfg.get("validation_sample_count", 6))),
+    ):
+        rows = [(batch, row) for batch in batches for row in range(len(batch["episodes"]))]
+        group_output = evaluation / group
+        for order, index in enumerate(evenly_spaced_indices(len(rows), count)):
+            batch, batch_row = rows[index]
+            episode = batch["episodes"][batch_row]
+            sample_config["style_transfer"]["sampling"]["seed"] = (
+                base_seed + (0 if group == "train" else 1_000_003) + order * 10_007
+            )
+            sheet, vae, elapsed = _sample_style_adapter(
+                anima, adapter, resampler, loader, sample_config, destination,
+                group_output, device, checkpoint_step, vae,
+                reference_mode="self", episode_index=int(episode.target_id),
+                batch_override=batch, batch_row=batch_row,
+            )
+            samples[group].append({
+                "target_id": int(episode.target_id), "style_id": str(episode.style_id),
+                "seed": int(sample_config["style_transfer"]["sampling"]["seed"]),
+                "sheet": str(sheet), "elapsed_s": elapsed,
+            })
+            print(
+                f"exact-self checkpoint sample group={group} target={episode.target_id} "
+                f"sheet={sheet}", flush=True,
+            )
+    result = {
+        "checkpoint": str(checkpoint), "step": checkpoint_step,
+        "train_pool": len(actual_train), "unseen_pool": len(actual_validation),
+        "samples": samples,
+    }
+    write_json(evaluation / "summary.json", result)
+    return result
+
+
 def _save_training_state(
     path: Path,
     step: int,
