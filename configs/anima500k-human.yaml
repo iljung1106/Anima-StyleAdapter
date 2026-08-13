@@ -720,8 +720,11 @@ real_artist_teacher:
     blocks_per_step: 2
     functional_blocks_per_step: 1
     queries_per_step: 8
-    gpu_resident_small_caches: false
-    gpu_resident_tokens: false
+    # H100 80GB can retain ~42GB packed text conditions plus ~8GB frozen
+    # Resampler tokens. This removes the CPU assembly/H2D bottleneck that left
+    # SM utilization near zero while six CPU cores fed tiny tensor copies.
+    gpu_resident_small_caches: true
+    gpu_resident_tokens: true
     gpu_resident_probes: true
     ram_resident_features: false
     resampler_trainable_encoder_layers: 0
