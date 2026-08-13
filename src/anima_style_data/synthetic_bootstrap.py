@@ -1652,7 +1652,7 @@ def train_offline_kvo_bootstrap(
     for row in train_rows:
         by_train_artist[str(row["artist"])].append(row)
     start_step = 1
-    if bool(training.get("resume", True)):
+    if steps_override is None and bool(training.get("resume", True)):
         candidates = sorted(checkpoint_dir.glob("step-*.pt"))
         if candidates:
             resume_state = torch.load(candidates[-1], map_location="cpu", weights_only=False)
