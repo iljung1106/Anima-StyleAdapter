@@ -774,7 +774,7 @@ real_artist_teacher:
     early_stop_patience: 8
     resume: true
     capacity_probe:
-      output_directory: offline_kvo_reference_head_capacity_64_batch64_v5
+      output_directory: offline_kvo_reference_head_capacity_64_batch64_v6
       training_artist_count: 64
       validate_on_training_artists: true
       skip_meta_test: true
@@ -785,14 +785,14 @@ real_artist_teacher:
       validation_every: 63
       validation_batches: 1
       train_heldout_batches: 1
-      warmup_steps: 50
-      functional_contrastive_start_step: 94
-      functional_contrastive_ramp_steps: 63
+      warmup_steps: 400
+      functional_contrastive_start_step: 1500
+      functional_contrastive_ramp_steps: 1000
       wandb:
         enabled: true
         project: anima-style-adapter
         name: real-artist-reference-head-capacity-64-batch64
-        id: real-artist-reference-head-capacity-64-batch64-v5
+        id: real-artist-reference-head-capacity-64-batch64-v6
     wandb:
       enabled: true
       project: anima-style-adapter
