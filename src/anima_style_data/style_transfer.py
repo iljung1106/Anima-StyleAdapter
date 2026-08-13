@@ -4386,6 +4386,27 @@ def _save_training_state(
     temporary.replace(path)
 
 
+def _save_final_model(
+    path: Path,
+    step: int,
+    adapter: nn.Module,
+    resampler: nn.Module,
+    cfg: dict[str, Any],
+) -> None:
+    """Write the deployable bundle once, without training-only optimizer state."""
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    torch.save(
+        {
+            "step": step,
+            "adapter": adapter.state_dict(),
+            "resampler": resampler.state_dict(),
+            "config": cfg,
+        },
+        temporary,
+    )
+    temporary.replace(path)
+
+
 def _archive_training_state(source: Path, destination: Path) -> None:
     """Snapshot an immutable checkpoint without serializing optimizer state twice."""
     temporary = destination.with_suffix(destination.suffix + ".tmp")
@@ -4824,6 +4845,7 @@ def train_style_adapter(config: dict[str, Any], destination: Path, *, steps_over
             "representation_grad_norm": clipped_norms["representation"],
             "output_grad_norm": clipped_norms["output"],
             "gate_grad_norm": clipped_norms["gate"],
+            "combined_grad_norm": clipped_norms["combined"],
         }
         if collect_step_details:
             group_grad_tensors.update({
@@ -4869,7 +4891,7 @@ def train_style_adapter(config: dict[str, Any], destination: Path, *, steps_over
         elapsed = time.perf_counter() - data_ready
         row = {
             "step": step, "loss": accumulated_loss,
-            "grad_norm": group_grads.get("bridge_grad_norm", float(grad_norm)),
+            "grad_norm": group_grads.get("combined_grad_norm", float(grad_norm)),
             "step_s": elapsed, "data_wait_s": data_wait,
             "gradient_accumulation_steps": accumulation_steps,
             "lr_multiplier": lr_multiplier,
@@ -5074,7 +5096,7 @@ def train_style_adapter(config: dict[str, Any], destination: Path, *, steps_over
         resampler if resampler_parameters else None,
         {"bridge": bridge_optimizer},
     )
-    _archive_training_state(checkpoint_path, checkpoint)
+    _save_final_model(checkpoint, steps, adapter, resampler, cfg)
     summary = {
         "steps": steps, "metrics": metrics, "elapsed_s": time.perf_counter() - started,
         "checkpoint": str(checkpoint.resolve()),
