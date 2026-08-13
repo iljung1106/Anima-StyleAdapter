@@ -1667,8 +1667,13 @@ def _optimize_frozen_anima(
 
 
 def _parameter_grad_norm(parameters) -> torch.Tensor:
+    parameters = list(parameters)
     values = [value.grad.detach().float().norm() for value in parameters if value.grad is not None]
-    return torch.stack(values).norm() if values else torch.tensor(0.0)
+    return (
+        torch.stack(values).norm()
+        if values
+        else torch.zeros((), device=parameters[0].device if parameters else "cpu")
+    )
 
 
 def _clip_style_gradient_groups(
@@ -1702,7 +1707,12 @@ def _clip_style_gradient_groups(
         name: torch.nn.utils.clip_grad_norm_(parameters, limits[name])
         for name, parameters in groups.items()
     }
-    norms["combined"] = torch.stack(list(norms.values())).square().sum().sqrt()
+    norm_device = next(
+        parameter.device for parameters in groups.values() for parameter in parameters
+    )
+    norms["combined"] = torch.stack([
+        value.to(norm_device) for value in norms.values()
+    ]).square().sum().sqrt()
     return norms
 
 
