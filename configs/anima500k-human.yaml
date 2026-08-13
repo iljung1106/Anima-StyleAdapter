@@ -280,7 +280,7 @@ tap_resampler_experiment:
 # and batches targets by exact latent shape. `style-smoke` forces two steps and
 # writes to a separate smoke directory; `style-train` uses `training.steps`.
 style_transfer:
-  output_directory: style_transfer_reference_head_batch64_v1
+  output_directory: style_transfer_full_train_fresh_20k_v1
   seed: 20260811
   loader:
     style_cache: style_features_l18_l24_siglip_l24
@@ -355,15 +355,14 @@ style_transfer:
     maximum_artist_similarity: 0.95
   training:
     device: cuda
-    initial_checkpoint: real_artist_teacher_5000/offline_kvo_reference_head_batch64_gpu_cache_v6/checkpoints/best.pt
-    # Bootstrap a fresh connector while reusing frozen Anima block K/V/O. Feed
-    # only the exact target as reference; keep the pretrained Resampler and the
-    # parameter-free single-reference aggregation path fixed.
-    steps: 8000
+    # Fresh Adapter initialization. Do not reuse the successful 2k diagnostic
+    # checkpoint or any older offline/bootstrap connector weights.
+    initial_checkpoint: null
+    steps: 20000
     # Trainable adapter weights and Adam moments stay FP32. Representation
     # modules need a higher LR than the stabilized zero-output path.
-    learning_rate: 0.0012
-    bridge_learning_rate: 0.00001
+    learning_rate: 0.0001
+    bridge_learning_rate: 0.0001
     bridge_warmup_steps: 400
     bridge_minimum_lr_ratio: 0.10
     bridge_adam_eps: 0.000001
@@ -372,8 +371,8 @@ style_transfer:
     # Native gate_cross has |gate| ~= 2.3e2 on this model. Even a globally
     # clipped 1e-3 first update is therefore destructive across 28 blocks;
     # open the zero-init connector on the corresponding inverse scale.
-    representation_learning_rate: 0.000005
-    output_learning_rate: 0.000005
+    representation_learning_rate: 0.0001
+    output_learning_rate: 0.0001
     # Retained for later stages; the negative start step below keeps this group
     # frozen throughout exact-self connector bootstrap.
     resampler_learning_rate: 0.00004
@@ -384,7 +383,7 @@ style_transfer:
     # newly pretrained 128-token representation.
     resampler_train_start_step: -1
     # The Minimal Set Aggregator remains frozen and is bypassed for one input.
-    aggregator_train_start_step: -1
+    aggregator_train_start_step: 2001
     # Disable every Resampler auxiliary. In this ablation its encoder and style
     # slots learn exclusively through Anima's exact-self flow objective.
     resampler_auxiliary_weight: 0.0
@@ -426,15 +425,22 @@ style_transfer:
     full_validation_batches: 32
     checkpoint_every: 250
     sample_every: 500
+    train_sample_artists: 4
+    validation_sample_artists: 4
     resume: true
     # Make the Adapter's useful residual dominate the gentle Resampler and
     # magnitude auxiliaries. Direction normalization is strongest during the
     # bootstrap, then fades as ordinary flow MSE takes over.
-    style_flow_loss_weight: 4.0
-    # The 0.5 ablation increased intervention magnitude but made validation
-    # worse. Retain only the gentle direction tie-breaker used by the best
-    # representation-preserving checkpoint.
-    style_flow_direction_weight: 0.05
+    style_flow_loss_weight: 0.25
+    exact_self_residual_weight: 1.0
+    exact_self_direction_weight: 0.20
+    exact_self_log_rms_weight: 0.05
+    exact_self_x0_weight: 1.0
+    exact_self_scale_floor: 0.001
+    # Match the successful 96/24 exact-self objective during bootstrap. The
+    # target-conditioned direct residual losses below provide direction and
+    # scale supervision only when target is actually present.
+    style_flow_direction_weight: 0.0
     style_direction_epsilon: 0.01
     style_direction_anneal_start: 1000
     style_direction_anneal_end: 4000
@@ -460,7 +466,7 @@ style_transfer:
     style_effect_calibration: style_effect_calibration.json
     style_magnitude_start_step: 5
     style_magnitude_ramp_steps: 250
-    style_magnitude_weight: 0.015
+    style_magnitude_weight: 0.0
     style_interval_huber_beta: 0.01
     style_guided_effect_scale: 1.0
     style_effect_upper_scale: 1.5
@@ -469,7 +475,13 @@ style_transfer:
     curriculum:
       gate_only_steps: 0
       self_reference_steps: 2000
-      target_anneal_end: 2001
+      target_mix_end_step: 8000
+      target_mix_end_probability: 0.5
+      target_mix_min_references: 1
+      target_mix_max_references: 4
+      target_anneal_end: 20000
+      target_anneal_min_references: 1
+      target_anneal_max_references: 8
       oracle_distill_end: 2000
     oracle_distill_weight: 0.0
     oracle_distill_probability: 0.25
@@ -478,8 +490,8 @@ style_transfer:
     wandb:
       enabled: true
       project: anima-style-adapter
-      name: anima-style-transfer-offline-head-exact-self-2000
-      id: anima-style-transfer-offline-head-exact-self-2000-v1
+      name: anima-style-transfer-full-train-fresh-20k-v1
+      id: anima-style-transfer-full-train-fresh-20k-v1
   diagnostics:
     checkpoint: smoke-2-steps/checkpoint.pt
     checkpoints:
@@ -553,19 +565,18 @@ style_transfer:
       id: exact-self-generalization-96-train-24-strict-low-rank-v3
   sampling:
     episode: 0
-    # Qualitative 1MP checkpoint evaluation across artist-disjoint validation
-    # episodes. Each sheet contains the frozen-base control, styled output,
-    # target, and held-out references for the selected artist.
+    # Frequent fixed-panel monitoring. Each checkpoint renders four train and
+    # four artist-disjoint validation styles with stable per-artist seeds.
     checkpoint: checkpoints/step-0001000.pt
     episodes: [0, 13, 29, 47, 71, 101]
     reference_modes: [heldout]
-    width: 1024
-    height: 1024
+    width: 512
+    height: 512
     steps: 30
     flow_shift: 3.0
     seed: 20260811
     text_cfg: 4.0
-    style_cfg: 4.0
+    style_cfg: 1.0
   benchmark:
     batch_sizes: [4, 8, 16]
     steps: 8

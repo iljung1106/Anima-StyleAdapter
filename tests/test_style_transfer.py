@@ -32,6 +32,7 @@ from anima_style_data.style_transfer import (
     _sample_flow_timesteps,
     _set_aggregator_trainable,
     _self_reference_curriculum_state,
+    _replace_reference_with_target,
     _set_adapter_trainable_stage,
     _style_bootstrap_state,
     _soft_interval_loss,
@@ -480,6 +481,62 @@ def test_self_reference_curriculum_has_explicit_terminal_phase():
     assert final["phase"] == "target_excluded"
     assert final["target_probability"] == 0.0
     assert not final["oracle_required"]
+
+
+def test_full_training_curriculum_uses_requested_reference_ranges_and_two_ramps():
+    config = {
+        "self_reference_steps": 2000,
+        "target_mix_end_step": 8000,
+        "target_mix_end_probability": 0.5,
+        "target_mix_min_references": 1,
+        "target_mix_max_references": 4,
+        "target_anneal_end": 20000,
+        "target_anneal_min_references": 1,
+        "target_anneal_max_references": 8,
+        "oracle_distill_end": 2000,
+    }
+    bootstrap = _self_reference_curriculum_state(2000, config)
+    assert bootstrap["target_only"]
+    assert bootstrap["target_probability"] == 1.0
+    assert (bootstrap["min_references"], bootstrap["max_references"]) == (1, 1)
+
+    first_midpoint = _self_reference_curriculum_state(5000, config)
+    assert first_midpoint["phase"] == "target_mix"
+    assert first_midpoint["target_probability"] == pytest.approx(0.75)
+    assert (first_midpoint["min_references"], first_midpoint["max_references"]) == (1, 4)
+
+    boundary = _self_reference_curriculum_state(8000, config)
+    assert boundary["target_probability"] == pytest.approx(0.5)
+    second_midpoint = _self_reference_curriculum_state(14000, config)
+    assert second_midpoint["phase"] == "target_anneal"
+    assert second_midpoint["target_probability"] == pytest.approx(0.25)
+    assert (second_midpoint["min_references"], second_midpoint["max_references"]) == (1, 8)
+
+    final = _self_reference_curriculum_state(20000, config)
+    assert final["phase"] == "target_excluded"
+    assert final["target_probability"] == 0.0
+
+
+def test_target_inclusion_replaces_reference_instead_of_exceeding_total_count():
+    references = torch.randn(3, 4, 2, 8)
+    target = torch.randn(3, 2, 8)
+    mask = torch.tensor(
+        [
+            [True, False, False, False],
+            [True, True, True, False],
+            [True, True, True, True],
+        ]
+    )
+    include = torch.tensor([True, False, True])
+
+    values, result_mask = _replace_reference_with_target(
+        references, mask, target, include
+    )
+
+    assert values.shape == (3, 5, 2, 8)
+    torch.testing.assert_close(result_mask.sum(1), mask.sum(1))
+    assert result_mask[:, -1].tolist() == [True, False, True]
+    torch.testing.assert_close(values[:, -1], target)
 
 
 def test_gate_only_stage_then_opens_entire_adapter():

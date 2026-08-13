@@ -101,6 +101,10 @@ class ProductionStyleLoader:
         self.min_references = int(cfg.get("min_references", 1))
         self.max_references = int(cfg.get("max_references", 8))
         self.split = str(cfg.get("split", "train"))
+        self.reference_curriculum = dict(cfg.get("reference_curriculum", {}))
+        self.gradient_accumulation_steps = max(
+            1, int(cfg.get("gradient_accumulation_steps", 1))
+        )
         # Anima was trained with fixed 512-token post-LLM conditioning. Its
         # cross-attention does not receive a text padding mask, so the trailing
         # zero embeddings are part of the learned softmax normalization and
@@ -161,6 +165,17 @@ class ProductionStyleLoader:
 
     def episodes_for_step(self, step: int) -> list[StyleEpisode]:
         rng = random.Random(self.seed + step * 1_000_003)
+        reference_curriculum = getattr(self, "reference_curriculum", {})
+        if reference_curriculum:
+            optimizer_step = step // getattr(self, "gradient_accumulation_steps", 1) + 1
+            curriculum = _self_reference_curriculum_state(
+                optimizer_step, reference_curriculum
+            )
+            min_references = int(curriculum["min_references"])
+            max_references = int(curriculum["max_references"])
+        else:
+            min_references = self.min_references
+            max_references = self.max_references
         # Sampling bucket names uniformly would drastically overrepresent rare
         # extreme aspect ratios. Weight by eligible target count so each image
         # retains approximately equal target probability while batches remain
@@ -193,7 +208,9 @@ class ProductionStyleLoader:
             row = self.style_by_id[target_id]
             style_id = str(row.get("style_id", row["artist"]))
             pool = [item for item in self.by_style[style_id] if item != target_id]
-            count = rng.randint(self.min_references, min(self.max_references, len(pool)))
+            upper = min(max_references, len(pool))
+            lower = min(min_references, upper)
+            count = rng.randint(lower, upper)
             references = tuple(rng.sample(pool, count))
             variants = self.text_variants[target_id]
             episodes.append(
@@ -1572,6 +1589,8 @@ def _self_reference_curriculum_state(step: int, config: dict[str, Any]) -> dict[
             "target_probability": 0.0,
             "oracle_required": False,
             "self_reference_steps": 0,
+            "min_references": 1,
+            "max_references": 8,
         }
     gate_only_steps = max(0, int(config.get("gate_only_steps", 0)))
     self_reference_steps = max(gate_only_steps, int(config.get("self_reference_steps", 0)))
@@ -1583,22 +1602,51 @@ def _self_reference_curriculum_state(step: int, config: dict[str, Any]) -> dict[
         self_reference_steps,
         int(config.get("oracle_distill_end", target_anneal_end)),
     )
+    target_mix_end_value = config.get("target_mix_end_step")
+    target_mix_end = (
+        max(self_reference_steps + 1, int(target_mix_end_value))
+        if target_mix_end_value is not None
+        else None
+    )
+    midpoint_probability = float(config.get("target_mix_end_probability", 0.5))
+    if not 0.0 <= midpoint_probability <= 1.0:
+        raise ValueError("target_mix_end_probability must be between 0 and 1")
     if step <= gate_only_steps:
         phase = "output_bootstrap_self_reference"
     elif step <= self_reference_steps:
         phase = "full_self_reference"
+    elif target_mix_end is not None and step <= target_mix_end:
+        phase = "target_mix"
     elif step < target_anneal_end:
-        phase = "oracle_target_anneal"
+        phase = "target_anneal" if target_mix_end is not None else "oracle_target_anneal"
     else:
         phase = "target_excluded"
     if step <= self_reference_steps:
         target_probability = 1.0
     elif step >= target_anneal_end:
         target_probability = 0.0
+    elif target_mix_end is not None and step <= target_mix_end:
+        progress = (step - self_reference_steps) / (
+            target_mix_end - self_reference_steps
+        )
+        target_probability = 1.0 + progress * (midpoint_probability - 1.0)
+    elif target_mix_end is not None:
+        progress = (step - target_mix_end) / (target_anneal_end - target_mix_end)
+        target_probability = midpoint_probability * (1.0 - progress)
     else:
         target_probability = 1.0 - (
             (step - self_reference_steps) / (target_anneal_end - self_reference_steps)
         )
+    if step <= self_reference_steps:
+        min_references = max_references = 1
+    elif target_mix_end is not None and step <= target_mix_end:
+        min_references = int(config.get("target_mix_min_references", 1))
+        max_references = int(config.get("target_mix_max_references", 4))
+    else:
+        min_references = int(config.get("target_anneal_min_references", 1))
+        max_references = int(config.get("target_anneal_max_references", 8))
+    if min_references < 1 or max_references < min_references:
+        raise ValueError("Curriculum reference counts must satisfy 1 <= min <= max")
     return {
         "phase": phase,
         "gate_only": step <= gate_only_steps,
@@ -1606,6 +1654,8 @@ def _self_reference_curriculum_state(step: int, config: dict[str, Any]) -> dict[
         "target_probability": target_probability,
         "oracle_required": self_reference_steps < step < oracle_distill_end,
         "self_reference_steps": self_reference_steps,
+        "min_references": min_references,
+        "max_references": max_references,
     }
 
 
@@ -1659,6 +1709,24 @@ def _set_aggregator_trainable(
     for parameter in adapter.aggregator.parameters():
         parameter.requires_grad_(trainable)
     return trainable
+
+
+def _replace_reference_with_target(
+    references: torch.Tensor,
+    reference_mask: torch.Tensor,
+    target_tokens: torch.Tensor,
+    include_target: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Insert target without changing each episode's total reference count."""
+    reference_mask = reference_mask.clone()
+    ordinary_counts = reference_mask.sum(dim=1)
+    rows = torch.nonzero(include_target, as_tuple=False).flatten()
+    if rows.numel() > 0:
+        reference_mask[rows, ordinary_counts[rows].sub(1).clamp_min(0)] = False
+    return (
+        torch.cat((references, target_tokens[:, None]), dim=1),
+        torch.cat((reference_mask, include_target[:, None]), dim=1),
+    )
 
 
 @contextmanager
@@ -1818,6 +1886,9 @@ def _forward_flow_loss(
         resampler_joint_prototype = latents.new_zeros((), dtype=torch.float32)
         resampler_slot_prototype = latents.new_zeros((), dtype=torch.float32)
         resampler_diversity = latents.new_zeros((), dtype=torch.float32)
+        target_included = torch.zeros(
+            latents.shape[0], dtype=torch.bool, device=latents.device
+        )
         if resampler_trainable:
             needs_episode_references = (
                 not curriculum["target_only"]
@@ -1873,6 +1944,7 @@ def _forward_flow_loss(
             reference_mask = torch.ones(
                 references.shape[:2], dtype=torch.bool, device=references.device
             )
+            target_included.fill_(True)
         else:
             if not resampler_trainable:
                 references = (
@@ -1886,8 +1958,17 @@ def _forward_flow_loss(
                     torch.rand(references.shape[0], device=references.device)
                     < target_probability
                 )
-                references = torch.cat((references, target_style_tokens[:, None]), dim=1)
-                reference_mask = torch.cat((reference_mask, include_target[:, None]), dim=1)
+                # The curriculum specifies the total number of style images,
+                # not non-target references plus an optional extra target. If
+                # target is included, replace one ordinary reference so 1--4
+                # and 1--8 remain exact bounds.
+                references, reference_mask = _replace_reference_with_target(
+                    references,
+                    reference_mask,
+                    target_style_tokens,
+                    include_target,
+                )
+                target_included = include_target
         raw_style_tokens = adapter.aggregate(
             references, reference_mask, apply_dropout=False
         )
@@ -1952,12 +2033,22 @@ def _forward_flow_loss(
                 < reference_rank_probability
             )
         )
+        exact_self_supervision_active = bool(target_included.any()) and any(
+            float(loss_config.get(key, 0.0)) > 0
+            for key in (
+                "exact_self_residual_weight",
+                "exact_self_direction_weight",
+                "exact_self_log_rms_weight",
+                "exact_self_x0_weight",
+            )
+        )
         bypass_prediction = None
         if (
             bool(loss_config.get("measure_bypass", False))
             or magnitude_weight > 0
             or direction_weight > 0
             or reference_rank_active
+            or exact_self_supervision_active
         ):
             # Frozen Anima establishes an absolute zero for style intervention.
             # Unlike a shuffled reference, this baseline cannot be made worse by
@@ -2036,10 +2127,14 @@ def _forward_flow_loss(
         exact_self_residual_weight = float(
             loss_config.get("exact_self_residual_weight", 0.0)
         )
-        if bypass_prediction is not None and exact_self_residual_weight > 0:
+        if (
+            bypass_prediction is not None
+            and exact_self_supervision_active
+        ):
             exact_self_losses = _exact_self_residual_losses(
-                prediction, bypass_prediction, target_velocity,
-                noisy.float(), latents.float(), sigma.float(),
+                prediction[target_included], bypass_prediction[target_included],
+                target_velocity[target_included], noisy.float()[target_included],
+                latents.float()[target_included], sigma.float()[target_included],
                 scale_floor=float(loss_config.get("exact_self_scale_floor", 1e-3)),
                 huber_beta=float(loss_config.get("exact_self_huber_beta", 0.1)),
             )
@@ -2262,6 +2357,7 @@ def _forward_flow_loss(
         "timestep_mean": float(timesteps.mean().detach()),
         "style_magnitude_floor": magnitude_floor,
         "target_reference_probability": target_probability,
+        "target_reference_fraction": float(target_included.float().mean()),
         "aggregator_trainable": any(
             parameter.requires_grad for parameter in adapter.aggregator.parameters()
         ),
@@ -2439,6 +2535,8 @@ def _sample_style_adapter(
     episode_index: int | None = None,
     batch_override: dict[str, Any] | None = None,
     batch_row: int = 0,
+    sample_group: str | None = None,
+    sample_seed: int | None = None,
 ) -> tuple[Path, nn.Module, float]:
     sample_cfg = config["style_transfer"]["sampling"]
     started = time.perf_counter()
@@ -2520,7 +2618,11 @@ def _sample_style_adapter(
     height = int(sample_cfg.get("height", 512))
     width = int(sample_cfg.get("width", 512))
     latent_h, latent_w = height // 8, width // 8
-    generator = torch.Generator(device="cpu").manual_seed(int(sample_cfg.get("seed", 20260811)))
+    generator = torch.Generator(device="cpu").manual_seed(
+        int(sample_cfg.get("seed", 20260811))
+        if sample_seed is None
+        else int(sample_seed)
+    )
     initial_noise = torch.randn(1, 16, 1, latent_h, latent_w, generator=generator, dtype=torch.float32).to(
         device=device, dtype=torch.bfloat16
     )
@@ -2587,6 +2689,8 @@ def _sample_style_adapter(
     base_generated = to_image(decoded[0])
     generated = to_image(decoded[1])
     sample_dir = output / "samples"
+    if sample_group:
+        sample_dir = sample_dir / sample_group
     sample_dir.mkdir(parents=True, exist_ok=True)
     cfg_label = f"{style_scale:g}".replace(".", "p")
     episode_label = "" if episode_index is None else f"-episode-{episode_number:05d}"
@@ -2632,6 +2736,24 @@ def _sample_style_adapter(
     anima.train()
     adapter.train()
     return sheet_path, vae, time.perf_counter() - started
+
+
+def _select_distinct_style_episode_indices(
+    loader: ProductionStyleLoader, count: int
+) -> list[int]:
+    """Choose a deterministic, fixed panel of distinct artists for sampling."""
+    selected: list[int] = []
+    seen: set[str] = set()
+    limit = max(1000, count * 100)
+    for episode_index in range(limit):
+        episode = loader.episodes_for_step(episode_index)[0]
+        if episode.style_id in seen:
+            continue
+        selected.append(episode_index)
+        seen.add(episode.style_id)
+        if len(selected) == count:
+            return selected
+    raise RuntimeError(f"Could select only {len(selected)}/{count} distinct artists")
 
 
 def sample_style_checkpoint(config: dict[str, Any], destination: Path) -> dict[str, Any]:
@@ -3867,10 +3989,25 @@ def train_style_adapter(config: dict[str, Any], destination: Path, *, steps_over
     random.seed(seed)
     torch.manual_seed(seed)
     torch.backends.cuda.matmul.allow_tf32 = bool(training.get("allow_tf32", True))
-    loader = ProductionStyleLoader(destination, cfg["loader"])
+    loader_cfg = {
+        **cfg["loader"],
+        "reference_curriculum": dict(training.get("curriculum", {})),
+        "gradient_accumulation_steps": int(
+            training.get("gradient_accumulation_steps", 1)
+        ),
+    }
+    loader = ProductionStyleLoader(destination, loader_cfg)
     validation_loader_cfg = {**cfg["loader"], "split": "validation", "batch_size": 1}
+    validation_loader_cfg.pop("reference_curriculum", None)
+    validation_loader_cfg.pop("gradient_accumulation_steps", None)
     validation_loader_cfg["seed"] = seed ^ 0x51A7
     validation_loader = ProductionStyleLoader(destination, validation_loader_cfg)
+    train_sample_loader_cfg = {
+        **validation_loader_cfg,
+        "split": "train",
+        "seed": seed ^ 0x71A1,
+    }
+    train_sample_loader = ProductionStyleLoader(destination, train_sample_loader_cfg)
     resampler = load_per_reference_resampler(
         destination, cfg["resampler"], device, trainable=True
     )
@@ -4008,7 +4145,12 @@ def train_style_adapter(config: dict[str, Any], destination: Path, *, steps_over
     oracle_adapter = None
     curriculum_cfg = dict(training.get("curriculum", {}))
     self_reference_steps = int(curriculum_cfg.get("self_reference_steps", 0))
-    if start_step > self_reference_steps:
+    oracle_distill_enabled = (
+        float(training.get("oracle_distill_weight", 0.0)) > 0
+        and int(curriculum_cfg.get("oracle_distill_end", self_reference_steps))
+        > self_reference_steps
+    )
+    if start_step > self_reference_steps and oracle_distill_enabled:
         if not oracle_path.exists():
             raise RuntimeError(
                 f"Resuming after self-reference bootstrap requires {oracle_path}"
@@ -4052,6 +4194,30 @@ def train_style_adapter(config: dict[str, Any], destination: Path, *, steps_over
         training.get("full_validation_batches", validation_batches)
     )
     sample_every = int(training.get("sample_every", 1000))
+    train_sample_artists = int(training.get("train_sample_artists", 4))
+    validation_sample_artists = int(training.get("validation_sample_artists", 4))
+    train_sample_episodes = _select_distinct_style_episode_indices(
+        train_sample_loader, train_sample_artists
+    )
+    validation_sample_episodes = _select_distinct_style_episode_indices(
+        validation_loader, validation_sample_artists
+    )
+    sample_panel = {
+        split_name: [
+            {
+                "episode": episode_index,
+                "target_id": int(sample_loader.episodes_for_step(episode_index)[0].target_id),
+                "style_id": str(sample_loader.episodes_for_step(episode_index)[0].style_id),
+            }
+            for episode_index in episode_indices
+        ]
+        for split_name, sample_loader, episode_indices in (
+            ("train", train_sample_loader, train_sample_episodes),
+            ("validation", validation_loader, validation_sample_episodes),
+        )
+    }
+    write_json(output / "sample_panel.json", sample_panel)
+    print(f"fixed qualitative sample panel: {sample_panel}", flush=True)
     log_every = int(training.get("log_every", 10))
     vae = None
     if start_step == 0 and steps_override is None:
@@ -4073,28 +4239,10 @@ def train_style_adapter(config: dict[str, Any], destination: Path, *, steps_over
             f"batches={validation_batches} elapsed_s={baseline['elapsed_s']:.2f}",
             flush=True,
         )
-        sheet_path, vae, sample_s = _sample_style_adapter(
-            anima,
-            adapter,
-            resampler,
-            validation_loader,
-            config,
-            destination,
-            output,
-            device,
-            0,
-            vae,
-            reference_mode="heldout",
-        )
-        print(f"sample step=0 path={sheet_path} elapsed_s={sample_s:.2f}", flush=True)
         if wandb_run is not None:
-            import wandb
-
             wandb_run.log(
                 {
                     **{f"validation/{key}": value for key, value in baseline.items()},
-                    "sample/image": wandb.Image(str(sheet_path)),
-                    "sample/elapsed_s": sample_s,
                 },
                 step=0,
             )
@@ -4332,17 +4480,51 @@ def train_style_adapter(config: dict[str, Any], destination: Path, *, steps_over
                     step=step,
                 )
         if sample_every and step % sample_every == 0:
-            heldout_sheet, vae, heldout_sample_s = _sample_style_adapter(
-                anima, adapter, resampler, validation_loader, config, destination,
-                output, device, step, vae, reference_mode="heldout",
-            )
-            self_sheet, vae, self_sample_s = _sample_style_adapter(
-                anima, adapter, resampler, validation_loader, config, destination,
-                output, device, step, vae, reference_mode="self",
-            )
+            # During the first stage the model is trained only on exact-self;
+            # later panels switch to target-excluded references to expose
+            # whether generalization appears as target inclusion is annealed.
+            sample_mode = "self" if step <= self_reference_steps else "heldout"
+            sample_records: list[tuple[str, Path]] = []
+            sample_elapsed_s = 0.0
+            for split_name, sample_loader, episode_indices, seed_offset in (
+                ("train", train_sample_loader, train_sample_episodes, 0),
+                (
+                    "validation",
+                    validation_loader,
+                    validation_sample_episodes,
+                    100_000,
+                ),
+            ):
+                for artist_index, episode_index in enumerate(episode_indices):
+                    sheet, vae, elapsed_s = _sample_style_adapter(
+                        anima,
+                        adapter,
+                        resampler,
+                        sample_loader,
+                        config,
+                        destination,
+                        output,
+                        device,
+                        step,
+                        vae,
+                        reference_mode=sample_mode,
+                        episode_index=episode_index,
+                        sample_group=split_name,
+                        sample_seed=int(
+                            cfg.get("sampling", {}).get("seed", seed)
+                        )
+                        + seed_offset
+                        + artist_index,
+                    )
+                    sample_records.append(
+                        (f"sample/{split_name}_artist_{artist_index + 1}", sheet)
+                    )
+                    sample_elapsed_s += elapsed_s
             print(
-                f"sample step={step} heldout={heldout_sheet} self={self_sheet} "
-                f"elapsed_s={heldout_sample_s + self_sample_s:.2f}",
+                f"sample step={step} mode={sample_mode} "
+                f"train_artists={len(train_sample_episodes)} "
+                f"validation_artists={len(validation_sample_episodes)} "
+                f"elapsed_s={sample_elapsed_s:.2f}",
                 flush=True,
             )
             if wandb_run is not None:
@@ -4350,9 +4532,11 @@ def train_style_adapter(config: dict[str, Any], destination: Path, *, steps_over
 
                 wandb_run.log(
                     {
-                        "sample/heldout": wandb.Image(str(heldout_sheet)),
-                        "sample/self": wandb.Image(str(self_sheet)),
-                        "sample/elapsed_s": heldout_sample_s + self_sample_s,
+                        **{
+                            key: wandb.Image(str(sheet))
+                            for key, sheet in sample_records
+                        },
+                        "sample/elapsed_s": sample_elapsed_s,
                     },
                     step=step,
                 )
