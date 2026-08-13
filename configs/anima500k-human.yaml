@@ -608,6 +608,7 @@ synthetic_teacher:
     centered_effect_scale_floor: 0.0001
     centered_effect_residual_start_step: 0
     centered_effect_residual_ramp_steps: 200
+    centered_target_native_only: true
     freeze_base_connector: true
     # Base connector losses are disabled in A0. These LR values are retained
     # only as explicit documentation of the frozen groups.
@@ -637,7 +638,8 @@ synthetic_teacher:
     checkpoint_full_effect_weight: 0.0
     checkpoint_full_cosine_weight: 0.0
     checkpoint_centered_cosine_weight: 1.0
-    checkpoint_discrimination_weight: 1.0
+    checkpoint_centered_accuracy_weight: 0.25
+    checkpoint_discrimination_weight: 0.0
     log_every: 20
     validation_every: 250
     validation_batches: 16

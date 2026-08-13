@@ -1556,7 +1556,11 @@ def train_offline_kvo_bootstrap(
                             - _batched_attention_output(pair_q, pair_kc, pair_vc, ow)
                     ).float().reshape_as(candidate_outputs)
                     if centered_head is not None:
-                        residual_target = pair_teacher - candidate_base.detach()
+                        residual_target = (
+                            pair_teacher
+                            if bool(training.get("centered_target_native_only", False))
+                            else pair_teacher - candidate_base.detach()
+                        )
                         centered_target = residual_target - residual_target.mean(
                             dim=1, keepdim=True
                         )
@@ -2017,6 +2021,8 @@ def train_offline_kvo_bootstrap(
                 * val["cosine"]
                 + float(training.get("checkpoint_centered_cosine_weight", 0.0))
                 * val["centered_effect_residual_cosine"]
+                + float(training.get("checkpoint_centered_accuracy_weight", 0.0))
+                * val["functional_centered_all_pairs_accuracy"]
                 + float(training.get("checkpoint_discrimination_weight", 0.05))
                 * (
                     val["correct_wrong_cosine_gap"]
