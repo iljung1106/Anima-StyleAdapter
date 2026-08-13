@@ -711,9 +711,9 @@ real_artist_teacher:
     query_probe_directory: ../synthetic_teacher_500x16/query_probe_bank
     seed: 20260814
     steps: 8000
-    batch_size: 16
-    # Random block subsampling yields 16 samples × 2 blocks per step; over
-    # 8k steps every Anima block receives about 9.1k sample exposures.
+    batch_size: 8
+    # Random block subsampling yields 8 samples × 2 blocks per step; over
+    # 8k steps every Anima block receives about 4.6k sample exposures.
     blocks_per_step: 2
     functional_blocks_per_step: 1
     queries_per_step: 8
@@ -750,11 +750,11 @@ real_artist_teacher:
     checkpoint_discrimination_weight: 2.0
     log_every: 20
     validation_every: 250
-    # 16 artists/batch: eight validation batches cover 128 disjoint artists
-    # per checkpoint; the final 16-batch meta pass covers all 250 artists.
-    validation_batches: 8
-    train_heldout_batches: 8
-    meta_test_batches: 16
+    # 8 artists/batch: sixteen validation batches cover 128 disjoint artists;
+    # the final 32-batch meta pass covers all 250 artists.
+    validation_batches: 16
+    train_heldout_batches: 16
+    meta_test_batches: 32
     checkpoint_every: 500
     minimum_steps: 2000
     early_stop_patience: 8
@@ -762,5 +762,5 @@ real_artist_teacher:
     wandb:
       enabled: true
       project: anima-style-adapter
-      name: real-artist-5000-reference-head-b2
-      id: real-artist-5000-reference-head-b2-v1
+      name: real-artist-5000-reference-head-b8
+      id: real-artist-5000-reference-head-b8-v1
