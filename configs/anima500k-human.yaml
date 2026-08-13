@@ -195,7 +195,7 @@ cradio_probe:
     max_pixels: 262144
 
 tap_resampler_experiment:
-  output_directory: per_reference_resampler_l18_l24_siglip_l24_128x1024_w1536
+  output_directory: per_reference_resampler_artist_specific_stage_r_v1
   seed: 20260810
   selected_variant: l18_l24_native_siglip_l24
   source_split: train
@@ -236,7 +236,10 @@ tap_resampler_experiment:
     prototype_pool: attention
     artists_per_batch: 4
     images_per_artist: 2
-    steps: 2000
+    # Stage R: run long enough to observe the retrieval/reconstruction sweet
+    # spot. Every 500-step checkpoint is retained; the final model is selected
+    # from the reconstruction Pareto band, not by retrieval alone.
+    steps: 15000
     learning_rate: 0.0001
     warmup_steps: 400
     min_lr_ratio: 0.10
@@ -244,11 +247,11 @@ tap_resampler_experiment:
     # Reconstruction remains primary. Artist supervision acts on an
     # attention-pooled whole-set descriptor; per-slot classification is only a
     # very weak alignment term and cannot dominate the 128 information slots.
-    joint_prototype_weight: 0.03
-    slot_prototype_weight: 0.001
+    joint_prototype_weight: 0.09
+    slot_prototype_weight: 0.002
     slot_diversity_weight: 0.0075
     slot_diversity_margin: 0.20
-    prototype_ramp: 0.20
+    prototype_ramp: 0.25
     temperature: 0.07
     huber_weight: 0.10
     max_grad_norm: 1.0
@@ -256,6 +259,7 @@ tap_resampler_experiment:
     validation_every: 250
     validation_episodes: 16
     full_validation_every: 500
+    selection_reconstruction_tolerance: 0.01
     prefetch_workers: 8
     prefetch_batches: 16
     token_buckets: 8
@@ -263,8 +267,8 @@ tap_resampler_experiment:
     wandb:
       enabled: true
       project: anima-style-adapter
-      name: per-reference-l18-l24-siglip-l24-128x1024-w1536
-      id: per-reference-l18-l24-siglip-l24-128x1024-w1536-v1
+      name: per-reference-artist-specific-stage-r
+      id: per-reference-artist-specific-stage-r-v1
     log_every: 20
     checkpoint_every: 500
     force: false

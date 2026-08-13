@@ -1137,6 +1137,48 @@ def _evaluate_model(
     }
 
 
+def _mean_reconstruction_cosine(evaluation: dict[str, Any]) -> float:
+    values = [float(value) for value in evaluation["reconstruction_cosine"].values()]
+    if not values:
+        raise ValueError("At least one reconstruction cosine is required")
+    return sum(values) / len(values)
+
+
+def _select_resampler_checkpoint(
+    candidates: list[dict[str, Any]], reconstruction_tolerance: float
+) -> dict[str, Any]:
+    """Select retrieval best inside the reconstruction Pareto band.
+
+    Prototype retrieval alone favors representations that discard image detail.
+    Keep candidates whose mean reconstruction is close to the best observed
+    reconstruction, then choose the highest unseen-artist mean Top-1.  MRR and
+    reconstruction break exact retrieval ties deterministically.
+    """
+    if not candidates:
+        raise ValueError("No Resampler validation candidates were provided")
+    scored = [
+        {**row, "mean_reconstruction": _mean_reconstruction_cosine(row)}
+        for row in candidates
+    ]
+    best_reconstruction = max(row["mean_reconstruction"] for row in scored)
+    eligible = [
+        row for row in scored
+        if row["mean_reconstruction"] >= best_reconstruction - reconstruction_tolerance
+    ]
+
+    def mean_mrr(row: dict[str, Any]) -> float:
+        values = [float(value["mrr"]) for value in row["prototype"]]
+        return sum(values) / len(values)
+
+    return max(
+        eligible,
+        key=lambda row: (
+            float(row["mean_top1"]), mean_mrr(row), row["mean_reconstruction"],
+            int(row["step"]),
+        ),
+    )
+
+
 def train_tap_resampler_variants(config: dict[str, Any], destination: Path) -> dict[str, Any]:
     import torch
 
@@ -1237,6 +1279,9 @@ def train_tap_resampler_variants(config: dict[str, Any], destination: Path) -> d
             if best_validation_path.exists()
             else None
         )
+        full_validation_candidates = [
+            row for row in validation_history if row.get("kind") == "full_retrieval"
+        ]
         start_step = 0
         if checkpoint_path.exists():
             state = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
@@ -1471,6 +1516,7 @@ def train_tap_resampler_variants(config: dict[str, Any], destination: Path) -> d
                     model.train()
                     row = {"step": completed_step, "kind": "full_retrieval", **retrieval}
                     validation_history.append(row)
+                    full_validation_candidates.append(row)
                     write_json(validation_history_path, validation_history)
                     step_checkpoint = checkpoint_dir / f"step-{completed_step:05d}.pt"
                     torch.save(
@@ -1483,14 +1529,22 @@ def train_tap_resampler_variants(config: dict[str, Any], destination: Path) -> d
                         },
                         step_checkpoint,
                     )
-                    if (
-                        best_validation is None
-                        or retrieval["mean_top1"] > best_validation["mean_top1"]
+                    selected = _select_resampler_checkpoint(
+                        full_validation_candidates,
+                        float(training.get("selection_reconstruction_tolerance", 0.01)),
+                    )
+                    if best_validation is None or int(selected["step"]) != int(
+                        best_validation["step"]
                     ):
+                        selected_checkpoint = checkpoint_dir / f"step-{int(selected['step']):05d}.pt"
                         best_validation = {
-                            "step": completed_step,
-                            "mean_top1": retrieval["mean_top1"],
-                            "checkpoint": str(step_checkpoint),
+                            "step": int(selected["step"]),
+                            "mean_top1": float(selected["mean_top1"]),
+                            "mean_reconstruction": float(selected["mean_reconstruction"]),
+                            "reconstruction_tolerance": float(
+                                training.get("selection_reconstruction_tolerance", 0.01)
+                            ),
+                            "checkpoint": str(selected_checkpoint),
                         }
                         write_json(best_validation_path, best_validation)
                     if wandb_run is not None:

@@ -7,12 +7,35 @@ from anima_style_data.tap_resampler import (
     _joint_token_prototype_loss,
     _load_feature_batch,
     _prototype_loss,
+    _select_resampler_checkpoint,
     _slot_variation_diversity_loss,
     _training_rows_for_step,
     _warmup_cosine_learning_rate,
     build_tap_resampler_model,
     select_tap_experiment_rows,
 )
+
+
+def test_resampler_checkpoint_selection_keeps_reconstruction_pareto_band():
+    def candidate(step, top1, reconstruction, mrr=0.5):
+        return {
+            "step": step,
+            "mean_top1": top1,
+            "prototype": [{"references": 1, "top1": top1, "mrr": mrr}],
+            "reconstruction_cosine": {"18": reconstruction, "24": reconstruction},
+        }
+
+    selected = _select_resampler_checkpoint(
+        [
+            candidate(500, 0.70, 0.80),
+            candidate(1000, 0.68, 0.90),
+            candidate(1500, 0.65, 0.895),
+        ],
+        reconstruction_tolerance=0.01,
+    )
+
+    assert selected["step"] == 1000
+    assert selected["mean_reconstruction"] == pytest.approx(0.90)
 
 
 def test_resampler_learning_rate_warms_up_then_decays():
