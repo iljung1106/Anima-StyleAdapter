@@ -8,6 +8,7 @@ torch = pytest.importorskip("torch")
 from torch import nn
 
 from anima_style_data.style_transfer import (
+    _exact_self_residual_losses,
     ProductionStyleLoader,
     QueryConditionedReferenceHead,
     SharedLowRankStyleAdapter,
@@ -835,3 +836,21 @@ def test_episode_resampler_prototypes_use_all_references_and_slots():
     )
     assert torch.isfinite(duplicate_joint)
     assert torch.isfinite(duplicate_slot)
+
+
+def test_exact_self_residual_losses_are_zero_for_exact_target_velocity():
+    clean = torch.randn(2, 4, 3, 3)
+    noise = torch.randn_like(clean)
+    sigma = torch.tensor([0.25, 0.75])[:, None, None, None]
+    noisy = (1 - sigma) * clean + sigma * noise
+    target = noise - clean
+    bypass = target + torch.randn_like(target) * 0.2
+
+    losses = _exact_self_residual_losses(
+        target, bypass, target, noisy, clean, sigma,
+    )
+
+    assert losses["normalized_huber"] == 0
+    assert losses["direction"] == pytest.approx(0.0, abs=1e-6)
+    assert losses["log_rms"] == 0
+    assert losses["x0"] == pytest.approx(0.0, abs=1e-6)

@@ -1729,6 +1729,43 @@ def _flow_direction_loss(
     return (1.0 - dot / delta_norm).mean()
 
 
+def _exact_self_residual_losses(
+    prediction: torch.Tensor,
+    bypass_prediction: torch.Tensor,
+    target_velocity: torch.Tensor,
+    noisy: torch.Tensor,
+    clean_latent: torch.Tensor,
+    sigma: torch.Tensor,
+    *,
+    scale_floor: float = 1e-3,
+    huber_beta: float = 0.1,
+) -> dict[str, torch.Tensor]:
+    """Directly supervise the adapter residual in the frozen-Anima coordinate system."""
+    dimensions = tuple(range(1, prediction.ndim))
+    student = prediction - bypass_prediction
+    desired = target_velocity - bypass_prediction
+    scale = desired.square().mean(dim=dimensions, keepdim=True).sqrt().clamp_min(scale_floor)
+    normalized_huber = F.smooth_l1_loss(
+        student / scale, desired / scale, beta=huber_beta
+    )
+    direction = 1 - F.cosine_similarity(
+        student.flatten(1), desired.flatten(1), dim=1
+    ).mean()
+    student_rms = student.square().mean(dim=dimensions).sqrt().clamp_min(1e-8)
+    desired_rms = desired.square().mean(dim=dimensions).sqrt().clamp_min(1e-8)
+    log_rms = F.smooth_l1_loss(
+        torch.log(student_rms), torch.log(desired_rms), beta=0.5
+    )
+    predicted_x0 = noisy.float() - sigma.float() * prediction
+    x0 = F.mse_loss(predicted_x0, clean_latent.float())
+    return {
+        "normalized_huber": normalized_huber,
+        "direction": direction,
+        "log_rms": log_rms,
+        "x0": x0,
+    }
+
+
 def _forward_flow_loss(
     anima: nn.Module,
     adapter: SharedLowRankStyleAdapter,
@@ -1981,6 +2018,20 @@ def _forward_flow_loss(
         prediction = prediction.float()
         target_velocity = (noise - latents).float()
         flow_loss = F.mse_loss(prediction, target_velocity)
+        exact_self_losses = {
+            key: flow_loss.new_zeros(())
+            for key in ("normalized_huber", "direction", "log_rms", "x0")
+        }
+        exact_self_residual_weight = float(
+            loss_config.get("exact_self_residual_weight", 0.0)
+        )
+        if bypass_prediction is not None and exact_self_residual_weight > 0:
+            exact_self_losses = _exact_self_residual_losses(
+                prediction, bypass_prediction, target_velocity,
+                noisy.float(), latents.float(), sigma.float(),
+                scale_floor=float(loss_config.get("exact_self_scale_floor", 1e-3)),
+                huber_beta=float(loss_config.get("exact_self_huber_beta", 0.1)),
+            )
         reference_rank_loss = flow_loss.new_zeros(())
         reference_rank_advantage = flow_loss.new_full((), float("nan"))
         reference_direction_loss = flow_loss.new_zeros(())
@@ -2144,6 +2195,13 @@ def _forward_flow_loss(
         flow_weight = float(loss_config.get("style_flow_loss_weight", 1.0))
         loss = (
             flow_weight * flow_loss
+            + exact_self_residual_weight * exact_self_losses["normalized_huber"]
+            + float(loss_config.get("exact_self_direction_weight", 0.0))
+            * exact_self_losses["direction"]
+            + float(loss_config.get("exact_self_log_rms_weight", 0.0))
+            * exact_self_losses["log_rms"]
+            + float(loss_config.get("exact_self_x0_weight", 0.0))
+            * exact_self_losses["x0"]
             + oracle_weight * oracle_distill_loss
             + magnitude_weight * magnitude_loss
             + direction_weight * direction_loss
@@ -2166,6 +2224,12 @@ def _forward_flow_loss(
         "references": int(reference_mask.sum()),
         "latent_shape": list(latents.shape),
         "flow_loss": float(flow_loss.detach()),
+        "exact_self_residual_loss": float(
+            exact_self_losses["normalized_huber"].detach()
+        ),
+        "exact_self_direction_loss": float(exact_self_losses["direction"].detach()),
+        "exact_self_log_rms_loss": float(exact_self_losses["log_rms"].detach()),
+        "predicted_x0_loss": float(exact_self_losses["x0"].detach()),
         "base_flow_loss": (
             float(F.mse_loss(bypass_prediction, target_velocity).detach())
             if bypass_prediction is not None else float("nan")
@@ -3080,13 +3144,17 @@ def overfit_exact_self_batch(config: dict[str, Any], destination: Path) -> dict[
     attach_style_adapter(anima, adapter)
 
     source_output = destination / str(cfg.get("output_directory", "style_transfer_training"))
-    checkpoint = Path(str(overfit_cfg.get("checkpoint", "checkpoints/step-0001000.pt")))
-    if not checkpoint.is_absolute():
-        checkpoint = source_output / checkpoint
-    state = torch.load(checkpoint, map_location="cpu", weights_only=False)
-    _load_adapter_checkpoint(adapter, state)
-    if "resampler" in state:
-        resampler.load_state_dict(state["resampler"])
+    checkpoint_value = overfit_cfg.get("checkpoint")
+    state: dict[str, Any] | None = None
+    checkpoint: Path | None = None
+    if checkpoint_value:
+        checkpoint = Path(str(checkpoint_value))
+        if not checkpoint.is_absolute():
+            checkpoint = source_output / checkpoint
+        state = torch.load(checkpoint, map_location="cpu", weights_only=False)
+        _load_adapter_checkpoint(adapter, state)
+        if "resampler" in state:
+            resampler.load_state_dict(state["resampler"])
     adapter.style_dropout = 0.0
 
     output_parameters = adapter.output_parameters()
@@ -3128,6 +3196,12 @@ def overfit_exact_self_batch(config: dict[str, Any], destination: Path) -> dict[
         "style_magnitude_weight": 0.0,
         "style_flow_loss_weight": float(overfit_cfg.get("flow_loss_weight", 1.0)),
         "style_flow_direction_weight": float(overfit_cfg.get("direction_weight", 0.0)),
+        "exact_self_residual_weight": float(overfit_cfg.get("residual_weight", 1.0)),
+        "exact_self_direction_weight": float(overfit_cfg.get("residual_direction_weight", 0.2)),
+        "exact_self_log_rms_weight": float(overfit_cfg.get("residual_log_rms_weight", 0.05)),
+        "exact_self_x0_weight": float(overfit_cfg.get("x0_weight", 1.0)),
+        "exact_self_scale_floor": float(overfit_cfg.get("residual_scale_floor", 1e-3)),
+        "exact_self_huber_beta": float(overfit_cfg.get("residual_huber_beta", 0.1)),
         "style_token_contrastive_weight": 0.0,
         "style_kv_contrastive_weight": 0.0,
         "measure_bypass": True,
@@ -3157,6 +3231,8 @@ def overfit_exact_self_batch(config: dict[str, Any], destination: Path) -> dict[
                 "style_output_ratio", "style_flow_direction_cosine",
                 "style_flow_desired_projection",
                 "style_flow_delta_to_desired_ratio",
+                "exact_self_residual_loss", "exact_self_direction_loss",
+                "exact_self_log_rms_loss", "predicted_x0_loss",
             )
         }
 
@@ -3180,6 +3256,20 @@ def overfit_exact_self_batch(config: dict[str, Any], destination: Path) -> dict[
     }
     history.append(initial)
     print(f"exact-self overfit step=0 metrics={initial}", flush=True)
+    sample_config = copy.deepcopy(config)
+    sample_config["style_transfer"]["sampling"].update({
+        "episode": int(overfit_cfg.get("episode", 0)),
+        "width": int(overfit_cfg.get("sample_width", 512)),
+        "height": int(overfit_cfg.get("sample_height", 512)),
+        "steps": int(overfit_cfg.get("sample_steps", 30)),
+        "seed": int(overfit_cfg.get("sample_seed", fixed_noise_seed)),
+        "style_cfg": 1.0,
+    })
+    vae = None
+    initial_sample, vae, _ = _sample_style_adapter(
+        anima, adapter, resampler, loader, sample_config, destination,
+        output, device, 0, vae, reference_mode="self",
+    )
 
     started = time.perf_counter()
     for step in range(1, steps + 1):
@@ -3216,12 +3306,21 @@ def overfit_exact_self_batch(config: dict[str, Any], destination: Path) -> dict[
     torch.save(
         {
             "step": steps,
-            "source_checkpoint": str(checkpoint),
+            "source_checkpoint": str(checkpoint) if checkpoint is not None else None,
             "adapter": adapter.state_dict(),
             "resampler": resampler.state_dict(),
         },
         checkpoint_output,
     )
+    final_samples = {"style_cfg_1": str(_sample_style_adapter(
+        anima, adapter, resampler, loader, sample_config, destination,
+        output, device, steps, vae, reference_mode="self",
+    )[0])}
+    sample_config["style_transfer"]["sampling"]["style_cfg"] = 4.0
+    final_samples["style_cfg_4"] = str(_sample_style_adapter(
+        anima, adapter, resampler, loader, sample_config, destination,
+        output, device, steps, vae, reference_mode="self",
+    )[0])
     randomized_evaluation: dict[str, dict[str, dict[str, float]]] = {}
     randomized_records: dict[str, dict[str, list[float]]] = defaultdict(
         lambda: defaultdict(list)
@@ -3244,8 +3343,8 @@ def overfit_exact_self_batch(config: dict[str, Any], destination: Path) -> dict[
         for name, metrics in randomized_records.items()
     }
     result = {
-        "source_checkpoint": str(checkpoint),
-        "source_step": int(state["step"]),
+        "source_checkpoint": str(checkpoint) if checkpoint is not None else None,
+        "source_step": int(state["step"]) if state is not None else 0,
         "steps": steps,
         "fixed_targets": [item.target_id for item in fixed_batch["episodes"]],
         "evaluation_noise_seed": fixed_noise_seed,
@@ -3263,6 +3362,8 @@ def overfit_exact_self_batch(config: dict[str, Any], destination: Path) -> dict[
         "randomized_flow_evaluation": randomized_evaluation,
         "history": str(output / "history.json"),
         "checkpoint": str(checkpoint_output),
+        "initial_sample": str(initial_sample),
+        "final_samples": final_samples,
         "elapsed_s": time.perf_counter() - started,
     }
     write_json(output / "summary.json", result)
