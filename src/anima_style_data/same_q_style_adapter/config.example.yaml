@@ -1,0 +1,19 @@
+# Replace style_transfer.adapter with this mapping.
+architecture: same_q_full_rank
+style_dim: 1024
+context_dim: 1024
+slots: 128
+heads: 16
+blocks: 28
+alpha_init: 0.01
+bridge_init: xavier
+style_dropout: 0.10
+aggregator_mode: minimal
+aggregator_bottleneck: 256
+aggregator_heads: 16
+aggregator_layers: 2
+aggregator_slot_mixer_layers: 1
+# A shallow live connector is used for the first clean baseline. Increase only
+# after this path proves exact-self learning and held-out reference sensitivity.
+connector_layers: 2
+connector_heads: 16

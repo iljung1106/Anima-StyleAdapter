@@ -1095,6 +1095,36 @@ def attach_style_adapter(anima: nn.Module, adapter: SharedLowRankStyleAdapter) -
         block._forward = types.MethodType(patched, block)
 
 
+def _create_and_attach_style_adapter(
+    anima: nn.Module,
+    adapter_config: dict[str, Any],
+    device: str,
+    *,
+    dtype: torch.dtype | None = None,
+) -> nn.Module:
+    """Select the legacy or isolated same-Q implementation at one boundary."""
+    config = dict(adapter_config)
+    architecture = str(config.pop("architecture", "legacy_low_rank"))
+    if architecture == "legacy_low_rank":
+        adapter = SharedLowRankStyleAdapter(**config)
+        adapter = adapter.to(device=device, dtype=dtype) if dtype else adapter.to(device)
+        attach_style_adapter(anima, adapter)
+        return adapter
+    if architecture == "same_q_full_rank":
+        from .same_q_style_adapter import (
+            SameQFullRankStyleAdapter,
+            attach_same_q_style_adapter,
+        )
+
+        adapter = SameQFullRankStyleAdapter(**config)
+        adapter = adapter.to(device=device, dtype=dtype) if dtype else adapter.to(device)
+        # Attachment materializes full-rank K/V copies, so it must happen
+        # before optimizer creation or checkpoint loading.
+        attach_same_q_style_adapter(anima, adapter)
+        return adapter
+    raise ValueError(f"Unknown style adapter architecture: {architecture}")
+
+
 def load_per_reference_resampler(
     destination: Path, cfg: dict[str, Any], device: str, *, trainable: bool = False
 ):
@@ -3227,8 +3257,9 @@ def sample_style_checkpoint(config: dict[str, Any], destination: Path) -> dict[s
     loader = ProductionStyleLoader(destination, loader_cfg)
     resampler = load_per_reference_resampler(destination, cfg["resampler"], device)
     anima = _resolve_anima_model(config, destination, device).requires_grad_(False).eval()
-    adapter = SharedLowRankStyleAdapter(**cfg["adapter"]).to(device, dtype=torch.bfloat16)
-    attach_style_adapter(anima, adapter)
+    adapter = _create_and_attach_style_adapter(
+        anima, cfg["adapter"], device, dtype=torch.bfloat16
+    )
     output = destination / str(cfg.get("output_directory", "style_transfer_training"))
     sample_cfg = dict(cfg.get("sampling", {}))
     checkpoint_path = Path(str(sample_cfg.get("checkpoint", "training_state.pt")))
@@ -3460,8 +3491,9 @@ def diagnose_style_reference_dependence(
     loader = ProductionStyleLoader(destination, loader_cfg)
     resampler = load_per_reference_resampler(destination, cfg["resampler"], device)
     anima = _resolve_anima_model(config, destination, device).requires_grad_(False).eval()
-    adapter = SharedLowRankStyleAdapter(**cfg["adapter"]).to(device, dtype=torch.bfloat16)
-    attach_style_adapter(anima, adapter)
+    adapter = _create_and_attach_style_adapter(
+        anima, cfg["adapter"], device, dtype=torch.bfloat16
+    )
     adapter.eval()
 
     output = destination / str(cfg.get("output_directory", "style_transfer_training"))
@@ -3787,8 +3819,7 @@ def overfit_exact_self_batch(config: dict[str, Any], destination: Path) -> dict[
         low_precision_rmsnorm=bool(training_cfg.get("low_precision_rmsnorm", False)),
         fuse_attention_projections=bool(training_cfg.get("fuse_attention_projections", False)),
     )
-    adapter = SharedLowRankStyleAdapter(**cfg["adapter"]).to(device)
-    attach_style_adapter(anima, adapter)
+    adapter = _create_and_attach_style_adapter(anima, cfg["adapter"], device)
 
     source_output = destination / str(cfg.get("output_directory", "style_transfer_training"))
     checkpoint_value = overfit_cfg.get("checkpoint")
@@ -4034,8 +4065,9 @@ def sample_exact_self_overfit_checkpoint(
     fixed_batch = loader.load_step(int(overfit_cfg.get("episode", 0)))
     resampler = load_per_reference_resampler(destination, cfg["resampler"], device)
     anima = _resolve_anima_model(config, destination, device).requires_grad_(False).eval()
-    adapter = SharedLowRankStyleAdapter(**cfg["adapter"]).to(device, dtype=torch.bfloat16)
-    attach_style_adapter(anima, adapter)
+    adapter = _create_and_attach_style_adapter(
+        anima, cfg["adapter"], device, dtype=torch.bfloat16
+    )
     output = (
         destination / str(cfg.get("output_directory", "style_transfer_training"))
         / str(overfit_cfg.get("output_name", "overfit_exact_self"))
@@ -4104,8 +4136,7 @@ def train_exact_self_generalization(
         low_precision_rmsnorm=bool(training_cfg.get("low_precision_rmsnorm", False)),
         fuse_attention_projections=bool(training_cfg.get("fuse_attention_projections", False)),
     )
-    adapter = SharedLowRankStyleAdapter(**cfg["adapter"]).to(device)
-    attach_style_adapter(anima, adapter)
+    adapter = _create_and_attach_style_adapter(anima, cfg["adapter"], device)
     adapter.style_dropout = 0.0
     output_parameters = adapter.output_parameters()
     gate_parameters = adapter.gate_parameters()
@@ -4306,12 +4337,11 @@ def sample_exact_self_generalization_checkpoint(
         low_precision_rmsnorm=bool(training_cfg.get("low_precision_rmsnorm", False)),
         fuse_attention_projections=bool(training_cfg.get("fuse_attention_projections", False)),
     )
-    adapter = SharedLowRankStyleAdapter(**cfg["adapter"]).to(
-        device=device, dtype=torch.bfloat16
+    adapter = _create_and_attach_style_adapter(
+        anima, cfg["adapter"], device, dtype=torch.bfloat16
     )
     _load_adapter_checkpoint(adapter, state)
     adapter.requires_grad_(False).eval()
-    attach_style_adapter(anima, adapter)
 
     sample_config = copy.deepcopy(config)
     sample_cfg = sample_config["style_transfer"]["sampling"]
@@ -4523,8 +4553,7 @@ def train_style_adapter(config: dict[str, Any], destination: Path, *, steps_over
     # master weights for BF16 parameters; at the production LR, updates to the
     # nonzero K/V and Aggregator weights otherwise round to exactly zero.
     # Autocast still executes the expensive attention/linear kernels in BF16.
-    adapter = SharedLowRankStyleAdapter(**cfg["adapter"]).to(device)
-    attach_style_adapter(anima, adapter)
+    adapter = _create_and_attach_style_adapter(anima, cfg["adapter"], device)
     output_parameters = adapter.output_parameters()
     gate_parameters = adapter.gate_parameters()
     bridge_parameters = adapter.bridge_parameters()
