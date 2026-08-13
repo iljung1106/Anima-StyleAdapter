@@ -846,12 +846,12 @@ def train_offline_kvo_bootstrap(
     if real_artist:
         real_cfg = config["real_artist_teacher"]
         training = dict(real_cfg.get("offline_bootstrap", {}))
-        if capacity_probe:
-            training.update(training.get("capacity_probe", {}))
         root = destination / str(real_cfg.get("output_directory", "real_artist_teacher_5000"))
     else:
-        training = cfg.get("offline_bootstrap" if phase == "a" else "offline_phase_b", {})
+        training = dict(cfg.get("offline_bootstrap" if phase == "a" else "offline_phase_b", {}))
         root = _root(config, destination)
+    if capacity_probe:
+        training.update(training.get("capacity_probe", {}))
     output = root / str(training.get("output_directory", "offline_kvo_bootstrap"))
     if steps_override is not None:
         output = output / f"smoke-{steps_override}-steps"
@@ -900,26 +900,6 @@ def train_offline_kvo_bootstrap(
             and row["reference_split"] == "test"
             and row["content_split"] == "test"
         ]
-        training_artist_count = int(training.get("training_artist_count", 0))
-        if training_artist_count:
-            available = sorted({str(row["artist"]) for row in train_rows})
-            if training_artist_count < 2 or training_artist_count > len(available):
-                raise ValueError(
-                    f"training_artist_count must be in [2, {len(available)}]"
-                )
-            selected = set(random.Random(int(training.get("seed", 0))).sample(
-                available, training_artist_count
-            ))
-            train_rows = [row for row in train_rows if str(row["artist"]) in selected]
-            selected_heldout = [
-                row for row in train_heldout_rows if str(row["artist"]) in selected
-            ]
-            train_heldout_rows = selected_heldout
-            if bool(training.get("validate_on_training_artists", False)):
-                # Capacity diagnostic: same artists, but disjoint reference
-                # images and held-out content. This measures learnability
-                # without claiming unseen-artist generalization.
-                validation_rows = selected_heldout
     else:
         validated = [row for row in read_records(root / "validated_manifest.parquet") if _bootstrap_eligible(row)]
         feature_rows = {int(row["id"]): row for row in read_records(root / "style_features" / "manifest.parquet")}
@@ -931,6 +911,26 @@ def train_offline_kvo_bootstrap(
         ]
         validation_rows = [row for row in by_split["validation"] if row["content_split"] == "validation"]
         meta_rows = [row for row in by_split["meta_test"] if row["content_split"] == "test"]
+    training_artist_count = int(training.get("training_artist_count", 0))
+    if training_artist_count:
+        available = sorted({str(row["artist"]) for row in train_rows})
+        if training_artist_count < 2 or training_artist_count > len(available):
+            raise ValueError(
+                f"training_artist_count must be in [2, {len(available)}]"
+            )
+        selected = set(random.Random(int(training.get("seed", 0))).sample(
+            available, training_artist_count
+        ))
+        train_rows = [row for row in train_rows if str(row["artist"]) in selected]
+        selected_heldout = [
+            row for row in train_heldout_rows if str(row["artist"]) in selected
+        ]
+        train_heldout_rows = selected_heldout
+        if bool(training.get("validate_on_training_artists", False)):
+            # Capacity diagnostic: same artists but disjoint content. This
+            # proves that the A0 head can learn the teacher mapping before an
+            # unseen-artist run is allowed to consume a full training budget.
+            validation_rows = selected_heldout
     if not train_rows or not train_heldout_rows or not validation_rows or not meta_rows:
         raise RuntimeError("Offline bootstrap split is empty")
 
@@ -1609,7 +1609,12 @@ def train_offline_kvo_bootstrap(
                             beta=0.5,
                         ))
                     if centered_pair_weight > 0:
-                        centered_student = pair_student_flat - pair_student_flat.mean(
+                        centered_pair_source = (
+                            candidate_correction.flatten(2)
+                            if bool(training.get("centered_pair_head_only", False))
+                            else pair_student_flat
+                        )
+                        centered_student = centered_pair_source - centered_pair_source.mean(
                             dim=1, keepdim=True
                         )
                         centered_teacher = pair_teacher_flat - pair_teacher_flat.mean(

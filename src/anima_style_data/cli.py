@@ -96,6 +96,7 @@ def build_parser() -> argparse.ArgumentParser:
         ("synthetic-query-probes", "Capture native Anima query probe bank"),
         ("synthetic-style-tokens", "Cache frozen per-reference Resampler tokens"),
         ("offline-kvo-smoke", "Run two offline K/V/O bootstrap steps"),
+        ("offline-kvo-capacity-probe", "Overexpose 64 synthetic train artists to test A0 capacity"),
         ("offline-kvo-train", "Train and validate offline K/V/O connector bootstrap"),
         ("offline-kvo-phase-b", "Jointly tune the Resampler top and connector"),
         ("offline-kvo-phase-b-smoke", "Run two Phase-B joint-tuning steps"),
@@ -238,7 +239,7 @@ def main() -> None:
         from .synthetic_bootstrap import cache_synthetic_resampler_tokens
 
         _run(cache_synthetic_resampler_tokens, config, destination)
-    elif args.command in {"offline-kvo-smoke", "offline-kvo-train", "offline-kvo-phase-b", "offline-kvo-phase-b-smoke"}:
+    elif args.command in {"offline-kvo-smoke", "offline-kvo-capacity-probe", "offline-kvo-train", "offline-kvo-phase-b", "offline-kvo-phase-b-smoke"}:
         from .synthetic_bootstrap import (
             smoke_offline_kvo_bootstrap,
             smoke_offline_kvo_phase_b,
@@ -248,6 +249,9 @@ def main() -> None:
 
         stage = {
             "offline-kvo-smoke": smoke_offline_kvo_bootstrap,
+            "offline-kvo-capacity-probe": lambda config, destination: train_offline_kvo_bootstrap(
+                config, destination, capacity_probe=True
+            ),
             "offline-kvo-train": train_offline_kvo_bootstrap,
             "offline-kvo-phase-b": train_offline_kvo_phase_b,
             "offline-kvo-phase-b-smoke": smoke_offline_kvo_phase_b,

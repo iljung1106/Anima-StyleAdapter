@@ -60,6 +60,18 @@ def test_centered_residual_regression_can_start_before_discrimination():
     ) == 1.0
 
 
+def test_centered_pair_head_only_removes_frozen_common_shortcut():
+    correction = torch.tensor([[[1.0], [2.0]], [[3.0], [5.0]]])
+    frozen_common = torch.tensor([[[100.0], [-50.0]], [[40.0], [-80.0]]])
+    full = correction + frozen_common
+
+    centered_head = correction - correction.mean(dim=1, keepdim=True)
+    centered_full = full - full.mean(dim=1, keepdim=True)
+
+    assert not torch.allclose(centered_head, centered_full)
+    torch.testing.assert_close(centered_head.mean(dim=1), torch.zeros(2, 1))
+
+
 def test_variable_spatial_tokens_use_batch_local_padding():
     values = [torch.ones(7, 3), torch.ones(5, 3)]
     padded = pad_sequence(values, batch_first=True)
