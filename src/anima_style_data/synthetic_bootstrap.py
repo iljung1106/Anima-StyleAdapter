@@ -1196,6 +1196,16 @@ def train_offline_kvo_bootstrap(
                 )
                 queries.append(probe_values[query_key])
             q = torch.stack(queries).to(device=device, dtype=torch.bfloat16).transpose(1, 2)
+            if train:
+                query_count = min(
+                    q.shape[2], int(training.get("queries_per_step", q.shape[2]))
+                )
+                if query_count < q.shape[2]:
+                    query_indices = torch.tensor(
+                        generator.sample(range(q.shape[2]), query_count),
+                        device=q.device,
+                    )
+                    q = q.index_select(2, query_indices)
             kw = basis[f"block_{block:02d}.k_proj.weight"]
             vw = basis[f"block_{block:02d}.v_proj.weight"]
             ow = basis[f"block_{block:02d}.output_proj.weight"]

@@ -713,7 +713,8 @@ real_artist_teacher:
     steps: 8000
     batch_size: 16
     blocks_per_step: 7
-    functional_blocks_per_step: 2
+    functional_blocks_per_step: 1
+    queries_per_step: 8
     gpu_resident_small_caches: false
     gpu_resident_tokens: false
     gpu_resident_probes: true
