@@ -632,7 +632,7 @@ def test_connector_preserves_tiny_context_bridge_initialization():
     torch.testing.assert_close(selected[3], contexts[3])
 
 
-def test_centered_reference_head_backpropagates_through_context_bridge():
+def test_centered_reference_head_owns_reference_specific_bridge():
     adapter = SharedLowRankStyleAdapter(
         style_dim=16, slots=4, hidden_dim=32, output_dim=32,
         heads=4, blocks=2, rank=4, projection_mode="pretrained_block_lora",
@@ -645,13 +645,12 @@ def test_centered_reference_head_backpropagates_through_context_bridge():
         adapter.reference_effect_head.output[-1].weight.normal_(std=0.02)
     tokens = torch.randn(2, 4, 16)
     queries = torch.randn(2, 4, 5, 8)
-    output = adapter.reference_effect_head(
-        adapter.reference_head_tokens(tokens), queries, 0
-    )
+    output = adapter.reference_effect_head(tokens, queries, 0)
     output.square().mean().backward()
 
-    assert adapter.style_context_proj.weight.grad is not None
-    assert adapter.style_context_proj.weight.grad.norm() > 0
+    assert adapter.reference_effect_head.style_kv.weight.grad is not None
+    assert adapter.reference_effect_head.style_kv.weight.grad.norm() > 0
+    assert adapter.style_context_proj.weight.grad is None
 
 
 def test_cross_slot_mixer_couples_pooled_slots():

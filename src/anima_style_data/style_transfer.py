@@ -710,16 +710,6 @@ class SharedLowRankStyleAdapter(nn.Module):
             return self.style_context_proj(tokens)
         return tokens
 
-    def reference_head_tokens(self, tokens: torch.Tensor) -> torch.Tensor:
-        """Map Resampler slots into the same Anima context used by the head.
-
-        Stage A0 trains the bridge and centered head together while the large
-        connector is frozen. Runtime must therefore feed the head the bridged
-        coordinates as well, rather than bypassing the trained alignment with
-        raw Resampler tokens.
-        """
-        return self._context_tokens(tokens)
-
     def _block_context_tokens(self, tokens: torch.Tensor) -> list[torch.Tensor]:
         shared = self._context_tokens(tokens)
         if not self.connector_enabled:
@@ -903,7 +893,7 @@ class SharedLowRankStyleAdapter(nn.Module):
             attended = cross_attention.output_proj(attended) + output_delta
         if self.reference_effect_head is not None:
             attended = attended + self.reference_effect_head(
-                self.reference_head_tokens(self._style_tokens), q, block_index
+                self._style_tokens, q, block_index
             )
         # Reuse Anima's pretrained channel-wise text cross-attention gate.
         # There is no independent style scale or learnable timestep gate that

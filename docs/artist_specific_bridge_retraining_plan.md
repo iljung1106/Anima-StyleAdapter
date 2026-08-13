@@ -131,8 +131,12 @@ Retrieval이 높아도 reconstruction이나 downstream effect gap이 악화되�
 
 우선 학습한다.
 
-- `style_context_proj` Bridge
-- Query-conditioned Centered Artist-Specific Head
+- Query-conditioned Centered Artist-Specific Head와 그 내부 full-rank `style_kv` Bridge
+
+공통효과 connector의 `style_context_proj`는 A0에서 동결한다. Centered Head 내부의
+`style_kv: 1024 -> 1024`가 reference-specific Anima 좌표 정렬을 담당한다. 작은 `1e-4`
+공통 Bridge를 Head의 LayerNorm 앞에서 함께 학습하면 scale은 제거되면서 gradient만 증폭되는
+퇴화가 발생하므로, 공통 Bridge는 A1에서 full effect와 함께 연다.
 
 이 단계에서는 full/common artist effect를 목표로 삼지 않는다. Reference-independent 평균 effect로
 loss를 줄이는 경로를 구조적으로 차단한다.

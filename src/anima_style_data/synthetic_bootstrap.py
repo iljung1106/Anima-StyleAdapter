@@ -1097,15 +1097,14 @@ def train_offline_kvo_bootstrap(
     adapter_parameters = bridge_parameters + connector_parameters + kvo_parameters
     if centered_head is not None and bool(training.get("freeze_base_connector", True)):
         adapter.requires_grad_(False)
-        # Stage A0 aligns the Resampler representation to Anima context through
-        # the bridge before the centered head reads it. Keep only that mapping
-        # live; the common connector and all block K/V/O deltas remain frozen.
-        for value in adapter.bridge_parameters():
-            value.requires_grad_(True)
-        bridge_parameters = list(adapter.bridge_parameters())
+        # The centered head owns its reference-specific full-rank style_kv
+        # bridge. Keep the common style_context_proj frozen until A1; passing
+        # its tiny 1e-4 output through the head's LayerNorm creates a scale
+        # degeneracy and enormous gradients without changing the head input.
+        bridge_parameters = []
         connector_parameters = []
         kvo_parameters = []
-        adapter_parameters = bridge_parameters
+        adapter_parameters = []
     resampler_parameters = (
         _enable_phase_b_resampler(
             resampler, int(training.get("resampler_trainable_encoder_layers", 1))
@@ -1355,9 +1354,7 @@ def train_offline_kvo_bootstrap(
                     attended = attended.transpose(1, 2).reshape(context.shape[0], attended.shape[2], hidden)
                     base_output = F.linear(attended, ow) + adapter.o_up[block](adapter.o_down[block](attended))
                     correction = (
-                        centered_head(
-                            adapter.reference_head_tokens(source_tokens), query, block
-                        )
+                        centered_head(source_tokens, query, block)
                         if centered_head is not None else torch.zeros_like(base_output)
                     )
                     return base_output, correction
@@ -1502,8 +1499,7 @@ def train_offline_kvo_bootstrap(
                     ).reshape(full_count, count, *pair_teacher_source.shape[1:])
                     candidate_correction = (
                         centered_head.grouped_pairs(
-                            adapter.reference_head_tokens(pair_token_source),
-                            pair_queries_source, block, count
+                            pair_token_source, pair_queries_source, block, count
                         )
                         if centered_head is not None
                         else torch.zeros_like(candidate_base)

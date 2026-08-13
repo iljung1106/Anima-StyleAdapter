@@ -589,7 +589,7 @@ synthetic_teacher:
     # query-conditioned artist head. The common connector and all K/V/O deltas
     # are frozen so a reference-independent mean artist effect cannot solve the
     # objective.
-    output_directory: offline_artist_specific_stage_a0_v1
+    output_directory: offline_artist_specific_stage_a0_v2
     seed: 20260812
     steps: 8000
     batch_size: 16
@@ -600,8 +600,8 @@ synthetic_teacher:
     representation_warmup_steps: 0
     centered_effect_head: true
     centered_effect_latent_dim: 512
-    centered_effect_learning_rate: 0.0001
-    centered_effect_max_grad_norm: 1.0
+    centered_effect_learning_rate: 0.00002
+    centered_effect_max_grad_norm: 0.10
     centered_effect_residual_weight: 1.0
     centered_effect_direction_weight: 0.20
     centered_effect_zero_mean_weight: 0.10
@@ -616,19 +616,19 @@ synthetic_teacher:
     primary_effect_weight: 0.0
     learning_rate: 0.0
     connector_learning_rate: 0.0
-    bridge_learning_rate: 0.000002
+    bridge_learning_rate: 0.0
     warmup_steps: 400
     minimum_lr_ratio: 0.1
     weight_decay: 0.01
-    bridge_max_grad_norm: 0.05
+    bridge_max_grad_norm: 0.0
     direction_weight: 0.0
     magnitude_weight: 0.0
     functional_rank_weight: 0.0
     functional_rank_margin: 0.02
     functional_contrastive_weight: 0.0
     functional_contrastive_temperature: 0.10
-    functional_contrastive_start_step: 0
-    functional_contrastive_ramp_steps: 500
+    functional_contrastive_start_step: 1000
+    functional_contrastive_ramp_steps: 1000
     functional_all_pairs_weight: 0.0
     functional_centered_all_pairs_weight: 0.20
     functional_centered_temperature: 0.07
@@ -652,8 +652,8 @@ synthetic_teacher:
     wandb:
       enabled: true
       project: anima-style-adapter
-      name: offline-artist-specific-stage-a0
-      id: offline-artist-specific-stage-a0-v1
+      name: offline-artist-specific-stage-a0-v2
+      id: offline-artist-specific-stage-a0-v2
   offline_phase_b:
     output_directory: offline_kvo_phase_b_exact512_two_stage_curriculum
     phase_a_checkpoint: offline_kvo_bootstrap_exact512_summary_tokens/checkpoints/best.pt
