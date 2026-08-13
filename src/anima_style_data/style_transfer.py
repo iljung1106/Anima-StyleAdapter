@@ -2929,6 +2929,30 @@ def _validate_style_adapter(
     return summary
 
 
+@contextmanager
+def _use_same_q_alpha_blocks(adapter: nn.Module, block_indices: Iterable[int]):
+    """Temporarily retain calibrated same-Q alpha only for selected blocks."""
+    alpha = getattr(adapter, "alpha", None)
+    if not isinstance(alpha, torch.Tensor) or alpha.ndim != 1:
+        raise TypeError("Block alpha ablation requires a same-Q style adapter")
+    selected = sorted({int(index) for index in block_indices})
+    if any(index < 0 or index >= alpha.numel() for index in selected):
+        raise ValueError(
+            f"Block indices must be in [0, {alpha.numel() - 1}], got {selected}"
+        )
+    original = alpha.detach().clone()
+    mask = torch.zeros_like(alpha)
+    if selected:
+        mask[selected] = 1
+    with torch.no_grad():
+        alpha.copy_(original * mask)
+    try:
+        yield
+    finally:
+        with torch.no_grad():
+            alpha.copy_(original)
+
+
 def _load_sampling_vae(config: dict[str, Any], destination: Path):
     from huggingface_hub import hf_hub_download
 
@@ -3440,6 +3464,38 @@ def sample_style_checkpoint(config: dict[str, Any], destination: Path) -> dict[s
     _load_adapter_checkpoint(adapter, state)
     if "resampler" in state:
         resampler.load_state_dict(state["resampler"])
+
+    alpha_block_ablation: dict[str, dict[str, float]] = {}
+    configured_block_groups = diagnostic_cfg.get("alpha_block_groups", {})
+    if configured_block_groups:
+        if not isinstance(configured_block_groups, dict):
+            raise TypeError("diagnostics.alpha_block_groups must be a mapping")
+        ablation_batches = int(
+            diagnostic_cfg.get("alpha_block_ablation_batches", 8)
+        )
+        ablation_seed = int(
+            diagnostic_cfg.get("alpha_block_ablation_seed", 20260811 ^ 0xA1FA)
+        )
+        validation_loss_config = {
+            **cfg["training"],
+            "timestep_sampling": "uniform",
+            "style_dropout": 0.0,
+        }
+        for name, block_indices in configured_block_groups.items():
+            with _use_same_q_alpha_blocks(adapter, block_indices):
+                alpha_block_ablation[str(name)] = _validate_style_adapter(
+                    anima,
+                    adapter,
+                    resampler,
+                    loader,
+                    device,
+                    batches=ablation_batches,
+                    seed=ablation_seed,
+                    step=int(state["step"]),
+                    loss_config=validation_loss_config,
+                    reference_mode="self",
+                )
+            adapter.eval()
     step = int(state["step"])
     episodes = [
         int(value)
@@ -3882,6 +3938,7 @@ def diagnose_style_reference_dependence(
         "timestep_metrics": timestep_metrics,
         "condition_delta_cosines": delta_cosines,
         "direct_condition_comparisons": direct_comparisons,
+        "alpha_block_ablation": alpha_block_ablation,
     }
     diagnostic_output = output / "diagnostics" / f"step-{int(state['step']):07d}"
     diagnostic_output.mkdir(parents=True, exist_ok=True)
