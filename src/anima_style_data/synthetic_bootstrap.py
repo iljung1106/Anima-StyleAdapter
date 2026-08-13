@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import math
 import random
 from collections import Counter, defaultdict, deque
@@ -14,6 +16,14 @@ from PIL import Image
 from safetensors import safe_open
 
 from .io import read_records, write_json, write_records
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(8 * 1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _root(config: dict[str, Any], destination: Path) -> Path:
@@ -421,9 +431,17 @@ def cache_synthetic_resampler_tokens(
     root = _root(config, destination)
     output = root / str(cache_cfg.get("output_directory", "resampler_tokens"))
     output.mkdir(parents=True, exist_ok=True)
+    resampler_cfg = config["style_transfer"]["resampler"]
+    checkpoint_path = destination / str(resampler_cfg["checkpoint"])
+    checkpoint_sha256 = _file_sha256(checkpoint_path)
     final_manifest = output / "manifest.parquet"
     summary_path = output / "summary.json"
     if final_manifest.exists() and summary_path.exists():
+        existing_summary = json.loads(summary_path.read_text(encoding="utf-8"))
+        if existing_summary.get("resampler_checkpoint_sha256") != checkpoint_sha256:
+            raise RuntimeError(
+                f"Resampler token cache {output} belongs to a different checkpoint"
+            )
         rows = read_records(final_manifest)
         summary = {
             "images": len(rows), "shards": len({row["token_shard"] for row in rows}),
@@ -445,7 +463,6 @@ def cache_synthetic_resampler_tokens(
         grouped[str(row["feature_shard"])].append(row)
 
     device = str(cfg.get("device", "cuda"))
-    resampler_cfg = config["style_transfer"]["resampler"]
     resampler = load_per_reference_resampler(destination, resampler_cfg, device, trainable=False)
     batch_size = int(cache_cfg.get("batch_size", 16))
     taps = [18, 24]
@@ -496,6 +513,7 @@ def cache_synthetic_resampler_tokens(
                 "seed_index": int(row["seed_index"]),
                 "token_shard": token_name, "token_row": index,
                 "slots": int(tokens.shape[1]), "style_dim": int(tokens.shape[2]),
+                "resampler_checkpoint_sha256": checkpoint_sha256,
             }
             for index, row in enumerate(shard_rows)
         ]
@@ -511,6 +529,8 @@ def cache_synthetic_resampler_tokens(
     summary = {
         "images": len(records), "shards": len(grouped), "slots": 128, "style_dim": 1024,
         "dtype": "bfloat16",
+        "resampler_checkpoint": str(resampler_cfg["checkpoint"]),
+        "resampler_checkpoint_sha256": checkpoint_sha256,
         "storage_bytes": sum(path.stat().st_size for path in output.glob("part-*.safetensors")),
     }
     write_json(summary_path, summary)
@@ -673,12 +693,21 @@ def _batched_attention_output(
 
 
 def _load_resampler_token_cache(
-    root: Path, device: str = "cpu"
+    root: Path, device: str = "cpu", *, directory: str = "resampler_tokens",
+    expected_checkpoint_sha256: str | None = None,
 ) -> tuple[dict[int, dict[str, Any]], dict[str, torch.Tensor]]:
     """Load the small Phase-A cache once, optionally keeping it on the GPU."""
     from safetensors.torch import load_file
 
-    cache_root = root / "resampler_tokens"
+    cache_root = root / directory
+    if expected_checkpoint_sha256 is not None:
+        summary = json.loads((cache_root / "summary.json").read_text(encoding="utf-8"))
+        actual = summary.get("resampler_checkpoint_sha256")
+        if actual != expected_checkpoint_sha256:
+            raise RuntimeError(
+                f"Resampler token cache checkpoint mismatch: expected "
+                f"{expected_checkpoint_sha256}, found {actual}"
+            )
     rows = read_records(cache_root / "manifest.parquet")
     row_by_id = {int(row["id"]): row for row in rows}
     tensors = {
@@ -1006,7 +1035,20 @@ def train_offline_kvo_bootstrap(
     token_device = device if bool(
         training.get("gpu_resident_tokens", training.get("gpu_resident_small_caches", True))
     ) else "cpu"
-    token_rows, token_tensors = _load_resampler_token_cache(root, token_device)
+    token_cache_directory = str(
+        training.get(
+            "style_token_directory",
+            cfg.get("style_token_cache", {}).get("output_directory", "resampler_tokens"),
+        )
+    )
+    token_rows, token_tensors = _load_resampler_token_cache(
+        root,
+        token_device,
+        directory=token_cache_directory,
+        expected_checkpoint_sha256=_file_sha256(
+            destination / str(resampler_cfg["checkpoint"])
+        ),
+    )
     resident_features = None
     if phase == "b" and bool(training.get("ram_resident_features", True)):
         configured_feature_root = training.get("local_feature_directory")

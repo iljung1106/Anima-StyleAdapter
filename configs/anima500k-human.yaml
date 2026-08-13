@@ -298,7 +298,7 @@ style_transfer:
     text_lru_shards: 2
     latent_lru_shards: 2
   resampler:
-    checkpoint: per_reference_resampler_l18_l24_siglip_l24_128x1024_w1536/runs/l18_l24_native_siglip_l24/checkpoint.pt
+    checkpoint: per_reference_resampler_artist_specific_stage_r_v1/runs/l18_l24_native_siglip_l24/checkpoint.pt
   adapter:
     # Project Resampler tokens into Anima's post-LLM condition space, then use
     # every block's frozen pretrained K/V/O as the full-rank base. Only the
@@ -582,7 +582,7 @@ synthetic_teacher:
     timesteps: [0.15, 0.35, 0.65, 0.85]
     queries_per_block: 32
   style_token_cache:
-    output_directory: resampler_tokens
+    output_directory: resampler_tokens_artist_specific_stage_r_v1
     batch_size: 16
   offline_bootstrap:
     output_directory: offline_kvo_bootstrap_exact512_summary_tokens

@@ -1,4 +1,6 @@
+import pytest
 import torch
+from safetensors.torch import save_file
 from torch.nn.utils.rnn import pad_sequence
 
 from anima_style_data.synthetic_bootstrap import (
@@ -7,9 +9,27 @@ from anima_style_data.synthetic_bootstrap import (
     _bootstrap_eligible,
     _centered_residual_curriculum_scale,
     _functional_curriculum_scale,
+    _load_resampler_token_cache,
     assign_bootstrap_splits,
     classify_artist_effects,
 )
+from anima_style_data.io import write_json, write_records
+
+
+def test_resampler_token_cache_rejects_checkpoint_mismatch(tmp_path):
+    cache = tmp_path / "tokens-v2"
+    cache.mkdir()
+    write_json(cache / "summary.json", {"resampler_checkpoint_sha256": "actual"})
+    write_records(
+        cache / "manifest.parquet",
+        [{"id": 1, "token_shard": "part.safetensors", "token_row": 0}],
+    )
+    save_file({"tokens": torch.randn(1, 2, 3)}, cache / "part.safetensors")
+
+    with pytest.raises(RuntimeError, match="checkpoint mismatch"):
+        _load_resampler_token_cache(
+            tmp_path, directory="tokens-v2", expected_checkpoint_sha256="expected"
+        )
 
 
 def test_reference_discrimination_curriculum_is_off_then_ramps_together():
