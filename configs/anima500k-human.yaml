@@ -280,7 +280,7 @@ tap_resampler_experiment:
 # and batches targets by exact latent shape. `style-smoke` forces two steps and
 # writes to a separate smoke directory; `style-train` uses `training.steps`.
 style_transfer:
-  output_directory: style_transfer_same_q_phase_a_alignment_4k_v1
+  output_directory: style_transfer_same_q_phase_a2_reference_kv_4k_v1
   seed: 20260811
   loader:
     style_cache: style_features_l18_l24_siglip_l24
@@ -354,8 +354,9 @@ style_transfer:
     # Fresh Adapter initialization. Do not reuse the successful 2k diagnostic
     # checkpoint or any older offline/bootstrap connector weights.
     initial_checkpoint: null
-    # Phase A only: prove that the visual context bridge can improve exact-self
-    # flow before any block-specific K/V or alpha adaptation is allowed.
+    # Phase A2: jointly align the visual bridge and block-specific native K/V
+    # copies while a live same-Q wrong-reference branch suppresses the common
+    # reference-independent shortcut. Never resume the failed Phase A run.
     steps: 4000
     # Trainable adapter weights and Adam moments stay FP32. Representation
     # modules need a higher LR than the stabilized zero-output path.
@@ -370,10 +371,11 @@ style_transfer:
     # clipped 1e-3 first update is therefore destructive across 28 blocks;
     # open the zero-init connector on the corresponding inverse scale.
     representation_learning_rate: 0.0001
+    style_kv_learning_rate: 0.00001
     output_learning_rate: 0.0001
-    # Keep the native full-rank K/V copies and nonzero alpha fixed. Otherwise
-    # shrinking alpha is easier than aligning Resampler tokens to Anima.
-    freeze_style_kv: true
+    # Open the pretrained full-rank K/V copies gently. The shared bridge uses
+    # the faster LR above; block-specific K/V only needs to adapt its basis.
+    freeze_style_kv: false
     freeze_style_alpha: true
     # Retained for later stages; the negative start step below keeps this group
     # frozen throughout exact-self connector bootstrap.
@@ -422,9 +424,10 @@ style_transfer:
     log_every: 10
     debug_autograd_steps: 0
     validation_every: 250
-    validation_batches: 8
+    validation_batch_size: 4
+    validation_batches: 4
     full_validation_every: 250
-    full_validation_batches: 32
+    full_validation_batches: 8
     checkpoint_every: 250
     sample_every: 500
     smoke_sample_every: 2
@@ -439,8 +442,8 @@ style_transfer:
     # magnitude. Direct flow MSE is the acceptance metric; normalized residual
     # and cosine terms make its initially small correction easier to learn.
     style_flow_loss_weight: 1.0
-    exact_self_residual_weight: 0.5
-    exact_self_direction_weight: 0.5
+    exact_self_residual_weight: 0.25
+    exact_self_direction_weight: 0.75
     exact_self_log_rms_weight: 0.0
     exact_self_x0_weight: 0.0
     exact_self_scale_floor: 0.001
@@ -455,18 +458,17 @@ style_transfer:
     style_token_contrastive_weight: 0.0
     style_kv_contrastive_weight: 0.0
     style_contrastive_temperature: 0.10
-    # The stronger live rank objective failed its controlled ablation, so keep
-    # its schedule here but disable the expensive wrong-reference branch.
+    # A2 uses one live wrong reference per microbatch. Correct and wrong styles
+    # share target, noisy latent, timestep, content condition, and native Q;
+    # only their visual style tokens differ.
     style_reference_rank_weight: 0.0
     style_reference_rank_margin: 0.005
     style_reference_rank_probability: 1.0
-    style_reference_rank_start_step: 1
-    style_reference_rank_end_step: 251
-    # Reference-direction and live wrong-reference gradients are also disabled
-    # so this run isolates normalized target-residual direction supervision.
-    style_reference_direction_weight: 0.0
+    style_reference_rank_start_step: 0
+    style_reference_rank_end_step: 0
+    style_reference_direction_weight: 0.5
     style_reference_direction_epsilon: 0.05
-    style_reference_wrong_grad_samples: 0
+    style_reference_wrong_grad_samples: 1
     # Softly match the timestep-conditioned magnitude of Anima's native artist
     # intervention. Standard target-only flow loss still chooses the direction;
     # this term only prevents the style path from remaining effectively null.
@@ -497,8 +499,8 @@ style_transfer:
     wandb:
       enabled: true
       project: anima-style-adapter
-      name: anima-style-transfer-same-q-phase-a-alignment-4k-v1
-      id: anima-style-transfer-same-q-phase-a-alignment-4k-v1
+      name: anima-style-transfer-same-q-phase-a2-reference-kv-4k-v1
+      id: anima-style-transfer-same-q-phase-a2-reference-kv-4k-v1
   diagnostics:
     checkpoint: smoke-2-steps/checkpoint.pt
     checkpoints:

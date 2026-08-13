@@ -2337,7 +2337,6 @@ def _forward_flow_loss(
         )
         reference_rank_active = (
             (reference_rank_weight > 0 or reference_direction_weight > 0)
-            and curriculum["target_only"]
             and style_tokens.shape[0] > 1
             and step >= reference_rank_start
             and (reference_rank_end <= 0 or step < reference_rank_end)
@@ -2734,6 +2733,7 @@ def _validate_style_adapter(
     base_losses = []
     paired_improvements = []
     output_ratios = []
+    reference_advantages = []
     alignment_samples: dict[str, list[float]] = defaultdict(list)
     timestep_alignment: list[tuple[float, dict[str, float]]] = []
     started = time.perf_counter()
@@ -2764,6 +2764,9 @@ def _validate_style_adapter(
             base_losses.append(details["base_flow_loss"])
             paired_improvements.append(details["paired_flow_improvement"])
             output_ratios.append(details["style_output_ratio"])
+            reference_advantage = float(details["style_reference_rank_advantage"])
+            if math.isfinite(reference_advantage):
+                reference_advantages.append(reference_advantage)
             alignment = {
                 key: float(details[key])
                 for key in (
@@ -2804,6 +2807,14 @@ def _validate_style_adapter(
     }
     for key, values in alignment_samples.items():
         summary[key] = sum(values) / len(values)
+    if reference_advantages:
+        summary["correct_vs_wrong_advantage"] = (
+            sum(reference_advantages) / len(reference_advantages)
+        )
+        summary["correct_vs_wrong_positive_fraction"] = sum(
+            value > 0 for value in reference_advantages
+        ) / len(reference_advantages)
+        summary["correct_vs_wrong_samples"] = float(len(reference_advantages))
     edges = list((loss_config or {}).get(
         "validation_timestep_edges", [0.0, 0.2, 0.4, 0.6, 0.8, 1.0]
     ))
@@ -4584,7 +4595,11 @@ def train_style_adapter(config: dict[str, Any], destination: Path, *, steps_over
         ),
     }
     loader = ProductionStyleLoader(destination, loader_cfg)
-    validation_loader_cfg = {**cfg["loader"], "split": "validation", "batch_size": 1}
+    validation_loader_cfg = {
+        **cfg["loader"],
+        "split": "validation",
+        "batch_size": int(training.get("validation_batch_size", 1)),
+    }
     validation_loader_cfg.pop("reference_curriculum", None)
     validation_loader_cfg.pop("gradient_accumulation_steps", None)
     validation_loader_cfg["seed"] = seed ^ 0x51A7
@@ -4642,18 +4657,27 @@ def train_style_adapter(config: dict[str, Any], destination: Path, *, steps_over
     output_parameters = adapter.output_parameters()
     gate_parameters = adapter.gate_parameters()
     bridge_parameters = adapter.bridge_parameters()
+    style_kv_parameters = adapter.kv_parameters()
     special_ids = {
-        id(value) for value in bridge_parameters + output_parameters + gate_parameters
+        id(value)
+        for value in (
+            bridge_parameters + style_kv_parameters
+            + output_parameters + gate_parameters
+        )
     }
     representation_parameters = [
         value for value in adapter.parameters() if id(value) not in special_ids
     ]
-    parameters = bridge_parameters + representation_parameters + output_parameters + gate_parameters
+    parameters = (
+        bridge_parameters + representation_parameters + style_kv_parameters
+        + output_parameters + gate_parameters
+    )
     if len({id(value) for value in parameters}) != len(list(adapter.parameters())):
         raise RuntimeError("Style optimizer parameter groups do not cover the adapter exactly once")
     representation_lr = float(
         training.get("representation_learning_rate", training.get("learning_rate", 1e-4))
     )
+    style_kv_lr = float(training.get("style_kv_learning_rate", representation_lr))
     bridge_lr = float(training.get("bridge_learning_rate", 1e-5))
     output_lr = float(training.get("output_learning_rate", representation_lr))
     gate_lr = float(training.get("gate_learning_rate", output_lr))
@@ -4671,6 +4695,12 @@ def train_style_adapter(config: dict[str, Any], destination: Path, *, steps_over
                 "lr": representation_lr,
                 "weight_decay": weight_decay,
                 "name": "representation",
+            },
+            {
+                "params": style_kv_parameters,
+                "lr": style_kv_lr,
+                "weight_decay": weight_decay,
+                "name": "style_kv",
             },
             {
                 "params": output_parameters,
@@ -4713,7 +4743,8 @@ def train_style_adapter(config: dict[str, Any], destination: Path, *, steps_over
         "style optimizer: FP32 trainable weights, BF16 autocast; adapter=AdamW "
         f"bridge=RAdam(lr={bridge_lr:g},warmup={int(training.get('bridge_warmup_steps', 400))},"
         f"eps={float(training.get('bridge_adam_eps', 1e-6)):g}) "
-        f"representation_lr={representation_lr:g} output_lr={output_lr:g} "
+        f"representation_lr={representation_lr:g} style_kv_lr={style_kv_lr:g} "
+        f"output_lr={output_lr:g} "
         f"gate_lr={gate_lr:g} "
         f"resampler={'AdamW(lr=' + format(resampler_lr, 'g') + ')' if resampler_parameters else 'frozen/external'}",
         flush=True,
@@ -4847,6 +4878,7 @@ def train_style_adapter(config: dict[str, Any], destination: Path, *, steps_over
             device,
             batches=validation_batches,
             seed=seed ^ 0xA11CE,
+            loss_config={**training, "timestep_sampling": "uniform"},
         )
         print(
             f"validation step=0 loss={baseline['loss']:.6f} "
@@ -4854,6 +4886,8 @@ def train_style_adapter(config: dict[str, Any], destination: Path, *, steps_over
             f"paired={baseline['paired_improvement']:.6f} "
             f"ci95=±{baseline['paired_improvement_ci95']:.6f} "
             f"output_ratio={baseline['style_output_ratio']:.6f} "
+            f"ref_adv={baseline.get('correct_vs_wrong_advantage', float('nan')):.6f}/"
+            f"{baseline.get('correct_vs_wrong_positive_fraction', float('nan')):.3f} "
             f"batches={validation_batches} elapsed_s={baseline['elapsed_s']:.2f}",
             flush=True,
         )
@@ -4951,7 +4985,7 @@ def train_style_adapter(config: dict[str, Any], destination: Path, *, steps_over
         if bool(training.get("separate_gradient_clipping", False)):
             clipped_norms = _clip_style_gradient_groups(
                 bridge_parameters,
-                representation_parameters,
+                representation_parameters + style_kv_parameters,
                 output_parameters,
                 gate_parameters,
                 training,
@@ -5035,9 +5069,11 @@ def train_style_adapter(config: dict[str, Any], destination: Path, *, steps_over
             "bridge_weight_norm": bridge_weight_norm,
             "bridge_update_norm": bridge_update_norm,
             "bridge_update_to_weight_ratio": bridge_update_to_weight_ratio,
-            "representation_lr": optimizer.param_groups[0]["lr"],
-            "output_lr": optimizer.param_groups[1]["lr"],
-            "gate_lr": optimizer.param_groups[2]["lr"],
+            **{
+                f"{group['name']}_lr": float(group["lr"])
+                for group in optimizer.param_groups
+                if group.get("name")
+            },
             "resampler_lr": (
                 next(
                     group["lr"] for group in optimizer.param_groups
@@ -5088,6 +5124,7 @@ def train_style_adapter(config: dict[str, Any], destination: Path, *, steps_over
             heldout_validation = _validate_style_adapter(
                 anima, adapter, resampler, validation_loader, device,
                 batches=current_validation_batches, seed=seed ^ 0xA11CE,
+                loss_config={**training, "timestep_sampling": "uniform"},
                 reference_mode="heldout",
             )
             self_validation = _validate_style_adapter(
@@ -5116,6 +5153,8 @@ def train_style_adapter(config: dict[str, Any], destination: Path, *, steps_over
                 f"projection={heldout_validation['style_flow_desired_projection']:.6f} "
                 f"cosine={heldout_validation['style_flow_direction_cosine']:.6f} "
                 f"orthogonal={heldout_validation['style_flow_orthogonal_to_desired_ratio']:.6f} "
+                f"ref_adv={heldout_validation.get('correct_vs_wrong_advantage', float('nan')):.6f}/"
+                f"{heldout_validation.get('correct_vs_wrong_positive_fraction', float('nan')):.3f} "
                 f"batches={current_validation_batches} "
                 f"elapsed_s={heldout_validation['elapsed_s']:.2f}",
                 flush=True,
@@ -5130,6 +5169,8 @@ def train_style_adapter(config: dict[str, Any], destination: Path, *, steps_over
                 f"projection={self_validation['style_flow_desired_projection']:.6f} "
                 f"cosine={self_validation['style_flow_direction_cosine']:.6f} "
                 f"orthogonal={self_validation['style_flow_orthogonal_to_desired_ratio']:.6f} "
+                f"ref_adv={self_validation.get('correct_vs_wrong_advantage', float('nan')):.6f}/"
+                f"{self_validation.get('correct_vs_wrong_positive_fraction', float('nan')):.3f} "
                 f"batches={current_validation_batches} "
                 f"elapsed_s={self_validation['elapsed_s']:.2f}",
                 flush=True,
