@@ -532,6 +532,10 @@ style_transfer:
       late_14_20: [14, 15, 16, 17, 18, 19, 20]
       final_21_27: [21, 22, 23, 24, 25, 26, 27]
       late_14_27: [14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27]
+      none: []
+      block_27_only: [27]
+      final_21_26: [21, 22, 23, 24, 25, 26]
+      all_without_27: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26]
   overfit:
     # Fresh A0-1 capacity test: no failed connector checkpoint is reused.
     checkpoint: null

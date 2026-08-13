@@ -41,8 +41,33 @@ from anima_style_data.style_transfer import (
     _symmetric_style_contrastive_loss,
     _timestep_interval_bounds,
     _uncached_no_grad_autocast,
+    _use_same_q_alpha_blocks,
     attach_style_adapter,
 )
+
+
+def test_same_q_alpha_block_ablation_masks_and_restores_values():
+    adapter = nn.Module()
+    adapter.alpha = nn.Parameter(torch.tensor([0.1, 0.2, 0.3, 0.4]))
+    original = adapter.alpha.detach().clone()
+
+    with _use_same_q_alpha_blocks(adapter, [1, 3]):
+        assert torch.equal(adapter.alpha, torch.tensor([0.0, 0.2, 0.0, 0.4]))
+
+    assert torch.equal(adapter.alpha, original)
+
+
+def test_same_q_alpha_block_ablation_restores_after_error():
+    adapter = nn.Module()
+    adapter.alpha = nn.Parameter(torch.tensor([0.1, 0.2]))
+    original = adapter.alpha.detach().clone()
+
+    with pytest.raises(RuntimeError, match="diagnostic failure"):
+        with _use_same_q_alpha_blocks(adapter, []):
+            assert torch.count_nonzero(adapter.alpha) == 0
+            raise RuntimeError("diagnostic failure")
+
+    assert torch.equal(adapter.alpha, original)
 
 
 def test_query_conditioned_reference_head_preserves_query_positions():
