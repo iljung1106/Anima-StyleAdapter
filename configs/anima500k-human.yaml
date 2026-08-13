@@ -774,24 +774,25 @@ real_artist_teacher:
     early_stop_patience: 8
     resume: true
     capacity_probe:
-      output_directory: offline_kvo_reference_head_capacity_64_v1
+      output_directory: offline_kvo_reference_head_capacity_64_batch32_v2
       training_artist_count: 64
       validate_on_training_artists: true
       skip_meta_test: true
-      steps: 2000
-      minimum_steps: 2000
+      steps: 500
+      minimum_steps: 500
       early_stop_patience: 0
       checkpoint_every: 500
-      validation_every: 250
-      validation_batches: 8
-      train_heldout_batches: 8
-      functional_contrastive_start_step: 750
-      functional_contrastive_ramp_steps: 500
+      validation_every: 125
+      validation_batches: 2
+      train_heldout_batches: 2
+      warmup_steps: 100
+      functional_contrastive_start_step: 188
+      functional_contrastive_ramp_steps: 125
       wandb:
         enabled: true
         project: anima-style-adapter
-        name: real-artist-reference-head-capacity-64
-        id: real-artist-reference-head-capacity-64-v1
+        name: real-artist-reference-head-capacity-64-batch32
+        id: real-artist-reference-head-capacity-64-batch32-v2
     wandb:
       enabled: true
       project: anima-style-adapter
