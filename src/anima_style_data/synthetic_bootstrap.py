@@ -1371,18 +1371,44 @@ def train_offline_kvo_bootstrap(
                 train and len(batch_rows) > 1 and contrastive_weight > 0
                 and block in functional_blocks
             ):
-                count = len(batch_rows)
+                full_count = len(batch_rows)
+                group_size = min(
+                    full_count,
+                    int(training.get("functional_pair_group_size", full_count)),
+                )
+                if full_count % group_size:
+                    raise ValueError(
+                        "batch_size must be divisible by functional_pair_group_size"
+                    )
+                group_count = full_count // group_size
+                group_index = (
+                    current_step + sorted(functional_blocks).index(block)
+                ) % group_count
+                pair_indices = torch.arange(
+                    group_index * group_size,
+                    (group_index + 1) * group_size,
+                    device=q.device,
+                )
+                count = group_size
+                pair_queries_source = q.index_select(0, pair_indices)
+                pair_context_source = contexts[block].index_select(0, pair_indices)
+                pair_token_source = representation_tokens.index_select(0, pair_indices)
+                pair_teacher_source = teacher_float.index_select(0, pair_indices)
+                pair_ka_source = ka.index_select(0, pair_indices)
+                pair_va_source = va.index_select(0, pair_indices)
+                pair_kc_source = kc.index_select(0, pair_indices)
+                pair_vc_source = vc.index_select(0, pair_indices)
                 # Every target/query attends to every candidate reference.
                 # Keeping the query fixed across candidates prevents content
                 # or probe identity from solving the matching task.
-                candidate_queries = q[:, None].expand(
+                candidate_queries = pair_queries_source[:, None].expand(
                     count, count, -1, -1, -1
                 ).reshape(count * count, *q.shape[1:])
                 # Project each of the N references once, then broadcast the
                 # resulting K/V over N target queries. The old flattened path
                 # repeated the expensive 130x2048 projections N times.
                 with torch.autocast("cuda", dtype=torch.bfloat16):
-                    unique_context = contexts[block]
+                    unique_context = pair_context_source
                     sk = F.linear(unique_context, kw) + adapter.k_up[block](
                         adapter.k_down[block](unique_context)
                     )
@@ -1405,9 +1431,11 @@ def train_offline_kvo_bootstrap(
                     candidate_base = (
                         F.linear(pair_attended, ow)
                         + adapter.o_up[block](adapter.o_down[block](pair_attended))
-                    ).reshape(count, count, *teacher_float.shape[1:])
+                    ).reshape(count, count, *pair_teacher_source.shape[1:])
                     candidate_correction = (
-                        centered_head.all_pairs(representation_tokens, q, block)
+                        centered_head.all_pairs(
+                            pair_token_source, pair_queries_source, block
+                        )
                         if centered_head is not None
                         else torch.zeros_like(candidate_base)
                     )
@@ -1415,7 +1443,9 @@ def train_offline_kvo_bootstrap(
                 candidate_correction = candidate_correction.float()
                 candidate_outputs = candidate_base + candidate_correction
                 candidate_directions = F.normalize(candidate_outputs.flatten(2), dim=-1)
-                teacher_directions = F.normalize(teacher_float.flatten(1), dim=-1)
+                teacher_directions = F.normalize(
+                    pair_teacher_source.flatten(1), dim=-1
+                )
                 similarities = torch.einsum(
                     "bcd,bd->bc", candidate_directions, teacher_directions
                 )
@@ -1428,20 +1458,20 @@ def train_offline_kvo_bootstrap(
                 if float(training.get("functional_all_pairs_weight", 0.0)) > 0:
                     if len({int(row["content_index"]) for row in batch_rows}) != 1:
                         raise RuntimeError("All-pairs training requires one shared content per batch")
-                    pair_q = q[:, None].expand(
+                    pair_q = pair_queries_source[:, None].expand(
                         count, count, -1, -1, -1
                     ).reshape(count * count, *q.shape[1:])
                     with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
                         # The reference artist order is the batch artist order;
                         # broadcast those N unique K/V tensors across targets.
-                        pair_ka = ka[None].expand(count, -1, -1, -1, -1).reshape(
+                        pair_ka = pair_ka_source[None].expand(count, -1, -1, -1, -1).reshape(
                             count * count, *ka.shape[1:]
                         )
-                        pair_va = va[None].expand(count, -1, -1, -1, -1).reshape_as(pair_ka)
-                        pair_kc = kc[:, None].expand(
+                        pair_va = pair_va_source[None].expand(count, -1, -1, -1, -1).reshape_as(pair_ka)
+                        pair_kc = pair_kc_source[:, None].expand(
                             count, count, -1, -1, -1
                         ).reshape(count * count, *kc.shape[1:])
-                        pair_vc = vc[:, None].expand(
+                        pair_vc = pair_vc_source[:, None].expand(
                             count, count, -1, -1, -1
                         ).reshape_as(pair_kc)
                     pair_teacher = (
