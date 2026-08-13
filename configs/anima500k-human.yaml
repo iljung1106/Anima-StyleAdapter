@@ -706,7 +706,7 @@ real_artist_teacher:
   style_token_batch_size: 32
   style_token_prefetch_shards: 4
   offline_bootstrap:
-    output_directory: offline_kvo_reference_head_two_stage_v4
+    output_directory: offline_kvo_reference_head_batch64_v5
     # Reuse the frozen common-effect connector learned on exact synthetic
     # teacher images. Only the reference-conditioned head is updated here.
     initial_checkpoint: ../synthetic_teacher_500x16/offline_kvo_bootstrap_exact512_summary_tokens/checkpoints/best.pt
@@ -796,5 +796,5 @@ real_artist_teacher:
     wandb:
       enabled: true
       project: anima-style-adapter
-      name: real-artist-5000-reference-head-two-stage-v4
-      id: real-artist-5000-reference-head-two-stage-v4
+      name: real-artist-5000-reference-head-batch64-v5
+      id: real-artist-5000-reference-head-batch64-v5
