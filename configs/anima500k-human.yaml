@@ -634,7 +634,7 @@ synthetic_teacher:
     resampler_trainable_encoder_layers: 2
     centered_effect_head: true
     centered_effect_latent_dim: 512
-    centered_effect_learning_rate: 0.0001
+    centered_effect_learning_rate: 0.00005
     centered_effect_max_grad_norm: 1.0
     centered_effect_residual_weight: 1.0
     centered_effect_zero_mean_weight: 0.10
@@ -774,7 +774,7 @@ real_artist_teacher:
     early_stop_patience: 8
     resume: true
     capacity_probe:
-      output_directory: offline_kvo_reference_head_capacity_64_batch64_v4
+      output_directory: offline_kvo_reference_head_capacity_64_batch64_v5
       training_artist_count: 64
       validate_on_training_artists: true
       skip_meta_test: true
@@ -792,7 +792,7 @@ real_artist_teacher:
         enabled: true
         project: anima-style-adapter
         name: real-artist-reference-head-capacity-64-batch64
-        id: real-artist-reference-head-capacity-64-batch64-v4
+        id: real-artist-reference-head-capacity-64-batch64-v5
     wandb:
       enabled: true
       project: anima-style-adapter
