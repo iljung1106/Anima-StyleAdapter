@@ -937,7 +937,13 @@ def train_offline_kvo_bootstrap(
     device = str(cfg.get("device", "cuda"))
     resampler_cfg = config["style_transfer"]["resampler"]
     resampler = load_per_reference_resampler(destination, resampler_cfg, device, trainable=False)
-    adapter = SharedLowRankStyleAdapter(**config["style_transfer"]["adapter"]).to(device)
+    adapter_config = dict(config["style_transfer"]["adapter"])
+    # Offline A0/A1 owns a separately checkpointed centered head. Do not also
+    # instantiate the runtime copy inside the base adapter or its parameters
+    # would be an untrained duplicate outside every optimizer group.
+    if bool(training.get("centered_effect_head", False)):
+        adapter_config["reference_effect_head"] = False
+    adapter = SharedLowRankStyleAdapter(**adapter_config).to(device)
     adapter.aggregator.requires_grad_(False)
     adapter.null_tokens.requires_grad_(False)
     adapter.train()
