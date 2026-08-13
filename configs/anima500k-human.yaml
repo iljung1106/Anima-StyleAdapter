@@ -477,13 +477,13 @@ style_transfer:
       name: anima-style-transfer-high-capacity-native-cross-gate-8000
       id: anima-style-transfer-high-capacity-native-cross-gate-8000-v1
   diagnostics:
-    checkpoint: checkpoints/step-0000250.pt
+    checkpoint: smoke-2-steps/checkpoint.pt
     checkpoints:
-      - checkpoints/step-0000250.pt
-    batch_size: 4
-    batches: 16
-    timesteps: [0.05, 0.15, 0.25, 0.35, 0.45, 0.55, 0.65, 0.75, 0.85, 0.95]
-    generate: true
+      - smoke-2-steps/checkpoint.pt
+    batch_size: 3
+    batches: 2
+    timesteps: [0.2, 0.5, 0.8]
+    generate: false
   overfit:
     checkpoint: checkpoints/step-0001000.pt
     output_name: overfit_exact_self_random_flow_direction005_flow4_2000
