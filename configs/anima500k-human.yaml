@@ -747,9 +747,11 @@ real_artist_teacher:
     checkpoint_discrimination_weight: 2.0
     log_every: 20
     validation_every: 250
-    validation_batches: 32
-    train_heldout_batches: 32
-    meta_test_batches: 32
+    # 16 artists/batch: eight validation batches cover 128 disjoint artists
+    # per checkpoint; the final 16-batch meta pass covers all 250 artists.
+    validation_batches: 8
+    train_heldout_batches: 8
+    meta_test_batches: 16
     checkpoint_every: 500
     minimum_steps: 2000
     early_stop_patience: 8
