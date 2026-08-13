@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import gc
 import math
@@ -23,11 +24,11 @@ import torch
 import torch.nn.functional as F
 from einops import rearrange
 from safetensors import safe_open
-from safetensors.torch import load_file
+from safetensors.torch import load_file, save_file
 from torch import nn
 from PIL import Image, ImageDraw, ImageOps
 
-from .io import read_records, write_json
+from .io import read_records, write_json, write_records
 from .tap_resampler import (
     _joint_token_descriptor,
     _reconstruction_loss,
@@ -162,6 +163,24 @@ class ProductionStyleLoader:
         self.bucket_weights = [len(self.buckets[key]) for key in self.bucket_keys]
         self.text_shards = _TensorShardCache(text_root, int(cfg.get("text_lru_shards", 2)))
         self.latent_shards = _TensorShardCache(latent_root, int(cfg.get("latent_lru_shards", 2)))
+        token_cache = cfg.get("resampler_token_cache")
+        self.token_root = (
+            destination / str(token_cache) if token_cache else None
+        )
+        self.token_by_id: dict[int, dict[str, Any]] = {}
+        self.token_shards: _TensorShardCache | None = None
+        if self.token_root is not None:
+            token_rows = read_records(self.token_root / "manifest.parquet")
+            self.token_by_id = {int(row["id"]): row for row in token_rows}
+            missing = sorted(valid_ids - set(self.token_by_id))
+            if missing:
+                raise RuntimeError(
+                    f"Resampler token cache misses {len(missing)} eligible {self.split} images; "
+                    f"first IDs={missing[:8]}"
+                )
+            self.token_shards = _TensorShardCache(
+                self.token_root, int(cfg.get("resampler_token_lru_shards", 2))
+            )
 
     def episodes_for_step(self, step: int) -> list[StyleEpisode]:
         rng = random.Random(self.seed + step * 1_000_003)
@@ -246,6 +265,34 @@ class ProductionStyleLoader:
             for ref_index, _ in enumerate(item.reference_ids):
                 reference_positions.append((batch_index, ref_index))
                 cursor += 1
+
+        if self.token_shards is not None:
+            token_values: dict[int, torch.Tensor] = {}
+            grouped_tokens: dict[str, list[int]] = defaultdict(list)
+            for image_id in dict.fromkeys(flat_references + target_ids):
+                row = self.token_by_id[image_id]
+                grouped_tokens[str(row["token_shard"])].append(image_id)
+            for shard_name, image_ids in grouped_tokens.items():
+                shard = self.token_shards.get(shard_name)["tokens"]
+                for image_id in image_ids:
+                    token_values[image_id] = shard[
+                        int(self.token_by_id[image_id]["token_row"])
+                    ]
+            reference_tokens = torch.stack(
+                [token_values[image_id] for image_id in flat_references]
+            )
+            target_tokens = torch.stack(
+                [token_values[image_id] for image_id in target_ids]
+            )
+            return {
+                "episodes": episodes,
+                "latents": latent_batch.pin_memory(),
+                "conditioning": condition_batch.pin_memory(),
+                "cached_reference_tokens": reference_tokens.pin_memory(),
+                "cached_target_tokens": target_tokens.pin_memory(),
+                "reference_positions": reference_positions,
+                "reference_mask": reference_mask.pin_memory(),
+            }
 
         feature_values: dict[int, dict[int, torch.Tensor]] = {}
         global_values: dict[int, torch.Tensor] = {}
@@ -415,13 +462,20 @@ class MinimalSlotSetAggregator(nn.Module):
         _, refs, slots, dim = references.shape
         if (slots, dim) != (self.slots, self.dim):
             raise ValueError(f"Expected slots/dim {(self.slots, self.dim)}, got {(slots, dim)}")
+        valid_counts = reference_mask.sum(dim=1)
         # Exact-self bootstrap bypasses every learned aggregation parameter.
+        # Use the mask rather than the padded reference dimension: batches can
+        # mix one- and multi-reference episodes.
         if refs == 1:
             return F.layer_norm(references[:, 0], (dim,))
         scores = self.score(references).squeeze(-1)
         scores = scores.masked_fill(~reference_mask[:, :, None], -torch.inf)
         pooled = torch.einsum("brs,brsd->bsd", scores.softmax(dim=1), references)
-        return F.layer_norm(pooled + self.residual(pooled), (dim,))
+        result = F.layer_norm(pooled + self.residual(pooled), (dim,))
+        single_rows = valid_counts == 1
+        single = (references * reference_mask[:, :, None, None]).sum(dim=1)
+        exact = F.layer_norm(single, (dim,))
+        return torch.where(single_rows[:, None, None], exact, result)
 
 
 class ConnectorTransformerLayer(nn.Module):
@@ -1071,6 +1125,181 @@ def load_per_reference_resampler(
     return model
 
 
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(8 * 1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def cache_production_resampler_tokens(
+    config: dict[str, Any], destination: Path
+) -> dict[str, Any]:
+    """Cache frozen Resampler outputs for every production style feature."""
+    cfg = config["style_transfer"]
+    loader_cfg = cfg["loader"]
+    cache_cfg = cfg.get("resampler_token_cache", {})
+    output = destination / str(
+        cache_cfg.get("output_directory", "production_resampler_tokens")
+    )
+    output.mkdir(parents=True, exist_ok=True)
+    feature_root = destination / str(loader_cfg["style_cache"])
+    feature_rows = read_records(feature_root / "manifest.parquet")
+    checkpoint = destination / str(cfg["resampler"]["checkpoint"])
+    checkpoint_sha256 = _file_sha256(checkpoint)
+    final_manifest = output / "manifest.parquet"
+    summary_path = output / "summary.json"
+    if final_manifest.exists() and summary_path.exists():
+        summary = json.loads(summary_path.read_text(encoding="utf-8"))
+        if summary.get("resampler_checkpoint_sha256") != checkpoint_sha256:
+            raise RuntimeError("Production Resampler token cache checkpoint mismatch")
+        if int(summary.get("images", -1)) == len(feature_rows):
+            return {**summary, "reused": len(feature_rows)}
+
+    grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for row in feature_rows:
+        grouped[str(row["feature_shard"])].append(row)
+    device = str(cache_cfg.get("device", cfg["training"].get("device", "cuda")))
+    resampler = load_per_reference_resampler(
+        destination, cfg["resampler"], device, trainable=False
+    )
+    batch_size = int(cache_cfg.get("batch_size", 32))
+    prefetch_shards = max(1, int(cache_cfg.get("prefetch_shards", 4)))
+    records: list[dict[str, Any]] = []
+    shard_groups = sorted(grouped.items())
+
+    def read_feature_shard(item):
+        feature_shard, rows = item
+        batches = []
+        with safe_open(feature_root / feature_shard, framework="pt", device="cpu") as handle:
+            for offset in range(0, len(rows), batch_size):
+                part = rows[offset : offset + batch_size]
+                ids = [int(row["id"]) for row in part]
+                layer18 = [
+                    handle.get_tensor(f"{image_id}.layer_18_spatial")
+                    for image_id in ids
+                ]
+                layer24 = [
+                    handle.get_tensor(f"{image_id}.layer_24_spatial")
+                    for image_id in ids
+                ]
+                batches.append(
+                    {
+                        "layer18": torch.nn.utils.rnn.pad_sequence(
+                            layer18, batch_first=True
+                        ).pin_memory(),
+                        "layer24": torch.nn.utils.rnn.pad_sequence(
+                            layer24, batch_first=True
+                        ).pin_memory(),
+                        "counts": torch.tensor(
+                            [value.shape[0] for value in layer18]
+                        ).pin_memory(),
+                        "global": torch.stack(
+                            [
+                                handle.get_tensor(
+                                    f"{image_id}.layer_24_siglip_cls"
+                                )
+                                for image_id in ids
+                            ]
+                        ).pin_memory(),
+                    }
+                )
+        return feature_shard, rows, batches
+
+    executor = ThreadPoolExecutor(max_workers=prefetch_shards)
+    pending = []
+    iterator = iter(shard_groups)
+    for _ in range(prefetch_shards):
+        item = next(iterator, None)
+        if item is not None:
+            pending.append(executor.submit(read_feature_shard, item))
+    started = time.perf_counter()
+    try:
+        for shard_index in range(len(shard_groups)):
+            _, rows, batches = pending.pop(0).result()
+            item = next(iterator, None)
+            if item is not None:
+                pending.append(executor.submit(read_feature_shard, item))
+            token_name = f"part-{shard_index:05d}.safetensors"
+            token_path = output / token_name
+            row_path = output / f"part-{shard_index:05d}.parquet"
+            if token_path.exists() and row_path.exists():
+                records.extend(read_records(row_path))
+                print(
+                    f"reused production Resampler token shard "
+                    f"{shard_index + 1}/{len(shard_groups)}",
+                    flush=True,
+                )
+                continue
+            token_parts = []
+            for batch in batches:
+                features = {
+                    18: batch["layer18"].to(device, non_blocking=True),
+                    24: batch["layer24"].to(device, non_blocking=True),
+                }
+                counts = batch["counts"].to(device, non_blocking=True)
+                mask = torch.arange(features[18].shape[1], device=device)[None] < counts[:, None]
+                global_features = batch["global"].to(device, non_blocking=True)
+                with torch.inference_mode(), torch.autocast(
+                    "cuda", dtype=torch.bfloat16, enabled=device.startswith("cuda")
+                ):
+                    _, tokens = resampler.encode(features, mask, global_features)
+                token_parts.append(tokens.to("cpu", dtype=torch.bfloat16))
+            tokens = torch.cat(token_parts).contiguous()
+            if tuple(tokens.shape[1:]) != (128, 1024) or not torch.isfinite(tokens).all():
+                raise RuntimeError(f"Invalid production token shard: {tuple(tokens.shape)}")
+            temporary = token_path.with_suffix(".safetensors.tmp")
+            save_file({"tokens": tokens}, temporary)
+            temporary.replace(token_path)
+            shard_records = [
+                {
+                    "id": int(row["id"]),
+                    "artist": str(row["artist"]),
+                    "style_id": str(row.get("style_id", row["artist"])),
+                    "split": str(row.get("split", "train")),
+                    "token_shard": token_name,
+                    "token_row": index,
+                    "slots": 128,
+                    "style_dim": 1024,
+                    "resampler_checkpoint_sha256": checkpoint_sha256,
+                }
+                for index, row in enumerate(rows)
+            ]
+            write_records(row_path, shard_records)
+            records.extend(shard_records)
+            elapsed = max(time.perf_counter() - started, 1e-6)
+            print(
+                f"cached production Resampler token shard "
+                f"{shard_index + 1}/{len(shard_groups)} "
+                f"({len(records)}/{len(feature_rows)} images, "
+                f"{len(records) / elapsed:.1f} img/s)",
+                flush=True,
+            )
+    finally:
+        executor.shutdown(wait=True)
+    if {int(row["id"]) for row in records} != {
+        int(row["id"]) for row in feature_rows
+    }:
+        raise RuntimeError("Production Resampler token cache ID set mismatch")
+    write_records(final_manifest, sorted(records, key=lambda row: int(row["id"])))
+    summary = {
+        "images": len(records),
+        "shards": len(shard_groups),
+        "slots": 128,
+        "style_dim": 1024,
+        "dtype": "bfloat16",
+        "resampler_checkpoint": str(cfg["resampler"]["checkpoint"]),
+        "resampler_checkpoint_sha256": checkpoint_sha256,
+        "storage_bytes": sum(
+            path.stat().st_size for path in output.glob("part-*.safetensors")
+        ),
+        "elapsed_s": time.perf_counter() - started,
+    }
+    write_json(summary_path, summary)
+    return summary
+
+
 def _pack_reference_tokens(tokens, batch: dict[str, Any]) -> torch.Tensor:
     batch_size, max_refs = batch["reference_mask"].shape
     packed = tokens.new_zeros(batch_size, max_refs, tokens.shape[1], tokens.shape[2])
@@ -1080,6 +1309,11 @@ def _pack_reference_tokens(tokens, batch: dict[str, Any]) -> torch.Tensor:
 
 
 def _encode_reference_tokens(model, batch: dict[str, Any], device: str) -> torch.Tensor:
+    if "cached_reference_tokens" in batch:
+        tokens = batch["cached_reference_tokens"].to(
+            device, non_blocking=device.startswith("cuda")
+        )
+        return _pack_reference_tokens(tokens, batch)
     non_blocking = device.startswith("cuda")
     features = {key: value.to(device, non_blocking=non_blocking) for key, value in batch["features"].items()}
     mask = batch["feature_mask"].to(device, non_blocking=non_blocking)
@@ -1090,6 +1324,10 @@ def _encode_reference_tokens(model, batch: dict[str, Any], device: str) -> torch
 
 
 def _encode_target_tokens(model, batch: dict[str, Any], device: str) -> torch.Tensor:
+    if "cached_target_tokens" in batch:
+        return batch["cached_target_tokens"].to(
+            device, non_blocking=device.startswith("cuda")
+        )
     non_blocking = device.startswith("cuda")
     features = {
         key: value.to(device, non_blocking=non_blocking)
@@ -1426,9 +1664,9 @@ def _optimize_frozen_anima(
     return counts
 
 
-def _parameter_grad_norm(parameters) -> float:
+def _parameter_grad_norm(parameters) -> torch.Tensor:
     values = [value.grad.detach().float().norm() for value in parameters if value.grad is not None]
-    return float(torch.stack(values).norm()) if values else 0.0
+    return torch.stack(values).norm() if values else torch.tensor(0.0)
 
 
 def _clip_style_gradient_groups(
@@ -1437,7 +1675,7 @@ def _clip_style_gradient_groups(
     output_parameters: list[nn.Parameter],
     gate_parameters: list[nn.Parameter],
     training: dict[str, Any],
-) -> dict[str, float]:
+) -> dict[str, torch.Tensor]:
     """Clip functional adapter paths independently.
 
     Timestep-gate gradients can be much larger than the K/V and output-path
@@ -1459,10 +1697,10 @@ def _clip_style_gradient_groups(
         "gate": float(training.get("gate_max_grad_norm", default)),
     }
     norms = {
-        name: float(torch.nn.utils.clip_grad_norm_(parameters, limits[name]))
+        name: torch.nn.utils.clip_grad_norm_(parameters, limits[name])
         for name, parameters in groups.items()
     }
-    norms["combined"] = math.sqrt(sum(value * value for value in norms.values()))
+    norms["combined"] = torch.stack(list(norms.values())).square().sum().sqrt()
     return norms
 
 
@@ -1718,15 +1956,13 @@ def _replace_reference_with_target(
     include_target: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Insert target without changing each episode's total reference count."""
-    reference_mask = reference_mask.clone()
+    references = references.clone()
     ordinary_counts = reference_mask.sum(dim=1)
     rows = torch.nonzero(include_target, as_tuple=False).flatten()
     if rows.numel() > 0:
-        reference_mask[rows, ordinary_counts[rows].sub(1).clamp_min(0)] = False
-    return (
-        torch.cat((references, target_tokens[:, None]), dim=1),
-        torch.cat((reference_mask, include_target[:, None]), dim=1),
-    )
+        replace_at = ordinary_counts[rows].sub(1).clamp_min(0)
+        references[rows, replace_at] = target_tokens[rows]
+    return references, reference_mask
 
 
 @contextmanager
@@ -1856,6 +2092,7 @@ def _forward_flow_loss(
     loss_config: dict[str, Any] | None = None,
     step: int = 0,
     oracle_adapter: SharedLowRankStyleAdapter | None = None,
+    collect_details: bool = True,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
     loss_config = loss_config or {}
     curriculum = _self_reference_curriculum_state(
@@ -1929,6 +2166,13 @@ def _forward_flow_loss(
                     torch.cat((flat_reference_tokens, target_style_tokens), dim=0),
                     float(loss_config.get("resampler_diversity_margin", 0.20)),
                 )
+        elif "cached_target_tokens" in batch and (
+            target_probability > 0 or curriculum["oracle_required"] or any(
+                float(loss_config.get(key, 0.0)) > 0
+                for key in ("style_token_contrastive_weight", "style_kv_contrastive_weight")
+            )
+        ):
+            target_style_tokens = _encode_target_tokens(resampler, batch, device)
         elif target_probability > 0 or curriculum["oracle_required"] or any(
             float(loss_config.get(key, 0.0)) > 0
             for key in ("style_token_contrastive_weight", "style_kv_contrastive_weight")
@@ -1984,6 +2228,9 @@ def _forward_flow_loss(
                 apply_dropout=False,
             )
         style_tokens = raw_style_tokens
+        dropped = torch.zeros(
+            style_tokens.shape[0], dtype=torch.bool, device=style_tokens.device
+        )
         if adapter.training and adapter.style_dropout > 0:
             dropped = torch.rand(
                 style_tokens.shape[0], device=style_tokens.device
@@ -2033,7 +2280,9 @@ def _forward_flow_loss(
                 < reference_rank_probability
             )
         )
-        exact_self_supervision_active = bool(target_included.any()) and any(
+        exact_self_mask = target_included & ~dropped
+        exact_self_fraction = exact_self_mask.float().mean()
+        exact_self_supervision_active = bool(exact_self_mask.any()) and any(
             float(loss_config.get(key, 0.0)) > 0
             for key in (
                 "exact_self_residual_weight",
@@ -2132,9 +2381,9 @@ def _forward_flow_loss(
             and exact_self_supervision_active
         ):
             exact_self_losses = _exact_self_residual_losses(
-                prediction[target_included], bypass_prediction[target_included],
-                target_velocity[target_included], noisy.float()[target_included],
-                latents.float()[target_included], sigma.float()[target_included],
+                prediction[exact_self_mask], bypass_prediction[exact_self_mask],
+                target_velocity[exact_self_mask], noisy.float()[exact_self_mask],
+                latents.float()[exact_self_mask], sigma.float()[exact_self_mask],
                 scale_floor=float(loss_config.get("exact_self_scale_floor", 1e-3)),
                 huber_beta=float(loss_config.get("exact_self_huber_beta", 0.1)),
             )
@@ -2301,13 +2550,14 @@ def _forward_flow_loss(
         flow_weight = float(loss_config.get("style_flow_loss_weight", 1.0))
         loss = (
             flow_weight * flow_loss
-            + exact_self_residual_weight * exact_self_losses["normalized_huber"]
+            + exact_self_fraction * exact_self_residual_weight
+            * exact_self_losses["normalized_huber"]
             + float(loss_config.get("exact_self_direction_weight", 0.0))
-            * exact_self_losses["direction"]
+            * exact_self_fraction * exact_self_losses["direction"]
             + float(loss_config.get("exact_self_log_rms_weight", 0.0))
-            * exact_self_losses["log_rms"]
+            * exact_self_fraction * exact_self_losses["log_rms"]
             + float(loss_config.get("exact_self_x0_weight", 0.0))
-            * exact_self_losses["x0"]
+            * exact_self_fraction * exact_self_losses["x0"]
             + oracle_weight * oracle_distill_loss
             + magnitude_weight * magnitude_loss
             + direction_weight * direction_loss
@@ -2326,6 +2576,9 @@ def _forward_flow_loss(
                 * resampler_diversity
             )
         )
+    if not collect_details:
+        adapter.reset_runtime_stats()
+        return loss, {}
     return loss, {
         "references": int(reference_mask.sum()),
         "latent_shape": list(latents.shape),
@@ -2358,6 +2611,8 @@ def _forward_flow_loss(
         "style_magnitude_floor": magnitude_floor,
         "target_reference_probability": target_probability,
         "target_reference_fraction": float(target_included.float().mean()),
+        "exact_self_supervision_fraction": float(exact_self_fraction.detach()),
+        "style_dropout_fraction": float(dropped.float().mean().detach()),
         "aggregator_trainable": any(
             parameter.requires_grad for parameter in adapter.aggregator.parameters()
         ),
@@ -2397,6 +2652,7 @@ def _validate_style_adapter(
     seed: int,
     step: int = 0,
     loss_config: dict[str, Any] | None = None,
+    reference_mode: str = "heldout",
 ) -> dict[str, float]:
     anima.eval()
     adapter.eval()
@@ -2410,9 +2666,19 @@ def _validate_style_adapter(
         for index in range(batches):
             batch = loader.load_step(index)
             generator = torch.Generator(device=device).manual_seed(seed + index)
+            validation_config = {**(loss_config or {}), "measure_bypass": True}
+            if reference_mode == "self":
+                validation_config["curriculum"] = {
+                    "gate_only_steps": 0,
+                    "self_reference_steps": max(1, step),
+                }
+            elif reference_mode == "heldout":
+                validation_config["curriculum"] = {}
+            elif reference_mode != "curriculum":
+                raise ValueError(f"Unknown validation reference mode: {reference_mode}")
             loss, details = _forward_flow_loss(
                 anima, adapter, resampler, batch, device, generator=generator,
-                loss_config={**(loss_config or {}), "measure_bypass": True},
+                loss_config=validation_config,
                 step=step,
             )
             # Validation reports the actual flow objective. Auxiliary training
@@ -2736,6 +3002,190 @@ def _sample_style_adapter(
     anima.train()
     adapter.train()
     return sheet_path, vae, time.perf_counter() - started
+
+
+@torch.no_grad()
+def _sample_style_adapter_batch(
+    anima: nn.Module,
+    adapter: SharedLowRankStyleAdapter,
+    resampler: nn.Module,
+    requests: list[tuple[str, ProductionStyleLoader, int, int]],
+    config: dict[str, Any],
+    destination: Path,
+    output: Path,
+    device: str,
+    step: int,
+    vae: nn.Module | None,
+    *,
+    reference_mode: str,
+) -> tuple[list[tuple[str, Path]], nn.Module, float]:
+    """Render the fixed panel in GPU batches while keeping VAE resident."""
+    sample_cfg = config["style_transfer"]["sampling"]
+    started = time.perf_counter()
+    anima.eval()
+    adapter.eval()
+    batches = [loader.load_step(episode_index) for _, loader, episode_index, _ in requests]
+    positive_text = torch.cat(
+        [batch["conditioning"][:1] for batch in batches]
+    ).to(device, dtype=torch.bfloat16)
+    positive_styles = []
+    sources_by_request = []
+    for batch in batches:
+        episode = batch["episodes"][0]
+        sources = [("target", episode.target_id)]
+        if reference_mode == "self":
+            references = _encode_target_tokens(resampler, batch, device)[:, None]
+            mask = torch.ones(references.shape[:2], dtype=torch.bool, device=device)
+            sources.append(("exact target", episode.target_id))
+        else:
+            references = _encode_reference_tokens(resampler, batch, device)
+            mask = batch["reference_mask"].to(device, non_blocking=True)
+            sources.extend(
+                (f"ref {index + 1}", image_id)
+                for index, image_id in enumerate(episode.reference_ids[:4])
+            )
+        positive_styles.append(adapter.aggregate(references, mask)[:1])
+        sources_by_request.append(sources)
+    positive_style = torch.cat(positive_styles)
+    batch_size = len(requests)
+    first_loader = requests[0][1]
+    null_text = load_file(
+        first_loader.text_root / "null_conditioning.safetensors", device="cpu"
+    )["empty_prompt"]
+    if null_text.ndim == 2:
+        null_text = null_text.unsqueeze(0)
+    null_text = _pad_text_conditions(
+        [null_text[0]] * batch_size, first_loader.text_conditioning_length
+    ).to(device, dtype=torch.bfloat16)
+    null_style = adapter.unconditional(batch_size)
+    height = int(sample_cfg.get("height", 768))
+    width = int(sample_cfg.get("width", 768))
+    latent_h, latent_w = height // 8, width // 8
+    noises = []
+    for _, _, _, sample_seed in requests:
+        generator = torch.Generator(device="cpu").manual_seed(sample_seed)
+        noises.append(
+            torch.randn(
+                1, 16, 1, latent_h, latent_w,
+                generator=generator, dtype=torch.float32,
+            )
+        )
+    initial_noise = torch.cat(noises).to(device=device, dtype=torch.bfloat16)
+    steps = int(sample_cfg.get("steps", 30))
+    sigmas = torch.linspace(1.0, 0.0, steps + 1, device=device, dtype=torch.bfloat16)
+    shift = float(sample_cfg.get("flow_shift", 3.0))
+    sigmas = (sigmas * shift) / (1 + (shift - 1) * sigmas)
+    padding_mask = torch.zeros(
+        batch_size, 1, latent_h, latent_w, device=device, dtype=torch.bfloat16
+    )
+    text_scale = float(sample_cfg.get("text_cfg", 4.0))
+    style_scale = float(sample_cfg.get("style_cfg", 1.0))
+
+    def predict(x, text, style, timestep):
+        adapter.set_style_tokens(style)
+        return anima(
+            x, timestep.expand(batch_size), context=text,
+            padding_mask=padding_mask, target_input_ids=None,
+        ).float()
+
+    def denoise(with_style: bool):
+        x = initial_noise.clone()
+        for index in range(steps):
+            timestep = sigmas[index].to(torch.bfloat16)
+            if with_style:
+                base = predict(x, null_text, null_style, timestep)
+                text_only = predict(x, positive_text, null_style, timestep)
+                full = predict(x, positive_text, positive_style, timestep)
+                velocity = (
+                    base + text_scale * (text_only - base)
+                    + style_scale * (full - text_only)
+                )
+            else:
+                adapter.clear_style_tokens()
+                base = anima(
+                    x, timestep.expand(batch_size), context=null_text,
+                    padding_mask=padding_mask, target_input_ids=None,
+                ).float()
+                text_only = anima(
+                    x, timestep.expand(batch_size), context=positive_text,
+                    padding_mask=padding_mask, target_input_ids=None,
+                ).float()
+                velocity = base + text_scale * (text_only - base)
+            x = (
+                x.float() + velocity
+                * (sigmas[index + 1] - sigmas[index]).float()
+            ).to(torch.bfloat16)
+        return x
+
+    try:
+        with torch.autocast(
+            device_type="cuda", dtype=torch.bfloat16, enabled=device.startswith("cuda")
+        ):
+            base_x = denoise(False)
+            styled_x = denoise(True)
+    finally:
+        adapter.clear_style_tokens()
+    if not torch.isfinite(base_x).all() or not torch.isfinite(styled_x).all():
+        raise FloatingPointError("Non-finite latent in batched qualitative sampling")
+    if vae is None:
+        vae = _load_sampling_vae(config, destination)
+    vae.to(device=device, dtype=torch.bfloat16)
+    generated_latents = torch.cat((base_x, styled_x), dim=0)
+    vae_batch_size = max(1, int(sample_cfg.get("vae_batch_size", 4)))
+    decoded = torch.cat([
+        vae.decode_to_pixels(generated_latents[offset : offset + vae_batch_size]).float()
+        for offset in range(0, generated_latents.shape[0], vae_batch_size)
+    ])
+    # Cached targets preserve their original aspect buckets, so they cannot be
+    # stacked. They are display-only and cheap relative to 30-step generation.
+    target_decoded = [
+        vae.decode_to_pixels(
+            batch["latents"][:1].to(
+                device=device, dtype=torch.bfloat16
+            ).unsqueeze(2)
+        ).float()[0]
+        for batch in batches
+    ]
+
+    def to_image(value):
+        if value.ndim == 4:
+            value = value[:, 0]
+        pixels = (
+            (value.clamp(-1, 1) + 1) * 127.5
+        ).byte().permute(1, 2, 0).cpu().numpy()
+        return Image.fromarray(pixels)
+
+    records = []
+    cfg_label = f"{style_scale:g}".replace(".", "p")
+    for index, ((split_name, loader, episode_index, _), batch, sources) in enumerate(
+        zip(requests, batches, sources_by_request, strict=True)
+    ):
+        sample_dir = output / "samples" / split_name
+        sample_dir.mkdir(parents=True, exist_ok=True)
+        episode_label = f"-episode-{episode_index:05d}"
+        raw_path = sample_dir / (
+            f"step-{step:07d}{episode_label}-{reference_mode}-style-cfg-{cfg_label}.png"
+        )
+        sheet_path = sample_dir / (
+            f"step-{step:07d}{episode_label}-{reference_mode}-style-cfg-{cfg_label}-sheet.png"
+        )
+        base_image = to_image(decoded[index])
+        styled_image = to_image(decoded[batch_size + index])
+        styled_image.save(raw_path)
+        base_image.save(sample_dir / f"step-{step:07d}{episode_label}-base.png")
+        to_image(target_decoded[index]).save(
+            sample_dir / f"step-{step:07d}{episode_label}-cached-target.png"
+        )
+        _make_sample_sheet(
+            styled_image, loader, batch, base_generated=base_image,
+            generated_label=(
+                f"styled CFG {style_scale:g} ({reference_mode}) — "
+                f"{batch['episodes'][0].style_id}"
+            ),
+            sources=sources,
+        ).save(sheet_path)
+        records.append((split_name, sheet_path))
+    return records, vae, time.perf_counter() - started
 
 
 def _select_distinct_style_episode_indices(
@@ -4009,7 +4459,10 @@ def train_style_adapter(config: dict[str, Any], destination: Path, *, steps_over
     }
     train_sample_loader = ProductionStyleLoader(destination, train_sample_loader_cfg)
     resampler = load_per_reference_resampler(
-        destination, cfg["resampler"], device, trainable=True
+        destination,
+        cfg["resampler"],
+        device,
+        trainable=int(training.get("resampler_train_start_step", -1)) >= 0,
     )
     anima = _resolve_anima_model(config, destination, device)
     anima.requires_grad_(False).train()
@@ -4048,7 +4501,11 @@ def train_style_adapter(config: dict[str, Any], destination: Path, *, steps_over
     output_lr = float(training.get("output_learning_rate", representation_lr))
     gate_lr = float(training.get("gate_learning_rate", output_lr))
     resampler_lr = float(training.get("resampler_learning_rate", representation_lr * 0.1))
-    resampler_parameters = list(resampler.parameters())
+    resampler_parameters = (
+        list(resampler.parameters())
+        if int(training.get("resampler_train_start_step", -1)) >= 0
+        else []
+    )
     weight_decay = float(training.get("weight_decay", 0.01))
     optimizer = torch.optim.AdamW(
         [
@@ -4070,12 +4527,15 @@ def train_style_adapter(config: dict[str, Any], destination: Path, *, steps_over
                 "weight_decay": 0.0,
                 "name": "gate",
             },
-            {
-                "params": resampler_parameters,
-                "lr": resampler_lr,
-                "weight_decay": weight_decay,
-                "name": "resampler",
-            },
+            *(
+                [{
+                    "params": resampler_parameters,
+                    "lr": resampler_lr,
+                    "weight_decay": weight_decay,
+                    "name": "resampler",
+                }]
+                if resampler_parameters else []
+            ),
         ],
         eps=float(training.get("adapter_adam_eps", 1e-6)),
     )
@@ -4093,11 +4553,12 @@ def train_style_adapter(config: dict[str, Any], destination: Path, *, steps_over
     base_learning_rates = [float(group["lr"]) for group in optimizer.param_groups]
     bridge_base_learning_rate = bridge_lr
     print(
-        "style optimizer: FP32 trainable weights, BF16 autocast; adapter=RAdam "
+        "style optimizer: FP32 trainable weights, BF16 autocast; adapter=AdamW "
         f"bridge=RAdam(lr={bridge_lr:g},warmup={int(training.get('bridge_warmup_steps', 400))},"
         f"eps={float(training.get('bridge_adam_eps', 1e-6)):g}) "
         f"representation_lr={representation_lr:g} output_lr={output_lr:g} "
-        f"gate_lr={gate_lr:g} resampler_lr={resampler_lr:g}",
+        f"gate_lr={gate_lr:g} "
+        f"resampler={'AdamW(lr=' + format(resampler_lr, 'g') + ')' if resampler_parameters else 'frozen/external'}",
         flush=True,
     )
     schedule_steps = int(training["steps"])
@@ -4292,6 +4753,14 @@ def train_style_adapter(config: dict[str, Any], destination: Path, *, steps_over
         data_wait = 0.0
         accumulated_loss = 0.0
         details = None
+        collect_step_details = (
+            step == start_step + 1
+            or step % log_every == 0
+            or step == steps
+            or (validation_every > 0 and step % validation_every == 0)
+            or (sample_every > 0 and step % sample_every == 0)
+            or (checkpoint_every > 0 and step % checkpoint_every == 0)
+        )
         numeric_detail_samples: dict[str, list[float]] = defaultdict(list)
         boolean_detail_any: dict[str, bool] = defaultdict(bool)
         for _ in range(accumulation_steps):
@@ -4301,8 +4770,10 @@ def train_style_adapter(config: dict[str, Any], destination: Path, *, steps_over
             loss, details = _forward_flow_loss(
                 anima, adapter, resampler, batch, device,
                 loss_config=training, step=step, oracle_adapter=oracle_adapter,
+                collect_details=collect_step_details,
             )
-            accumulated_loss += float(loss.detach()) / accumulation_steps
+            if collect_step_details:
+                accumulated_loss += float(loss.detach()) / accumulation_steps
             for key, value in details.items():
                 if isinstance(value, bool):
                     boolean_detail_any[key] = boolean_detail_any[key] or value
@@ -4338,43 +4809,65 @@ def train_style_adapter(config: dict[str, Any], destination: Path, *, steps_over
                 "gate": float("nan"),
             }
             grad_norm = float(global_norm)
-        resampler_grad_norm = torch.nn.utils.clip_grad_norm_(
-            resampler_parameters,
-            float(training.get("resampler_max_grad_norm", 0.25)),
+        resampler_grad_norm = (
+            torch.nn.utils.clip_grad_norm_(
+                resampler_parameters,
+                float(training.get("resampler_max_grad_norm", 0.25)),
+            )
+            if resampler_parameters
+            else 0.0
         )
-        group_grads = {
-            "bridge_grad_norm": clipped_norms.get("bridge", float("nan")),
+        group_grad_tensors = {
+            "bridge_grad_norm": clipped_norms.get("bridge", torch.tensor(float("nan"))),
             "representation_grad_norm": clipped_norms["representation"],
             "output_grad_norm": clipped_norms["output"],
             "gate_grad_norm": clipped_norms["gate"],
-            "aggregator_grad": _parameter_grad_norm(adapter.aggregator.parameters()),
-            "shared_kv_grad": _parameter_grad_norm(adapter.kv_parameters()),
-            "style_output_grad": _parameter_grad_norm(adapter.output_parameters()),
-            "gate_grad": _parameter_grad_norm(adapter.gate_parameters()),
-            "resampler_grad": _parameter_grad_norm(resampler.parameters()),
-            "resampler_grad_norm": float(resampler_grad_norm),
         }
-        bridge_weights_before = [value.detach().clone() for value in bridge_parameters]
-        bridge_weight_norm_before = math.sqrt(
-            sum(float(value.detach().float().square().sum()) for value in bridge_parameters)
-        )
+        if collect_step_details:
+            group_grad_tensors.update({
+                "aggregator_grad": _parameter_grad_norm(adapter.aggregator.parameters()),
+                "shared_kv_grad": _parameter_grad_norm(adapter.kv_parameters()),
+                "style_output_grad": _parameter_grad_norm(adapter.output_parameters()),
+                "gate_grad": _parameter_grad_norm(adapter.gate_parameters()),
+                "resampler_grad": _parameter_grad_norm(resampler_parameters),
+                "resampler_grad_norm": torch.as_tensor(resampler_grad_norm),
+            })
+            bridge_weights_before = [
+                value.detach().clone() for value in bridge_parameters
+            ]
+            bridge_weight_norm_before_tensor = torch.stack([
+                value.detach().float().square().sum() for value in bridge_parameters
+            ]).sum().sqrt()
         optimizer.step()
         bridge_optimizer.step()
-        bridge_update_norm = math.sqrt(
-            sum(
-                float((value.detach().float() - before.float()).square().sum())
-                for value, before in zip(bridge_parameters, bridge_weights_before, strict=True)
+        if not collect_step_details:
+            continue
+        bridge_update_norm_tensor = torch.stack([
+            (value.detach().float() - before.float()).square().sum()
+            for value, before in zip(
+                bridge_parameters, bridge_weights_before, strict=True
             )
-        )
-        bridge_weight_norm = math.sqrt(
-            sum(float(value.detach().float().square().sum()) for value in bridge_parameters)
-        )
+        ]).sum().sqrt()
+        bridge_weight_norm_tensor = torch.stack([
+            value.detach().float().square().sum() for value in bridge_parameters
+        ]).sum().sqrt()
+        # This is intentionally restricted to logging/checkpoint/validation
+        # steps. Synchronizing these scalars on every microbatch previously
+        # serialized the otherwise asynchronous CUDA pipeline.
+        group_grads = {
+            name: float(torch.as_tensor(value))
+            for name, value in group_grad_tensors.items()
+        }
+        bridge_update_norm = float(bridge_update_norm_tensor)
+        bridge_weight_norm = float(bridge_weight_norm_tensor)
+        bridge_weight_norm_before = float(bridge_weight_norm_before_tensor)
         bridge_update_to_weight_ratio = bridge_update_norm / max(
             bridge_weight_norm_before, 1e-12
         )
         elapsed = time.perf_counter() - data_ready
         row = {
-            "step": step, "loss": accumulated_loss, "grad_norm": float(grad_norm),
+            "step": step, "loss": accumulated_loss,
+            "grad_norm": group_grads.get("bridge_grad_norm", float(grad_norm)),
             "step_s": elapsed, "data_wait_s": data_wait,
             "gradient_accumulation_steps": accumulation_steps,
             "lr_multiplier": lr_multiplier,
@@ -4386,7 +4879,13 @@ def train_style_adapter(config: dict[str, Any], destination: Path, *, steps_over
             "representation_lr": optimizer.param_groups[0]["lr"],
             "output_lr": optimizer.param_groups[1]["lr"],
             "gate_lr": optimizer.param_groups[2]["lr"],
-            "resampler_lr": optimizer.param_groups[3]["lr"],
+            "resampler_lr": (
+                next(
+                    group["lr"] for group in optimizer.param_groups
+                    if group.get("name") == "resampler"
+                )
+                if resampler_parameters else 0.0
+            ),
             "peak_vram_gib": torch.cuda.max_memory_allocated() / (1024**3) if device.startswith("cuda") else 0.0,
             **details, **group_grads,
         }
@@ -4427,6 +4926,7 @@ def train_style_adapter(config: dict[str, Any], destination: Path, *, steps_over
             heldout_validation = _validate_style_adapter(
                 anima, adapter, resampler, validation_loader, device,
                 batches=current_validation_batches, seed=seed ^ 0xA11CE,
+                reference_mode="heldout",
             )
             self_validation = _validate_style_adapter(
                 anima,
@@ -4442,6 +4942,7 @@ def train_style_adapter(config: dict[str, Any], destination: Path, *, steps_over
                 # timestep sampler. Only the curriculum/reference mode should
                 # differ between these paired reports.
                 loss_config={**training, "timestep_sampling": "uniform"},
+                reference_mode="self",
             )
             print(
                 f"validation[heldout] step={step} loss={heldout_validation['loss']:.6f} "
@@ -4485,7 +4986,7 @@ def train_style_adapter(config: dict[str, Any], destination: Path, *, steps_over
             # whether generalization appears as target inclusion is annealed.
             sample_mode = "self" if step <= self_reference_steps else "heldout"
             sample_records: list[tuple[str, Path]] = []
-            sample_elapsed_s = 0.0
+            sample_requests = []
             for split_name, sample_loader, episode_indices, seed_offset in (
                 ("train", train_sample_loader, train_sample_episodes, 0),
                 (
@@ -4496,30 +4997,45 @@ def train_style_adapter(config: dict[str, Any], destination: Path, *, steps_over
                 ),
             ):
                 for artist_index, episode_index in enumerate(episode_indices):
-                    sheet, vae, elapsed_s = _sample_style_adapter(
-                        anima,
-                        adapter,
-                        resampler,
-                        sample_loader,
-                        config,
-                        destination,
-                        output,
-                        device,
-                        step,
-                        vae,
-                        reference_mode=sample_mode,
-                        episode_index=episode_index,
-                        sample_group=split_name,
-                        sample_seed=int(
+                    sample_requests.append(
+                        (
+                            split_name,
+                            sample_loader,
+                            episode_index,
+                            int(
                             cfg.get("sampling", {}).get("seed", seed)
+                            )
+                            + seed_offset
+                            + artist_index,
                         )
-                        + seed_offset
-                        + artist_index,
                     )
+            sample_batch_size = max(
+                1, int(training.get("sample_batch_size", 4))
+            )
+            sample_elapsed_s = 0.0
+            split_counts = defaultdict(int)
+            for offset in range(0, len(sample_requests), sample_batch_size):
+                records, vae, elapsed_s = _sample_style_adapter_batch(
+                    anima, adapter, resampler,
+                    sample_requests[offset : offset + sample_batch_size],
+                    config, destination, output, device, step, vae,
+                    reference_mode=sample_mode,
+                )
+                sample_elapsed_s += elapsed_s
+                for split_name, sheet in records:
+                    split_counts[split_name] += 1
                     sample_records.append(
-                        (f"sample/{split_name}_artist_{artist_index + 1}", sheet)
+                        (
+                            f"sample/{split_name}_artist_{split_counts[split_name]}",
+                            sheet,
+                        )
                     )
-                    sample_elapsed_s += elapsed_s
+            if vae is not None:
+                vae.to("cpu")
+            anima.train()
+            adapter.train()
+            if device.startswith("cuda"):
+                torch.cuda.empty_cache()
             print(
                 f"sample step={step} mode={sample_mode} "
                 f"train_artists={len(train_sample_episodes)} "
@@ -4542,7 +5058,8 @@ def train_style_adapter(config: dict[str, Any], destination: Path, *, steps_over
                 )
         if checkpoint_every and step % checkpoint_every == 0:
             _save_training_state(
-                checkpoint_path, step, adapter, optimizer, cfg, resampler,
+                checkpoint_path, step, adapter, optimizer, cfg,
+                resampler if resampler_parameters else None,
                 {"bridge": bridge_optimizer},
             )
             _archive_training_state(
@@ -4551,14 +5068,18 @@ def train_style_adapter(config: dict[str, Any], destination: Path, *, steps_over
 
     checkpoint = output / "checkpoint.pt"
     _save_training_state(
-        checkpoint_path, steps, adapter, optimizer, cfg, resampler,
+        checkpoint_path, steps, adapter, optimizer, cfg,
+        resampler if resampler_parameters else None,
         {"bridge": bridge_optimizer},
     )
     _archive_training_state(checkpoint_path, checkpoint)
     summary = {
         "steps": steps, "metrics": metrics, "elapsed_s": time.perf_counter() - started,
         "checkpoint": str(checkpoint.resolve()),
-        "trainable_parameters": sum(value.numel() for value in parameters + resampler_parameters),
+        "trainable_parameters": sum(
+            value.numel() for value in parameters + resampler_parameters
+        ),
+        "resampler_checkpoint": str(cfg["resampler"]["checkpoint"]),
     }
     write_json(output / "summary.json", summary)
     if wandb_run is not None:
@@ -4585,7 +5106,19 @@ def smoke_test_style_adapter(config: dict[str, Any], destination: Path) -> dict[
 def benchmark_style_batches(config: dict[str, Any], destination: Path) -> dict[str, Any]:
     """Measure end-to-end training throughput without validation/sample overhead."""
     benchmark_cfg = config["style_transfer"].get("benchmark", {})
-    batch_sizes = [int(value) for value in benchmark_cfg.get("batch_sizes", [4, 8, 16])]
+    candidates = benchmark_cfg.get("candidates")
+    if candidates is None:
+        candidates = [
+            {
+                "batch_size": int(value),
+                "gradient_accumulation_steps": int(
+                    config["style_transfer"]["training"].get(
+                        "gradient_accumulation_steps", 1
+                    )
+                ),
+            }
+            for value in benchmark_cfg.get("batch_sizes", [4, 8, 16])
+        ]
     steps = int(benchmark_cfg.get("steps", 8))
     warmup = int(benchmark_cfg.get("warmup_steps", 2))
     if warmup >= steps:
@@ -4593,10 +5126,14 @@ def benchmark_style_batches(config: dict[str, Any], destination: Path) -> dict[s
     results = []
     benchmark_root = destination / "style_transfer_benchmarks"
     benchmark_root.mkdir(parents=True, exist_ok=True)
-    for batch_size in batch_sizes:
+    for benchmark_candidate in candidates:
+        batch_size = int(benchmark_candidate["batch_size"])
+        accumulation = int(benchmark_candidate["gradient_accumulation_steps"])
         candidate = copy.deepcopy(config)
         style_cfg = candidate["style_transfer"]
-        style_cfg["output_directory"] = f"style_transfer_benchmarks/batch-{batch_size}"
+        style_cfg["output_directory"] = (
+            f"style_transfer_benchmarks/batch-{batch_size}-accum-{accumulation}"
+        )
         style_cfg["loader"]["batch_size"] = batch_size
         training = style_cfg["training"]
         training.update(
@@ -4606,6 +5143,7 @@ def benchmark_style_batches(config: dict[str, Any], destination: Path) -> dict[s
                 "sample_every": 0,
                 "log_every": 1,
                 "resume": False,
+                "gradient_accumulation_steps": accumulation,
             }
         )
         training.setdefault("wandb", {})["enabled"] = False
@@ -4617,12 +5155,13 @@ def benchmark_style_batches(config: dict[str, Any], destination: Path) -> dict[s
             wall_step = mean_compute + mean_wait
             result = {
                 "batch_size": batch_size,
+                "gradient_accumulation_steps": accumulation,
                 "status": "ok",
                 "measured_steps": len(measured),
                 "mean_compute_s": mean_compute,
                 "mean_data_wait_s": mean_wait,
                 "mean_wall_step_s": wall_step,
-                "target_images_s": batch_size / wall_step,
+                "target_images_s": batch_size * accumulation / wall_step,
                 "mean_reference_images": sum(row["references"] for row in measured) / len(measured),
                 "peak_vram_gib": max(row["peak_vram_gib"] for row in summary["metrics"]),
             }

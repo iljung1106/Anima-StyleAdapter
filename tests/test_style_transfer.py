@@ -533,10 +533,12 @@ def test_target_inclusion_replaces_reference_instead_of_exceeding_total_count():
         references, mask, target, include
     )
 
-    assert values.shape == (3, 5, 2, 8)
+    assert values.shape == references.shape
     torch.testing.assert_close(result_mask.sum(1), mask.sum(1))
-    assert result_mask[:, -1].tolist() == [True, False, True]
-    torch.testing.assert_close(values[:, -1], target)
+    torch.testing.assert_close(result_mask, mask)
+    torch.testing.assert_close(values[0, 0], target[0])
+    torch.testing.assert_close(values[1], references[1])
+    torch.testing.assert_close(values[2, 3], target[2])
 
 
 def test_gate_only_stage_then_opens_entire_adapter():
@@ -644,6 +646,10 @@ def test_minimal_aggregator_is_invariant_and_bypasses_single_reference():
     single = values[:, :1]
     expected = torch.nn.functional.layer_norm(single[:, 0], (16,))
     torch.testing.assert_close(model(single, torch.ones(2, 1, dtype=torch.bool)), expected)
+
+    padded = torch.cat((single, torch.randn(2, 2, 4, 16)), dim=1)
+    padded_mask = torch.tensor([[True, False, False], [True, False, False]])
+    torch.testing.assert_close(model(padded, padded_mask), expected)
 
 
 def test_high_capacity_connector_builds_distinct_block_contexts_and_gradients():

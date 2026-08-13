@@ -78,6 +78,7 @@ def build_parser() -> argparse.ArgumentParser:
         ("anima-cache", "Cache all frozen Anima training inputs"),
         ("anima-cache-validate", "Validate packed Anima cache manifests and tensors"),
         ("style-train", "Train the multi-reference Anima style adapter"),
+        ("style-token-cache", "Cache frozen production Resampler tokens"),
         ("style-smoke", "Run two real Anima style-adapter training steps"),
         ("style-benchmark", "Benchmark production style training batch sizes"),
         ("style-sample", "Render frozen-base and styled controls from the current checkpoint"),
@@ -165,7 +166,7 @@ def main() -> None:
     elif args.command == "anima-cache-validate":
         _run(validate_anima_caches, config, destination)
     elif args.command in {
-        "style-train", "style-smoke", "style-benchmark", "style-sample", "style-diagnose",
+        "style-train", "style-token-cache", "style-smoke", "style-benchmark", "style-sample", "style-diagnose",
         "style-overfit", "style-overfit-sample", "style-exact-self-generalize",
         "style-exact-self-sample",
         "style-calibrate",
@@ -173,6 +174,7 @@ def main() -> None:
         # Keep torch/sd-scripts optional for metadata-only commands.
         from .style_transfer import (
             benchmark_style_batches,
+            cache_production_resampler_tokens,
             diagnose_style_reference_dependence,
             overfit_exact_self_batch,
             sample_exact_self_overfit_checkpoint,
@@ -186,6 +188,7 @@ def main() -> None:
 
         stage = {
             "style-train": train_style_adapter,
+            "style-token-cache": cache_production_resampler_tokens,
             "style-smoke": smoke_test_style_adapter,
             "style-benchmark": benchmark_style_batches,
             "style-sample": sample_style_checkpoint,

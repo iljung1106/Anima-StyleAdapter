@@ -46,8 +46,18 @@ Per-reference Resampler도 이 20k 검증 구간에서는 동결한다. 별도�
 - 총 20,000 optimizer steps
 - validation/checkpoint: 250 steps
 - 고정 패널 생성: 500 steps
-- output: `style_transfer_full_train_fresh_20k_v1`
-- W&B: `anima-style-transfer-full-train-fresh-20k-v1`
+- output: `style_transfer_full_train_fresh_20k_v2`
+- W&B: `anima-style-transfer-full-train-fresh-20k-v2`
+
+`validation_self`는 전체 20k 동안 강제로 exact-self 한 장을 사용한다. Target이
+제외되는 커리큘럼과 무관한 고정 진단이며, `validation_heldout`은 항상 target-excluded다.
+Style dropout 10%는 학습 가능한 null style token을 실제 flow objective로 훈련한다.
+Exact-self 보조항은 target이 포함되고 dropout되지 않은 배치 비율만큼 자동 감쇠한다.
+
+Frozen Per-reference Resampler의 128×1024 BF16 출력은 production 전체에 대해
+`production_resampler_tokens_l18_l24_siglip_l24`로 선계산한다. Resampler 본체는
+optimizer와 resumable checkpoint에 넣지 않고, 최종 배포 시 원본 Resampler checkpoint와
+Style Adapter checkpoint를 함께 묶는다.
 
 20k 이후 단계는 이번 실행 결과를 보고 별도로 결정한다. 특히 train/validation 작가의
 스타일 분화, target 제외 전환기의 품질, reference 수 증가 효과를 확인하기 전에는
