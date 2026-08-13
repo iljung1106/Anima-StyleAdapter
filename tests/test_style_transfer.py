@@ -56,6 +56,27 @@ def test_query_conditioned_reference_head_preserves_query_positions():
     assert torch.isfinite(result).all()
 
 
+def test_query_conditioned_reference_head_all_pairs_matches_loop():
+    head = QueryConditionedReferenceHead(
+        style_dim=16, hidden_dim=32, latent_dim=16, blocks=2, heads=4
+    ).eval()
+    with torch.no_grad():
+        head.output[-1].weight.normal_(std=0.01)
+    tokens = torch.randn(3, 8, 16)
+    queries = torch.randn(3, 4, 5, 8)
+    expected = torch.stack([
+        torch.stack([
+            head(tokens[reference : reference + 1], queries[target : target + 1], 1)[0]
+            for reference in range(3)
+        ])
+        for target in range(3)
+    ])
+
+    actual = head.all_pairs(tokens, queries, block=1)
+
+    assert torch.allclose(actual, expected, atol=1e-6, rtol=1e-5)
+
+
 def test_offline_reference_head_checkpoint_loads_into_runtime_adapter():
     kwargs = dict(
         style_dim=16, slots=8, hidden_dim=32, output_dim=32, heads=4,

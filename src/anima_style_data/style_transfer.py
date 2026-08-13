@@ -463,27 +463,54 @@ class QueryConditionedReferenceHead(nn.Module):
         )
         nn.init.zeros_(self.output[-1].weight)
 
-    def forward(
-        self, tokens: torch.Tensor, queries: torch.Tensor, block: int
-    ) -> torch.Tensor:
+    def _style_heads(self, tokens: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        batch = tokens.shape[0]
+        style = F.layer_norm(tokens.float(), (tokens.shape[-1],)).to(tokens.dtype)
+        key, value = self.style_kv(style).chunk(2, dim=-1)
+        return tuple(
+            item.reshape(batch, item.shape[1], self.heads, self.head_dim).transpose(1, 2)
+            for item in (key, value)
+        )
+
+    def _query_heads(self, queries: torch.Tensor, block: int) -> torch.Tensor:
         batch, _, query_count, _ = queries.shape
         query = queries.transpose(1, 2).reshape(batch, query_count, self.hidden_dim)
         query = self.query(
             F.layer_norm(query.float(), (self.hidden_dim,)).to(query.dtype)
         ) + self.block_embedding[block][None, None]
-        style = F.layer_norm(tokens.float(), (tokens.shape[-1],)).to(tokens.dtype)
-        key, value = self.style_kv(style).chunk(2, dim=-1)
+        return query.reshape(
+            batch, query_count, self.heads, self.head_dim
+        ).transpose(1, 2)
 
-        def split_heads(values: torch.Tensor) -> torch.Tensor:
-            return values.reshape(
-                batch, values.shape[1], self.heads, self.head_dim
-            ).transpose(1, 2)
-
+    def forward(
+        self, tokens: torch.Tensor, queries: torch.Tensor, block: int
+    ) -> torch.Tensor:
+        query = self._query_heads(queries, block)
+        key, value = self._style_heads(tokens)
         attended = F.scaled_dot_product_attention(
-            split_heads(query), split_heads(key), split_heads(value)
+            query, key, value
         )
-        attended = attended.transpose(1, 2).reshape(batch, query_count, -1)
+        attended = attended.transpose(1, 2).flatten(2)
         return self.output(attended)
+
+    def all_pairs(
+        self, tokens: torch.Tensor, queries: torch.Tensor, block: int
+    ) -> torch.Tensor:
+        """Return [targets, references, queries, hidden] without repeated projections."""
+        targets, references = queries.shape[0], tokens.shape[0]
+        query = self._query_heads(queries, block)
+        key, value = self._style_heads(tokens)
+        query = query[:, None].expand(-1, references, -1, -1, -1).reshape(
+            targets * references, *query.shape[1:]
+        )
+        key = key[None].expand(targets, -1, -1, -1, -1).reshape(
+            targets * references, *key.shape[1:]
+        )
+        value = value[None].expand(targets, -1, -1, -1, -1).reshape_as(key)
+        attended = F.scaled_dot_product_attention(query, key, value)
+        return self.output(attended.transpose(1, 2).flatten(2)).reshape(
+            targets, references, attended.shape[2], self.hidden_dim
+        )
 
 
 class SharedLowRankStyleAdapter(nn.Module):
