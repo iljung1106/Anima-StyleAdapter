@@ -111,6 +111,20 @@ def _functional_curriculum_scale(
     return min(1.0, max(0.0, (current_step - start) / max(ramp, 1)))
 
 
+def _centered_residual_curriculum_scale(
+    training: dict[str, Any], *, train: bool, current_step: int
+) -> float:
+    """Schedule direct artist-residual regression independently of discrimination."""
+    if not train:
+        return 1.0
+    start = int(training.get(
+        "centered_effect_residual_start_step",
+        training.get("functional_contrastive_start_step", 0),
+    ))
+    ramp = int(training.get("centered_effect_residual_ramp_steps", 0))
+    return min(1.0, max(0.0, (current_step - start) / max(ramp, 1)))
+
+
 def validate_synthetic_teacher_corpus(
     config: dict[str, Any], destination: Path
 ) -> dict[str, Any]:
@@ -1111,6 +1125,9 @@ def train_offline_kvo_bootstrap(
         contrastive_scale = _functional_curriculum_scale(
             training, train=train, current_step=current_step
         )
+        centered_residual_scale = _centered_residual_curriculum_scale(
+            training, train=train, current_step=current_step
+        )
         tokens, drift_loss = encode(reference_rows)
         representation_tokens = tokens.detach() if detach_representation else tokens
         # A trainable Resampler must not shift the frozen Phase-A common
@@ -1535,10 +1552,10 @@ def train_offline_kvo_bootstrap(
             + contrastive_scale
             * float(training.get("functional_centered_all_pairs_weight", 0.0))
             * centered_pair_loss
-            + contrastive_scale
+            + centered_residual_scale
             * float(training.get("centered_effect_residual_weight", 0.0))
             * centered_residual_loss
-            + contrastive_scale
+            + centered_residual_scale
             * float(training.get("centered_effect_zero_mean_weight", 0.0))
             * centered_residual_mean_loss
         )
@@ -1556,6 +1573,7 @@ def train_offline_kvo_bootstrap(
                 if contrastive_accuracies else 0.0
             ),
             "functional_contrastive_scale": float(contrastive_scale),
+            "centered_effect_residual_scale": float(centered_residual_scale),
             "primary_effect_scale": float(primary_weight),
             "functional_all_pairs_direction_loss": float(
                 all_pair_direction_loss.detach()

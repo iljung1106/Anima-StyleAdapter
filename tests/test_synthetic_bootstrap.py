@@ -5,6 +5,7 @@ from anima_style_data.synthetic_bootstrap import (
     _attention_output,
     _batched_attention_output,
     _bootstrap_eligible,
+    _centered_residual_curriculum_scale,
     _functional_curriculum_scale,
     assign_bootstrap_splits,
     classify_artist_effects,
@@ -20,6 +21,23 @@ def test_reference_discrimination_curriculum_is_off_then_ramps_together():
     assert _functional_curriculum_scale(training, train=True, current_step=1000) == 0.5
     assert _functional_curriculum_scale(training, train=True, current_step=1500) == 1.0
     assert _functional_curriculum_scale(training, train=False, current_step=0) == 1.0
+
+
+def test_centered_residual_regression_can_start_before_discrimination():
+    training = {
+        "functional_contrastive_start_step": 500,
+        "centered_effect_residual_start_step": 0,
+        "centered_effect_residual_ramp_steps": 100,
+    }
+    assert _centered_residual_curriculum_scale(
+        training, train=True, current_step=0
+    ) == 0.0
+    assert _centered_residual_curriculum_scale(
+        training, train=True, current_step=50
+    ) == 0.5
+    assert _centered_residual_curriculum_scale(
+        training, train=True, current_step=100
+    ) == 1.0
 
 
 def test_variable_spatial_tokens_use_batch_local_padding():
