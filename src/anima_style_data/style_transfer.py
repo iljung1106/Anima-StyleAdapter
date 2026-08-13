@@ -4491,12 +4491,22 @@ def train_style_adapter(config: dict[str, Any], destination: Path, *, steps_over
         "seed": seed ^ 0x71A1,
     }
     train_sample_loader = ProductionStyleLoader(destination, train_sample_loader_cfg)
+    resampler_train_start = int(training.get("resampler_train_start_step", -1))
+    has_resampler_token_cache = bool(loader_cfg.get("resampler_token_cache"))
+    # With a complete token cache the frozen Resampler is only needed when the
+    # final deployable checkpoint is assembled.  Keep it on CPU so it consumes
+    # neither training VRAM nor optimizer/checkpoint state during the run.
+    resampler_device = (
+        "cpu" if resampler_train_start < 0 and has_resampler_token_cache else device
+    )
     resampler = load_per_reference_resampler(
         destination,
         cfg["resampler"],
-        device,
-        trainable=int(training.get("resampler_train_start_step", -1)) >= 0,
+        resampler_device,
+        trainable=resampler_train_start >= 0,
     )
+    if resampler_device == "cpu":
+        print("frozen Resampler retained on CPU; training uses cached tokens", flush=True)
     anima = _resolve_anima_model(config, destination, device)
     anima.requires_grad_(False).train()
     optimization_counts = _optimize_frozen_anima(
@@ -4536,7 +4546,7 @@ def train_style_adapter(config: dict[str, Any], destination: Path, *, steps_over
     resampler_lr = float(training.get("resampler_learning_rate", representation_lr * 0.1))
     resampler_parameters = (
         list(resampler.parameters())
-        if int(training.get("resampler_train_start_step", -1)) >= 0
+        if resampler_train_start >= 0
         else []
     )
     weight_decay = float(training.get("weight_decay", 0.01))
