@@ -632,6 +632,28 @@ def test_connector_preserves_tiny_context_bridge_initialization():
     torch.testing.assert_close(selected[3], contexts[3])
 
 
+def test_centered_reference_head_backpropagates_through_context_bridge():
+    adapter = SharedLowRankStyleAdapter(
+        style_dim=16, slots=4, hidden_dim=32, output_dim=32,
+        heads=4, blocks=2, rank=4, projection_mode="pretrained_block_lora",
+        context_dim=16, aggregator_mode="minimal", aggregator_bottleneck=4,
+        connector_layers=1, connector_heads=4, connector_groups=1,
+        connector_group_layers=1, reference_effect_head=True,
+        reference_effect_latent_dim=16, reference_effect_heads=4,
+    )
+    with torch.no_grad():
+        adapter.reference_effect_head.output[-1].weight.normal_(std=0.02)
+    tokens = torch.randn(2, 4, 16)
+    queries = torch.randn(2, 4, 5, 8)
+    output = adapter.reference_effect_head(
+        adapter.reference_head_tokens(tokens), queries, 0
+    )
+    output.square().mean().backward()
+
+    assert adapter.style_context_proj.weight.grad is not None
+    assert adapter.style_context_proj.weight.grad.norm() > 0
+
+
 def test_cross_slot_mixer_couples_pooled_slots():
     torch.manual_seed(11)
     model = SlotSetAggregator(

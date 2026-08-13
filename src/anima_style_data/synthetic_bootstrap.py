@@ -1091,10 +1091,15 @@ def train_offline_kvo_bootstrap(
     adapter_parameters = bridge_parameters + connector_parameters + kvo_parameters
     if centered_head is not None and bool(training.get("freeze_base_connector", True)):
         adapter.requires_grad_(False)
-        bridge_parameters = []
+        # Stage A0 aligns the Resampler representation to Anima context through
+        # the bridge before the centered head reads it. Keep only that mapping
+        # live; the common connector and all block K/V/O deltas remain frozen.
+        for value in adapter.bridge_parameters():
+            value.requires_grad_(True)
+        bridge_parameters = list(adapter.bridge_parameters())
         connector_parameters = []
         kvo_parameters = []
-        adapter_parameters = []
+        adapter_parameters = bridge_parameters
     resampler_parameters = (
         _enable_phase_b_resampler(
             resampler, int(training.get("resampler_trainable_encoder_layers", 1))
@@ -1344,7 +1349,9 @@ def train_offline_kvo_bootstrap(
                     attended = attended.transpose(1, 2).reshape(context.shape[0], attended.shape[2], hidden)
                     base_output = F.linear(attended, ow) + adapter.o_up[block](adapter.o_down[block](attended))
                     correction = (
-                        centered_head(source_tokens, query, block)
+                        centered_head(
+                            adapter.reference_head_tokens(source_tokens), query, block
+                        )
                         if centered_head is not None else torch.zeros_like(base_output)
                     )
                     return base_output, correction
@@ -1409,9 +1416,22 @@ def train_offline_kvo_bootstrap(
                     + float(training.get("functional_rank_margin", 0.02))
                 ).unbind())
             contrastive_weight = float(training.get("functional_contrastive_weight", 0.0))
+            centered_pair_weight = float(
+                training.get("functional_centered_all_pairs_weight", 0.0)
+            )
+            centered_regression_weight = float(
+                training.get("centered_effect_residual_weight", 0.0)
+            )
+            full_all_pairs_weight = float(
+                training.get("functional_all_pairs_weight", 0.0)
+            )
             if (
-                train and len(batch_rows) > 1 and contrastive_weight > 0
-                and block in functional_blocks
+                len(batch_rows) > 1
+                and max(
+                    contrastive_weight, centered_pair_weight,
+                    centered_regression_weight, full_all_pairs_weight,
+                ) > 0
+                and (not train or block in functional_blocks)
             ):
                 full_count = len(batch_rows)
                 group_size = min(
@@ -1476,7 +1496,8 @@ def train_offline_kvo_bootstrap(
                     ).reshape(full_count, count, *pair_teacher_source.shape[1:])
                     candidate_correction = (
                         centered_head.grouped_pairs(
-                            pair_token_source, pair_queries_source, block, count
+                            adapter.reference_head_tokens(pair_token_source),
+                            pair_queries_source, block, count
                         )
                         if centered_head is not None
                         else torch.zeros_like(candidate_base)
@@ -1495,9 +1516,15 @@ def train_offline_kvo_bootstrap(
                     training.get("functional_contrastive_temperature", 0.1)
                 )
                 labels = torch.arange(count, device=logits.device).repeat(group_count)
-                contrastive_losses.append(F.cross_entropy(logits, labels))
-                contrastive_accuracies.append((logits.argmax(dim=1) == labels).float().mean())
-                if float(training.get("functional_all_pairs_weight", 0.0)) > 0:
+                if contrastive_weight > 0:
+                    contrastive_losses.append(F.cross_entropy(logits, labels))
+                    contrastive_accuracies.append(
+                        (logits.argmax(dim=1) == labels).float().mean()
+                    )
+                if max(
+                    full_all_pairs_weight, centered_pair_weight,
+                    centered_regression_weight,
+                ) > 0:
                     if len({int(row["content_index"]) for row in batch_rows}) != 1:
                         raise RuntimeError("All-pairs training requires one shared content per batch")
                     pair_q = candidate_queries
@@ -1562,42 +1589,44 @@ def train_offline_kvo_bootstrap(
                         )
                     pair_student_flat = candidate_outputs.flatten(2)
                     pair_teacher_flat = pair_teacher.flatten(2)
-                    all_pair_direction_losses.append(
-                        (1 - F.cosine_similarity(
-                            pair_student_flat, pair_teacher_flat, dim=-1
-                        )).mean()
-                    )
-                    pair_student_rms = pair_student_flat.square().mean(-1).sqrt().clamp_min(1e-6)
-                    pair_teacher_rms = pair_teacher_flat.square().mean(-1).sqrt().clamp_min(1e-6)
-                    all_pair_magnitude_losses.append(F.smooth_l1_loss(
-                        torch.log(pair_student_rms),
-                        torch.log(pair_teacher_rms),
-                        beta=0.5,
-                    ))
-                    centered_student = pair_student_flat - pair_student_flat.mean(
-                        dim=1, keepdim=True
-                    )
-                    centered_teacher = pair_teacher_flat - pair_teacher_flat.mean(
-                        dim=1, keepdim=True
-                    )
-                    centered_student = F.normalize(centered_student, dim=-1)
-                    centered_teacher = F.normalize(centered_teacher, dim=-1)
-                    centered_logits = torch.einsum(
-                        "bcd,bkd->bck", centered_student, centered_teacher
-                    ) / float(training.get("functional_centered_temperature", 0.07))
-                    centered_labels = torch.arange(
-                        count, device=centered_logits.device
-                    )
-                    centered_pair_losses.append(F.cross_entropy(
-                        centered_logits.reshape(full_count * count, count),
-                        centered_labels.repeat(full_count),
-                    ))
-                    centered_pair_accuracies.append(
-                        (
-                            centered_logits.argmax(dim=-1)
-                            == centered_labels[None]
-                        ).float().mean()
-                    )
+                    if full_all_pairs_weight > 0:
+                        all_pair_direction_losses.append(
+                            (1 - F.cosine_similarity(
+                                pair_student_flat, pair_teacher_flat, dim=-1
+                            )).mean()
+                        )
+                        pair_student_rms = pair_student_flat.square().mean(-1).sqrt().clamp_min(1e-6)
+                        pair_teacher_rms = pair_teacher_flat.square().mean(-1).sqrt().clamp_min(1e-6)
+                        all_pair_magnitude_losses.append(F.smooth_l1_loss(
+                            torch.log(pair_student_rms),
+                            torch.log(pair_teacher_rms),
+                            beta=0.5,
+                        ))
+                    if centered_pair_weight > 0:
+                        centered_student = pair_student_flat - pair_student_flat.mean(
+                            dim=1, keepdim=True
+                        )
+                        centered_teacher = pair_teacher_flat - pair_teacher_flat.mean(
+                            dim=1, keepdim=True
+                        )
+                        centered_student = F.normalize(centered_student, dim=-1)
+                        centered_teacher = F.normalize(centered_teacher, dim=-1)
+                        centered_logits = torch.einsum(
+                            "bcd,bkd->bck", centered_student, centered_teacher
+                        ) / float(training.get("functional_centered_temperature", 0.07))
+                        centered_labels = torch.arange(
+                            count, device=centered_logits.device
+                        )
+                        centered_pair_losses.append(F.cross_entropy(
+                            centered_logits.reshape(full_count * count, count),
+                            centered_labels.repeat(full_count),
+                        ))
+                        centered_pair_accuracies.append(
+                            (
+                                centered_logits.argmax(dim=-1)
+                                == centered_labels[None]
+                            ).float().mean()
+                        )
         output_loss = torch.stack(output_losses).mean()
         cosine_loss = (1 - torch.stack(cosines)).mean()
         rms_loss = torch.stack(rms_losses).mean()
@@ -1976,7 +2005,12 @@ def train_offline_kvo_bootstrap(
             history.append(record)
             write_json(output / "evaluation.json", {"history": history, "latest": record})
             score = (
-                val["zero_improvement"] + 0.1 * val["cosine"]
+                float(training.get("checkpoint_full_effect_weight", 1.0))
+                * val["zero_improvement"]
+                + float(training.get("checkpoint_full_cosine_weight", 0.1))
+                * val["cosine"]
+                + float(training.get("checkpoint_centered_cosine_weight", 0.0))
+                * val["centered_effect_residual_cosine"]
                 + float(training.get("checkpoint_discrimination_weight", 0.05))
                 * (
                     val["correct_wrong_cosine_gap"]

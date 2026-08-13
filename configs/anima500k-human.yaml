@@ -585,46 +585,73 @@ synthetic_teacher:
     output_directory: resampler_tokens_artist_specific_stage_r_v1
     batch_size: 16
   offline_bootstrap:
-    output_directory: offline_kvo_bootstrap_exact512_summary_tokens
+    # Stage A0: align only the Resampler->Anima bridge and the centered
+    # query-conditioned artist head. The common connector and all K/V/O deltas
+    # are frozen so a reference-independent mean artist effect cannot solve the
+    # objective.
+    output_directory: offline_artist_specific_stage_a0_v1
     seed: 20260812
-    steps: 3000
+    steps: 8000
     batch_size: 16
     blocks_per_step: 7
+    functional_blocks_per_step: 1
     gpu_resident_small_caches: true
-    representation_warmup_steps: 250
-    learning_rate: 0.00002
-    connector_learning_rate: 0.000005
+    style_token_directory: resampler_tokens_artist_specific_stage_r_v1
+    representation_warmup_steps: 0
+    centered_effect_head: true
+    centered_effect_latent_dim: 512
+    centered_effect_learning_rate: 0.0001
+    centered_effect_max_grad_norm: 1.0
+    centered_effect_residual_weight: 1.0
+    centered_effect_direction_weight: 0.20
+    centered_effect_zero_mean_weight: 0.10
+    centered_effect_scale_floor: 0.0001
+    centered_effect_residual_start_step: 0
+    centered_effect_residual_ramp_steps: 200
+    freeze_base_connector: true
+    # Base connector losses are disabled in A0. These LR values are retained
+    # only as explicit documentation of the frozen groups.
+    primary_effect_initial_weight: 0.0
+    primary_effect_weight: 0.0
+    learning_rate: 0.0
+    connector_learning_rate: 0.0
     bridge_learning_rate: 0.000002
-    warmup_steps: 200
+    warmup_steps: 400
     minimum_lr_ratio: 0.1
     weight_decay: 0.01
-    max_grad_norm: 1.0
-    connector_max_grad_norm: 0.1
-    bridge_max_grad_norm: 0.01
-    direction_weight: 0.2
-    magnitude_weight: 0.02
-    functional_rank_weight: 0.10
+    bridge_max_grad_norm: 0.05
+    direction_weight: 0.0
+    magnitude_weight: 0.0
+    functional_rank_weight: 0.0
     functional_rank_margin: 0.02
-    functional_contrastive_weight: 0.25
+    functional_contrastive_weight: 0.0
     functional_contrastive_temperature: 0.10
-    functional_contrastive_start_step: 250
-    functional_contrastive_ramp_steps: 750
-    target_excluded_start_step: 250
-    target_excluded_end_step: 1500
-    exact_self_probability: 0.25
+    functional_contrastive_start_step: 0
+    functional_contrastive_ramp_steps: 500
+    functional_all_pairs_weight: 0.0
+    functional_centered_all_pairs_weight: 0.20
+    functional_centered_temperature: 0.07
+    target_excluded_start_step: 0
+    target_excluded_end_step: 1
+    exact_self_probability: 0.0
+    checkpoint_full_effect_weight: 0.0
+    checkpoint_full_cosine_weight: 0.0
+    checkpoint_centered_cosine_weight: 1.0
+    checkpoint_discrimination_weight: 1.0
     log_every: 20
     validation_every: 250
-    validation_batches: 8
-    meta_test_batches: 8
+    validation_batches: 16
+    train_heldout_batches: 16
+    meta_test_batches: 16
     checkpoint_every: 500
-    minimum_steps: 1000
-    early_stop_patience: 5
-    resume: true
+    minimum_steps: 2000
+    early_stop_patience: 12
+    resume: false
     wandb:
       enabled: true
       project: anima-style-adapter
-      name: offline-kvo-phase-a-exact512-summary-tokens
-      id: offline-kvo-phase-a-exact512-summary-tokens-v1
+      name: offline-artist-specific-stage-a0
+      id: offline-artist-specific-stage-a0-v1
   offline_phase_b:
     output_directory: offline_kvo_phase_b_exact512_two_stage_curriculum
     phase_a_checkpoint: offline_kvo_bootstrap_exact512_summary_tokens/checkpoints/best.pt
