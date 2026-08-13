@@ -3469,7 +3469,7 @@ def train_style_adapter(config: dict[str, Any], destination: Path, *, steps_over
         if state.get("cuda_rng") is not None:
             torch.cuda.set_rng_state_all(state["cuda_rng"])
         print(f"resuming style training from step {start_step}", flush=True)
-    elif steps_override is None and training.get("initial_checkpoint"):
+    elif training.get("initial_checkpoint"):
         initial_path = Path(str(training["initial_checkpoint"]))
         if not initial_path.is_absolute():
             initial_path = destination / initial_path
