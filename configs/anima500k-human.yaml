@@ -543,6 +543,11 @@ style_transfer:
     sample_steps: 30
     sample_style_cfg: 1.0
     sample_seed: 2026081501
+    wandb:
+      enabled: true
+      project: anima-style-adapter
+      name: exact-self-generalization-96-train-24-validation-v1
+      id: exact-self-generalization-96-train-24-validation-v1
   sampling:
     episode: 0
     # Qualitative 1MP checkpoint evaluation across artist-disjoint validation

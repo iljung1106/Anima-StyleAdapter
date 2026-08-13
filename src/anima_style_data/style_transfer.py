@@ -3553,6 +3553,18 @@ def train_exact_self_generalization(
     write_json(output / "split.json", {
         "train_ids": train_ids, "validation_ids": validation_ids,
     })
+    wandb_run = None
+    wandb_cfg = dict(run_cfg.get("wandb", {}))
+    if bool(wandb_cfg.get("enabled", False)):
+        import wandb
+        wandb_run = wandb.init(
+            project=str(wandb_cfg.get("project", "anima-style-adapter")),
+            entity=wandb_cfg.get("entity"),
+            name=str(wandb_cfg.get("name", "exact-self-generalization-96-24")),
+            id=str(wandb_cfg.get("id", "exact-self-generalization-96-24-v1")),
+            resume="never",
+            config={"style_transfer": cfg, "experiment": run_cfg},
+        )
 
     metric_keys = (
         "flow_loss", "base_flow_loss", "paired_flow_improvement",
@@ -3591,6 +3603,7 @@ def train_exact_self_generalization(
     vae = None
     started = time.perf_counter()
     for step in range(1, steps + 1):
+        step_started = time.perf_counter()
         anima.train(); adapter.train(); optimizer.zero_grad(set_to_none=True)
         batch = train_batches[(step - 1) % len(train_batches)]
         generator = torch.Generator(device=device).manual_seed(seed + step * 10_007)
@@ -3601,6 +3614,15 @@ def train_exact_self_generalization(
         loss.backward()
         grad_norm = torch.nn.utils.clip_grad_norm_(adapter.parameters(), max_grad_norm)
         optimizer.step()
+        step_s = time.perf_counter() - step_started
+        if wandb_run is not None:
+            wandb_run.log({
+                "train/loss": float(loss.detach()),
+                "train/grad_norm": float(grad_norm),
+                "train/step_s": step_s,
+                "train/learning_rate": float(optimizer.param_groups[0]["lr"]),
+                **{f"train/{key}": float(metrics[key]) for key in metric_keys},
+            }, step=step)
         if step % validation_every == 0 or step == steps:
             validation = evaluate_pool(validation_batches, seed ^ 0xA11CE)
             train_probe = evaluate_pool(train_batches[:4], seed ^ 0xBEEF)
@@ -3609,6 +3631,11 @@ def train_exact_self_generalization(
                    "validation": validation}
             history.append(row); write_json(output / "history.json", history)
             print(f"exact-self generalization step={step} metrics={row}", flush=True)
+            if wandb_run is not None:
+                wandb_run.log({
+                    **{f"train_probe/{key}": value for key, value in train_probe.items()},
+                    **{f"validation/{key}": value for key, value in validation.items()},
+                }, step=step)
         if step % checkpoint_every == 0 or step == steps:
             torch.save({"step": step, "adapter": adapter.state_dict(),
                         "resampler": resampler.state_dict(), "config": run_cfg},
@@ -3621,12 +3648,17 @@ def train_exact_self_generalization(
                 batch_override=validation_batches[0], batch_row=0,
             )
             print(f"exact-self generalization sample={sheet}", flush=True)
+            if wandb_run is not None:
+                import wandb
+                wandb_run.log({"sample/unseen_exact_self": wandb.Image(str(sheet))}, step=step)
     result = {
         "steps": steps, "train_images": len(train_ids),
         "validation_images": len(validation_ids), "final": history[-1],
         "elapsed_s": time.perf_counter() - started,
     }
     write_json(output / "summary.json", result)
+    if wandb_run is not None:
+        wandb_run.finish()
     return result
 
 
