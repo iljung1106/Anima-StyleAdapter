@@ -703,7 +703,7 @@ real_artist_teacher:
   style_token_batch_size: 32
   style_token_prefetch_shards: 4
   offline_bootstrap:
-    output_directory: offline_kvo_reference_head_two_stage_v3
+    output_directory: offline_kvo_reference_head_two_stage_v4
     # Reuse the frozen common-effect connector learned on exact synthetic
     # teacher images. Only the reference-conditioned head is updated here.
     initial_checkpoint: ../synthetic_teacher_500x16/offline_kvo_bootstrap_exact512_summary_tokens/checkpoints/best.pt
@@ -728,7 +728,9 @@ real_artist_teacher:
     centered_effect_learning_rate: 0.00005
     centered_effect_max_grad_norm: 1.0
     centered_effect_residual_weight: 1.0
+    centered_effect_direction_weight: 0.20
     centered_effect_zero_mean_weight: 0.10
+    centered_effect_scale_floor: 0.0001
     # Unlike classification/ranking, this is supervised regression to the
     # native artist-specific residual and should shape the head from the start.
     centered_effect_residual_start_step: 0
@@ -771,5 +773,5 @@ real_artist_teacher:
     wandb:
       enabled: true
       project: anima-style-adapter
-      name: real-artist-5000-reference-head-two-stage-v3
-      id: real-artist-5000-reference-head-two-stage-v3
+      name: real-artist-5000-reference-head-two-stage-v4
+      id: real-artist-5000-reference-head-two-stage-v4

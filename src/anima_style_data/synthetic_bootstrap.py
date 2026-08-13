@@ -1186,7 +1186,10 @@ def train_offline_kvo_bootstrap(
         centered_pair_accuracies = []
         centered_residual_losses = []
         centered_residual_cosines = []
+        centered_residual_direction_losses = []
         centered_residual_mean_losses = []
+        centered_target_rms_values = []
+        centered_prediction_rms_values = []
         reference_teacher_cosines = []
         reference_teacher_relative_distances = []
         block_count = int(training.get("blocks_per_step", 7)) if train else 28
@@ -1431,18 +1434,32 @@ def train_offline_kvo_bootstrap(
                         centered_prediction = candidate_correction - candidate_correction.mean(
                             dim=1, keepdim=True
                         )
-                        residual_scale = pair_teacher.square().mean(
+                        # The head is responsible only for artist-dependent
+                        # variation, not the much larger common teacher effect.
+                        # Normalize by that centered target itself so weak but
+                        # meaningful artist differences receive a live gradient.
+                        residual_scale = centered_target.square().mean(
                             dim=(-2, -1), keepdim=True
-                        ).sqrt().clamp_min(effect_scale_floor)
+                        ).sqrt().clamp_min(float(training.get(
+                            "centered_effect_scale_floor", 1e-4
+                        )))
                         centered_residual_losses.append(F.smooth_l1_loss(
                             centered_prediction / residual_scale,
                             centered_target / residual_scale,
                             beta=0.1,
                         ))
-                        centered_residual_cosines.append(F.cosine_similarity(
+                        residual_cosine = F.cosine_similarity(
                             centered_prediction.flatten(2),
                             centered_target.flatten(2), dim=-1,
-                        ).mean())
+                        ).mean()
+                        centered_residual_cosines.append(residual_cosine)
+                        centered_residual_direction_losses.append(1 - residual_cosine)
+                        centered_target_rms_values.append(
+                            centered_target.square().mean().sqrt()
+                        )
+                        centered_prediction_rms_values.append(
+                            centered_prediction.square().mean().sqrt()
+                        )
                         centered_residual_mean_losses.append(
                             (candidate_correction.mean(dim=1) / residual_scale[:, 0])
                             .square().mean()
@@ -1515,6 +1532,18 @@ def train_offline_kvo_bootstrap(
             torch.stack(centered_residual_cosines).mean()
             if centered_residual_cosines else output_loss.new_zeros(())
         )
+        centered_residual_direction_loss = (
+            torch.stack(centered_residual_direction_losses).mean()
+            if centered_residual_direction_losses else output_loss.new_zeros(())
+        )
+        centered_target_rms = (
+            torch.stack(centered_target_rms_values).mean()
+            if centered_target_rms_values else output_loss.new_zeros(())
+        )
+        centered_prediction_rms = (
+            torch.stack(centered_prediction_rms_values).mean()
+            if centered_prediction_rms_values else output_loss.new_zeros(())
+        )
         centered_residual_mean_loss = (
             torch.stack(centered_residual_mean_losses).mean()
             if centered_residual_mean_losses else output_loss.new_zeros(())
@@ -1554,7 +1583,11 @@ def train_offline_kvo_bootstrap(
             * centered_pair_loss
             + centered_residual_scale
             * float(training.get("centered_effect_residual_weight", 0.0))
-            * centered_residual_loss
+            * (
+                centered_residual_loss
+                + float(training.get("centered_effect_direction_weight", 0.0))
+                * centered_residual_direction_loss
+            )
             + centered_residual_scale
             * float(training.get("centered_effect_zero_mean_weight", 0.0))
             * centered_residual_mean_loss
@@ -1589,6 +1622,11 @@ def train_offline_kvo_bootstrap(
             ),
             "centered_effect_residual_loss": float(centered_residual_loss.detach()),
             "centered_effect_residual_cosine": float(centered_residual_cosine.detach()),
+            "centered_effect_direction_loss": float(
+                centered_residual_direction_loss.detach()
+            ),
+            "centered_effect_target_rms": float(centered_target_rms.detach()),
+            "centered_effect_prediction_rms": float(centered_prediction_rms.detach()),
             "centered_effect_zero_mean_loss": float(
                 centered_residual_mean_loss.detach()
             ),
