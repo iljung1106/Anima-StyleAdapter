@@ -95,6 +95,20 @@ def test_query_conditioned_reference_head_grouped_pairs_matches_group_loops():
     assert torch.allclose(actual, expected, atol=1e-6, rtol=1e-5)
 
 
+def test_style_token_runtime_boundary_matches_adapter_dtype():
+    adapter = SharedLowRankStyleAdapter(
+        style_dim=8, slots=2, hidden_dim=8, output_dim=8, heads=2,
+        blocks=2, rank=2, projection_mode="pretrained_block_lora",
+        context_dim=8, connector_groups=1, connector_layers=1,
+        connector_heads=2, aggregator_mode="minimal",
+    ).to(dtype=torch.bfloat16)
+
+    adapter.set_style_tokens(torch.randn(2, 2, 8, dtype=torch.float32))
+
+    assert adapter._style_tokens.dtype == torch.bfloat16
+    assert all(value.dtype == torch.bfloat16 for value in adapter._style_block_tokens)
+
+
 def test_offline_reference_head_checkpoint_loads_into_runtime_adapter():
     kwargs = dict(
         style_dim=16, slots=8, hidden_dim=32, output_dim=32, heads=4,

@@ -820,6 +820,11 @@ class SharedLowRankStyleAdapter(nn.Module):
         return self.null_tokens.expand(batch, -1, -1)
 
     def set_style_tokens(self, tokens: torch.Tensor) -> None:
+        # Runtime inference commonly keeps the adapter in BF16 while the
+        # numerically stable aggregator returns FP32 tokens outside autocast.
+        # Normalize once at this boundary instead of relying on caller state.
+        parameter = next(self.parameters())
+        tokens = tokens.to(device=parameter.device, dtype=parameter.dtype)
         self._style_tokens = tokens
         # Cache the expensive high-capacity connector once per Anima forward.
         # Legacy/no-connector mode retains its stateless behavior.
