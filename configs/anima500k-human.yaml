@@ -288,9 +288,9 @@ style_transfer:
     latent_cache: anima_latent_cache_qwen_2d
     resampler_token_cache: production_resampler_tokens_l18_l24_siglip_l24
     split: train
-    # Batch 5 OOMed on large buckets. Batch 4 fits while the Resampler is frozen,
-    # but batch 3 reserves headroom for the step-500 trainable decoder transition.
-    batch_size: 3
+    # Cache-backed H100 benchmark: batch 4 x accumulation 4 reached 5.14
+    # targets/s at 66.96 GiB, versus 4.59 targets/s for batch 2 x accumulation 8.
+    batch_size: 4
     min_references: 1
     max_references: 8
     # Anima cross-attention was trained with 512 post-LLM tokens, including
@@ -412,7 +412,7 @@ style_transfer:
     # H100 80GB has ample headroom for the frozen Anima activations. Keeping
     # them avoids recomputing all 28 blocks during backward.
     gradient_checkpointing: false
-    gradient_accumulation_steps: 5
+    gradient_accumulation_steps: 4
     low_precision_rmsnorm: true
     fuse_attention_projections: true
     allow_tf32: true

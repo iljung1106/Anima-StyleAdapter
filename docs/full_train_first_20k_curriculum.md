@@ -59,6 +59,10 @@ Frozen Per-reference Resampler의 128×1024 BF16 출력은 production 전체에 
 optimizer와 resumable checkpoint에 넣지 않고, 최종 배포 시 원본 Resampler checkpoint와
 Style Adapter checkpoint를 함께 묶는다.
 
+H100 cache-backed benchmark에서는 동일한 effective batch 16에서 `batch 4 × accumulation
+4`가 5.14 target/s, 66.96 GiB였고 `batch 2 × accumulation 8`은 4.59 target/s,
+37.63 GiB였다. 본학습은 더 빠른 4×4 구성을 사용한다.
+
 20k 이후 단계는 이번 실행 결과를 보고 별도로 결정한다. 특히 train/validation 작가의
 스타일 분화, target 제외 전환기의 품질, reference 수 증가 효과를 확인하기 전에는
 Resampler 공동학습이나 더 긴 production schedule을 열지 않는다.
