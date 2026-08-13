@@ -168,7 +168,6 @@ class ProductionStyleLoader:
             destination / str(token_cache) if token_cache else None
         )
         self.token_by_id: dict[int, dict[str, Any]] = {}
-        self.token_shards: _TensorShardCache | None = None
         if self.token_root is not None:
             token_rows = read_records(self.token_root / "manifest.parquet")
             self.token_by_id = {int(row["id"]): row for row in token_rows}
@@ -178,9 +177,6 @@ class ProductionStyleLoader:
                     f"Resampler token cache misses {len(missing)} eligible {self.split} images; "
                     f"first IDs={missing[:8]}"
                 )
-            self.token_shards = _TensorShardCache(
-                self.token_root, int(cfg.get("resampler_token_lru_shards", 2))
-            )
 
     def episodes_for_step(self, step: int) -> list[StyleEpisode]:
         rng = random.Random(self.seed + step * 1_000_003)
@@ -266,18 +262,24 @@ class ProductionStyleLoader:
                 reference_positions.append((batch_index, ref_index))
                 cursor += 1
 
-        if self.token_shards is not None:
+        if self.token_root is not None:
             token_values: dict[int, torch.Tensor] = {}
             grouped_tokens: dict[str, list[int]] = defaultdict(list)
             for image_id in dict.fromkeys(flat_references + target_ids):
                 row = self.token_by_id[image_id]
                 grouped_tokens[str(row["token_shard"])].append(image_id)
             for shard_name, image_ids in grouped_tokens.items():
-                shard = self.token_shards.get(shard_name)["tokens"]
-                for image_id in image_ids:
-                    token_values[image_id] = shard[
-                        int(self.token_by_id[image_id]["token_row"])
-                    ]
+                # One token shard is about 128 MiB. `load_file` would read the
+                # entire tensor for a handful of random references and thrash
+                # the NFS/LRU. PySafeSlice maps only the requested rows.
+                with safe_open(
+                    self.token_root / shard_name, framework="pt", device="cpu"
+                ) as handle:
+                    token_slice = handle.get_slice("tokens")
+                    for image_id in image_ids:
+                        token_values[image_id] = token_slice[
+                            int(self.token_by_id[image_id]["token_row"])
+                        ]
             reference_tokens = torch.stack(
                 [token_values[image_id] for image_id in flat_references]
             )
