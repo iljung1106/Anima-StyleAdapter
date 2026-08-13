@@ -1381,29 +1381,23 @@ def train_offline_kvo_bootstrap(
                         "batch_size must be divisible by functional_pair_group_size"
                     )
                 group_count = full_count // group_size
-                group_index = (
-                    current_step + sorted(functional_blocks).index(block)
-                ) % group_count
-                pair_indices = torch.arange(
-                    group_index * group_size,
-                    (group_index + 1) * group_size,
-                    device=q.device,
-                )
                 count = group_size
-                pair_queries_source = q.index_select(0, pair_indices)
-                pair_context_source = contexts[block].index_select(0, pair_indices)
-                pair_token_source = representation_tokens.index_select(0, pair_indices)
-                pair_teacher_source = teacher_float.index_select(0, pair_indices)
-                pair_ka_source = ka.index_select(0, pair_indices)
-                pair_va_source = va.index_select(0, pair_indices)
-                pair_kc_source = kc.index_select(0, pair_indices)
-                pair_vc_source = vc.index_select(0, pair_indices)
+                pair_queries_source = q
+                pair_context_source = contexts[block]
+                pair_token_source = representation_tokens
+                pair_teacher_source = teacher_float
+                pair_ka_source = ka.reshape(group_count, count, *ka.shape[1:])
+                pair_va_source = va.reshape(group_count, count, *va.shape[1:])
+                pair_kc_source = kc.reshape(group_count, count, *kc.shape[1:])
+                pair_vc_source = vc.reshape(group_count, count, *vc.shape[1:])
                 # Every target/query attends to every candidate reference.
                 # Keeping the query fixed across candidates prevents content
                 # or probe identity from solving the matching task.
-                candidate_queries = pair_queries_source[:, None].expand(
-                    count, count, -1, -1, -1
-                ).reshape(count * count, *q.shape[1:])
+                candidate_queries = pair_queries_source.reshape(
+                    group_count, count, *q.shape[1:]
+                )[:, :, None].expand(
+                    -1, -1, count, -1, -1, -1
+                ).reshape(full_count * count, *q.shape[1:])
                 # Project each of the N references once, then broadcast the
                 # resulting K/V over N target queries. The old flattened path
                 # repeated the expensive 130x2048 projections N times.
@@ -1420,10 +1414,16 @@ def train_offline_kvo_bootstrap(
                         norm_weight,
                     )
                     sv = sv.reshape(count, -1, heads, head_dim).transpose(1, 2)
-                    pair_sk = sk[None].expand(count, -1, -1, -1, -1).reshape(
-                        count * count, *sk.shape[1:]
+                    grouped_sk = sk.reshape(group_count, count, *sk.shape[1:])
+                    grouped_sv = sv.reshape(group_count, count, *sv.shape[1:])
+                    pair_sk = grouped_sk[:, None].expand(
+                        -1, count, -1, -1, -1, -1
+                    ).reshape(
+                        full_count * count, *sk.shape[1:]
                     )
-                    pair_sv = sv[None].expand(count, -1, -1, -1, -1).reshape_as(pair_sk)
+                    pair_sv = grouped_sv[:, None].expand(
+                        -1, count, -1, -1, -1, -1
+                    ).reshape_as(pair_sk)
                     pair_attended = F.scaled_dot_product_attention(
                         candidate_queries, pair_sk, pair_sv
                     )
@@ -1431,10 +1431,10 @@ def train_offline_kvo_bootstrap(
                     candidate_base = (
                         F.linear(pair_attended, ow)
                         + adapter.o_up[block](adapter.o_down[block](pair_attended))
-                    ).reshape(count, count, *pair_teacher_source.shape[1:])
+                    ).reshape(full_count, count, *pair_teacher_source.shape[1:])
                     candidate_correction = (
-                        centered_head.all_pairs(
-                            pair_token_source, pair_queries_source, block
+                        centered_head.grouped_pairs(
+                            pair_token_source, pair_queries_source, block, count
                         )
                         if centered_head is not None
                         else torch.zeros_like(candidate_base)
@@ -1452,27 +1452,29 @@ def train_offline_kvo_bootstrap(
                 logits = similarities / float(
                     training.get("functional_contrastive_temperature", 0.1)
                 )
-                labels = torch.arange(count, device=logits.device)
+                labels = torch.arange(count, device=logits.device).repeat(group_count)
                 contrastive_losses.append(F.cross_entropy(logits, labels))
                 contrastive_accuracies.append((logits.argmax(dim=1) == labels).float().mean())
                 if float(training.get("functional_all_pairs_weight", 0.0)) > 0:
                     if len({int(row["content_index"]) for row in batch_rows}) != 1:
                         raise RuntimeError("All-pairs training requires one shared content per batch")
-                    pair_q = pair_queries_source[:, None].expand(
-                        count, count, -1, -1, -1
-                    ).reshape(count * count, *q.shape[1:])
+                    pair_q = candidate_queries
                     with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
                         # The reference artist order is the batch artist order;
                         # broadcast those N unique K/V tensors across targets.
-                        pair_ka = pair_ka_source[None].expand(count, -1, -1, -1, -1).reshape(
-                            count * count, *ka.shape[1:]
+                        pair_ka = pair_ka_source[:, None].expand(
+                            -1, count, -1, -1, -1, -1
+                        ).reshape(
+                            full_count * count, *ka.shape[1:]
                         )
-                        pair_va = pair_va_source[None].expand(count, -1, -1, -1, -1).reshape_as(pair_ka)
-                        pair_kc = pair_kc_source[:, None].expand(
-                            count, count, -1, -1, -1
-                        ).reshape(count * count, *kc.shape[1:])
-                        pair_vc = pair_vc_source[:, None].expand(
-                            count, count, -1, -1, -1
+                        pair_va = pair_va_source[:, None].expand(
+                            -1, count, -1, -1, -1, -1
+                        ).reshape_as(pair_ka)
+                        pair_kc = pair_kc_source[:, :, None].expand(
+                            -1, -1, count, -1, -1, -1
+                        ).reshape(full_count * count, *kc.shape[1:])
+                        pair_vc = pair_vc_source[:, :, None].expand(
+                            -1, -1, count, -1, -1, -1
                         ).reshape_as(pair_kc)
                     pair_teacher = (
                             _batched_attention_output(pair_q, pair_ka, pair_va, ow)
@@ -1541,10 +1543,12 @@ def train_offline_kvo_bootstrap(
                     centered_logits = torch.einsum(
                         "bcd,bkd->bck", centered_student, centered_teacher
                     ) / float(training.get("functional_centered_temperature", 0.07))
-                    centered_labels = torch.arange(count, device=centered_logits.device)
+                    centered_labels = torch.arange(
+                        count, device=centered_logits.device
+                    )
                     centered_pair_losses.append(F.cross_entropy(
-                        centered_logits.reshape(count * count, count),
-                        centered_labels.repeat(count),
+                        centered_logits.reshape(full_count * count, count),
+                        centered_labels.repeat(full_count),
                     ))
                     centered_pair_accuracies.append(
                         (

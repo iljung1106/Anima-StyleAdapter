@@ -512,6 +512,35 @@ class QueryConditionedReferenceHead(nn.Module):
             targets, references, attended.shape[2], self.hidden_dim
         )
 
+    def grouped_pairs(
+        self, tokens: torch.Tensor, queries: torch.Tensor, block: int,
+        group_size: int,
+    ) -> torch.Tensor:
+        """Attend within contiguous negative groups without cross-group B² work."""
+        batch = tokens.shape[0]
+        if batch % group_size:
+            raise ValueError("Reference-head batch must divide into equal groups")
+        groups = batch // group_size
+        query = self._query_heads(queries, block).reshape(
+            groups, group_size, self.heads, -1, self.head_dim
+        )
+        key, value = self._style_heads(tokens)
+        key = key.reshape(groups, group_size, self.heads, -1, self.head_dim)
+        value = value.reshape_as(key)
+        pair_query = query[:, :, None].expand(
+            -1, -1, group_size, -1, -1, -1
+        ).reshape(batch * group_size, *query.shape[2:])
+        pair_key = key[:, None].expand(
+            -1, group_size, -1, -1, -1, -1
+        ).reshape(batch * group_size, *key.shape[2:])
+        pair_value = value[:, None].expand(
+            -1, group_size, -1, -1, -1, -1
+        ).reshape_as(pair_key)
+        attended = F.scaled_dot_product_attention(pair_query, pair_key, pair_value)
+        return self.output(attended.transpose(1, 2).flatten(2)).reshape(
+            batch, group_size, attended.shape[2], self.hidden_dim
+        )
+
 
 class SharedLowRankStyleAdapter(nn.Module):
     """Set aggregation plus either learned or pretrained block K/V/O projections."""

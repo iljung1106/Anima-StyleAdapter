@@ -77,6 +77,24 @@ def test_query_conditioned_reference_head_all_pairs_matches_loop():
     assert torch.allclose(actual, expected, atol=1e-6, rtol=1e-5)
 
 
+def test_query_conditioned_reference_head_grouped_pairs_matches_group_loops():
+    head = QueryConditionedReferenceHead(
+        style_dim=16, hidden_dim=32, latent_dim=16, blocks=2, heads=4
+    ).eval()
+    with torch.no_grad():
+        head.output[-1].weight.normal_(std=0.01)
+    tokens = torch.randn(6, 8, 16)
+    queries = torch.randn(6, 4, 5, 8)
+    expected = torch.cat([
+        head.all_pairs(tokens[start : start + 3], queries[start : start + 3], 1)
+        for start in (0, 3)
+    ])
+
+    actual = head.grouped_pairs(tokens, queries, block=1, group_size=3)
+
+    assert torch.allclose(actual, expected, atol=1e-6, rtol=1e-5)
+
+
 def test_offline_reference_head_checkpoint_loads_into_runtime_adapter():
     kwargs = dict(
         style_dim=16, slots=8, hidden_dim=32, output_dim=32, heads=4,
