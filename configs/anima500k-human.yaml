@@ -432,6 +432,7 @@ style_transfer:
     full_validation_batches: 32
     checkpoint_every: 250
     sample_every: 500
+    smoke_sample_every: 2
     train_sample_artists: 4
     validation_sample_artists: 4
     sample_batch_size: 4
