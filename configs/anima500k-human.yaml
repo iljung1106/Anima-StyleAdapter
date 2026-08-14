@@ -280,7 +280,7 @@ tap_resampler_experiment:
 # and batches targets by exact latent shape. `style-smoke` forces two steps and
 # writes to a separate smoke directory; `style-train` uses `training.steps`.
 style_transfer:
-  output_directory: style_transfer_same_q_phase_a210_kv_delta_r128_2k_v1
+  output_directory: style_transfer_same_q_phase_a211_reference_specific_r128_2k_v1
   seed: 20260811
   loader:
     style_cache: style_features_l18_l24_siglip_l24
@@ -348,10 +348,10 @@ style_transfer:
     aggregator_heads: 16
     aggregator_layers: 2
     aggregator_slot_mixer_layers: 1
-    # Isolate exact-self direction learning first. Null-style dropout is
-    # re-enabled only after paired flow improvement is statistically positive;
-    # otherwise its shared weights learn an unrelated average correction.
-    style_dropout: 0.0
+    # A2.9/A2.10 established statistically positive absolute flow improvement.
+    # Train the null condition now so inference-time Style CFG has a valid
+    # unconditional branch instead of an untrained common residual.
+    style_dropout: 0.10
     # Native gate_cross(t) is applied once after the merged native O output.
   # Measure only the magnitude of Anima's native @artist intervention. Residual
   # directions are discarded. Weak artist tags and near-identical centered
@@ -371,11 +371,13 @@ style_transfer:
     maximum_artist_similarity: 0.95
   training:
     device: cuda
-    # Phase A2.10: initialize from the statistically positive A2.9 step-1000
-    # Bridge + style-only output direction. Open only the rank-32 K/V deltas so
-    # attention coordinates can adapt without discarding that learned residual
-    # direction or moving Anima's native full-rank K/V basis.
-    initial_checkpoint: style_transfer_same_q_phase_a29_normalized_mse_r128_4k_v1/checkpoints/step-0001000.pt
+    # Phase A2.11: A2.10 showed that opening rank-32 K/V deltas alone does not
+    # significantly improve held-out flow. Its reference diagnostic found a
+    # dominant common residual: correct, wrong and untrained null conditions
+    # improved low/mid timesteps similarly. Start from A2.10 step 500 and add a
+    # live wrong-reference margin plus trained null dropout while retaining the
+    # absolute normalized residual target.
+    initial_checkpoint: style_transfer_same_q_phase_a210_kv_delta_r128_2k_v1/checkpoints/step-0000500.pt
     steps: 2000
     # Trainable adapter weights and Adam moments stay FP32. Representation
     # modules need a higher LR than the stabilized zero-output path.
@@ -478,10 +480,10 @@ style_transfer:
     # normalized direct target. Make residual alignment the bootstrap task.
     exact_self_residual_mse_weight: 1.0
     exact_self_residual_weight: 0.10
-    # These two weights start at zero. After four statistically positive
-    # self-validation checks they ramp toward the target values below.
+    # The normalized L2 target already supplies exact-self direction. Keep its
+    # redundant cosine auxiliary off when the reference-specific loss opens.
     exact_self_direction_weight: 0.0
-    exact_self_direction_target_weight: 0.10
+    exact_self_direction_target_weight: 0.0
     exact_self_log_rms_weight: 0.0
     exact_self_x0_weight: 0.0
     exact_self_scale_floor: 0.001
@@ -496,26 +498,28 @@ style_transfer:
     style_token_contrastive_weight: 0.0
     style_kv_contrastive_weight: 0.0
     style_contrastive_temperature: 0.10
-    # Do not even evaluate the live wrong-reference branch before absolute flow
-    # improvement is stable. The runner injects the ramped target weight.
-    style_reference_rank_weight: 0.0
+    # A live wrong branch makes any reference-independent Jacobian cancel in the
+    # correct-vs-wrong comparison. Evaluate it on one row in half the optimizer
+    # microsteps to control VRAM/throughput while requiring a 0.5% advantage.
+    style_reference_rank_weight: 0.10
     style_reference_rank_margin: 0.005
-    style_reference_rank_probability: 1.0
+    style_reference_rank_probability: 0.50
     style_reference_rank_start_step: 0
     style_reference_rank_end_step: 0
     style_reference_direction_weight: 0.0
-    style_reference_direction_target_weight: 0.20
+    # After the first statistically positive validation, gently align the
+    # correct-minus-wrong residual direction; ramp it rather than opening it at
+    # full strength together with null dropout.
+    style_reference_direction_target_weight: 0.05
     style_reference_direction_epsilon: 0.05
     style_reference_wrong_grad_samples: 1
-    # Isolate whether K/V coordinate adaptation improves exact paired flow.
-    # Wrong-reference and direction auxiliaries remain off for this ablation.
-    adaptive_reference_loss: false
-    reference_loss_activation_validations: 4
+    adaptive_reference_loss: true
+    reference_loss_activation_validations: 1
     # Require at least 0.1% normalized flow-error reduction, not merely a
     # floating-point-positive result, before counting one qualifying check.
     reference_loss_activation_paired_threshold: 0.001
     reference_loss_activation_positive_fraction: 0.75
-    reference_loss_ramp_steps: 750
+    reference_loss_ramp_steps: 500
     # Softly match the timestep-conditioned magnitude of Anima's native artist
     # intervention. Standard target-only flow loss still chooses the direction;
     # this term only prevents the style path from remaining effectively null.
@@ -546,8 +550,8 @@ style_transfer:
     wandb:
       enabled: true
       project: anima-style-adapter
-      name: anima-style-transfer-same-q-phase-a210-kv-delta-r128-2k-v1
-      id: anima-style-transfer-same-q-phase-a210-kv-delta-r128-2k-v1
+      name: anima-style-transfer-same-q-phase-a211-reference-specific-r128-2k-v1
+      id: anima-style-transfer-same-q-phase-a211-reference-specific-r128-2k-v1
   diagnostics:
     checkpoint: checkpoints/step-0000500.pt
     batch_size: 4
