@@ -658,6 +658,14 @@ style_transfer:
     text_cfg: 4.0
     style_cfg: 1.0
     vae_batch_size: 4
+  comparison:
+    checkpoint: training_state.pt
+    fixed_style_cfgs: [1.0, 4.0]
+    controlled_style_cfgs: [1.0, 2.0, 4.0]
+    controlled_reference_modes: [bypass, null, wrong_artist, heldout, mixed, self]
+    controlled_split: validation
+    controlled_episode: 0
+    controlled_batch_size: 4
   benchmark:
     candidates:
       - {batch_size: 4, gradient_accumulation_steps: 4}

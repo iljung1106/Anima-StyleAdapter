@@ -82,6 +82,7 @@ def build_parser() -> argparse.ArgumentParser:
         ("style-smoke", "Run two real Anima style-adapter training steps"),
         ("style-benchmark", "Benchmark production style training batch sizes"),
         ("style-sample", "Render frozen-base and styled controls from the current checkpoint"),
+        ("style-compare", "Render a fixed-panel and controlled-reference CFG comparison"),
         ("style-diagnose", "Measure correct, shuffled, null, and bypass style conditioning"),
         ("style-overfit", "Overfit a fixed exact-self batch to diagnose style-flow capacity"),
         ("style-overfit-sample", "Render every target from the completed exact-self overfit"),
@@ -166,7 +167,7 @@ def main() -> None:
     elif args.command == "anima-cache-validate":
         _run(validate_anima_caches, config, destination)
     elif args.command in {
-        "style-train", "style-token-cache", "style-smoke", "style-benchmark", "style-sample", "style-diagnose",
+        "style-train", "style-token-cache", "style-smoke", "style-benchmark", "style-sample", "style-compare", "style-diagnose",
         "style-overfit", "style-overfit-sample", "style-exact-self-generalize",
         "style-exact-self-sample",
         "style-calibrate",
@@ -179,6 +180,7 @@ def main() -> None:
             overfit_exact_self_batch,
             sample_exact_self_overfit_checkpoint,
             sample_exact_self_generalization_checkpoint,
+            compare_style_checkpoint_samples,
             train_exact_self_generalization,
             sample_style_checkpoint,
             smoke_test_style_adapter,
@@ -192,6 +194,7 @@ def main() -> None:
             "style-smoke": smoke_test_style_adapter,
             "style-benchmark": benchmark_style_batches,
             "style-sample": sample_style_checkpoint,
+            "style-compare": compare_style_checkpoint_samples,
             "style-diagnose": diagnose_style_reference_dependence,
             "style-overfit": overfit_exact_self_batch,
             "style-overfit-sample": sample_exact_self_overfit_checkpoint,

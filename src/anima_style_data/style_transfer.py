@@ -3671,6 +3671,239 @@ def sample_style_checkpoint(config: dict[str, Any], destination: Path) -> dict[s
     }
 
 
+def _pixel_distance(first: Path, second: Path) -> dict[str, float]:
+    """Report normalized pixel distances for paired deterministic samples."""
+    with Image.open(first) as first_image, Image.open(second) as second_image:
+        first_tensor = torch.frombuffer(
+            bytearray(first_image.convert("RGB").tobytes()), dtype=torch.uint8
+        ).float()
+        second_tensor = torch.frombuffer(
+            bytearray(second_image.convert("RGB").tobytes()), dtype=torch.uint8
+        ).float()
+    if first_tensor.shape != second_tensor.shape:
+        raise ValueError(f"Cannot compare differently sized samples: {first} and {second}")
+    delta = (first_tensor - second_tensor) / 255.0
+    return {
+        "pixel_mae": float(delta.abs().mean()),
+        "pixel_rmse": float(delta.square().mean().sqrt()),
+    }
+
+
+def _write_comparison_grid(
+    rows: list[tuple[str, list[tuple[str, Path]]]], output: Path, *, cell_size: int = 256
+) -> None:
+    if not rows:
+        return
+    columns = max(len(images) for _, images in rows)
+    label_height = 24
+    canvas = Image.new(
+        "RGB", (columns * cell_size, len(rows) * (cell_size + label_height)), "white"
+    )
+    draw = ImageDraw.Draw(canvas)
+    for row_index, (row_label, images) in enumerate(rows):
+        top = row_index * (cell_size + label_height)
+        for column_index, (column_label, path) in enumerate(images):
+            with Image.open(path) as source:
+                thumbnail = ImageOps.fit(source.convert("RGB"), (cell_size, cell_size))
+            left = column_index * cell_size
+            canvas.paste(thumbnail, (left, top + label_height))
+            draw.text((left + 4, top + 4), f"{row_label} | {column_label}", fill="black")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    canvas.save(output)
+
+
+@torch.no_grad()
+def compare_style_checkpoint_samples(
+    config: dict[str, Any], destination: Path
+) -> dict[str, Any]:
+    """Generate deterministic fixed-panel and reference/CFG controlled comparisons."""
+    cfg = config["style_transfer"]
+    comparison_cfg = dict(cfg.get("comparison", {}))
+    device = str(cfg["training"].get("device", "cuda"))
+    output = destination / str(cfg.get("output_directory", "style_transfer_training"))
+    checkpoint = Path(str(comparison_cfg.get("checkpoint", "training_state.pt")))
+    if not checkpoint.is_absolute():
+        candidate = output / checkpoint
+        checkpoint = candidate if candidate.exists() else destination / checkpoint
+    state = torch.load(checkpoint, map_location="cpu", weights_only=False)
+
+    resampler = load_per_reference_resampler(destination, cfg["resampler"], device)
+    anima = _resolve_anima_model(config, destination, device).requires_grad_(False).eval()
+    adapter = _create_and_attach_style_adapter(
+        anima, cfg["adapter"], device, dtype=torch.bfloat16
+    )
+    _load_adapter_checkpoint(adapter, state)
+    if "resampler" in state:
+        resampler.load_state_dict(state["resampler"])
+    adapter.eval()
+
+    step = int(state["step"])
+    comparison_root = output / "sample_comparison" / f"step-{step:07d}"
+    comparison_root.mkdir(parents=True, exist_ok=True)
+    sample_config = copy.deepcopy(config)
+    sampling_cfg = sample_config["style_transfer"]["sampling"]
+    sampling_cfg["width"] = int(comparison_cfg.get("width", sampling_cfg.get("width", 768)))
+    sampling_cfg["height"] = int(comparison_cfg.get("height", sampling_cfg.get("height", 768)))
+    sampling_cfg["steps"] = int(comparison_cfg.get("steps", sampling_cfg.get("steps", 30)))
+    sampling_cfg["seed"] = int(comparison_cfg.get("seed", sampling_cfg.get("seed", 20260811)))
+
+    loader_seed = int(cfg.get("seed", 20260811)) ^ 0x51A7
+    loaders: dict[str, ProductionStyleLoader] = {}
+    for split in ("train", "validation"):
+        loader_cfg = {**cfg["loader"], "split": split, "batch_size": 1, "seed": loader_seed}
+        loaders[split] = ProductionStyleLoader(destination, loader_cfg)
+
+    panel_path = output / "sample_panel.json"
+    with panel_path.open("r", encoding="utf-8") as handle:
+        panel = json.load(handle)
+    fixed_cfgs = [float(value) for value in comparison_cfg.get("fixed_style_cfgs", [1.0, 4.0])]
+    fixed_paths: dict[str, dict[str, dict[str, str]]] = defaultdict(dict)
+    vae = None
+    for style_cfg in fixed_cfgs:
+        sampling_cfg["style_cfg"] = style_cfg
+        for split, seed_offset in (("train", 0), ("validation", 100_000)):
+            entries = panel[split]
+            requests = [
+                (
+                    split,
+                    loaders[split],
+                    int(entry["episode"]),
+                    sampling_cfg["seed"] + seed_offset + index,
+                )
+                for index, entry in enumerate(entries)
+            ]
+            records, vae, _ = _sample_style_adapter_batch(
+                anima, adapter, resampler, requests, sample_config, destination,
+                comparison_root, device, step, vae, reference_mode="self",
+            )
+            for entry, (_, sheet) in zip(entries, records, strict=True):
+                raw = Path(str(sheet).replace("-sheet.png", ".png"))
+                key = f"episode-{int(entry['episode']):05d}"
+                fixed_paths[split].setdefault(key, {})[f"cfg-{style_cfg:g}"] = str(raw)
+                fixed_paths[split][key]["sheet"] = str(sheet)
+    if vae is not None:
+        vae.to("cpu")
+
+    controlled_split = str(comparison_cfg.get("controlled_split", "validation"))
+    controlled_batch_size = max(2, int(comparison_cfg.get("controlled_batch_size", 4)))
+    controlled_loader = ProductionStyleLoader(
+        destination,
+        {
+            **cfg["loader"],
+            "split": controlled_split,
+            "batch_size": controlled_batch_size,
+            "seed": loader_seed,
+        },
+    )
+    controlled_episode = int(comparison_cfg.get("controlled_episode", 0))
+    controlled_batch = controlled_loader.load_step(controlled_episode)
+    controlled_target = controlled_batch["episodes"][0]
+    controlled_donor = controlled_batch["episodes"][-1]
+    controlled_cfgs = [
+        float(value) for value in comparison_cfg.get("controlled_style_cfgs", [1.0, 2.0, 4.0])
+    ]
+    controlled_modes = [
+        str(value)
+        for value in comparison_cfg.get(
+            "controlled_reference_modes",
+            ["bypass", "null", "wrong_artist", "heldout", "mixed", "self"],
+        )
+    ]
+    controlled_paths: dict[str, dict[str, dict[str, str]]] = defaultdict(dict)
+    vae = None
+    for style_cfg in controlled_cfgs:
+        sampling_cfg["style_cfg"] = style_cfg
+        for mode in controlled_modes:
+            sheet, vae, _ = _sample_style_adapter(
+                anima, adapter, resampler, controlled_loader, sample_config,
+                destination, comparison_root, device, step, vae,
+                reference_mode=mode, episode_index=controlled_episode,
+                sample_group=f"controlled/{mode}",
+                sample_seed=sampling_cfg["seed"],
+            )
+            raw = Path(str(sheet).replace("-sheet.png", ".png"))
+            controlled_paths[mode][f"cfg-{style_cfg:g}"] = {
+                "image": str(raw), "sheet": str(sheet)
+            }
+    if vae is not None:
+        vae.to("cpu")
+
+    fixed_metrics: dict[str, Any] = {}
+    fixed_grid_rows = []
+    for split, episodes in fixed_paths.items():
+        for episode, paths in episodes.items():
+            first_path = Path(next(iter(paths[key] for key in paths if key.startswith("cfg-"))))
+            base = first_path.parent / first_path.name.replace(
+                f"-self-style-cfg-{next(key[4:] for key in paths if key.startswith('cfg-'))}.png",
+                "-base.png",
+            )
+            images = [("base", base)]
+            row_metrics: dict[str, Any] = {}
+            for key in sorted(value for value in paths if value.startswith("cfg-")):
+                path = Path(paths[key])
+                images.append((key, path))
+                row_metrics[f"{key}_vs_base"] = _pixel_distance(path, base)
+            cfg_keys = sorted(value for value in paths if value.startswith("cfg-"))
+            if len(cfg_keys) >= 2:
+                row_metrics[f"{cfg_keys[0]}_vs_{cfg_keys[-1]}"] = _pixel_distance(
+                    Path(paths[cfg_keys[0]]), Path(paths[cfg_keys[-1]])
+                )
+            fixed_metrics[f"{split}/{episode}"] = row_metrics
+            fixed_grid_rows.append((f"{split}/{episode}", images))
+
+    controlled_metrics: dict[str, Any] = {}
+    controlled_grid_rows = []
+    base_path = Path(controlled_paths["bypass"][f"cfg-{controlled_cfgs[0]:g}"]["image"])
+    for mode in controlled_modes:
+        images = []
+        mode_metrics: dict[str, Any] = {}
+        for style_cfg in controlled_cfgs:
+            key = f"cfg-{style_cfg:g}"
+            path = Path(controlled_paths[mode][key]["image"])
+            images.append((key, path))
+            mode_metrics[f"{key}_vs_base"] = _pixel_distance(path, base_path)
+        mode_metrics["cfg_min_vs_max"] = _pixel_distance(images[0][1], images[-1][1])
+        controlled_metrics[mode] = mode_metrics
+        controlled_grid_rows.append((mode, images))
+    for style_cfg in controlled_cfgs:
+        key = f"cfg-{style_cfg:g}"
+        for first_mode, second_mode in (
+            ("self", "heldout"), ("self", "wrong_artist"),
+            ("heldout", "wrong_artist"), ("heldout", "mixed"),
+        ):
+            if first_mode in controlled_paths and second_mode in controlled_paths:
+                controlled_metrics[f"{first_mode}_vs_{second_mode}/{key}"] = _pixel_distance(
+                    Path(controlled_paths[first_mode][key]["image"]),
+                    Path(controlled_paths[second_mode][key]["image"]),
+                )
+
+    fixed_grid = comparison_root / "fixed-panel-cfg-grid.png"
+    controlled_grid = comparison_root / "controlled-reference-cfg-grid.png"
+    _write_comparison_grid(fixed_grid_rows, fixed_grid)
+    _write_comparison_grid(controlled_grid_rows, controlled_grid)
+    result = {
+        "step": step,
+        "checkpoint": str(checkpoint.resolve()),
+        "fixed_panel": dict(fixed_paths),
+        "fixed_metrics": fixed_metrics,
+        "controlled": {
+            "split": controlled_split,
+            "episode": controlled_episode,
+            "target_id": int(controlled_target.target_id),
+            "style_id": str(controlled_target.style_id),
+            "same_artist_reference_ids": [int(value) for value in controlled_target.reference_ids],
+            "wrong_artist_style_id": str(controlled_donor.style_id),
+            "wrong_artist_reference_ids": [int(value) for value in controlled_donor.reference_ids],
+            "paths": dict(controlled_paths),
+            "metrics": controlled_metrics,
+        },
+        "fixed_grid": str(fixed_grid),
+        "controlled_grid": str(controlled_grid),
+    }
+    write_json(comparison_root / "summary.json", result)
+    return result
+
+
 def _per_sample_flow_residual_metrics(
     prediction: torch.Tensor,
     bypass: torch.Tensor,
