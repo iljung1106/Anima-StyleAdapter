@@ -700,8 +700,10 @@ def _sample_tokenizer(
     device: str,
     step: int,
     vae: nn.Module | None,
+    *,
+    config_section: str = "style_tokenizer",
 ) -> tuple[list[Path], nn.Module]:
-    cfg = config["style_tokenizer"]
+    cfg = config[config_section]
     sample_cfg = dict(cfg.get("sampling", {}))
     tokenizer.eval()
     loaded = [
@@ -1050,6 +1052,7 @@ def train_style_tokenizer(
             sheets, vae = _sample_tokenizer(
                 anima, tokenizer, sample_requests, config, destination,
                 output, device, start_step, vae,
+                config_section=config_section,
             )
             if wandb_run is not None:
                 import wandb
@@ -1221,6 +1224,7 @@ def train_style_tokenizer(
                 sheets, vae = _sample_tokenizer(
                     anima, tokenizer, sample_requests, config, destination,
                     output, device, step, vae,
+                    config_section=config_section,
                 )
                 if wandb_run is not None:
                     import wandb
@@ -1415,6 +1419,28 @@ def select_style_tokenizer_checkpoint(
                 - wrong["paired_flow_improvement"]
             ),
         }
+    train_loader_cfg = _tokenizer_loader_config(
+        config, source_cfg, split=str(source_cfg.get("train_split", "train"))
+    )
+    train_loader = ProductionStyleLoader(destination, train_loader_cfg)
+    sample_requests = [
+        ("train-0", train_loader, 0, "self"),
+        ("train-1", train_loader, 13, "heldout"),
+        ("validation-0", validation_loader, 0, "self"),
+        ("validation-1", validation_loader, 13, "heldout"),
+    ]
+    selected_sample_sheets, _ = _sample_tokenizer(
+        anima,
+        tokenizer,
+        sample_requests,
+        config,
+        destination,
+        output,
+        device,
+        int(selected["step"]),
+        None,
+        config_section=source_section,
+    )
     summary = {
         "source_config_section": source_section,
         "selection_rule": (
@@ -1427,6 +1453,9 @@ def select_style_tokenizer_checkpoint(
         "selected_step": int(selected["step"]),
         "selected_checkpoint": str(selected_path.resolve()),
         "reference_count_evaluation": reference_count_evaluation,
+        "selected_sample_sheets": [
+            str(path.resolve()) for path in selected_sample_sheets
+        ],
         "resampler_cache": cache_summary,
     }
     write_json(output / "selection.json", summary)
