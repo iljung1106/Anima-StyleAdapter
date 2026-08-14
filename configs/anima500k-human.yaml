@@ -386,6 +386,9 @@ style_transfer:
     # weight-only restart at 5e-5 increased the orthogonal style residual and
     # degraded every validation split by step 500.
     resume_checkpoint: style_transfer_ip_adapter_exposure_bootstrap_5k_v1/training_state.pt
+    # Smoke runs deliberately skip optimizer resume because their local step
+    # limit is below 2k; initialize those from the matching adapter weights.
+    initial_checkpoint: style_transfer_ip_adapter_exposure_bootstrap_5k_v1/checkpoints/step-0002000.pt
     steps: 4000
     learning_rate: 0.00001
     bridge_learning_rate: 0.00001
