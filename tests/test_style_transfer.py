@@ -29,6 +29,7 @@ from anima_style_data.style_transfer import (
     _per_sample_flow_residual_metrics,
     _reference_flow_direction_loss,
     _reference_flow_rank_loss,
+    _reference_flow_residual_mse_loss,
     _save_training_state,
     _sample_flow_timesteps,
     _set_aggregator_trainable,
@@ -421,6 +422,30 @@ def test_reference_direction_loss_live_wrong_branch_cancels_common_gradient():
     assert wrong.grad is not None
     assert correct.grad.norm() > 0
     torch.testing.assert_close(wrong.grad, -correct.grad)
+
+
+def test_reference_residual_mse_preserves_target_error_and_cancels_common_gradient():
+    common = torch.tensor([[[[0.4, -0.2]]]], requires_grad=True)
+    correct_specific = torch.tensor([[[[0.1, 0.0]]]], requires_grad=True)
+    wrong_specific = torch.tensor([[[[-0.1, 0.2]]]], requires_grad=True)
+    correct = common + correct_specific
+    wrong = common + wrong_specific
+    target = torch.tensor([[[[1.0, -1.0]]]])
+
+    loss = _reference_flow_residual_mse_loss(
+        correct, wrong, target, scale_floor=1e-6
+    )
+    desired = target - wrong.detach()
+    expected = torch.nn.functional.mse_loss(
+        (correct - target) / desired.square().mean().sqrt(),
+        torch.zeros_like(correct),
+    )
+    torch.testing.assert_close(loss.detach(), expected.detach())
+
+    loss.backward()
+    torch.testing.assert_close(common.grad, torch.zeros_like(common.grad))
+    assert correct_specific.grad is not None and correct_specific.grad.norm() > 0
+    torch.testing.assert_close(wrong_specific.grad, -correct_specific.grad)
 
 
 class RMSNorm(nn.Module):

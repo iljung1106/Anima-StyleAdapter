@@ -280,7 +280,7 @@ tap_resampler_experiment:
 # and batches targets by exact latent shape. `style-smoke` forces two steps and
 # writes to a separate smoke directory; `style-train` uses `training.steps`.
 style_transfer:
-  output_directory: style_transfer_same_q_phase_a211_reference_specific_r128_2k_v1
+  output_directory: style_transfer_same_q_phase_a212_reference_centered_mse_r128_2k_v1
   seed: 20260811
   loader:
     style_cache: style_features_l18_l24_siglip_l24
@@ -348,10 +348,11 @@ style_transfer:
     aggregator_heads: 16
     aggregator_layers: 2
     aggregator_slot_mixer_layers: 1
-    # A2.9/A2.10 established statistically positive absolute flow improvement.
-    # Train the null condition now so inference-time Style CFG has a valid
-    # unconditional branch instead of an untrained common residual.
-    style_dropout: 0.10
+    # A2.11 proved that premature null dropout learns the same common residual
+    # as correct and wrong references. Keep it disabled while the conditional
+    # path is centered; train null=no-op only after reference specificity is
+    # statistically established.
+    style_dropout: 0.0
     # Native gate_cross(t) is applied once after the merged native O output.
   # Measure only the magnitude of Anima's native @artist intervention. Residual
   # directions are discarded. Weak artist tags and near-identical centered
@@ -371,12 +372,11 @@ style_transfer:
     maximum_artist_similarity: 0.95
   training:
     device: cuda
-    # Phase A2.11: A2.10 showed that opening rank-32 K/V deltas alone does not
-    # significantly improve held-out flow. Its reference diagnostic found a
-    # dominant common residual: correct, wrong and untrained null conditions
-    # improved low/mid timesteps similarly. Start from A2.10 step 500 and add a
-    # live wrong-reference margin plus trained null dropout while retaining the
-    # absolute normalized residual target.
+    # Phase A2.12: A2.11's correct/wrong/null diagnostic exposed a dominant
+    # reference-independent correction. Start from the clean A2.10 checkpoint
+    # and regress the exact flow residual through correct-minus-live-wrong.
+    # Its forward value remains the ordinary target error, while its common
+    # bridge/KV/O Jacobian cancels and only reference-specific updates survive.
     initial_checkpoint: style_transfer_same_q_phase_a210_kv_delta_r128_2k_v1/checkpoints/step-0000500.pt
     steps: 2000
     # Trainable adapter weights and Adam moments stay FP32. Representation
@@ -499,21 +499,22 @@ style_transfer:
     style_kv_contrastive_weight: 0.0
     style_contrastive_temperature: 0.10
     # A live wrong branch makes any reference-independent Jacobian cancel in the
-    # correct-vs-wrong comparison. Evaluate it on one row in half the optimizer
-    # microsteps to control VRAM/throughput while requiring a 0.5% advantage.
+    # correct-vs-wrong comparison. Use one row on every optimizer microstep;
+    # two retained Anima graphs fit, while two wrong rows approach the H100 cap.
     style_reference_rank_weight: 0.10
     style_reference_rank_margin: 0.005
-    style_reference_rank_probability: 0.50
+    style_reference_rank_probability: 1.0
     style_reference_rank_start_step: 0
     style_reference_rank_end_step: 0
     style_reference_direction_weight: 0.0
-    # After the first statistically positive validation, gently align the
-    # correct-minus-wrong residual direction; ramp it rather than opening it at
-    # full strength together with null dropout.
-    style_reference_direction_target_weight: 0.05
+    # Normalized centered MSE already supervises direction and magnitude. The
+    # older cosine-only objective is redundant and much weaker near zero.
+    style_reference_direction_target_weight: 0.0
     style_reference_direction_epsilon: 0.05
     style_reference_wrong_grad_samples: 1
-    adaptive_reference_loss: true
+    style_reference_residual_mse_weight: 1.0
+    style_reference_residual_scale_floor: 0.001
+    adaptive_reference_loss: false
     reference_loss_activation_validations: 1
     # Require at least 0.1% normalized flow-error reduction, not merely a
     # floating-point-positive result, before counting one qualifying check.
@@ -550,8 +551,8 @@ style_transfer:
     wandb:
       enabled: true
       project: anima-style-adapter
-      name: anima-style-transfer-same-q-phase-a211-reference-specific-r128-2k-v1
-      id: anima-style-transfer-same-q-phase-a211-reference-specific-r128-2k-v1
+      name: anima-style-transfer-same-q-phase-a212-reference-centered-mse-r128-2k-v1
+      id: anima-style-transfer-same-q-phase-a212-reference-centered-mse-r128-2k-v1
   diagnostics:
     checkpoint: checkpoints/step-0000500.pt
     batch_size: 4

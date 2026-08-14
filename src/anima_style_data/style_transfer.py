@@ -2490,6 +2490,9 @@ def _forward_flow_loss(
         reference_direction_weight = float(
             loss_config.get("style_reference_direction_weight", 0.0)
         )
+        reference_residual_mse_weight = float(
+            loss_config.get("style_reference_residual_mse_weight", 0.0)
+        )
         reference_rank_start = int(loss_config.get("style_reference_rank_start_step", 0))
         reference_rank_end = int(loss_config.get("style_reference_rank_end_step", 0))
         reference_rank_probability = float(
@@ -2499,7 +2502,11 @@ def _forward_flow_loss(
             0, int(loss_config.get("style_reference_wrong_grad_samples", 0))
         )
         reference_rank_active = (
-            (reference_rank_weight > 0 or reference_direction_weight > 0)
+            (
+                reference_rank_weight > 0
+                or reference_direction_weight > 0
+                or reference_residual_mse_weight > 0
+            )
             and style_tokens.shape[0] > 1
             and step >= reference_rank_start
             and (reference_rank_end <= 0 or step < reference_rank_end)
@@ -2620,6 +2627,7 @@ def _forward_flow_loss(
         reference_rank_loss = flow_loss.new_zeros(())
         reference_rank_advantage = flow_loss.new_full((), float("nan"))
         reference_direction_loss = flow_loss.new_zeros(())
+        reference_residual_mse_loss = flow_loss.new_zeros(())
         if wrong_reference_prediction is not None and bypass_prediction is not None:
             if wrong_reference_indices is not None:
                 correct_for_reference = prediction[wrong_reference_indices]
@@ -2657,6 +2665,24 @@ def _forward_flow_loss(
                             loss_config.get("style_reference_direction_epsilon", 0.05)
                         ),
                         wrong_has_grad=wrong_has_grad,
+                    )
+                if reference_residual_mse_weight > 0:
+                    if not wrong_has_grad:
+                        raise RuntimeError(
+                            "style_reference_residual_mse_weight requires "
+                            "style_reference_wrong_grad_samples > 0"
+                        )
+                    reference_residual_mse_loss = (
+                        _reference_flow_residual_mse_loss(
+                            correct_for_reference,
+                            wrong_for_reference,
+                            target_for_reference,
+                            scale_floor=float(
+                                loss_config.get(
+                                    "style_reference_residual_scale_floor", 1e-3
+                                )
+                            ),
+                        )
                     )
 
         oracle_distill_loss = flow_loss.new_zeros(())
@@ -2800,6 +2826,7 @@ def _forward_flow_loss(
             + direction_weight * direction_loss
             + reference_rank_weight * reference_rank_loss
             + reference_direction_weight * reference_direction_loss
+            + reference_residual_mse_weight * reference_residual_mse_loss
             + token_weight * token_contrastive
             + kv_weight * kv_contrastive
             + resampler_auxiliary_weight
@@ -2877,6 +2904,9 @@ def _forward_flow_loss(
         "style_reference_rank_advantage": float(reference_rank_advantage.detach()),
         "style_reference_rank_applied": bool(wrong_reference_prediction is not None),
         "style_reference_direction_loss": float(reference_direction_loss.detach()),
+        "style_reference_residual_mse_loss": float(
+            reference_residual_mse_loss.detach()
+        ),
         "style_token_contrastive": float(token_contrastive.detach()),
         "style_kv_contrastive": float(kv_contrastive.detach()),
         **adapter.runtime_stats(),
@@ -3712,6 +3742,33 @@ def _reference_flow_direction_loss(
         desired_rms,
         epsilon=float(epsilon),
     )
+
+
+def _reference_flow_residual_mse_loss(
+    correct: torch.Tensor,
+    wrong: torch.Tensor,
+    target: torch.Tensor,
+    *,
+    scale_floor: float = 1e-3,
+) -> torch.Tensor:
+    """Regress the target residual with a reference-centered gradient.
+
+    Numerically, ``(correct - wrong) - (target - stopgrad(wrong))`` is the
+    ordinary ``correct - target`` error.  Its backward path is different:
+    gradients flow through both conditions, so a reference-independent
+    adapter path has identical Jacobians in ``correct`` and ``wrong`` and
+    cancels exactly.  The cyclic wrong-reference branch therefore preserves
+    the direct flow target while making its useful gradient reference-specific.
+    """
+    dimensions = tuple(range(1, correct.ndim))
+    wrong_value = wrong.float()
+    wrong_target = wrong_value.detach()
+    student = correct.float() - wrong_value
+    desired = target.float() - wrong_target
+    scale = desired.square().mean(
+        dim=dimensions, keepdim=True
+    ).sqrt().clamp_min(float(scale_floor))
+    return F.mse_loss(student / scale, desired / scale)
 
 
 def _summarize_scalar_samples(values: list[float]) -> dict[str, float]:
@@ -5450,6 +5507,7 @@ def train_style_adapter(config: dict[str, Any], destination: Path, *, steps_over
                 f"rank={row['style_reference_rank_loss']:.5f}/"
                 f"{row['style_reference_rank_advantage']:.5f} "
                 f"ref_dir={row['style_reference_direction_loss']:.5f} "
+                f"ref_mse={row['style_reference_residual_mse_loss']:.5f} "
                 f"oracle={row['oracle_distill_loss']:.5f}/{int(row['oracle_distill_applied'])} "
                 f"gate={row['style_gate_abs_mean']:.4f} "
                 f"context_rms={row['style_context_rms']:.4f} "
