@@ -15,7 +15,7 @@ import types
 import weakref
 from collections import OrderedDict, defaultdict
 from concurrent.futures import Future, ThreadPoolExecutor
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Iterator
@@ -3797,27 +3797,27 @@ def diagnose_style_reference_dependence(
             *,
             bypass: bool = False,
         ) -> torch.Tensor:
-            patched_forwards = None
             if bypass:
                 adapter.clear_style_tokens()
-                patched_forwards = [block._forward for block in anima.blocks]
-                for block in anima.blocks:
-                    block._forward = block.__dict__["_style_original_forward"]
             else:
                 adapter.set_style_tokens(style)
             try:
-                with torch.autocast(
-                    device_type="cuda", dtype=torch.bfloat16, enabled=device.startswith("cuda")
-                ):
-                    return anima(
-                        noisy.unsqueeze(2), timesteps.to(latents.dtype), context=conditioning,
-                        padding_mask=padding_mask, target_input_ids=None,
-                    ).squeeze(2).float()
+                bypass_context = (
+                    _bypass_style_blocks(anima, adapter)
+                    if bypass else nullcontext()
+                )
+                with bypass_context:
+                    with torch.autocast(
+                        device_type="cuda", dtype=torch.bfloat16,
+                        enabled=device.startswith("cuda"),
+                    ):
+                        return anima(
+                            noisy.unsqueeze(2), timesteps.to(latents.dtype),
+                            context=conditioning, padding_mask=padding_mask,
+                            target_input_ids=None,
+                        ).squeeze(2).float()
             finally:
                 adapter.clear_style_tokens()
-                if patched_forwards is not None:
-                    for block, patched in zip(anima.blocks, patched_forwards, strict=True):
-                        block._forward = patched
 
         flat = F.normalize(correct_style.float().flatten(1), dim=1)
         self_flat = F.normalize(self_style.float().flatten(1), dim=1)
