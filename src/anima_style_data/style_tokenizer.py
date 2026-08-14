@@ -319,6 +319,25 @@ def _artist_direction_loss(
     }
 
 
+def _parameter_gradient_norm(
+    loss: torch.Tensor, parameters: list[nn.Parameter]
+) -> torch.Tensor:
+    gradients = torch.autograd.grad(
+        loss,
+        parameters,
+        retain_graph=True,
+        allow_unused=True,
+    )
+    squared = [
+        gradient.detach().float().square().sum()
+        for gradient in gradients
+        if gradient is not None
+    ]
+    if not squared:
+        return loss.new_zeros((), dtype=torch.float32)
+    return torch.stack(squared).sum().sqrt()
+
+
 def _flow_metrics(
     prediction: torch.Tensor,
     base_prediction: torch.Tensor,
@@ -410,6 +429,8 @@ def _forward_tokenizer_flow(
     target = (noise - latents).float()
     flow_loss = F.mse_loss(prediction, target)
     total_loss = flow_loss
+    token_loss = None
+    direction_loss = None
     metrics = {
         "total_loss": float(total_loss.detach()),
         "flow_loss": float(flow_loss.detach()),
@@ -511,6 +532,23 @@ def _forward_tokenizer_flow(
             },
         })
     metrics["total_loss"] = float(total_loss.detach())
+    if bool(training_cfg.get("diagnose_auxiliary_gradients", False)):
+        trainable = [parameter for parameter in tokenizer.parameters() if parameter.requires_grad]
+        metrics["flow_gradient_norm"] = float(
+            _parameter_gradient_norm(flow_loss, trainable)
+        )
+        if token_loss is not None:
+            metrics["weighted_token_gradient_norm"] = float(
+                _parameter_gradient_norm(
+                    token_contrastive_weight * token_loss, trainable
+                )
+            )
+        if direction_loss is not None:
+            metrics["weighted_artist_direction_gradient_norm"] = float(
+                _parameter_gradient_norm(
+                    artist_direction_weight * direction_loss, trainable
+                )
+            )
     if measure_base:
         assert base_prediction is not None
         metrics.update({
@@ -1079,6 +1117,8 @@ def train_style_tokenizer(
                 "artist_wrong_direction_cosine",
                 "artist_centered_direction_cosine",
                 "artist_direction_ranking_loss",
+                "flow_gradient_norm", "weighted_token_gradient_norm",
+                "weighted_artist_direction_gradient_norm",
             ):
                 values = [row[key] for row in micro_metrics if key in row]
                 if values:
@@ -1378,6 +1418,7 @@ def smoke_test_style_tokenizer_generalization(
     training["artist_direction_start_step"] = 1
     training["artist_direction_ramp_steps"] = 0
     training["artist_direction_every"] = 1
+    training["diagnose_auxiliary_gradients"] = True
     training["wandb"] = {"enabled": False}
     return train_style_tokenizer(
         smoke,
