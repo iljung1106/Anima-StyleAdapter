@@ -13,7 +13,7 @@ from typing import Any
 
 import torch
 import torch.nn.functional as F
-from PIL import Image
+from PIL import Image, ImageDraw, ImageOps
 from safetensors.torch import load_file, save_file
 from torch import nn
 
@@ -1551,6 +1551,241 @@ def export_style_tokenizer_checkpoint(
         encoding="utf-8",
     )
     return manifest
+
+
+def _comparison_contact_sheet(
+    entries: list[tuple[str, Image.Image]], *, columns: int = 3, tile: int = 512
+) -> Image.Image:
+    label_height = 40
+    rows = math.ceil(len(entries) / columns)
+    sheet = Image.new("RGB", (columns * tile, rows * (tile + label_height)), "white")
+    draw = ImageDraw.Draw(sheet)
+    for index, (label, value) in enumerate(entries):
+        x = (index % columns) * tile
+        y = (index // columns) * (tile + label_height)
+        sheet.paste(ImageOps.fit(value.convert("RGB"), (tile, tile)), (x, y))
+        draw.rectangle((x, y + tile, x + tile, y + tile + label_height), fill="black")
+        draw.text((x + 8, y + tile + 11), label.encode("ascii", "replace").decode(), fill="white")
+    return sheet
+
+
+@torch.no_grad()
+def compare_style_tokenizer_artists(
+    config: dict[str, Any], destination: Path
+) -> dict[str, Any]:
+    """Render different validation artists under one prompt, seed, and noise."""
+
+    compare_cfg = dict(config["style_tokenizer_artist_comparison"])
+    source_section = str(
+        compare_cfg.get(
+            "source_config_section",
+            config["style_tokenizer_selection"]["source_config_section"],
+        )
+    )
+    source_cfg = copy.deepcopy(config[source_section])
+    output = destination / str(source_cfg["output_directory"])
+    device = str(compare_cfg.get("device", source_cfg["training"].get("device", "cuda")))
+    artist_count = int(compare_cfg.get("artists", 8))
+    reference_count = int(compare_cfg.get("references", 4))
+    if artist_count <= 0 or reference_count <= 0:
+        raise ValueError("artists and references must be positive")
+
+    loader_cfg = _tokenizer_loader_config(
+        config,
+        source_cfg,
+        split=str(compare_cfg.get("split", source_cfg.get("validation_split", "validation"))),
+    )
+    loader_cfg.update({
+        "batch_size": artist_count,
+        "min_references": reference_count,
+        "max_references": reference_count,
+        "artist_balanced": True,
+    })
+    loader = ProductionStyleLoader(destination, loader_cfg)
+    batch = loader.load_step(int(compare_cfg.get("episode", 0)))
+    episodes = batch["episodes"]
+
+    prompt_id = int(compare_cfg["prompt_image_id"])
+    prompt_variant = int(compare_cfg.get("prompt_variant", 0))
+    prompt_row = loader.text_by_key[(prompt_id, prompt_variant)]
+    prompt_shard = loader.text_shards.get(str(prompt_row["cache_shard"]))
+    prompt_start = int(prompt_row["token_offset"])
+    prompt_length = int(prompt_row["token_length"])
+    prompt_value = prompt_shard["conditioning"][
+        prompt_start : prompt_start + prompt_length
+    ]
+    positive_text = _pad_text_conditions(
+        [prompt_value] * artist_count, loader.text_conditioning_length
+    ).to(device, dtype=torch.bfloat16)
+    lengths = torch.full(
+        (artist_count,), prompt_length, device=device, dtype=torch.long
+    )
+
+    references, reference_mask = _reference_tokens(batch, device, mode="heldout")
+    tokenizer = AnimaStyleTokenizer(**dict(source_cfg["model"])).to(device).eval()
+    selected = torch.load(
+        output / "checkpoints" / "selected.pt", map_location="cpu", weights_only=False
+    )
+    tokenizer.load_state_dict(selected["tokenizer"], strict=True)
+    anima = _resolve_anima_model(config, destination, device).requires_grad_(False).eval()
+    training_cfg = dict(source_cfg["training"])
+    _optimize_frozen_anima(
+        anima,
+        low_precision_rmsnorm=bool(training_cfg.get("low_precision_rmsnorm", True)),
+        fuse_attention_projections=bool(
+            training_cfg.get("fuse_attention_projections", True)
+        ),
+    )
+    with torch.autocast(
+        device_type="cuda", dtype=torch.bfloat16, enabled=device.startswith("cuda")
+    ):
+        style_tokens = tokenizer(references, reference_mask)
+    full_text = insert_style_tokens(positive_text, lengths, style_tokens)
+    null_raw = load_file(
+        loader.text_root / "null_conditioning.safetensors", device="cpu"
+    )["empty_prompt"]
+    if null_raw.ndim == 3:
+        null_raw = null_raw[0]
+    null_text = _pad_text_conditions(
+        [null_raw] * artist_count, loader.text_conditioning_length
+    ).to(device, dtype=torch.bfloat16)
+
+    width = int(compare_cfg.get("width", 768))
+    height = int(compare_cfg.get("height", 768))
+    steps = int(compare_cfg.get("steps", 30))
+    seed = int(compare_cfg.get("seed", 20260820))
+    text_cfg = float(compare_cfg.get("text_cfg", 4.0))
+    flow_shift = float(compare_cfg.get("flow_shift", 3.0))
+    base_noise = torch.randn(
+        1,
+        16,
+        1,
+        height // 8,
+        width // 8,
+        generator=torch.Generator(device="cpu").manual_seed(seed),
+        dtype=torch.float32,
+    ).to(device=device, dtype=torch.bfloat16)
+    styled_noise = base_noise.expand(artist_count, -1, -1, -1, -1).clone()
+    sigmas = torch.linspace(1.0, 0.0, steps + 1, device=device, dtype=torch.bfloat16)
+    sigmas = sigmas * flow_shift / (1 + (flow_shift - 1) * sigmas)
+
+    def denoise(
+        initial: torch.Tensor, positive: torch.Tensor, negative: torch.Tensor
+    ) -> torch.Tensor:
+        x = initial.clone()
+        padding_mask = torch.zeros(
+            x.shape[0], 1, x.shape[-2], x.shape[-1],
+            device=device, dtype=torch.bfloat16,
+        )
+        for index in range(steps):
+            timestep = sigmas[index].to(torch.bfloat16).expand(x.shape[0])
+            base_prediction = anima(
+                x, timestep, context=negative, padding_mask=padding_mask,
+                target_input_ids=None,
+            ).float()
+            full_prediction = anima(
+                x, timestep, context=positive, padding_mask=padding_mask,
+                target_input_ids=None,
+            ).float()
+            velocity = base_prediction + text_cfg * (full_prediction - base_prediction)
+            x = (
+                x.float() + velocity * (sigmas[index + 1] - sigmas[index]).float()
+            ).to(torch.bfloat16)
+        return x
+
+    with torch.autocast(
+        device_type="cuda", dtype=torch.bfloat16, enabled=device.startswith("cuda")
+    ):
+        base_latent = denoise(base_noise, positive_text[:1], null_text[:1])
+        styled_latents = denoise(styled_noise, full_text, null_text)
+    vae = _load_sampling_vae(config, destination).to(device=device, dtype=torch.bfloat16)
+    decoded = vae.decode_to_pixels(
+        torch.cat((base_latent, styled_latents), dim=0)
+    ).float()
+
+    def to_image(value: torch.Tensor) -> Image.Image:
+        if value.ndim == 4:
+            value = value[:, 0]
+        pixels = ((value.clamp(-1, 1) + 1) * 127.5).byte().permute(1, 2, 0)
+        return Image.fromarray(pixels.cpu().numpy())
+
+    result_dir = output / str(
+        compare_cfg.get("output_directory", "comparisons/same-prompt-seed")
+    )
+    result_dir.mkdir(parents=True, exist_ok=True)
+    base_image = to_image(decoded[0])
+    base_path = result_dir / "00-base-text-only.png"
+    base_image.save(base_path)
+    entries: list[tuple[str, Image.Image]] = [("text only", base_image)]
+    artists = []
+    for index, episode in enumerate(episodes):
+        artist = str(loader.style_by_id[episode.target_id]["artist"])
+        image = to_image(decoded[index + 1])
+        safe_artist = "".join(
+            character if character.isalnum() or character in "-_" else "_"
+            for character in artist
+        )
+        image_path = result_dir / f"{index + 1:02d}-{safe_artist}.png"
+        image.save(image_path)
+        sources = [
+            Path(str(loader.style_by_id[image_id]["local_path"]))
+            for image_id in episode.reference_ids
+        ]
+        reference_strip = Image.new("RGB", (reference_count * 192, 192), "white")
+        for reference_index, source in enumerate(sources):
+            with Image.open(source) as reference_image:
+                reference_strip.paste(
+                    ImageOps.fit(reference_image.convert("RGB"), (192, 192)),
+                    (reference_index * 192, 0),
+                )
+        reference_path = result_dir / f"{index + 1:02d}-{safe_artist}-references.png"
+        reference_strip.save(reference_path)
+        per_artist = Image.new("RGB", (1536, 1032), "white")
+        per_artist.paste(ImageOps.fit(base_image, (768, 768)), (0, 0))
+        per_artist.paste(ImageOps.fit(image, (768, 768)), (768, 0))
+        per_artist_draw = ImageDraw.Draw(per_artist)
+        per_artist_draw.rectangle((0, 768, 768, 808), fill="black")
+        per_artist_draw.rectangle((768, 768, 1536, 808), fill="black")
+        per_artist_draw.text((8, 779), "same text / no style", fill="white")
+        per_artist_draw.text(
+            (776, 779),
+            f"style: {artist}".encode("ascii", "replace").decode(),
+            fill="white",
+        )
+        per_artist_draw.text((8, 819), "four target-excluded references", fill="black")
+        per_artist.paste(reference_strip, (384, 840))
+        sheet_path = result_dir / f"{index + 1:02d}-{safe_artist}-sheet.png"
+        per_artist.save(sheet_path)
+        entries.append((artist, image))
+        artists.append({
+            "artist": artist,
+            "style_id": episode.style_id,
+            "reference_ids": list(episode.reference_ids),
+            "image": str(image_path.resolve()),
+            "references": str(reference_path.resolve()),
+            "sheet": str(sheet_path.resolve()),
+        })
+    contact_path = result_dir / "all-artists-contact-sheet.png"
+    _comparison_contact_sheet(entries).save(contact_path)
+    summary = {
+        "selected_step": int(selected["step"]),
+        "split": loader.split,
+        "prompt_image_id": prompt_id,
+        "prompt_variant": prompt_variant,
+        "prompt": str(prompt_row["caption"]),
+        "seed": seed,
+        "same_initial_noise": True,
+        "text_cfg": text_cfg,
+        "steps": steps,
+        "width": width,
+        "height": height,
+        "references_per_artist": reference_count,
+        "base_image": str(base_path.resolve()),
+        "contact_sheet": str(contact_path.resolve()),
+        "artists": artists,
+    }
+    write_json(result_dir / "summary.json", summary)
+    return summary
 
 
 def smoke_test_style_tokenizer(

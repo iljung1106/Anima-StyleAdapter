@@ -95,6 +95,7 @@ def build_parser() -> argparse.ArgumentParser:
         ("style-tokenizer-lr10x-scratch", "Train the 10x-LR StyleTokenizer ablation from scratch"),
         ("style-tokenizer-select", "Re-evaluate and select a StyleTokenizer checkpoint"),
         ("style-tokenizer-export", "Export the selected StyleTokenizer inference bundle"),
+        ("style-tokenizer-compare-artists", "Render different artists with one prompt and seed"),
         ("style-tokenizer-smoke", "Run two real Anima StyleTokenizer training steps"),
         ("style-calibrate", "Measure empirical Anima artist-tag velocity effect ranges"),
         ("synthetic-teacher", "Generate and fully cache artist-tag teacher images"),
@@ -217,12 +218,14 @@ def main() -> None:
         "style-tokenizer-lr10x-scratch",
         "style-tokenizer-select",
         "style-tokenizer-export",
+        "style-tokenizer-compare-artists",
         "style-tokenizer-smoke", "style-tokenizer-generalize-smoke",
     }:
         from .style_tokenizer import (
             smoke_test_style_tokenizer,
             smoke_test_style_tokenizer_generalization,
             export_style_tokenizer_checkpoint,
+            compare_style_tokenizer_artists,
             select_style_tokenizer_checkpoint,
             train_style_tokenizer,
             train_style_tokenizer_generalization,
@@ -237,6 +240,7 @@ def main() -> None:
             "style-tokenizer-lr10x-scratch": train_style_tokenizer_lr10x_scratch,
             "style-tokenizer-select": select_style_tokenizer_checkpoint,
             "style-tokenizer-export": export_style_tokenizer_checkpoint,
+            "style-tokenizer-compare-artists": compare_style_tokenizer_artists,
             "style-tokenizer-smoke": smoke_test_style_tokenizer,
             "style-tokenizer-generalize-smoke": smoke_test_style_tokenizer_generalization,
         }[args.command]

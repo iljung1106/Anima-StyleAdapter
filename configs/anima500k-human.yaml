@@ -832,6 +832,26 @@ style_tokenizer_selection:
   reference_count_validation_batches: 32
   seed: 20260819
 
+# Controlled qualitative comparison: every row receives the exact same cached
+# prompt conditioning and initial noise. Only four target-excluded references
+# from a different held-out validation artist change between rows.
+style_tokenizer_artist_comparison:
+  source_config_section: style_tokenizer_generalization
+  device: cuda
+  split: validation
+  episode: 0
+  artists: 8
+  references: 4
+  prompt_image_id: 3094764
+  prompt_variant: 0
+  width: 768
+  height: 768
+  steps: 30
+  flow_shift: 3.0
+  seed: 20260820
+  text_cfg: 4.0
+  output_directory: comparisons/same-prompt-seed-validation-8-artists
+
 # Controlled LR ablation. Before running, copy Phase A step-1500.pt to this
 # output directory as training_state.pt. That preserves optimizer moments,
 # RNG state, data position, and the original Phase A output independently.
