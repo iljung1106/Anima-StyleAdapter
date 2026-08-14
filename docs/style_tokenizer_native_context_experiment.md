@@ -60,14 +60,17 @@ initialization에서 시작한다.
 - frozen-Anima rectified-flow MSE가 주 손실이다.
 - 같은 작가의 비중첩 reference 집합 두 개에서 얻은 전체 16개 slot을 직접
   supervised contrastive로 정렬한다. 다른 batch 작가는 negative이며 이
-  손실은 첫 1,000 step 동안 weight `0.005`까지 ramp한다.
+  손실은 첫 1,000 step 동안 weight `0.00075`까지 ramp한다.
 - step 1,500부터 같은 target, prompt, noise, timestep에서 correct와 wrong
-  artist의 flow 방향을 비교하는 bounded auxiliary loss를 weight `0.005`까지
+  artist의 flow 방향을 비교하는 bounded auxiliary loss를 weight `0.00075`까지
   ramp한다. 두 이미지에 대해 4 optimizer step마다 한 번 계산한다.
 - wrong-artist 예측은 이 손실에서 stop-gradient한다. 따라서 wrong reference를
   의도적으로 파괴적인 방향으로 보내는 shortcut은 허용하지 않는다.
 - 공통 flow 성분의 centering은 이 보조 비교 안에서만 사용하며 실제 style
   residual에서는 제거하지 않는다.
+- 2-step real-cache gradient 진단에서 두 최대 보조 weight는 각각 flow
+  gradient norm의 약 9%였다. direction은 4 step마다만 계산하므로 평균 영향은
+  약 2--3%이며, flow MSE가 계속 최적화를 지배한다.
 - 500 step마다 self와 heldout 생성 패널을 보며 target content 복사 감소,
   스타일 변화, 붕괴 여부를 함께 판단한다.
 

@@ -789,11 +789,11 @@ style_tokenizer_generalization:
     discrete_flow_shift: 3.0
     prefetch_workers: 2
     prefetch_batches: 4
-    token_contrastive_weight: 0.005
+    token_contrastive_weight: 0.00075
     token_contrastive_temperature: 0.10
     token_contrastive_start_step: 1
     token_contrastive_ramp_steps: 1000
-    artist_direction_weight: 0.005
+    artist_direction_weight: 0.00075
     artist_direction_start_step: 1500
     artist_direction_ramp_steps: 1000
     artist_direction_every: 4
