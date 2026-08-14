@@ -4875,11 +4875,13 @@ def train_style_adapter(config: dict[str, Any], destination: Path, *, steps_over
     gate_parameters = adapter.gate_parameters()
     bridge_parameters = adapter.bridge_parameters()
     style_kv_parameters = adapter.kv_parameters()
-    style_kv_base_parameters: list[nn.Parameter] = []
+    style_k_base_parameters: list[nn.Parameter] = []
+    style_v_base_parameters: list[nn.Parameter] = []
     if bool(training.get("train_full_rank_style_k", False)):
-        style_kv_base_parameters.extend(adapter.active_k_base_parameters())
+        style_k_base_parameters.extend(adapter.active_k_base_parameters())
     if bool(training.get("train_full_rank_style_v", False)):
-        style_kv_base_parameters.extend(adapter.active_v_base_parameters())
+        style_v_base_parameters.extend(adapter.active_v_base_parameters())
+    style_kv_base_parameters = style_k_base_parameters + style_v_base_parameters
     special_ids = {
         id(value)
         for value in (
@@ -4901,8 +4903,17 @@ def train_style_adapter(config: dict[str, Any], destination: Path, *, steps_over
         training.get("representation_learning_rate", training.get("learning_rate", 1e-4))
     )
     style_kv_lr = float(training.get("style_kv_learning_rate", representation_lr))
-    style_kv_base_lr = float(
-        training.get("style_kv_base_learning_rate", style_kv_lr)
+    style_k_base_lr = float(
+        training.get(
+            "style_k_base_learning_rate",
+            training.get("style_kv_base_learning_rate", style_kv_lr),
+        )
+    )
+    style_v_base_lr = float(
+        training.get(
+            "style_v_base_learning_rate",
+            training.get("style_kv_base_learning_rate", style_kv_lr),
+        )
     )
     bridge_lr = float(training.get("bridge_learning_rate", 1e-5))
     output_lr = float(training.get("output_learning_rate", representation_lr))
@@ -4930,12 +4941,21 @@ def train_style_adapter(config: dict[str, Any], destination: Path, *, steps_over
             },
             *(
                 [{
-                    "params": style_kv_base_parameters,
-                    "lr": style_kv_base_lr,
+                    "params": style_k_base_parameters,
+                    "lr": style_k_base_lr,
                     "weight_decay": weight_decay,
-                    "name": "style_kv_base",
+                    "name": "style_k_base",
                 }]
-                if style_kv_base_parameters else []
+                if style_k_base_parameters else []
+            ),
+            *(
+                [{
+                    "params": style_v_base_parameters,
+                    "lr": style_v_base_lr,
+                    "weight_decay": weight_decay,
+                    "name": "style_v_base",
+                }]
+                if style_v_base_parameters else []
             ),
             {
                 "params": output_parameters,
@@ -4979,8 +4999,10 @@ def train_style_adapter(config: dict[str, Any], destination: Path, *, steps_over
         f"bridge=RAdam(lr={bridge_lr:g},warmup={int(training.get('bridge_warmup_steps', 400))},"
         f"eps={float(training.get('bridge_adam_eps', 1e-6)):g}) "
         f"representation_lr={representation_lr:g} style_kv_lr={style_kv_lr:g} "
-        f"style_kv_base_lr={style_kv_base_lr:g}/"
-        f"{'trainable' if style_kv_base_parameters else 'frozen'} "
+        f"style_k_base_lr={style_k_base_lr:g}/"
+        f"{'trainable' if style_k_base_parameters else 'frozen'} "
+        f"style_v_base_lr={style_v_base_lr:g}/"
+        f"{'trainable' if style_v_base_parameters else 'frozen'} "
         f"output_lr={output_lr:g} "
         f"gate_lr={gate_lr:g} "
         f"resampler={'AdamW(lr=' + format(resampler_lr, 'g') + ')' if resampler_parameters else 'frozen/external'}",
@@ -5066,12 +5088,22 @@ def train_style_adapter(config: dict[str, Any], destination: Path, *, steps_over
             seed=seed ^ 0xA17A,
         )
         write_json(output / "alpha_calibration.json", alpha_calibration)
+        active_calibration_blocks = alpha_calibration["active_blocks"]
+        def mean_active(name: str) -> float:
+            return sum(
+                alpha_calibration[name][index]
+                for index in active_calibration_blocks
+            ) / len(active_calibration_blocks)
         print(
             "calibrated block alpha from raw style/text RMS: "
             f"target={alpha_calibration['target_style_to_text_ratio']:.4f} "
             f"raw_mean={sum(alpha_calibration['raw_style_to_text_ratio']) / len(alpha_calibration['raw_style_to_text_ratio']):.4f} "
             f"alpha_min={min(alpha_calibration['alpha']):.6g} "
-            f"alpha_max={max(alpha_calibration['alpha']):.6g}",
+            f"alpha_max={max(alpha_calibration['alpha']):.6g} "
+            f"entropy=text:{mean_active('text_attention_normalized_entropy'):.4f}/"
+            f"style:{mean_active('style_attention_normalized_entropy'):.4f} "
+            f"top1=text:{mean_active('text_attention_top1_probability'):.4f}/"
+            f"style:{mean_active('style_attention_top1_probability'):.4f}",
             flush=True,
         )
     if start_step >= steps:
@@ -5313,7 +5345,8 @@ def train_style_adapter(config: dict[str, Any], destination: Path, *, steps_over
             group_grad_tensors.update({
                 "aggregator_grad": _parameter_grad_norm(adapter.aggregator.parameters()),
                 "shared_kv_grad": _parameter_grad_norm(adapter.kv_parameters()),
-                "full_rank_kv_grad": _parameter_grad_norm(style_kv_base_parameters),
+                "full_rank_k_grad": _parameter_grad_norm(style_k_base_parameters),
+                "full_rank_v_grad": _parameter_grad_norm(style_v_base_parameters),
                 "style_output_grad": _parameter_grad_norm(adapter.output_parameters()),
                 "gate_grad": _parameter_grad_norm(adapter.gate_parameters()),
                 "resampler_grad": _parameter_grad_norm(resampler_parameters),
@@ -5409,7 +5442,8 @@ def train_style_adapter(config: dict[str, Any], destination: Path, *, steps_over
                 f"bridge=grad:{row['bridge_grad_norm']:.4g}/"
                 f"update:{row['bridge_update_norm']:.3g}/rel:{row['bridge_update_to_weight_ratio']:.3g} "
                 f"grads=agg:{row['aggregator_grad']:.4g}/kv:{row['shared_kv_grad']:.4g}/"
-                f"full_kv:{row['full_rank_kv_grad']:.4g}/"
+                f"full_k:{row['full_rank_k_grad']:.4g}/"
+                f"full_v:{row['full_rank_v_grad']:.4g}/"
                 f"o:{row['style_output_grad']:.4g}/gate:{row['gate_grad']:.4g}/"
                 f"res:{row['resampler_grad']:.4g} "
                 f"peak_vram={row['peak_vram_gib']:.2f}GiB",

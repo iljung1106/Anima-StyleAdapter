@@ -211,6 +211,7 @@ class SameQFullRankStyleAdapter(nn.Module):
         bridge_init: str = "xavier",
         bridge_output_rms_init: float = 0.15,
         style_kv_delta_rank: int = 32,
+        style_attention_context_length: int | None = None,
         active_blocks: list[int] | None = None,
     ) -> None:
         super().__init__()
@@ -221,6 +222,14 @@ class SameQFullRankStyleAdapter(nn.Module):
         self.style_dim = int(style_dim)
         self.context_dim = int(context_dim)
         self.slots = int(slots)
+        self.style_attention_context_length = int(
+            style_attention_context_length
+            if style_attention_context_length is not None else slots
+        )
+        if self.style_attention_context_length < self.slots:
+            raise ValueError(
+                "style_attention_context_length must be at least the style slot count"
+            )
         self.heads = int(heads)
         self.blocks = int(blocks)
         selected_blocks = (
@@ -283,6 +292,8 @@ class SameQFullRankStyleAdapter(nn.Module):
         self._runtime_style_context_rms: torch.Tensor | None = None
         self._alpha_calibration_sums: list[torch.Tensor] | None = None
         self._alpha_calibration_counts: list[int] | None = None
+        self._attention_geometry_sums: dict[str, list[torch.Tensor]] | None = None
+        self._attention_geometry_counts: list[int] | None = None
 
     def initialize_from_anima(self, anima: nn.Module) -> None:
         """Create trainable full-rank K/V copies from all native Anima blocks."""
@@ -459,6 +470,16 @@ class SameQFullRankStyleAdapter(nn.Module):
         device = self.alpha.device
         self._alpha_calibration_sums = [torch.zeros((), device=device) for _ in range(self.blocks)]
         self._alpha_calibration_counts = [0 for _ in range(self.blocks)]
+        self._attention_geometry_sums = {
+            name: [torch.zeros((), device=device) for _ in range(self.blocks)]
+            for name in (
+                "text_attention_normalized_entropy",
+                "style_attention_normalized_entropy",
+                "text_attention_top1_probability",
+                "style_attention_top1_probability",
+            )
+        }
+        self._attention_geometry_counts = [0 for _ in range(self.blocks)]
         with torch.no_grad():
             self.alpha.zero_()
 
@@ -495,9 +516,50 @@ class SameQFullRankStyleAdapter(nn.Module):
             "raw_style_to_text_ratio": raw.detach().float().cpu().tolist(),
             "alpha": calibrated.detach().float().cpu().tolist(),
         }
+        if self._attention_geometry_sums is not None:
+            assert self._attention_geometry_counts is not None
+            for name, values in self._attention_geometry_sums.items():
+                result[name] = [
+                    float(value / count) if count else 0.0
+                    for value, count in zip(
+                        values, self._attention_geometry_counts, strict=True
+                    )
+                ]
         self._alpha_calibration_sums = None
         self._alpha_calibration_counts = None
+        self._attention_geometry_sums = None
+        self._attention_geometry_counts = None
         return result
+
+    def _collect_attention_geometry(
+        self,
+        block_index: int,
+        query: torch.Tensor,
+        text_key: torch.Tensor,
+        style_key: torch.Tensor,
+    ) -> None:
+        if self._attention_geometry_sums is None:
+            return
+        assert self._attention_geometry_counts is not None
+        query = query[:, : min(32, query.shape[1])].float()
+        scale = query.shape[-1] ** -0.5
+        for prefix, key in (("text", text_key), ("style", style_key)):
+            logits = torch.einsum(
+                "bqhd,bkhd->bhqk", query, key.float()
+            ) * scale
+            probabilities = logits.softmax(dim=-1)
+            entropy = -(
+                probabilities * probabilities.clamp_min(1e-12).log()
+            ).sum(dim=-1)
+            normalized_entropy = entropy / math.log(max(2, key.shape[1]))
+            top1 = probabilities.amax(dim=-1)
+            self._attention_geometry_sums[
+                f"{prefix}_attention_normalized_entropy"
+            ][block_index].add_(normalized_entropy.mean())
+            self._attention_geometry_sums[
+                f"{prefix}_attention_top1_probability"
+            ][block_index].add_(top1.mean())
+        self._attention_geometry_counts[block_index] += 1
 
     def projected_signature(
         self,
@@ -508,7 +570,7 @@ class SameQFullRankStyleAdapter(nn.Module):
         del cross_attentions
         if not self._initialized:
             raise RuntimeError("Adapter must be initialized from Anima before use")
-        context = self.bridge(tokens)
+        context = self._pad_style_context(self.bridge(tokens))
         values = []
         for index, (key, value) in enumerate(zip(self.style_k, self.style_v, strict=True)):
             projected_key = key(context) + self.style_k_up[index](
@@ -527,7 +589,7 @@ class SameQFullRankStyleAdapter(nn.Module):
             raise RuntimeError("Adapter must be initialized from Anima before use")
         if self._style_context is None:
             raise RuntimeError("No style tokens are active")
-        context = self._style_context
+        context = self._pad_style_context(self._style_context)
         key = self.style_k[block_index](context) + self.style_k_up[block_index](
             self.style_k_down[block_index](context)
         )
@@ -543,6 +605,25 @@ class SameQFullRankStyleAdapter(nn.Module):
             d=cross_attention.head_dim,
         )
         return cross_attention.k_norm(key), cross_attention.v_norm(value)
+
+    def _pad_style_context(self, context: torch.Tensor) -> torch.Tensor:
+        """Restore Anima's fixed text-context length after the learned bridge.
+
+        Text conditioning contains exact zero vectors after its nonzero tokens
+        and Anima receives no padding mask.  Padding here, after the connector,
+        gives copied native K/V the same softmax-denominator convention without
+        letting connector self-attention turn padding into nonzero features.
+        """
+        missing = self.style_attention_context_length - context.shape[1]
+        if missing < 0:
+            raise ValueError(
+                f"Bridge produced {context.shape[1]} tokens, configured style "
+                f"attention length is {self.style_attention_context_length}"
+            )
+        if missing == 0:
+            return context
+        padding = context.new_zeros(context.shape[0], missing, context.shape[2])
+        return torch.cat((context, padding), dim=1)
 
     def merged_cross_attention(
         self,
@@ -564,6 +645,9 @@ class SameQFullRankStyleAdapter(nn.Module):
             normalized_x, text_context
         )
         style_key, style_value = self._style_kv(block_index, cross_attention)
+        self._collect_attention_geometry(
+            block_index, query, text_key, style_key
+        )
         query, text_key, text_value, style_key, style_value = (
             _match_native_attention_dtypes(
                 query, text_key, text_value, style_key, style_value, attn_params

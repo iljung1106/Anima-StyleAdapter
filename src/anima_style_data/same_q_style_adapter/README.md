@@ -18,6 +18,11 @@ affine-free LayerNorm scaled to the measured nonzero text-token RMS. There is
 no terminal `o_down/o_up` bottleneck: Anima's native full-rank O remains the
 only output projection.
 
+Anima's post-LLM text context is always 512 positions and cross-attention gets
+no padding mask. A 128-slot style representation may therefore append 384
+exact zero context vectors *after* the learned bridge. These are attention
+padding, not the learned 128-slot null-style condition used for Style CFG.
+
 Attach before constructing the optimizer so that copied K/V parameters are
 included:
 

@@ -68,7 +68,11 @@ class _Anima(nn.Module):
         self.blocks = nn.ModuleList(_Block() for _ in range(blocks))
 
 
-def _adapter(connector_layers: int = 1, active_blocks: list[int] | None = None):
+def _adapter(
+    connector_layers: int = 1,
+    active_blocks: list[int] | None = None,
+    style_attention_context_length: int | None = None,
+):
     return SameQFullRankStyleAdapter(
         style_dim=6,
         context_dim=6,
@@ -81,6 +85,7 @@ def _adapter(connector_layers: int = 1, active_blocks: list[int] | None = None):
         aggregator_bottleneck=3,
         connector_layers=connector_layers,
         connector_heads=2,
+        style_attention_context_length=style_attention_context_length,
         active_blocks=active_blocks,
     )
 
@@ -141,6 +146,23 @@ def test_bridge_scale_calibration_ignores_zero_text_padding():
     assert abs(float(adapter.bridge.output_rms) - expected) < 1e-7
 
 
+def test_style_context_is_zero_padded_after_the_learned_bridge():
+    torch.manual_seed(29)
+    anima = _Anima().requires_grad_(False)
+    adapter = _adapter(
+        connector_layers=0, style_attention_context_length=5
+    )
+    adapter.initialize_from_anima(anima)
+    adapter.set_style_tokens(torch.randn(2, 3, 6))
+
+    padded = adapter._pad_style_context(adapter._style_context)
+    key, value = adapter._style_kv(0, anima.blocks[0].cross_attn)
+
+    assert padded.shape == (2, 5, 6)
+    torch.testing.assert_close(padded[:, 3:], torch.zeros_like(padded[:, 3:]))
+    assert key.shape[1] == value.shape[1] == 5
+
+
 def test_alpha_calibration_matches_measured_raw_attention_ratio():
     torch.manual_seed(7)
     anima = _Anima().requires_grad_(False)
@@ -161,6 +183,14 @@ def test_alpha_calibration_matches_measured_raw_attention_ratio():
 
     for alpha, raw_ratio in zip(result["alpha"], result["raw_style_to_text_ratio"], strict=True):
         assert abs(alpha * raw_ratio - 0.02) < 1e-6
+    for name in (
+        "text_attention_normalized_entropy",
+        "style_attention_normalized_entropy",
+        "text_attention_top1_probability",
+        "style_attention_top1_probability",
+    ):
+        assert len(result[name]) == 2
+        assert all(0 < value <= 1 for value in result[name])
 
 
 def test_inactive_blocks_remain_native_and_are_excluded_from_calibration():

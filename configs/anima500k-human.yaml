@@ -280,7 +280,7 @@ tap_resampler_experiment:
 # and batches targets by exact latent shape. `style-smoke` forces two steps and
 # writes to a separate smoke directory; `style-train` uses `training.steps`.
 style_transfer:
-  output_directory: style_transfer_same_q_phase_a25_fullrank_v_4k_v1
+  output_directory: style_transfer_same_q_phase_a26_contextpad_512_4k_v1
   seed: 20260811
   loader:
     style_cache: style_features_l18_l24_siglip_l24
@@ -313,6 +313,10 @@ style_transfer:
     context_dim: 1024
     style_dim: 1024
     slots: 128
+    # Anima receives 512 post-LLM text positions without a padding mask. Keep
+    # 128 meaningful style slots, then append 384 exact zero contexts after the
+    # bridge so the separate style softmax uses the same null-token mass.
+    style_attention_context_length: 512
     heads: 16
     blocks: 28
     # A2.1 block ablation found early 0--6 and especially block 27 harmful,
@@ -363,8 +367,9 @@ style_transfer:
     # Fresh Adapter initialization. Do not reuse the successful 2k diagnostic
     # checkpoint or any older offline/bootstrap connector weights.
     initial_checkpoint: null
-    # Phase A2.5: retain text-scale normalization, then let each active native-
-    # initialized full-rank V learn the visual context coordinates directly.
+    # Phase A2.6: V-only adaptation moved 0.72% from native initialization but
+    # did not improve flow. Isolate the remaining 128-vs-512 softmax geometry
+    # mismatch before opening more full-rank parameters.
     steps: 4000
     # Trainable adapter weights and Adam moments stay FP32. Representation
     # modules need a higher LR than the stabilized zero-output path.
@@ -380,14 +385,15 @@ style_transfer:
     # open the zero-init connector on the corresponding inverse scale.
     representation_learning_rate: 0.0001
     style_kv_learning_rate: 0.00005
-    style_kv_base_learning_rate: 0.000005
+    style_k_base_learning_rate: 0.000002
+    style_v_base_learning_rate: 0.000005
     output_learning_rate: 0.0001
     # The full-rank native K/V copies remain frozen inside the adapter; this LR
     # applies only to rank-32 block-specific K/V deltas.
     freeze_style_kv: false
     freeze_style_alpha: true
     train_full_rank_style_k: false
-    train_full_rank_style_v: true
+    train_full_rank_style_v: false
     calibrate_bridge_output_rms_from_text: true
     bridge_rms_calibration_batches: 4
     calibrate_alpha_from_attention_rms: true
@@ -529,8 +535,8 @@ style_transfer:
     wandb:
       enabled: true
       project: anima-style-adapter
-      name: anima-style-transfer-same-q-phase-a25-fullrank-v-4k-v1
-      id: anima-style-transfer-same-q-phase-a25-fullrank-v-4k-v1
+      name: anima-style-transfer-same-q-phase-a26-contextpad-512-4k-v1
+      id: anima-style-transfer-same-q-phase-a26-contextpad-512-4k-v1
   diagnostics:
     checkpoint: ../style_transfer_same_q_phase_a22_midblocks_residual_4k_v1/checkpoints/step-0000250.pt
     batch_size: 4
