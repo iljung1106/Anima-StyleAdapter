@@ -330,3 +330,24 @@ def test_delta_only_policy_refreezes_native_kv_after_stage_transition():
     assert counts["style_kv_base"] > 0
     assert not any(parameter.requires_grad for parameter in adapter.kv_base_parameters())
     assert all(parameter.requires_grad for parameter in adapter.kv_parameters())
+
+
+def test_full_rank_v_policy_opens_only_active_native_initialized_values():
+    anima = _Anima().requires_grad_(False)
+    adapter = _adapter(active_blocks=[1])
+    adapter.initialize_from_anima(anima)
+    adapter.requires_grad_(True)
+
+    counts = _apply_adapter_freeze_policy(
+        adapter,
+        {
+            "freeze_style_kv": False,
+            "freeze_style_alpha": True,
+            "train_full_rank_style_v": True,
+        },
+    )
+
+    assert counts["style_kv_base_frozen"] > 0
+    assert not any(parameter.requires_grad for parameter in adapter.style_k.parameters())
+    assert not any(parameter.requires_grad for parameter in adapter.style_v[0].parameters())
+    assert all(parameter.requires_grad for parameter in adapter.style_v[1].parameters())

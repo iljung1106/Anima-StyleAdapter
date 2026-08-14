@@ -11,9 +11,12 @@ Data flow per Anima block:
    `output_proj`.
 5. Apply Anima's native timestep-conditioned `gate_cross` once.
 
-The trainable style K/V matrices are full-rank copies of the native text K/V
-matrices. `alpha` starts at `0.01`; the bridge is `LayerNorm + Linear` with
-Xavier initialization. There is no terminal `o_down/o_up` bottleneck.
+Style K/V matrices start as full-rank copies of native text K/V. Their bases
+can be opened per active block at a low learning rate; block-specific low-rank
+deltas are available for cheaper corrections. The bridge ends with an
+affine-free LayerNorm scaled to the measured nonzero text-token RMS. There is
+no terminal `o_down/o_up` bottleneck: Anima's native full-rank O remains the
+only output projection.
 
 Attach before constructing the optimizer so that copied K/V parameters are
 included:

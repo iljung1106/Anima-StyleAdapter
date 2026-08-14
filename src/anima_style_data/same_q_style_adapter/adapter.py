@@ -7,9 +7,9 @@ frozen Anima cross-attention output projection::
     O_native(attn(Q, K_text, V_text) + alpha[block] *
              attn(Q, K_style, V_style))
 
-Style K/V projections are full-rank trainable copies of Anima's native text
-K/V projections.  There is deliberately no zero-init output projection, output
-LoRA, or second post-text cross-attention call.
+Style K/V projections start as full-rank copies of Anima's native text K/V
+projections.  Training may open selected full-rank copies or their low-rank
+deltas without adding a second post-text cross-attention call.
 """
 
 from __future__ import annotations
@@ -398,6 +398,22 @@ class SameQFullRankStyleAdapter(nn.Module):
     def kv_base_parameters(self) -> list[nn.Parameter]:
         """Frozen native K/V copies that define Anima's context coordinates."""
         return list(self.style_k.parameters()) + list(self.style_v.parameters())
+
+    def active_k_base_parameters(self) -> list[nn.Parameter]:
+        return [
+            parameter
+            for index, layer in enumerate(self.style_k)
+            if bool(self.active_block_mask[index])
+            for parameter in layer.parameters()
+        ]
+
+    def active_v_base_parameters(self) -> list[nn.Parameter]:
+        return [
+            parameter
+            for index, layer in enumerate(self.style_v)
+            if bool(self.active_block_mask[index])
+            for parameter in layer.parameters()
+        ]
 
     def alpha_parameters(self) -> list[nn.Parameter]:
         return [self.alpha]
