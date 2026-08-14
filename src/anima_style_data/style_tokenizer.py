@@ -532,7 +532,10 @@ def _forward_tokenizer_flow(
             },
         })
     metrics["total_loss"] = float(total_loss.detach())
-    if bool(training_cfg.get("diagnose_auxiliary_gradients", False)):
+    if (
+        torch.is_grad_enabled()
+        and bool(training_cfg.get("diagnose_auxiliary_gradients", False))
+    ):
         trainable = [parameter for parameter in tokenizer.parameters() if parameter.requires_grad]
         metrics["flow_gradient_norm"] = float(
             _parameter_gradient_norm(flow_loss, trainable)
@@ -1142,6 +1145,15 @@ def train_style_tokenizer(
                     f"step_s={step_s:.3f} img_s={train_metrics['images_per_s']:.2f}",
                     flush=True,
                 )
+                if bool(training_cfg.get("diagnose_auxiliary_gradients", False)):
+                    print(
+                        "style-tokenizer auxiliary-gradients "
+                        f"step={step} "
+                        f"flow={train_metrics.get('flow_gradient_norm', float('nan')):.6f} "
+                        f"token={train_metrics.get('weighted_token_gradient_norm', float('nan')):.6f} "
+                        f"direction={train_metrics.get('weighted_artist_direction_gradient_norm', float('nan')):.6f}",
+                        flush=True,
+                    )
             if wandb_run is not None:
                 wandb_run.log(
                     {f"train/{key}": value for key, value in train_metrics.items()},
