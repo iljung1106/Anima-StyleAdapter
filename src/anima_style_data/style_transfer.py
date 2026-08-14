@@ -2008,6 +2008,54 @@ def _adaptive_reference_loss_config(
 
 
 @torch.no_grad()
+def _calibrate_same_q_bridge_output_rms(
+    adapter: nn.Module,
+    loader: ProductionStyleLoader,
+    *,
+    batches: int,
+) -> dict[str, Any]:
+    """Match bridge output scale to real nonzero Anima text tokens.
+
+    Text-cache padding is exactly zero and intentionally remains in Anima's
+    512-token attention context.  It must not dilute the scale that native K/V
+    learned for actual conditioning tokens, so only nonzero tokens contribute
+    to this calibration.
+    """
+    if not hasattr(adapter, "set_bridge_output_rms"):
+        raise TypeError("Bridge RMS calibration requires the same-Q adapter")
+    square_sum = 0.0
+    value_sum = 0.0
+    value_count = 0
+    token_count = 0
+    padded_token_count = 0
+    for index in range(max(1, batches)):
+        conditioning = loader.load_step(index)["conditioning"].float()
+        token_square_mean = conditioning.square().mean(dim=-1)
+        nonzero = token_square_mean > 1e-12
+        values = conditioning[nonzero]
+        square_sum += float(values.square().sum(dtype=torch.float64))
+        value_sum += float(values.sum(dtype=torch.float64))
+        value_count += values.numel()
+        token_count += int(nonzero.sum())
+        padded_token_count += int(nonzero.numel() - nonzero.sum())
+    if value_count == 0:
+        raise RuntimeError("Text conditioning calibration observed no nonzero tokens")
+    rms = math.sqrt(square_sum / value_count)
+    mean = value_sum / value_count
+    standard_deviation = math.sqrt(max(0.0, square_sum / value_count - mean * mean))
+    adapter.set_bridge_output_rms(rms)
+    return {
+        "batches": max(1, int(batches)),
+        "nonzero_tokens": token_count,
+        "padding_tokens": padded_token_count,
+        "nonzero_text_mean": mean,
+        "nonzero_text_standard_deviation": standard_deviation,
+        "nonzero_text_rms": rms,
+        "bridge_output_rms": rms,
+    }
+
+
+@torch.no_grad()
 def _calibrate_same_q_alpha(
     anima: nn.Module,
     adapter: nn.Module,
@@ -4952,6 +5000,25 @@ def train_style_adapter(config: dict[str, Any], destination: Path, *, steps_over
         )
     if (
         start_step == 0
+        and bool(training.get("calibrate_bridge_output_rms_from_text", False))
+    ):
+        bridge_calibration = _calibrate_same_q_bridge_output_rms(
+            adapter,
+            validation_loader,
+            batches=int(training.get("bridge_rms_calibration_batches", 4)),
+        )
+        write_json(output / "bridge_rms_calibration.json", bridge_calibration)
+        print(
+            "calibrated bridge output from nonzero text conditioning: "
+            f"tokens={bridge_calibration['nonzero_tokens']} "
+            f"padding={bridge_calibration['padding_tokens']} "
+            f"mean={bridge_calibration['nonzero_text_mean']:.6f} "
+            f"std={bridge_calibration['nonzero_text_standard_deviation']:.6f} "
+            f"rms={bridge_calibration['bridge_output_rms']:.6f}",
+            flush=True,
+        )
+    if (
+        start_step == 0
         and bool(training.get("calibrate_alpha_from_attention_rms", False))
     ):
         alpha_calibration = _calibrate_same_q_alpha(
@@ -5301,6 +5368,7 @@ def train_style_adapter(config: dict[str, Any], destination: Path, *, steps_over
                 f"ref_dir={row['style_reference_direction_loss']:.5f} "
                 f"oracle={row['oracle_distill_loss']:.5f}/{int(row['oracle_distill_applied'])} "
                 f"gate={row['style_gate_abs_mean']:.4f} "
+                f"context_rms={row['style_context_rms']:.4f} "
                 f"block_res={row['style_block_residual_ratio_mean']:.4f} "
                 f"bridge=grad:{row['bridge_grad_norm']:.4g}/"
                 f"update:{row['bridge_update_norm']:.3g}/rel:{row['bridge_update_to_weight_ratio']:.3g} "

@@ -6,6 +6,7 @@ from anima_style_data.same_q_style_adapter import SameQFullRankStyleAdapter
 from anima_style_data.style_transfer import (
     _adaptive_reference_loss_config,
     _apply_adapter_freeze_policy,
+    _calibrate_same_q_bridge_output_rms,
 )
 
 
@@ -102,6 +103,42 @@ def test_native_kv_are_copied_and_alpha_is_small_nonzero():
     assert not hasattr(adapter, "o_up")
     assert not any(parameter.requires_grad for parameter in adapter.kv_base_parameters())
     assert all(parameter.requires_grad for parameter in adapter.kv_parameters())
+
+
+def test_bridge_has_fixed_text_scale_without_an_affine_scale_shortcut():
+    torch.manual_seed(23)
+    adapter = _adapter(connector_layers=1)
+    adapter.set_bridge_output_rms(0.25)
+
+    output = adapter.bridge(torch.randn(4, 3, 6) * 10)
+
+    per_token_rms = output.float().square().mean(dim=-1).sqrt()
+    torch.testing.assert_close(per_token_rms, torch.full_like(per_token_rms, 0.25), atol=1e-4, rtol=1e-4)
+    assert not adapter.bridge.output_norm.elementwise_affine
+
+
+def test_bridge_scale_calibration_ignores_zero_text_padding():
+    adapter = _adapter(connector_layers=0)
+    conditioning = torch.tensor(
+        [[
+            [1.0, -1.0, 1.0, -1.0, 1.0, -1.0],
+            [2.0, -2.0, 2.0, -2.0, 2.0, -2.0],
+            [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        ]]
+    )
+
+    class Loader:
+        def load_step(self, step):
+            del step
+            return {"conditioning": conditioning}
+
+    result = _calibrate_same_q_bridge_output_rms(adapter, Loader(), batches=2)
+
+    expected = (2.5 ** 0.5)
+    assert abs(result["nonzero_text_rms"] - expected) < 1e-7
+    assert result["nonzero_tokens"] == 4
+    assert result["padding_tokens"] == 2
+    assert abs(float(adapter.bridge.output_rms) - expected) < 1e-7
 
 
 def test_alpha_calibration_matches_measured_raw_attention_ratio():

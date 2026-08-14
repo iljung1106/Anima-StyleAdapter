@@ -14,6 +14,7 @@ LoRA, or second post-text cross-attention call.
 
 from __future__ import annotations
 
+import math
 import types
 import weakref
 from typing import Any
@@ -135,7 +136,14 @@ def _match_native_attention_dtypes(
 
 
 class StyleTokenBridge(nn.Module):
-    """Full-strength normalized bridge followed by optional residual connector."""
+    """Bridge style slots into the distribution expected by native text K/V.
+
+    The copied Anima V projections do not normalize their inputs.  Leaving the
+    connector's unconstrained output scale therefore lets it produce values far
+    outside the text-conditioning distribution and forces the small block alpha
+    to hide that mismatch.  A final affine-free LayerNorm preserves learned
+    directions while a measured scalar restores the real text-token RMS.
+    """
 
     def __init__(
         self,
@@ -145,8 +153,11 @@ class StyleTokenBridge(nn.Module):
         connector_layers: int,
         connector_heads: int,
         init: str,
+        output_rms_init: float,
     ) -> None:
         super().__init__()
+        if output_rms_init <= 0:
+            raise ValueError("bridge_output_rms_init must be positive")
         self.norm = nn.LayerNorm(style_dim)
         self.projection = nn.Linear(style_dim, context_dim, bias=False)
         if init == "xavier":
@@ -159,12 +170,22 @@ class StyleTokenBridge(nn.Module):
             ConnectorTransformerLayer(context_dim, connector_heads)
             for _ in range(connector_layers)
         )
+        self.output_norm = nn.LayerNorm(context_dim, elementwise_affine=False)
+        self.register_buffer(
+            "output_rms", torch.tensor(float(output_rms_init)), persistent=True
+        )
+
+    def set_output_rms(self, value: float) -> None:
+        if not math.isfinite(value) or value <= 0:
+            raise ValueError("Bridge output RMS must be finite and positive")
+        with torch.no_grad():
+            self.output_rms.fill_(float(value))
 
     def forward(self, tokens: torch.Tensor) -> torch.Tensor:
         tokens = self.projection(self.norm(tokens))
         for layer in self.connector:
             tokens = layer(tokens)
-        return tokens
+        return self.output_norm(tokens) * self.output_rms.to(dtype=tokens.dtype)
 
 
 class SameQFullRankStyleAdapter(nn.Module):
@@ -188,6 +209,7 @@ class SameQFullRankStyleAdapter(nn.Module):
         connector_layers: int = 2,
         connector_heads: int = 16,
         bridge_init: str = "xavier",
+        bridge_output_rms_init: float = 0.15,
         style_kv_delta_rank: int = 32,
         active_blocks: list[int] | None = None,
     ) -> None:
@@ -239,6 +261,7 @@ class SameQFullRankStyleAdapter(nn.Module):
             connector_layers=connector_layers,
             connector_heads=connector_heads,
             init=bridge_init,
+            output_rms_init=bridge_output_rms_init,
         )
         self.alpha = nn.Parameter(
             torch.full((blocks,), float(alpha_init)) * active_mask.float()
@@ -257,6 +280,7 @@ class SameQFullRankStyleAdapter(nn.Module):
         self._style_context: torch.Tensor | None = None
         self._runtime_ratio: dict[int, torch.Tensor] = {}
         self._runtime_raw_ratio: dict[int, torch.Tensor] = {}
+        self._runtime_style_context_rms: torch.Tensor | None = None
         self._alpha_calibration_sums: list[torch.Tensor] | None = None
         self._alpha_calibration_counts: list[int] | None = None
 
@@ -349,10 +373,16 @@ class SameQFullRankStyleAdapter(nn.Module):
         parameter = next(self.parameters())
         self._style_tokens = tokens.to(device=parameter.device, dtype=parameter.dtype)
         self._style_context = self.bridge(self._style_tokens)
+        self._runtime_style_context_rms = (
+            self._style_context.detach().float().square().mean().sqrt()
+        )
 
     def clear_style_tokens(self) -> None:
         self._style_tokens = None
         self._style_context = None
+
+    def set_bridge_output_rms(self, value: float) -> None:
+        self.bridge.set_output_rms(value)
 
     def bridge_parameters(self) -> list[nn.Parameter]:
         return list(self.bridge.parameters())
@@ -386,6 +416,7 @@ class SameQFullRankStyleAdapter(nn.Module):
     def reset_runtime_stats(self) -> None:
         self._runtime_ratio.clear()
         self._runtime_raw_ratio.clear()
+        self._runtime_style_context_rms = None
 
     def runtime_stats(self) -> dict[str, float]:
         ratios = (
@@ -401,6 +432,10 @@ class SameQFullRankStyleAdapter(nn.Module):
             "style_block_raw_ratio_mean": float(
                 torch.stack(list(self._runtime_raw_ratio.values())).float().mean()
             ) if self._runtime_raw_ratio else 0.0,
+            "style_context_rms": (
+                float(self._runtime_style_context_rms)
+                if self._runtime_style_context_rms is not None else 0.0
+            ),
         }
 
     def begin_alpha_calibration(self) -> None:

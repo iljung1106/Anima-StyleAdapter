@@ -280,7 +280,7 @@ tap_resampler_experiment:
 # and batches targets by exact latent shape. `style-smoke` forces two steps and
 # writes to a separate smoke directory; `style-train` uses `training.steps`.
 style_transfer:
-  output_directory: style_transfer_same_q_phase_a23_midblocks_fastalign_4k_v1
+  output_directory: style_transfer_same_q_phase_a24_contextnorm_4k_v1
   seed: 20260811
   loader:
     style_cache: style_features_l18_l24_siglip_l24
@@ -322,6 +322,9 @@ style_transfer:
     # gradient on the first step without introducing a second learned gate.
     alpha_init: 0.01
     bridge_init: xavier
+    # Native Anima V has no input norm. The final affine-free bridge norm is
+    # scaled to the measured nonzero text-token RMS before alpha calibration.
+    bridge_output_rms_init: 0.15
     # Reference pooling stays below 1M parameters and is bypassed exactly for
     # the one-reference reconstruction bootstrap.
     aggregator_mode: minimal
@@ -360,8 +363,8 @@ style_transfer:
     # Fresh Adapter initialization. Do not reuse the successful 2k diagnostic
     # checkpoint or any older offline/bootstrap connector weights.
     initial_checkpoint: null
-    # Phase A2.3: retain A2.2's useful middle blocks while removing the
-    # measured gradient/update bottleneck. Start fresh from native K/V.
+    # Phase A2.4: retain the useful middle blocks and fixed optimizer, but
+    # first put style context on the scale expected by native text K/V.
     steps: 4000
     # Trainable adapter weights and Adam moments stay FP32. Representation
     # modules need a higher LR than the stabilized zero-output path.
@@ -382,11 +385,13 @@ style_transfer:
     # applies only to rank-32 block-specific K/V deltas.
     freeze_style_kv: false
     freeze_style_alpha: true
+    calibrate_bridge_output_rms_from_text: true
+    bridge_rms_calibration_batches: 4
     calibrate_alpha_from_attention_rms: true
     alpha_calibration_batches: 4
-    alpha_target_style_to_text_ratio: 0.05
+    alpha_target_style_to_text_ratio: 0.03
     alpha_minimum: 0.000001
-    alpha_maximum: 0.01
+    alpha_maximum: 0.05
     # Retained for later stages; the negative start step below keeps this group
     # frozen throughout exact-self connector bootstrap.
     resampler_learning_rate: 0.00004
@@ -521,8 +526,8 @@ style_transfer:
     wandb:
       enabled: true
       project: anima-style-adapter
-      name: anima-style-transfer-same-q-phase-a23-midblocks-fastalign-4k-v1
-      id: anima-style-transfer-same-q-phase-a23-midblocks-fastalign-4k-v1
+      name: anima-style-transfer-same-q-phase-a24-contextnorm-4k-v1
+      id: anima-style-transfer-same-q-phase-a24-contextnorm-4k-v1
   diagnostics:
     checkpoint: ../style_transfer_same_q_phase_a22_midblocks_residual_4k_v1/checkpoints/step-0000250.pt
     batch_size: 4
