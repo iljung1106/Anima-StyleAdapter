@@ -930,6 +930,15 @@ def train_style_tokenizer_generalization(
     )
 
 
+def train_style_tokenizer_lr_probe(
+    config: dict[str, Any], destination: Path
+) -> dict[str, Any]:
+    """Resume the isolated high-LR exact-self branch."""
+    return train_style_tokenizer(
+        config, destination, config_section="style_tokenizer_lr_probe"
+    )
+
+
 @torch.no_grad()
 def select_style_tokenizer_checkpoint(
     config: dict[str, Any], destination: Path

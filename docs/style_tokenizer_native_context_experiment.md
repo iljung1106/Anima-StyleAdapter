@@ -60,3 +60,13 @@ Phase A의 validation Pareto 최적 체크포인트를 `checkpoints/selected.pt`
 correct-vs-wrong advantage가 양수이며, 정성 샘플에서 콘텐츠 누출이 낮은
 Pareto 후보로 선택한다. 단일 noisy validation 지점만으로 고르지 않고 후보를
 더 큰 고정 validation 표본으로 재평가한다.
+
+## LR 10배 분기 실험
+
+Phase A의 step 1,500 체크포인트를 별도 출력 디렉터리의
+`training_state.pt`로 복사하여 optimizer moments, RNG, data position을 모두
+보존한다. 원래 Phase A 디렉터리는 변경하지 않는다. 분기 run은
+`LR=1e-3`을 고정해 step 1,501–2,000만 실행하며 50 step마다 검증하고 250
+step마다 같은 정성 패널을 만든다. heldout improvement와 direction cosine이
+빠르게 상승하지 않거나 wrong-artist와 구분되지 않거나 샘플이 붕괴하면 높은
+LR을 채택하지 않고 원래 Phase A를 재개한다.
