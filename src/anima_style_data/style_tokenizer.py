@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import gc
+import hashlib
 import json
 import math
 import random
@@ -13,7 +14,7 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 from PIL import Image
-from safetensors.torch import load_file
+from safetensors.torch import load_file, save_file
 from torch import nn
 
 from .io import write_json
@@ -1297,8 +1298,11 @@ def select_style_tokenizer_checkpoint(
     def provisional_score(row: dict[str, Any]) -> float:
         heldout = row["validation_heldout"]
         self_metrics = row["validation_self"]
-        return float(heldout["paired_flow_improvement"]) + 0.5 * float(
-            self_metrics["paired_flow_improvement"]
+        advantage = float(row["correct_vs_wrong_paired_advantage"])
+        return (
+            float(heldout["paired_flow_improvement"])
+            + 0.5 * advantage
+            + 0.25 * float(self_metrics["paired_flow_improvement"])
         )
 
     top_k = max(1, int(selection_cfg.get("top_k", 5)))
@@ -1357,7 +1361,7 @@ def select_style_tokenizer_checkpoint(
             heldout["paired_flow_improvement"]
             - heldout["paired_flow_improvement_ci95"]
         )
-        score = heldout_lcb + 0.5 * self_lcb + 0.5 * advantage
+        score = heldout_lcb + 0.25 * self_lcb + 0.5 * advantage
         results.append({
             "step": step,
             "checkpoint": str(checkpoint),
@@ -1379,10 +1383,42 @@ def select_style_tokenizer_checkpoint(
     temporary = selected_path.with_suffix(".pt.tmp")
     shutil.copyfile(Path(str(selected["checkpoint"])), temporary)
     temporary.replace(selected_path)
+    selected_state = torch.load(
+        Path(str(selected["checkpoint"])), map_location="cpu", weights_only=False
+    )
+    tokenizer.load_state_dict(selected_state["tokenizer"], strict=True)
+    reference_count_batches = int(
+        selection_cfg.get("reference_count_validation_batches", 32)
+    )
+    reference_count_evaluation = {}
+    for reference_count in selection_cfg.get("reference_counts", [1, 2, 4, 8]):
+        count = int(reference_count)
+        count_loader_cfg = dict(validation_loader_cfg)
+        count_loader_cfg["min_references"] = count
+        count_loader_cfg["max_references"] = count
+        count_loader = ProductionStyleLoader(destination, count_loader_cfg)
+        heldout = _evaluate(
+            anima, tokenizer, count_loader, device, training_cfg,
+            batches=reference_count_batches,
+            seed=seed ^ (0x5100 + count), reference_mode="heldout",
+        )
+        wrong = _evaluate(
+            anima, tokenizer, count_loader, device, training_cfg,
+            batches=reference_count_batches,
+            seed=seed ^ (0x5100 + count), reference_mode="wrong_artist",
+        )
+        reference_count_evaluation[str(count)] = {
+            "heldout": heldout,
+            "wrong_artist": wrong,
+            "correct_vs_wrong_paired_advantage": (
+                heldout["paired_flow_improvement"]
+                - wrong["paired_flow_improvement"]
+            ),
+        }
     summary = {
         "source_config_section": source_section,
         "selection_rule": (
-            "heldout_lcb95 + 0.5*self_lcb95 + "
+            "heldout_lcb95 + 0.25*self_lcb95 + "
             "0.5*(heldout_improvement-wrong_artist_improvement)"
         ),
         "validation_batches": batches,
@@ -1390,10 +1426,96 @@ def select_style_tokenizer_checkpoint(
         "candidates": results,
         "selected_step": int(selected["step"]),
         "selected_checkpoint": str(selected_path.resolve()),
+        "reference_count_evaluation": reference_count_evaluation,
         "resampler_cache": cache_summary,
     }
     write_json(output / "selection.json", summary)
     return summary
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(8 * 1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def export_style_tokenizer_checkpoint(
+    config: dict[str, Any], destination: Path
+) -> dict[str, Any]:
+    """Export the selected tokenizer as a verified inference-only bundle."""
+
+    selection_cfg = dict(config["style_tokenizer_selection"])
+    source_section = str(selection_cfg["source_config_section"])
+    source_cfg = copy.deepcopy(config[source_section])
+    output = destination / str(source_cfg["output_directory"])
+    selection = json.loads(
+        (output / "selection.json").read_text(encoding="utf-8")
+    )
+    selected_path = output / "checkpoints" / "selected.pt"
+    state = torch.load(selected_path, map_location="cpu", weights_only=False)
+    weights = {
+        key: value.detach().cpu().contiguous()
+        for key, value in state["tokenizer"].items()
+    }
+    deploy = output / "deploy"
+    deploy.mkdir(parents=True, exist_ok=True)
+    weights_path = deploy / "style_tokenizer.safetensors"
+    temporary = deploy / "style_tokenizer.safetensors.tmp"
+    save_file(weights, temporary)
+    temporary.replace(weights_path)
+
+    verified = AnimaStyleTokenizer(**dict(source_cfg["model"]))
+    verified.load_state_dict(load_file(weights_path, device="cpu"), strict=True)
+    selected_candidate = next(
+        row
+        for row in selection["candidates"]
+        if int(row["step"]) == int(selection["selected_step"])
+    )
+    manifest = {
+        "format_version": 1,
+        "architecture": "AnimaStyleTokenizer",
+        "weights": weights_path.name,
+        "weights_sha256": _sha256_file(weights_path),
+        "selected_step": int(selection["selected_step"]),
+        "source_config_section": source_section,
+        "model": dict(source_cfg["model"]),
+        "input_contract": {
+            "resampler_tokens": [
+                "batch", "references", 128, int(source_cfg["model"]["source_dim"])
+            ],
+            "reference_mask": ["batch", "references"],
+            "output_tokens": [
+                "batch",
+                int(source_cfg["model"]["output_tokens"]),
+                int(source_cfg["model"]["context_dim"]),
+            ],
+            "text_insertion": "first unused positions after conditioning_lengths",
+            "null_style": "do not insert style tokens; use frozen Anima context",
+            "guidance": "shared text+style CFG",
+        },
+        "anima_model": dict(config["anima_cache"]["models"]),
+        "resampler_cache": selection["resampler_cache"],
+        "selection_rule": selection["selection_rule"],
+        "selected_metrics": selected_candidate,
+        "reference_count_evaluation": selection[
+            "reference_count_evaluation"
+        ],
+        "roundtrip_verified": True,
+    }
+    write_json(deploy / "manifest.json", manifest)
+    (deploy / "README.md").write_text(
+        "# Anima StyleTokenizer\n\n"
+        "Inference-only StyleTokenizer weights selected from the full-data "
+        "target-excluded multi-reference run. Load `style_tokenizer.safetensors` "
+        "into `AnimaStyleTokenizer`, insert its 16 output tokens immediately "
+        "after each prompt's cached conditioning length, and keep Anima's "
+        "remaining 512-token context unchanged. No-style inference skips token "
+        "insertion. See `manifest.json` for the exact model and cache contract.\n",
+        encoding="utf-8",
+    )
+    return manifest
 
 
 def smoke_test_style_tokenizer(

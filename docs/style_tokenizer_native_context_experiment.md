@@ -79,6 +79,15 @@ correct-vs-wrong advantage가 양수이며, 정성 샘플에서 콘텐츠 누출
 Pareto 후보로 선택한다. 단일 noisy validation 지점만으로 고르지 않고 후보를
 더 큰 고정 validation 표본으로 재평가한다.
 
+완료 후 `style-tokenizer-select`는 step 1,500--8,000의 상위 8개 후보와
+마지막 체크포인트를 64개 고정 validation batch로 재평가한다. 선택 점수는
+`heldout LCB95 + 0.25*self LCB95 + 0.5*(heldout-wrong)`이며, 선택된 후보는
+reference 1/2/4/8장 각각에 대해 추가로 heldout/wrong 검증한다.
+`style-tokenizer-export`는 선택 checkpoint에서 optimizer를 제거한
+`style_tokenizer.safetensors`, SHA-256·모델/입출력 계약·검증 지표를 담은
+`manifest.json`, 사용 설명을 담은 `README.md`를 생성하고 strict round-trip
+load를 확인한다.
+
 ## LR 10배 분기 실험
 
 Phase A의 step 1,500 체크포인트를 별도 출력 디렉터리의

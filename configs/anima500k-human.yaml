@@ -822,13 +822,15 @@ style_tokenizer_generalization:
     guidance_mode: shared
 
 style_tokenizer_selection:
-  source_config_section: style_tokenizer
+  source_config_section: style_tokenizer_generalization
   device: cuda
-  minimum_step: 500
-  maximum_step: 4000
-  top_k: 5
-  validation_batches: 32
-  seed: 20260817
+  minimum_step: 1500
+  maximum_step: 8000
+  top_k: 8
+  validation_batches: 64
+  reference_counts: [1, 2, 4, 8]
+  reference_count_validation_batches: 32
+  seed: 20260819
 
 # Controlled LR ablation. Before running, copy Phase A step-1500.pt to this
 # output directory as training_state.pt. That preserves optimizer moments,

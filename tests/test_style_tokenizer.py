@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -12,6 +13,7 @@ from anima_style_data.style_tokenizer import (
     _reference_tokens,
     _split_reference_views,
     _style_token_contrastive_loss,
+    export_style_tokenizer_checkpoint,
     insert_style_tokens,
 )
 
@@ -180,3 +182,49 @@ def test_artist_direction_loss_prefers_correct_residual_alignment():
         "artist_wrong_direction_cosine"
     ]
     assert correct.grad is not None
+
+
+def test_selected_tokenizer_exports_verified_safetensors_bundle(tmp_path):
+    model_cfg = {
+        "source_dim": 16,
+        "context_dim": 12,
+        "output_tokens": 4,
+        "bottleneck_dim": 8,
+        "score_hidden_dim": 4,
+        "output_rms_init": 0.2,
+    }
+    tokenizer = AnimaStyleTokenizer(**model_cfg)
+    output = tmp_path / "tokenizer-run"
+    checkpoint_dir = output / "checkpoints"
+    checkpoint_dir.mkdir(parents=True)
+    selected = checkpoint_dir / "selected.pt"
+    torch.save({"tokenizer": tokenizer.state_dict()}, selected)
+    selection = {
+        "selected_step": 1500,
+        "selection_rule": "test-rule",
+        "resampler_cache": {"resampler_checkpoint_sha256": "abc"},
+        "reference_count_evaluation": {"1": {"heldout": {}}},
+        "candidates": [{"step": 1500, "score": 1.0}],
+    }
+    (output / "selection.json").write_text(
+        json.dumps(selection), encoding="utf-8"
+    )
+    config = {
+        "style_tokenizer_selection": {
+            "source_config_section": "production_tokenizer"
+        },
+        "production_tokenizer": {
+            "output_directory": "tokenizer-run",
+            "model": model_cfg,
+        },
+        "anima_cache": {
+            "models": {"repo_id": "circlestone-labs/Anima", "revision": "test"}
+        },
+    }
+
+    manifest = export_style_tokenizer_checkpoint(config, tmp_path)
+
+    assert manifest["roundtrip_verified"] is True
+    assert manifest["input_contract"]["output_tokens"] == ["batch", 4, 12]
+    assert (output / "deploy" / "style_tokenizer.safetensors").is_file()
+    assert len(manifest["weights_sha256"]) == 64
