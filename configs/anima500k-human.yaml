@@ -281,10 +281,10 @@ tap_resampler_experiment:
 # writes to a separate smoke directory; `style-train` uses `training.steps`.
 style_transfer:
   # Second exact-self alignment stage. The first 2k-step representative-pool
-  # run approached zero paired improvement without instability; restart from
-  # its adapter checkpoint with fresh, lower-LR Adam moments instead of
-  # entering the harder target-mix curriculum prematurely.
-  output_directory: style_transfer_ip_adapter_exposure_bootstrap_continue_to_4k_v1
+  # run approached zero paired improvement without instability; resume its
+  # complete state and retain the learned Adam moments at the final 1e-5 LR
+  # instead of entering the harder target-mix curriculum prematurely.
+  output_directory: style_transfer_ip_adapter_exposure_bootstrap_optimizer_resume_to_4k_v1
   seed: 20260811
   loader:
     style_cache: style_features_l18_l24_siglip_l24
@@ -382,27 +382,28 @@ style_transfer:
     maximum_artist_similarity: 0.95
   training:
     device: cuda
-    initial_checkpoint: style_transfer_ip_adapter_exposure_bootstrap_5k_v1/checkpoints/step-0002000.pt
-    steps: 2000
-    # Trainable adapter weights and Adam moments stay FP32. Representation
-    # modules need a higher LR than the stabilized zero-output path.
-    learning_rate: 0.00005
-    bridge_learning_rate: 0.00005
+    # Continue from the complete 2k state, including Adam moments and RNG. A
+    # weight-only restart at 5e-5 increased the orthogonal style residual and
+    # degraded every validation split by step 500.
+    resume_checkpoint: style_transfer_ip_adapter_exposure_bootstrap_5k_v1/training_state.pt
+    steps: 4000
+    learning_rate: 0.00001
+    bridge_learning_rate: 0.00001
     bridge_optimizer: adamw
     bridge_betas: [0.9, 0.999]
-    bridge_warmup_steps: 100
-    bridge_minimum_lr_ratio: 0.25
+    bridge_warmup_steps: 0
+    bridge_minimum_lr_ratio: 1.0
     bridge_adam_eps: 0.00000001
     bridge_weight_decay: 0.0
     adapter_adam_eps: 0.00000001
     # Use the official optimizer scale for the learned image projection and
     # copied K/V. Native gate_cross(t) acts equally on text and style after the
     # branches are merged and therefore does not replace IP-Adapter's scale.
-    representation_learning_rate: 0.00005
-    style_kv_learning_rate: 0.00005
-    style_k_base_learning_rate: 0.00005
-    style_v_base_learning_rate: 0.00005
-    output_learning_rate: 0.00005
+    representation_learning_rate: 0.00001
+    style_kv_learning_rate: 0.00001
+    style_k_base_learning_rate: 0.00001
+    style_v_base_learning_rate: 0.00001
+    output_learning_rate: 0.00001
     # Train copied full-rank image K/V exactly as the original IP-Adapter does;
     # freeze the experimental low-rank K/V deltas for a clean comparison.
     freeze_style_kv: true
@@ -426,8 +427,8 @@ style_transfer:
     # Retained for later stages; the negative start step below keeps this group
     # frozen throughout exact-self connector bootstrap.
     resampler_learning_rate: 0.00001
-    warmup_steps: 100
-    minimum_lr_ratio: 0.25
+    warmup_steps: 0
+    minimum_lr_ratio: 1.0
     resampler_max_grad_norm: 1.0
     # First prove the new connector on exact-self inputs without moving the
     # newly pretrained 128-token representation.
@@ -549,15 +550,15 @@ style_transfer:
     # image and introduce DEADiff-style same-artist/different-image pairs.
     curriculum:
       gate_only_steps: 0
-      self_reference_steps: 2000
-      target_mix_end_step: 2001
+      self_reference_steps: 4000
+      target_mix_end_step: 4001
       target_mix_end_probability: 0.5
       target_mix_min_references: 1
       target_mix_max_references: 4
-      target_anneal_end: 2002
+      target_anneal_end: 4002
       target_anneal_min_references: 1
       target_anneal_max_references: 8
-      oracle_distill_end: 2000
+      oracle_distill_end: 4000
     oracle_distill_weight: 0.0
     oracle_distill_probability: 0.25
     oracle_distill_scale_floor: 0.02
@@ -565,8 +566,8 @@ style_transfer:
     wandb:
       enabled: true
       project: anima-style-adapter
-      name: anima-style-transfer-ip-adapter-exposure-bootstrap-continue-to-4k-v1
-      id: anima-style-transfer-ip-adapter-exposure-bootstrap-continue-to-4k-v1
+      name: anima-style-transfer-ip-adapter-exposure-bootstrap-optimizer-resume-to-4k-v1
+      id: anima-style-transfer-ip-adapter-exposure-bootstrap-optimizer-resume-to-4k-v1
   diagnostics:
     checkpoint: checkpoints/step-0000500.pt
     batch_size: 4

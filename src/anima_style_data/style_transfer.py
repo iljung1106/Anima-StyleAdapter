@@ -4887,6 +4887,28 @@ def _archive_training_state(source: Path, destination: Path) -> None:
     temporary.replace(destination)
 
 
+def _resolve_training_resume_checkpoint(
+    output_checkpoint: Path,
+    destination: Path,
+    training: dict[str, Any],
+    steps_override: int | None,
+) -> Path | None:
+    """Resolve an in-place or explicitly imported full training state."""
+    if steps_override is not None or not bool(training.get("resume", True)):
+        return None
+    if output_checkpoint.exists():
+        return output_checkpoint
+    configured = training.get("resume_checkpoint")
+    if not configured:
+        return None
+    checkpoint = Path(str(configured))
+    if not checkpoint.is_absolute():
+        checkpoint = destination / checkpoint
+    if not checkpoint.exists():
+        raise FileNotFoundError(f"Training resume checkpoint does not exist: {checkpoint}")
+    return checkpoint
+
+
 def _save_oracle_adapter(path: Path, adapter: SharedLowRankStyleAdapter) -> None:
     """Persist the immutable end-of-bootstrap teacher once, without optimizer state."""
     temporary = path.with_suffix(path.suffix + ".tmp")
@@ -5187,9 +5209,12 @@ def train_style_adapter(config: dict[str, Any], destination: Path, *, steps_over
         "positive_validations": 0,
         "activation_step": None,
     }
-    resume = bool(training.get("resume", True)) and steps_override is None
-    if resume and checkpoint_path.exists():
-        state = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    resume_checkpoint = _resolve_training_resume_checkpoint(
+        checkpoint_path, destination, training, steps_override
+    )
+    resumed = resume_checkpoint is not None
+    if resume_checkpoint is not None:
+        state = torch.load(resume_checkpoint, map_location="cpu", weights_only=False)
         _load_adapter_checkpoint(adapter, state)
         if "resampler" in state:
             resampler.load_state_dict(state["resampler"])
@@ -5204,7 +5229,10 @@ def train_style_adapter(config: dict[str, Any], destination: Path, *, steps_over
         torch.set_rng_state(state["torch_rng"])
         if state.get("cuda_rng") is not None:
             torch.cuda.set_rng_state_all(state["cuda_rng"])
-        print(f"resuming style training from step {start_step}", flush=True)
+        print(
+            f"resuming style training from {resume_checkpoint} at step {start_step}",
+            flush=True,
+        )
     elif training.get("initial_checkpoint"):
         initial_path = Path(str(training["initial_checkpoint"]))
         if not initial_path.is_absolute():
@@ -5303,7 +5331,7 @@ def train_style_adapter(config: dict[str, Any], destination: Path, *, steps_over
             # merely because a human-readable ID was reused. True checkpoint
             # resumes retain the existing W&B run; fresh runs must use a new
             # ID and fail loudly otherwise.
-            resume="allow" if resume else "never",
+            resume="allow" if resumed else "never",
             config=cfg,
         )
     metrics = []

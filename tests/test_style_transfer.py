@@ -30,6 +30,7 @@ from anima_style_data.style_transfer import (
     _reference_flow_direction_loss,
     _reference_flow_rank_loss,
     _reference_flow_residual_mse_loss,
+    _resolve_training_resume_checkpoint,
     _save_training_state,
     _sample_flow_timesteps,
     _set_aggregator_trainable,
@@ -985,6 +986,25 @@ def test_training_state_is_atomic_and_archivable(tmp_path):
     assert state["step"] == 1
     assert state["config"] == {"name": "test"}
     assert set(state["adapter"]) == set(model.state_dict())
+
+
+def test_training_resume_checkpoint_prefers_local_then_external(tmp_path):
+    destination = tmp_path / "data"
+    destination.mkdir()
+    local = tmp_path / "output" / "training_state.pt"
+    external = destination / "source" / "training_state.pt"
+    external.parent.mkdir()
+    external.write_bytes(b"external")
+    training = {"resume": True, "resume_checkpoint": "source/training_state.pt"}
+
+    assert (
+        _resolve_training_resume_checkpoint(local, destination, training, None)
+        == external
+    )
+    local.parent.mkdir()
+    local.write_bytes(b"local")
+    assert _resolve_training_resume_checkpoint(local, destination, training, None) == local
+    assert _resolve_training_resume_checkpoint(local, destination, training, 2) is None
 
 
 def test_episode_resampler_prototypes_use_all_references_and_slots():
