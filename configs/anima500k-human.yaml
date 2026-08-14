@@ -467,7 +467,9 @@ style_transfer:
     train_sample_artists: 4
     validation_sample_artists: 4
     sample_batch_size: 4
-    resume: false
+    # Fresh runs have no checkpoint; interrupted gate runs resume from the
+    # latest periodic state so the 250/500/750/1000 trend is comparable.
+    resume: true
     # Use the same single denoising/flow regression objective as IP-Adapter.
     # All A2.x normalized-direction, wrong-reference, and magnitude shaping
     # losses are disabled so this run measures the injection path itself.

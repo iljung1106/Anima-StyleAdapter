@@ -54,6 +54,10 @@ are true on held-out exact-self targets:
 3. output magnitude does not grow while paired improvement falls;
 4. samples remain structurally valid and visibly respond to the reference.
 
+Do not accept or reject the baseline from a single 250-step measurement. The
+minimum trend gate is the fixed 250/500/750/1000 sequence; an interrupted run
+resumes from its periodic training state.
+
 If this baseline fails, the next change must target the visual-to-context bridge
 or representation, not another residual-strength loss. If it passes, use its
 checkpoint to start a non-reconstructive curriculum: retain some exact-self
