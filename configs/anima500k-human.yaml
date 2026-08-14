@@ -414,7 +414,11 @@ style_transfer:
     # its 512-position text branch, so calibrate to the same *effective* ratio.
     calibrate_bridge_output_rms_from_text: false
     bridge_rms_calibration_batches: 4
-    calibrate_alpha_from_attention_rms: true
+    # The initialization checkpoint already learned its K/V under calibrated
+    # blockwise alpha values. Recalibrating after K/V changed would alter the
+    # inherited function (the first continuation smoke moved mean alpha from
+    # 0.2067 to 0.3321), so preserve the checkpoint scales exactly.
+    calibrate_alpha_from_attention_rms: false
     alpha_calibration_batches: 4
     alpha_target_style_to_text_ratio: 1.0
     alpha_minimum: 0.01
