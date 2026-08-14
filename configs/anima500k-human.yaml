@@ -280,7 +280,11 @@ tap_resampler_experiment:
 # and batches targets by exact latent shape. `style-smoke` forces two steps and
 # writes to a separate smoke directory; `style-train` uses `training.steps`.
 style_transfer:
-  output_directory: style_transfer_ip_adapter_exposure_bootstrap_5k_v1
+  # Second exact-self alignment stage. The first 2k-step representative-pool
+  # run approached zero paired improvement without instability; restart from
+  # its adapter checkpoint with fresh, lower-LR Adam moments instead of
+  # entering the harder target-mix curriculum prematurely.
+  output_directory: style_transfer_ip_adapter_exposure_bootstrap_continue_to_4k_v1
   seed: 20260811
   loader:
     style_cache: style_features_l18_l24_siglip_l24
@@ -294,9 +298,10 @@ style_transfer:
     min_references: 1
     max_references: 8
     # During the exact-self bootstrap, draw one deterministic representative
-    # target per artist. This yields about 6.4 exposures/image in 2k updates
-    # instead of 0.21 over the full 150k-image pool. Validation and all later
-    # mixed/target-excluded phases continue to draw from the complete split.
+    # target per artist. The measured eligible pool is 3,949 images, so each
+    # 2k-update stage adds about 8.1 exposures/image instead of 0.21 over the
+    # full 150k-image pool. Validation and all later mixed/target-excluded
+    # phases continue to draw from the complete split.
     self_reference_target_images_per_style: 1
     # Anima cross-attention was trained with 512 post-LLM tokens, including
     # trailing zeros; it has no text padding mask, so runtime must restore them.
@@ -377,28 +382,27 @@ style_transfer:
     maximum_artist_similarity: 0.95
   training:
     device: cuda
-    # Fresh exact-self baseline. Do not inherit any A2.x connector state.
-    initial_checkpoint: null
+    initial_checkpoint: style_transfer_ip_adapter_exposure_bootstrap_5k_v1/checkpoints/step-0002000.pt
     steps: 2000
     # Trainable adapter weights and Adam moments stay FP32. Representation
     # modules need a higher LR than the stabilized zero-output path.
-    learning_rate: 0.0001
-    bridge_learning_rate: 0.0001
+    learning_rate: 0.00005
+    bridge_learning_rate: 0.00005
     bridge_optimizer: adamw
     bridge_betas: [0.9, 0.999]
-    bridge_warmup_steps: 250
-    bridge_minimum_lr_ratio: 0.10
+    bridge_warmup_steps: 100
+    bridge_minimum_lr_ratio: 0.25
     bridge_adam_eps: 0.00000001
     bridge_weight_decay: 0.0
     adapter_adam_eps: 0.00000001
     # Use the official optimizer scale for the learned image projection and
     # copied K/V. Native gate_cross(t) acts equally on text and style after the
     # branches are merged and therefore does not replace IP-Adapter's scale.
-    representation_learning_rate: 0.0001
-    style_kv_learning_rate: 0.0001
-    style_k_base_learning_rate: 0.0001
-    style_v_base_learning_rate: 0.0001
-    output_learning_rate: 0.0001
+    representation_learning_rate: 0.00005
+    style_kv_learning_rate: 0.00005
+    style_k_base_learning_rate: 0.00005
+    style_v_base_learning_rate: 0.00005
+    output_learning_rate: 0.00005
     # Train copied full-rank image K/V exactly as the original IP-Adapter does;
     # freeze the experimental low-rank K/V deltas for a clean comparison.
     freeze_style_kv: true
@@ -418,8 +422,8 @@ style_transfer:
     # Retained for later stages; the negative start step below keeps this group
     # frozen throughout exact-self connector bootstrap.
     resampler_learning_rate: 0.00001
-    warmup_steps: 250
-    minimum_lr_ratio: 0.10
+    warmup_steps: 100
+    minimum_lr_ratio: 0.25
     resampler_max_grad_norm: 1.0
     # First prove the new connector on exact-self inputs without moving the
     # newly pretrained 128-token representation.
@@ -466,6 +470,10 @@ style_transfer:
     validation_batches: 4
     full_validation_every: 250
     full_validation_batches: 8
+    # Evaluate exact-self on the active train target pool as well as on
+    # artist-disjoint validation rows. This reveals whether a weak validation
+    # score is underfitting or a genuine generalization gap.
+    train_validation_batches: 8
     checkpoint_every: 250
     sample_every: 500
     smoke_sample_every: 2
@@ -553,8 +561,8 @@ style_transfer:
     wandb:
       enabled: true
       project: anima-style-adapter
-      name: anima-style-transfer-ip-adapter-exposure-bootstrap-5k-v1
-      id: anima-style-transfer-ip-adapter-exposure-bootstrap-5k-v1
+      name: anima-style-transfer-ip-adapter-exposure-bootstrap-continue-to-4k-v1
+      id: anima-style-transfer-ip-adapter-exposure-bootstrap-continue-to-4k-v1
   diagnostics:
     checkpoint: checkpoints/step-0000500.pt
     batch_size: 4

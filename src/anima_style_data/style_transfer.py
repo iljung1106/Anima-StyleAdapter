@@ -4956,6 +4956,24 @@ def train_style_adapter(config: dict[str, Any], destination: Path, *, steps_over
     validation_loader_cfg.pop("gradient_accumulation_steps", None)
     validation_loader_cfg["seed"] = seed ^ 0x51A7
     validation_loader = ProductionStyleLoader(destination, validation_loader_cfg)
+    train_validation_batches = max(
+        0, int(training.get("train_validation_batches", 0))
+    )
+    train_validation_loader = None
+    if train_validation_batches:
+        # Keep the training curriculum on this loader. During exact-self
+        # bootstrap it therefore evaluates the deterministic representative
+        # target pool; after the bootstrap it automatically expands to the
+        # complete train split. This separates underfitting from failure to
+        # generalize to artist-disjoint validation rows.
+        train_validation_loader_cfg = {
+            **loader_cfg,
+            "batch_size": int(training.get("validation_batch_size", 1)),
+            "seed": seed ^ 0x7A11,
+        }
+        train_validation_loader = ProductionStyleLoader(
+            destination, train_validation_loader_cfg
+        )
     train_sample_loader_cfg = {
         **validation_loader_cfg,
         "split": "train",
@@ -5353,8 +5371,9 @@ def train_style_adapter(config: dict[str, Any], destination: Path, *, steps_over
             f"paired={baseline['paired_improvement']:.6f} "
             f"ci95=±{baseline['paired_improvement_ci95']:.6f} "
             f"output_ratio={baseline['style_output_ratio']:.6f} "
-            f"ref_adv={baseline.get('correct_vs_wrong_advantage', float('nan')):.6f}/"
-            f"{baseline.get('correct_vs_wrong_positive_fraction', float('nan')):.3f} "
+            "ref_adv="
+            f"{_format_optional_metric(baseline.get('correct_vs_wrong_advantage', float('nan')), 6)}/"
+            f"{_format_optional_metric(baseline.get('correct_vs_wrong_positive_fraction', float('nan')), 3)} "
             f"batches={validation_batches} elapsed_s={baseline['elapsed_s']:.2f}",
             flush=True,
         )
@@ -5646,6 +5665,23 @@ def train_style_adapter(config: dict[str, Any], destination: Path, *, steps_over
                 loss_config={**active_loss_config, "timestep_sampling": "uniform"},
                 reference_mode="self",
             )
+            train_self_validation = None
+            if train_validation_loader is not None:
+                train_self_validation = _validate_style_adapter(
+                    anima,
+                    adapter,
+                    resampler,
+                    train_validation_loader,
+                    device,
+                    batches=train_validation_batches,
+                    seed=seed ^ 0x7A11CE,
+                    step=step,
+                    loss_config={
+                        **active_loss_config,
+                        "timestep_sampling": "uniform",
+                    },
+                    reference_mode="self",
+                )
             print(
                 f"validation[heldout] step={step} loss={heldout_validation['loss']:.6f} "
                 f"base={heldout_validation['base_loss']:.6f} "
@@ -5656,8 +5692,9 @@ def train_style_adapter(config: dict[str, Any], destination: Path, *, steps_over
                 f"projection={heldout_validation['style_flow_desired_projection']:.6f} "
                 f"cosine={heldout_validation['style_flow_direction_cosine']:.6f} "
                 f"orthogonal={heldout_validation['style_flow_orthogonal_to_desired_ratio']:.6f} "
-                f"ref_adv={heldout_validation.get('correct_vs_wrong_advantage', float('nan')):.6f}/"
-                f"{heldout_validation.get('correct_vs_wrong_positive_fraction', float('nan')):.3f} "
+                "ref_adv="
+                f"{_format_optional_metric(heldout_validation.get('correct_vs_wrong_advantage', float('nan')), 6)}/"
+                f"{_format_optional_metric(heldout_validation.get('correct_vs_wrong_positive_fraction', float('nan')), 3)} "
                 f"batches={current_validation_batches} "
                 f"elapsed_s={heldout_validation['elapsed_s']:.2f}",
                 flush=True,
@@ -5720,12 +5757,29 @@ def train_style_adapter(config: dict[str, Any], destination: Path, *, steps_over
                 f"projection={self_validation['style_flow_desired_projection']:.6f} "
                 f"cosine={self_validation['style_flow_direction_cosine']:.6f} "
                 f"orthogonal={self_validation['style_flow_orthogonal_to_desired_ratio']:.6f} "
-                f"ref_adv={self_validation.get('correct_vs_wrong_advantage', float('nan')):.6f}/"
-                f"{self_validation.get('correct_vs_wrong_positive_fraction', float('nan')):.3f} "
+                "ref_adv="
+                f"{_format_optional_metric(self_validation.get('correct_vs_wrong_advantage', float('nan')), 6)}/"
+                f"{_format_optional_metric(self_validation.get('correct_vs_wrong_positive_fraction', float('nan')), 3)} "
                 f"batches={current_validation_batches} "
                 f"elapsed_s={self_validation['elapsed_s']:.2f}",
                 flush=True,
             )
+            if train_self_validation is not None:
+                print(
+                    "validation[train_self] "
+                    f"step={step} loss={train_self_validation['loss']:.6f} "
+                    f"base={train_self_validation['base_loss']:.6f} "
+                    f"paired={train_self_validation['paired_improvement']:.6f} "
+                    f"ci95=±{train_self_validation['paired_improvement_ci95']:.6f} "
+                    f"positive={train_self_validation['paired_positive_fraction']:.3f} "
+                    f"output_ratio={train_self_validation['style_output_ratio']:.6f} "
+                    f"projection={train_self_validation['style_flow_desired_projection']:.6f} "
+                    f"cosine={train_self_validation['style_flow_direction_cosine']:.6f} "
+                    f"orthogonal={train_self_validation['style_flow_orthogonal_to_desired_ratio']:.6f} "
+                    f"batches={train_validation_batches} "
+                    f"elapsed_s={train_self_validation['elapsed_s']:.2f}",
+                    flush=True,
+                )
             if wandb_run is not None:
                 wandb_run.log(
                     {
@@ -5737,6 +5791,14 @@ def train_style_adapter(config: dict[str, Any], destination: Path, *, steps_over
                             f"validation_self/{key}": value
                             for key, value in self_validation.items()
                         },
+                        **(
+                            {
+                                f"validation_train_self/{key}": value
+                                for key, value in train_self_validation.items()
+                            }
+                            if train_self_validation is not None
+                            else {}
+                        ),
                         "curriculum/reference_validation_qualified": int(
                             bool(training.get("adaptive_reference_loss", False))
                             and validation_qualifies
