@@ -520,7 +520,7 @@ class SameQFullRankStyleAdapter(nn.Module):
             assert self._attention_geometry_counts is not None
             for name, values in self._attention_geometry_sums.items():
                 result[name] = [
-                    float(value / count) if count else 0.0
+                    float((value / count).detach()) if count else 0.0
                     for value, count in zip(
                         values, self._attention_geometry_counts, strict=True
                     )
