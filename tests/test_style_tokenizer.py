@@ -8,7 +8,10 @@ torch = pytest.importorskip("torch")
 
 from anima_style_data.style_tokenizer import (
     AnimaStyleTokenizer,
+    _artist_direction_loss,
     _reference_tokens,
+    _split_reference_views,
+    _style_token_contrastive_loss,
     insert_style_tokens,
 )
 
@@ -121,3 +124,59 @@ def test_wrong_artist_references_skip_duplicate_artist_in_batch():
     assert torch.equal(
         wrong.float().flatten(), torch.tensor([3.0, 3.0, 1.0])
     )
+
+
+def test_reference_views_are_disjoint_and_skip_single_reference_rows():
+    mask = torch.tensor([
+        [True, True, True, False],
+        [True, False, False, False],
+        [True, True, False, False],
+    ])
+
+    eligible, first, second = _split_reference_views(mask)
+
+    assert torch.equal(eligible, torch.tensor([True, False, True]))
+    assert not bool((first & second).any())
+    assert torch.equal(first | second, mask[eligible])
+    assert bool(first.any(dim=1).all())
+    assert bool(second.any(dim=1).all())
+
+
+def test_slotwise_contrastive_loss_prefers_matching_artist_views():
+    first = torch.tensor([
+        [[1.0, 0.0], [0.0, 1.0]],
+        [[-1.0, 0.0], [0.0, -1.0]],
+    ])
+    matching = first.clone()
+    swapped = first.flip(0)
+
+    matching_loss, metrics = _style_token_contrastive_loss(
+        first, matching, ["a", "b"], temperature=0.1
+    )
+    swapped_loss, _ = _style_token_contrastive_loss(
+        first, swapped, ["a", "b"], temperature=0.1
+    )
+
+    assert matching_loss < swapped_loss
+    assert metrics["token_similarity_margin"] > 0
+
+
+def test_artist_direction_loss_prefers_correct_residual_alignment():
+    target = torch.tensor([[[[1.0, 0.0]]]])
+    base = torch.zeros_like(target)
+    correct = target.clone().requires_grad_(True)
+    wrong = torch.tensor([[[[0.0, 1.0]]]])
+
+    aligned_loss, metrics = _artist_direction_loss(
+        correct, wrong, base, target, margin=0.02, centered_weight=0.25
+    )
+    reversed_loss, _ = _artist_direction_loss(
+        -correct, wrong, base, target, margin=0.02, centered_weight=0.25
+    )
+    aligned_loss.backward()
+
+    assert aligned_loss < reversed_loss
+    assert metrics["artist_correct_direction_cosine"] > metrics[
+        "artist_wrong_direction_cosine"
+    ]
+    assert correct.grad is not None

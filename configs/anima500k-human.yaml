@@ -741,18 +741,20 @@ style_tokenizer:
     text_cfg: 4.0
     guidance_mode: shared
 
-# Phase B starts from the validation-selected exact-self checkpoint. Ordinary
-# ProductionStyleLoader references always exclude the target, so this stage
-# trains genuine same-artist transfer over the full train image pool.
+# Full-data StyleTokenizer training from a fresh initialization. Ordinary
+# ProductionStyleLoader references always exclude the target. Two disjoint
+# views of each artist's references supervise the token set directly; a weak,
+# delayed correct-vs-wrong direction objective emphasizes artist-specific flow.
 style_tokenizer_generalization:
-  output_directory: style_tokenizer_native_context_16_heldout_8k_v1
-  seed: 20260816
+  output_directory: style_tokenizer_native_context_16_multiref_contrastive_8k_v1
+  seed: 20260818
   train_split: train
   validation_split: validation
   loader:
     batch_size: 4
     min_references: 1
     max_references: 8
+    artist_balanced: true
     self_reference_target_images_per_style: 0
     text_conditioning_length: 512
     text_lru_shards: 2
@@ -768,9 +770,8 @@ style_tokenizer_generalization:
   training:
     device: cuda
     reference_mode: heldout
-    initial_checkpoint: style_tokenizer_native_context_16_exact_self_4k_v1/checkpoints/selected.pt
     steps: 8000
-    learning_rate: 0.00005
+    learning_rate: 0.0001
     betas: [0.9, 0.999]
     adam_eps: 0.00000001
     weight_decay: 0.01
@@ -788,6 +789,17 @@ style_tokenizer_generalization:
     discrete_flow_shift: 3.0
     prefetch_workers: 2
     prefetch_batches: 4
+    token_contrastive_weight: 0.005
+    token_contrastive_temperature: 0.10
+    token_contrastive_start_step: 1
+    token_contrastive_ramp_steps: 1000
+    artist_direction_weight: 0.005
+    artist_direction_start_step: 1500
+    artist_direction_ramp_steps: 1000
+    artist_direction_every: 4
+    artist_direction_batch_size: 2
+    artist_direction_margin: 0.02
+    artist_centered_direction_weight: 0.25
     log_every: 10
     validation_every: 250
     validation_batches: 8
@@ -798,14 +810,14 @@ style_tokenizer_generalization:
     wandb:
       enabled: true
       project: anima-style-adapter
-      name: style-tokenizer-native-context-16-heldout-8k-v1
-      id: style-tokenizer-native-context-16-heldout-8k-v1
+      name: style-tokenizer-native-context-16-multiref-contrastive-8k-v1
+      id: style-tokenizer-native-context-16-multiref-contrastive-8k-v1
   sampling:
     width: 768
     height: 768
     steps: 30
     flow_shift: 3.0
-    seed: 20260816
+    seed: 20260818
     text_cfg: 4.0
     guidance_mode: shared
 

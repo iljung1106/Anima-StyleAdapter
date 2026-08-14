@@ -90,6 +90,7 @@ def build_parser() -> argparse.ArgumentParser:
         ("style-exact-self-sample", "Render train and unseen targets from an exact-self checkpoint"),
         ("style-tokenizer-train", "Train native-context StyleTokenizer from frozen Resampler tokens"),
         ("style-tokenizer-generalize", "Train StyleTokenizer with target-excluded same-artist references"),
+        ("style-tokenizer-generalize-smoke", "Smoke-test multi-reference StyleTokenizer auxiliaries"),
         ("style-tokenizer-lr-probe", "Resume an isolated high-LR StyleTokenizer branch"),
         ("style-tokenizer-lr10x-scratch", "Train the 10x-LR StyleTokenizer ablation from scratch"),
         ("style-tokenizer-select", "Re-evaluate and select a StyleTokenizer checkpoint"),
@@ -214,10 +215,11 @@ def main() -> None:
         "style-tokenizer-lr-probe",
         "style-tokenizer-lr10x-scratch",
         "style-tokenizer-select",
-        "style-tokenizer-smoke",
+        "style-tokenizer-smoke", "style-tokenizer-generalize-smoke",
     }:
         from .style_tokenizer import (
             smoke_test_style_tokenizer,
+            smoke_test_style_tokenizer_generalization,
             select_style_tokenizer_checkpoint,
             train_style_tokenizer,
             train_style_tokenizer_generalization,
@@ -232,6 +234,7 @@ def main() -> None:
             "style-tokenizer-lr10x-scratch": train_style_tokenizer_lr10x_scratch,
             "style-tokenizer-select": select_style_tokenizer_checkpoint,
             "style-tokenizer-smoke": smoke_test_style_tokenizer,
+            "style-tokenizer-generalize-smoke": smoke_test_style_tokenizer_generalization,
         }[args.command]
         _run(stage, config, destination)
     elif args.command == "synthetic-teacher":

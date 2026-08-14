@@ -49,16 +49,25 @@ target-excluded multi-reference curriculum이나 Resampler 상단 공동학습�
 
 ## Phase B: target-excluded 일반화
 
-Phase A의 validation Pareto 최적 체크포인트를 `checkpoints/selected.pt`로
-고정한 뒤 새 optimizer로 이어서 학습한다.
+현재 production run은 Phase A 체크포인트를 재사용하지 않고 fresh
+initialization에서 시작한다.
 
-- target은 전체 train 이미지 풀에서 선택한다.
+- 전체 train 이미지 풀을 사용하고 target 노출은 작가별로 거의 균등하게
+  샘플링한다.
 - reference는 같은 작가의 다른 그림 1–8장이고 target을 포함하지 않는다.
 - frozen Resampler, frozen Anima, 16×1024 native-context 삽입 구조는 유지한다.
-- AdamW LR `5e-5`, 200-step warmup, cosine decay, 최대 8,000 step을 사용한다.
-- self/heldout뿐 아니라 같은 batch의 작가 reference를 순환시킨 wrong-artist
-  조건을 함께 검증한다. `heldout paired improvement - wrong-artist paired
-  improvement`가 양수여야 reference-specific style을 학습했다고 본다.
+- AdamW LR `1e-4`, 200-step warmup, cosine decay, 8,000 step을 사용한다.
+- frozen-Anima rectified-flow MSE가 주 손실이다.
+- 같은 작가의 비중첩 reference 집합 두 개에서 얻은 전체 16개 slot을 직접
+  supervised contrastive로 정렬한다. 다른 batch 작가는 negative이며 이
+  손실은 첫 1,000 step 동안 weight `0.005`까지 ramp한다.
+- step 1,500부터 같은 target, prompt, noise, timestep에서 correct와 wrong
+  artist의 flow 방향을 비교하는 bounded auxiliary loss를 weight `0.005`까지
+  ramp한다. 두 이미지에 대해 4 optimizer step마다 한 번 계산한다.
+- wrong-artist 예측은 이 손실에서 stop-gradient한다. 따라서 wrong reference를
+  의도적으로 파괴적인 방향으로 보내는 shortcut은 허용하지 않는다.
+- 공통 flow 성분의 centering은 이 보조 비교 안에서만 사용하며 실제 style
+  residual에서는 제거하지 않는다.
 - 500 step마다 self와 heldout 생성 패널을 보며 target content 복사 감소,
   스타일 변화, 붕괴 여부를 함께 판단한다.
 

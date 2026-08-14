@@ -107,6 +107,7 @@ class ProductionStyleLoader:
         self.min_references = int(cfg.get("min_references", 1))
         self.max_references = int(cfg.get("max_references", 8))
         self.split = str(cfg.get("split", "train"))
+        self.artist_balanced = bool(cfg.get("artist_balanced", False))
         self.reference_curriculum = dict(cfg.get("reference_curriculum", {}))
         self.self_reference_target_images_per_style = max(
             0, int(cfg.get("self_reference_target_images_per_style", 0))
@@ -168,7 +169,30 @@ class ProductionStyleLoader:
         if not self.by_style or not self.buckets:
             raise RuntimeError("No eligible same-style episodes exist in the cache intersection")
         self.bucket_keys = sorted(self.buckets)
-        self.bucket_weights = [len(self.buckets[key]) for key in self.bucket_keys]
+        self.target_sampling_weights: dict[tuple[int, int], list[float]] = {}
+        if self.artist_balanced:
+            for shape, image_ids in self.buckets.items():
+                self.target_sampling_weights[shape] = [
+                    1.0
+                    / len(
+                        self.by_style[
+                            str(
+                                self.style_by_id[image_id].get(
+                                    "style_id", self.style_by_id[image_id]["artist"]
+                                )
+                            )
+                        ]
+                    )
+                    for image_id in image_ids
+                ]
+            # Selecting buckets by their summed inverse-frequency mass and
+            # rows by the same weights makes total target exposure close to
+            # uniform per artist while preserving exact latent-shape batches.
+            self.bucket_weights = [
+                sum(self.target_sampling_weights[key]) for key in self.bucket_keys
+            ]
+        else:
+            self.bucket_weights = [len(self.buckets[key]) for key in self.bucket_keys]
         self.self_reference_buckets: dict[tuple[int, int], list[int]] = {}
         self.self_reference_target_ids: set[int] = set()
         if self.reference_curriculum and self.self_reference_target_images_per_style > 0:
@@ -255,7 +279,14 @@ class ProductionStyleLoader:
         chosen: list[int] = []
         attempts = 0
         while len(chosen) < self.batch_size and attempts < max(64, self.batch_size * 32):
-            target_id = candidates[rng.randrange(len(candidates))]
+            if getattr(self, "artist_balanced", False) and not use_self_reference_pool:
+                target_id = rng.choices(
+                    candidates,
+                    weights=self.target_sampling_weights[shape],
+                    k=1,
+                )[0]
+            else:
+                target_id = candidates[rng.randrange(len(candidates))]
             style_row = self.style_by_id[target_id]
             style_id = str(style_row.get("style_id", style_row["artist"]))
             if target_id not in chosen and style_id not in {

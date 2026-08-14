@@ -211,6 +211,114 @@ def _reference_tokens(
     return values, mask
 
 
+def _split_reference_views(
+    reference_mask: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Build two disjoint, non-empty views for rows with at least two refs."""
+
+    if reference_mask.ndim != 2:
+        raise ValueError("reference_mask must have shape [batch, references]")
+    eligible = reference_mask.sum(dim=1) >= 2
+    selected = reference_mask[eligible]
+    positions = torch.arange(
+        reference_mask.shape[1], device=reference_mask.device
+    )[None]
+    first = selected & ((positions % 2) == 0)
+    second = selected & ((positions % 2) == 1)
+    return eligible, first, second
+
+
+def _style_token_contrastive_loss(
+    first: torch.Tensor,
+    second: torch.Tensor,
+    style_ids: list[str],
+    temperature: float,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Match aligned output slots across two same-artist reference views."""
+
+    if first.shape != second.shape or first.ndim != 3:
+        raise ValueError("Style token views must have equal [batch, slots, dim] shape")
+    if len(style_ids) != first.shape[0]:
+        raise ValueError("style_ids must contain one value per token view")
+    if temperature <= 0:
+        raise ValueError("contrastive temperature must be positive")
+
+    first = F.normalize(first.float(), dim=-1)
+    second = F.normalize(second.float(), dim=-1)
+    logits = torch.einsum("bsd,csd->bc", first, second)
+    logits = logits / (first.shape[1] * temperature)
+    positive = torch.tensor(
+        [
+            [left == right for right in style_ids]
+            for left in style_ids
+        ],
+        dtype=torch.bool,
+        device=logits.device,
+    )
+    log_prob = logits.log_softmax(dim=1)
+    positive_log_prob = torch.logsumexp(
+        log_prob.masked_fill(~positive, -torch.inf), dim=1
+    )
+    reverse_log_prob = logits.T.log_softmax(dim=1)
+    reverse_positive_log_prob = torch.logsumexp(
+        reverse_log_prob.masked_fill(~positive.T, -torch.inf), dim=1
+    )
+    loss = -0.5 * (
+        positive_log_prob.mean() + reverse_positive_log_prob.mean()
+    )
+    similarities = logits * temperature
+    negative = ~positive
+    negative_similarity = (
+        similarities[negative].mean()
+        if bool(negative.any())
+        else similarities.new_zeros(())
+    )
+    return loss, {
+        "token_positive_similarity": similarities[positive].mean(),
+        "token_negative_similarity": negative_similarity,
+        "token_similarity_margin": (
+            similarities[positive].mean() - negative_similarity
+        ),
+    }
+
+
+def _artist_direction_loss(
+    prediction: torch.Tensor,
+    wrong_prediction: torch.Tensor,
+    base_prediction: torch.Tensor,
+    target: torch.Tensor,
+    *,
+    margin: float,
+    centered_weight: float,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Prefer the correct artist residual without training wrong refs to be harmful."""
+
+    correct_delta = prediction - base_prediction
+    wrong_delta = wrong_prediction.detach() - base_prediction
+    desired = target - base_prediction
+    correct_cosine = F.cosine_similarity(
+        correct_delta.flatten(1), desired.flatten(1), dim=1, eps=1e-8
+    )
+    wrong_cosine = F.cosine_similarity(
+        wrong_delta.flatten(1), desired.flatten(1), dim=1, eps=1e-8
+    )
+    centered_cosine = F.cosine_similarity(
+        (correct_delta - wrong_delta).flatten(1),
+        desired.flatten(1),
+        dim=1,
+        eps=1e-8,
+    )
+    ranking = F.relu(margin - correct_cosine + wrong_cosine).mean()
+    centered = (1.0 - centered_cosine).mean()
+    loss = ranking + float(centered_weight) * centered
+    return loss, {
+        "artist_correct_direction_cosine": correct_cosine.mean(),
+        "artist_wrong_direction_cosine": wrong_cosine.mean(),
+        "artist_centered_direction_cosine": centered_cosine.mean(),
+        "artist_direction_ranking_loss": ranking,
+    }
+
+
 def _flow_metrics(
     prediction: torch.Tensor,
     base_prediction: torch.Tensor,
@@ -262,6 +370,8 @@ def _forward_tokenizer_flow(
     generator: torch.Generator,
     reference_mode: str,
     measure_base: bool,
+    token_contrastive_weight: float = 0.0,
+    artist_direction_weight: float = 0.0,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     latents = batch["latents"].to(
         device, dtype=torch.bfloat16, non_blocking=True
@@ -299,14 +409,52 @@ def _forward_tokenizer_flow(
         ).squeeze(2).float()
     target = (noise - latents).float()
     flow_loss = F.mse_loss(prediction, target)
+    total_loss = flow_loss
     metrics = {
+        "total_loss": float(total_loss.detach()),
         "flow_loss": float(flow_loss.detach()),
         "token_rms": float(style_tokens.detach().float().square().mean().sqrt()),
         "token_scale": float(tokenizer.log_output_rms.detach().exp()),
         "references": float(reference_mask.sum(dim=1).float().mean()),
         "timestep_mean": float(timesteps.detach().float().mean()),
     }
-    if measure_base:
+
+    if token_contrastive_weight > 0:
+        eligible, first_mask, second_mask = _split_reference_views(reference_mask)
+        if bool(eligible.any()) and int(eligible.sum()) >= 2:
+            eligible_references = references[eligible]
+            with torch.autocast(
+                device_type="cuda", dtype=torch.bfloat16,
+                enabled=device.startswith("cuda"),
+            ):
+                first_tokens = tokenizer(eligible_references, first_mask)
+                second_tokens = tokenizer(eligible_references, second_mask)
+            episodes = batch.get("episodes") or []
+            eligible_indices = eligible.nonzero(as_tuple=False).flatten().tolist()
+            style_ids = (
+                [str(episodes[index].style_id) for index in eligible_indices]
+                if episodes
+                else [str(index) for index in eligible_indices]
+            )
+            token_loss, token_metrics = _style_token_contrastive_loss(
+                first_tokens,
+                second_tokens,
+                style_ids,
+                float(training_cfg.get("token_contrastive_temperature", 0.10)),
+            )
+            total_loss = total_loss + token_contrastive_weight * token_loss
+            metrics.update({
+                "token_contrastive_loss": float(token_loss.detach()),
+                "token_contrastive_weight": float(token_contrastive_weight),
+                "token_contrastive_eligible": float(eligible.sum()),
+                **{
+                    key: float(value.detach())
+                    for key, value in token_metrics.items()
+                },
+            })
+
+    base_prediction = None
+    if measure_base or artist_direction_weight > 0:
         with torch.no_grad(), torch.autocast(
             device_type="cuda", dtype=torch.bfloat16,
             enabled=device.startswith("cuda"),
@@ -316,13 +464,62 @@ def _forward_tokenizer_flow(
                 context=conditioning, padding_mask=padding_mask,
                 target_input_ids=None,
             ).squeeze(2).float()
+    if artist_direction_weight > 0:
+        direction_batch = min(
+            int(training_cfg.get("artist_direction_batch_size", 2)),
+            latents.shape[0],
+        )
+        wrong_references, wrong_mask = _reference_tokens(
+            batch, device, mode="wrong_artist"
+        )
+        with torch.no_grad(), torch.autocast(
+            device_type="cuda", dtype=torch.bfloat16,
+            enabled=device.startswith("cuda"),
+        ):
+            wrong_tokens = tokenizer(
+                wrong_references[:direction_batch], wrong_mask[:direction_batch]
+            )
+            wrong_conditioning = insert_style_tokens(
+                conditioning[:direction_batch],
+                lengths[:direction_batch],
+                wrong_tokens,
+            )
+            wrong_prediction = anima(
+                noisy[:direction_batch].unsqueeze(2),
+                timesteps[:direction_batch].to(latents.dtype),
+                context=wrong_conditioning,
+                padding_mask=padding_mask[:direction_batch],
+                target_input_ids=None,
+            ).squeeze(2).float()
+        direction_loss, direction_metrics = _artist_direction_loss(
+            prediction[:direction_batch],
+            wrong_prediction,
+            base_prediction[:direction_batch],
+            target[:direction_batch],
+            margin=float(training_cfg.get("artist_direction_margin", 0.02)),
+            centered_weight=float(
+                training_cfg.get("artist_centered_direction_weight", 0.25)
+            ),
+        )
+        total_loss = total_loss + artist_direction_weight * direction_loss
+        metrics.update({
+            "artist_direction_loss": float(direction_loss.detach()),
+            "artist_direction_weight": float(artist_direction_weight),
+            **{
+                key: float(value.detach())
+                for key, value in direction_metrics.items()
+            },
+        })
+    metrics["total_loss"] = float(total_loss.detach())
+    if measure_base:
+        assert base_prediction is not None
         metrics.update({
             key: float(value.detach())
             for key, value in _flow_metrics(
                 prediction.detach(), base_prediction, target
             ).items()
         })
-    return flow_loss, metrics
+    return total_loss, metrics
 
 
 def _mean_metrics(rows: list[dict[str, float]]) -> dict[str, float]:
@@ -343,6 +540,17 @@ def _mean_metrics(rows: list[dict[str, float]]) -> dict[str, float]:
         result["paired_flow_improvement_ci95"] = 0.0
     result["batches"] = float(len(rows))
     return result
+
+
+def _ramped_auxiliary_weight(
+    step: int, *, maximum: float, start_step: int, ramp_steps: int
+) -> float:
+    if maximum <= 0 or step < start_step:
+        return 0.0
+    if ramp_steps <= 0:
+        return float(maximum)
+    progress = min(1.0, (step - start_step + 1) / ramp_steps)
+    return float(maximum) * progress
 
 
 @torch.no_grad()
@@ -726,6 +934,27 @@ def train_style_tokenizer(
     max_grad_norm = float(training_cfg.get("max_grad_norm", 1.0))
     prefetch_workers = int(training_cfg.get("prefetch_workers", 2))
     prefetch_batches = int(training_cfg.get("prefetch_batches", 4))
+    token_contrastive_maximum = float(
+        training_cfg.get("token_contrastive_weight", 0.0)
+    )
+    token_contrastive_start = int(
+        training_cfg.get("token_contrastive_start_step", 1)
+    )
+    token_contrastive_ramp = int(
+        training_cfg.get("token_contrastive_ramp_steps", 1000)
+    )
+    artist_direction_maximum = float(
+        training_cfg.get("artist_direction_weight", 0.0)
+    )
+    artist_direction_start = int(
+        training_cfg.get("artist_direction_start_step", 1500)
+    )
+    artist_direction_ramp = int(
+        training_cfg.get("artist_direction_ramp_steps", 1000)
+    )
+    artist_direction_every = max(
+        1, int(training_cfg.get("artist_direction_every", 4))
+    )
 
     wandb_run = None
     wandb_cfg = dict(training_cfg.get("wandb", {}))
@@ -794,6 +1023,20 @@ def train_style_tokenizer(
                 group["lr"] = base_lr * multiplier
             optimizer.zero_grad(set_to_none=True)
             micro_metrics = []
+            token_contrastive_weight = _ramped_auxiliary_weight(
+                step,
+                maximum=token_contrastive_maximum,
+                start_step=token_contrastive_start,
+                ramp_steps=token_contrastive_ramp,
+            )
+            artist_direction_weight = _ramped_auxiliary_weight(
+                step,
+                maximum=artist_direction_maximum,
+                start_step=artist_direction_start,
+                ramp_steps=artist_direction_ramp,
+            )
+            if step % artist_direction_every != 0:
+                artist_direction_weight = 0.0
             for micro in range(accumulation):
                 batch = next(prefetched)
                 should_measure = (
@@ -806,6 +1049,8 @@ def train_style_tokenizer(
                     anima, tokenizer, batch, device, training_cfg,
                     generator=generator, reference_mode=reference_mode,
                     measure_base=should_measure,
+                    token_contrastive_weight=token_contrastive_weight,
+                    artist_direction_weight=artist_direction_weight,
                 )
                 (loss / accumulation).backward()
                 micro_metrics.append(metrics)
@@ -815,14 +1060,29 @@ def train_style_tokenizer(
             optimizer.step()
             step_s = time.perf_counter() - step_started
             train_metrics = {
-                "loss": sum(row["flow_loss"] for row in micro_metrics) / len(micro_metrics),
+                "loss": sum(row["total_loss"] for row in micro_metrics) / len(micro_metrics),
+                "flow_loss": sum(row["flow_loss"] for row in micro_metrics) / len(micro_metrics),
                 "token_rms": sum(row["token_rms"] for row in micro_metrics) / len(micro_metrics),
                 "token_scale": sum(row["token_scale"] for row in micro_metrics) / len(micro_metrics),
                 "grad_norm": float(grad_norm),
                 "learning_rate": float(optimizer.param_groups[0]["lr"]),
                 "step_s": step_s,
                 "images_per_s": train_loader.batch_size * accumulation / max(step_s, 1e-6),
+                "token_contrastive_weight": token_contrastive_weight,
+                "artist_direction_weight": artist_direction_weight,
             }
+            for key in (
+                "token_contrastive_loss", "token_contrastive_eligible",
+                "token_positive_similarity", "token_negative_similarity",
+                "token_similarity_margin", "artist_direction_loss",
+                "artist_correct_direction_cosine",
+                "artist_wrong_direction_cosine",
+                "artist_centered_direction_cosine",
+                "artist_direction_ranking_loss",
+            ):
+                values = [row[key] for row in micro_metrics if key in row]
+                if values:
+                    train_metrics[key] = sum(values) / len(values)
             measured = micro_metrics[-1]
             for key in (
                 "base_flow_loss", "paired_flow_improvement",
@@ -938,7 +1198,7 @@ def train_style_tokenizer(
 def train_style_tokenizer_generalization(
     config: dict[str, Any], destination: Path
 ) -> dict[str, Any]:
-    """Continue a trained tokenizer with target-excluded references."""
+    """Train the full-data, target-excluded multi-reference tokenizer."""
     return train_style_tokenizer(
         config, destination, config_section="style_tokenizer_generalization"
     )
@@ -1096,3 +1356,32 @@ def smoke_test_style_tokenizer(
     cfg["training"]["sample_every"] = 0
     cfg["training"]["wandb"] = {"enabled": False}
     return train_style_tokenizer(smoke, destination, steps_override=2)
+
+
+def smoke_test_style_tokenizer_generalization(
+    config: dict[str, Any], destination: Path
+) -> dict[str, Any]:
+    """Exercise both multi-view and wrong-artist auxiliaries on real caches."""
+
+    smoke = copy.deepcopy(config)
+    cfg = smoke["style_tokenizer_generalization"]
+    cfg["output_directory"] = str(cfg["output_directory"]) + "_smoke"
+    training = cfg["training"]
+    training["resume"] = False
+    training["validation_every"] = 2
+    training["validation_batches"] = 1
+    training["train_validation_batches"] = 1
+    training["checkpoint_every"] = 2
+    training["sample_every"] = 0
+    training["token_contrastive_start_step"] = 1
+    training["token_contrastive_ramp_steps"] = 0
+    training["artist_direction_start_step"] = 1
+    training["artist_direction_ramp_steps"] = 0
+    training["artist_direction_every"] = 1
+    training["wandb"] = {"enabled": False}
+    return train_style_tokenizer(
+        smoke,
+        destination,
+        steps_override=2,
+        config_section="style_tokenizer_generalization",
+    )
