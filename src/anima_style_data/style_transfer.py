@@ -3465,37 +3465,6 @@ def sample_style_checkpoint(config: dict[str, Any], destination: Path) -> dict[s
     if "resampler" in state:
         resampler.load_state_dict(state["resampler"])
 
-    alpha_block_ablation: dict[str, dict[str, float]] = {}
-    configured_block_groups = diagnostic_cfg.get("alpha_block_groups", {})
-    if configured_block_groups:
-        if not isinstance(configured_block_groups, dict):
-            raise TypeError("diagnostics.alpha_block_groups must be a mapping")
-        ablation_batches = int(
-            diagnostic_cfg.get("alpha_block_ablation_batches", 8)
-        )
-        ablation_seed = int(
-            diagnostic_cfg.get("alpha_block_ablation_seed", 20260811 ^ 0xA1FA)
-        )
-        validation_loss_config = {
-            **cfg["training"],
-            "timestep_sampling": "uniform",
-            "style_dropout": 0.0,
-        }
-        for name, block_indices in configured_block_groups.items():
-            with _use_same_q_alpha_blocks(adapter, block_indices):
-                alpha_block_ablation[str(name)] = _validate_style_adapter(
-                    anima,
-                    adapter,
-                    resampler,
-                    loader,
-                    device,
-                    batches=ablation_batches,
-                    seed=ablation_seed,
-                    step=int(state["step"]),
-                    loss_config=validation_loss_config,
-                    reference_mode="self",
-                )
-            adapter.eval()
     step = int(state["step"])
     episodes = [
         int(value)
@@ -3744,6 +3713,38 @@ def diagnose_style_reference_dependence(
     _load_adapter_checkpoint(adapter, state)
     if "resampler" in state:
         resampler.load_state_dict(state["resampler"])
+
+    alpha_block_ablation: dict[str, dict[str, float]] = {}
+    configured_block_groups = diagnostic_cfg.get("alpha_block_groups", {})
+    if configured_block_groups:
+        if not isinstance(configured_block_groups, dict):
+            raise TypeError("diagnostics.alpha_block_groups must be a mapping")
+        ablation_batches = int(
+            diagnostic_cfg.get("alpha_block_ablation_batches", 8)
+        )
+        ablation_seed = int(
+            diagnostic_cfg.get("alpha_block_ablation_seed", 20260811 ^ 0xA1FA)
+        )
+        validation_loss_config = {
+            **cfg["training"],
+            "timestep_sampling": "uniform",
+            "style_dropout": 0.0,
+        }
+        for name, block_indices in configured_block_groups.items():
+            with _use_same_q_alpha_blocks(adapter, block_indices):
+                alpha_block_ablation[str(name)] = _validate_style_adapter(
+                    anima,
+                    adapter,
+                    resampler,
+                    loader,
+                    device,
+                    batches=ablation_batches,
+                    seed=ablation_seed,
+                    step=int(state["step"]),
+                    loss_config=validation_loss_config,
+                    reference_mode="self",
+                )
+            adapter.eval()
 
     records: list[dict[str, float]] = []
     batches = int(diagnostic_cfg.get("batches", 4))
