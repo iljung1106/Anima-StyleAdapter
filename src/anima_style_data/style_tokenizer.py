@@ -679,6 +679,25 @@ def train_style_tokenizer(
         ("validation-1", validation_loader, 13, "heldout"),
     ]
     try:
+        # A checkpoint is committed before qualitative sampling. If sampling
+        # was interrupted, resume the missing panel before advancing so the
+        # monitored sequence retains every configured interval.
+        resumed_sample_dir = output / "samples" / f"step-{start_step:07d}"
+        if (
+            start_step > 0
+            and sample_every > 0
+            and start_step % sample_every == 0
+            and not resumed_sample_dir.exists()
+        ):
+            sheets, vae = _sample_tokenizer(
+                anima, tokenizer, sample_requests, config, destination,
+                output, device, start_step, vae,
+            )
+            if wandb_run is not None:
+                import wandb
+                wandb_run.log({
+                    "samples/panel": [wandb.Image(str(path)) for path in sheets]
+                }, step=start_step)
         for step in range(start_step + 1, steps + 1):
             step_started = time.perf_counter()
             multiplier = _learning_rate_multiplier(
