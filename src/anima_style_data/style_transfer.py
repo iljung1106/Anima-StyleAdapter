@@ -37,6 +37,11 @@ from .tap_resampler import (
 )
 
 
+def _format_optional_metric(value: float, digits: int = 4) -> str:
+    numeric = float(value)
+    return f"{numeric:.{digits}f}" if math.isfinite(numeric) else "n/a"
+
+
 @dataclass(frozen=True)
 class StyleEpisode:
     target_id: int
@@ -103,6 +108,9 @@ class ProductionStyleLoader:
         self.max_references = int(cfg.get("max_references", 8))
         self.split = str(cfg.get("split", "train"))
         self.reference_curriculum = dict(cfg.get("reference_curriculum", {}))
+        self.self_reference_target_images_per_style = max(
+            0, int(cfg.get("self_reference_target_images_per_style", 0))
+        )
         self.gradient_accumulation_steps = max(
             1, int(cfg.get("gradient_accumulation_steps", 1))
         )
@@ -161,6 +169,39 @@ class ProductionStyleLoader:
             raise RuntimeError("No eligible same-style episodes exist in the cache intersection")
         self.bucket_keys = sorted(self.buckets)
         self.bucket_weights = [len(self.buckets[key]) for key in self.bucket_keys]
+        self.self_reference_buckets: dict[tuple[int, int], list[int]] = {}
+        self.self_reference_target_ids: set[int] = set()
+        if self.reference_curriculum and self.self_reference_target_images_per_style > 0:
+            selected_ids: set[int] = set()
+            for style_id, image_ids in sorted(self.by_style.items()):
+                digest = hashlib.blake2b(
+                    f"{self.seed}:{style_id}".encode("utf-8"), digest_size=8
+                ).digest()
+                style_rng = random.Random(int.from_bytes(digest, "little"))
+                selected_ids.update(
+                    style_rng.sample(
+                        image_ids,
+                        min(self.self_reference_target_images_per_style, len(image_ids)),
+                    )
+                )
+            for shape, values in self.buckets.items():
+                selected = [image_id for image_id in values if image_id in selected_ids]
+                if len(selected) >= self.batch_size:
+                    self.self_reference_buckets[shape] = selected
+            if not self.self_reference_buckets:
+                raise RuntimeError(
+                    "The self-reference target pool cannot form an exact-shape batch"
+                )
+            self.self_reference_target_ids = {
+                image_id
+                for values in self.self_reference_buckets.values()
+                for image_id in values
+            }
+        self.self_reference_bucket_keys = sorted(self.self_reference_buckets)
+        self.self_reference_bucket_weights = [
+            len(self.self_reference_buckets[key])
+            for key in self.self_reference_bucket_keys
+        ]
         self.text_shards = _TensorShardCache(text_root, int(cfg.get("text_lru_shards", 2)))
         self.latent_shards = _TensorShardCache(latent_root, int(cfg.get("latent_lru_shards", 2)))
         token_cache = cfg.get("resampler_token_cache")
@@ -191,12 +232,26 @@ class ProductionStyleLoader:
         else:
             min_references = self.min_references
             max_references = self.max_references
+            curriculum = None
         # Sampling bucket names uniformly would drastically overrepresent rare
         # extreme aspect ratios. Weight by eligible target count so each image
         # retains approximately equal target probability while batches remain
         # exact-shape.
-        shape = rng.choices(self.bucket_keys, weights=self.bucket_weights, k=1)[0]
-        candidates = self.buckets[shape]
+        use_self_reference_pool = bool(
+            curriculum
+            and curriculum["target_only"]
+            and getattr(self, "self_reference_buckets", {})
+        )
+        if use_self_reference_pool:
+            bucket_keys = self.self_reference_bucket_keys
+            bucket_weights = self.self_reference_bucket_weights
+            target_buckets = self.self_reference_buckets
+        else:
+            bucket_keys = self.bucket_keys
+            bucket_weights = self.bucket_weights
+            target_buckets = self.buckets
+        shape = rng.choices(bucket_keys, weights=bucket_weights, k=1)[0]
+        candidates = target_buckets[shape]
         chosen: list[int] = []
         attempts = 0
         while len(chosen) < self.batch_size and attempts < max(64, self.batch_size * 32):
@@ -2868,6 +2923,7 @@ def _forward_flow_loss(
             )
             if bypass_prediction is not None else float("nan")
         ),
+        "bypass_measured": bypass_prediction is not None,
         "curriculum_phase": str(curriculum["phase"]),
         "curriculum_gate_only": bool(curriculum["gate_only"]),
         "oracle_distill_weight": oracle_weight,
@@ -4883,6 +4939,14 @@ def train_style_adapter(config: dict[str, Any], destination: Path, *, steps_over
         ),
     }
     loader = ProductionStyleLoader(destination, loader_cfg)
+    if loader.self_reference_target_ids:
+        print(
+            "self-reference target pool: "
+            f"{len(loader.self_reference_target_ids)} images across "
+            f"{len(loader.self_reference_buckets)} latent buckets; "
+            f"limit={loader.self_reference_target_images_per_style}/style",
+            flush=True,
+        )
     validation_loader_cfg = {
         **cfg["loader"],
         "split": "validation",
@@ -5505,18 +5569,33 @@ def train_style_adapter(config: dict[str, Any], destination: Path, *, steps_over
         metrics.append(row)
         metrics = metrics[-100:]
         if step == start_step + 1 or step % log_every == 0 or step == steps:
+            bypass_measured = bool(row.get("bypass_measured", False))
+            output_ratio = (
+                _format_optional_metric(row["style_output_ratio"])
+                if bypass_measured else "n/a"
+            )
+            projection = (
+                _format_optional_metric(row["style_flow_desired_projection"])
+                if bypass_measured else "n/a"
+            )
+            direction_cosine = (
+                _format_optional_metric(row["style_flow_direction_cosine"])
+                if bypass_measured else "n/a"
+            )
+            orthogonal_ratio = (
+                _format_optional_metric(row["style_flow_orthogonal_to_desired_ratio"])
+                if bypass_measured else "n/a"
+            )
             print(
                 f"style step={step}/{steps} loss={row['loss']:.6f} grad={row['grad_norm']:.4f} "
                 f"phase={row['curriculum_phase']} "
-                f"refs={row['references']} shape={tuple(row['latent_shape'])} step_s={elapsed:.2f} "
-                f"data_wait_s={data_wait:.3f} output_ratio={row['style_output_ratio']:.4f} "
+                f"total_refs={row['references']} shape={tuple(row['latent_shape'])} step_s={elapsed:.2f} "
+                f"data_wait_s={data_wait:.3f} output_ratio={output_ratio} "
                 f"res_mse={row['exact_self_residual_mse_loss']:.4f} "
-                f"align=proj:{row['style_flow_desired_projection']:.4f}/"
-                f"cos:{row['style_flow_direction_cosine']:.4f}/"
-                f"orth:{row['style_flow_orthogonal_to_desired_ratio']:.4f} "
+                f"align=proj:{projection}/cos:{direction_cosine}/orth:{orthogonal_ratio} "
                 f"mag={row['style_magnitude_loss']:.5f} dir={row['style_flow_direction_loss']:.5f} "
                 f"rank={row['style_reference_rank_loss']:.5f}/"
-                f"{row['style_reference_rank_advantage']:.5f} "
+                f"{_format_optional_metric(row['style_reference_rank_advantage'], 5)} "
                 f"ref_dir={row['style_reference_direction_loss']:.5f} "
                 f"ref_mse={row['style_reference_residual_mse_loss']:.5f} "
                 f"oracle={row['oracle_distill_loss']:.5f}/{int(row['oracle_distill_applied'])} "

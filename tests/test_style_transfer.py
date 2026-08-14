@@ -822,6 +822,37 @@ def test_episode_sampler_never_uses_target_as_reference():
         assert len(set(episode.reference_ids)) == len(episode.reference_ids)
 
 
+def test_episode_sampler_limits_targets_only_during_self_reference():
+    loader = ProductionStyleLoader.__new__(ProductionStyleLoader)
+    loader.seed = 41
+    loader.batch_size = 1
+    loader.min_references = 1
+    loader.max_references = 1
+    loader.gradient_accumulation_steps = 1
+    loader.reference_curriculum = {
+        "self_reference_steps": 2,
+        "target_anneal_end": 3,
+    }
+    loader.bucket_keys = [(32, 32)]
+    loader.bucket_weights = [4]
+    loader.buckets = {(32, 32): [10, 11, 12, 13]}
+    loader.self_reference_bucket_keys = [(32, 32)]
+    loader.self_reference_bucket_weights = [1]
+    loader.self_reference_buckets = {(32, 32): [10]}
+    loader.style_by_id = {
+        image_id: {"artist": "artist", "style_id": "style"}
+        for image_id in (10, 11, 12, 13)
+    }
+    loader.by_style = {"style": [10, 11, 12, 13]}
+    loader.text_variants = {image_id: [0] for image_id in (10, 11, 12, 13)}
+
+    assert loader.episodes_for_step(0)[0].target_id == 10
+    later_targets = {
+        loader.episodes_for_step(step)[0].target_id for step in range(4, 20)
+    }
+    assert later_targets - {10}
+
+
 class _FakeCrossAttention(nn.Module):
     def __init__(self, hidden: int, context: int | None = None):
         super().__init__()

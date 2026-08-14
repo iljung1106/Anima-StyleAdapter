@@ -280,7 +280,7 @@ tap_resampler_experiment:
 # and batches targets by exact latent shape. `style-smoke` forces two steps and
 # writes to a separate smoke directory; `style-train` uses `training.steps`.
 style_transfer:
-  output_directory: style_transfer_ip_adapter_fullscale_exact_self_8k_v1
+  output_directory: style_transfer_ip_adapter_exposure_bootstrap_5k_v1
   seed: 20260811
   loader:
     style_cache: style_features_l18_l24_siglip_l24
@@ -293,6 +293,11 @@ style_transfer:
     batch_size: 4
     min_references: 1
     max_references: 8
+    # During the exact-self bootstrap, draw one deterministic representative
+    # target per artist. This yields about 6.4 exposures/image in 2k updates
+    # instead of 0.21 over the full 150k-image pool. Validation and all later
+    # mixed/target-excluded phases continue to draw from the complete split.
+    self_reference_target_images_per_style: 1
     # Anima cross-attention was trained with 512 post-LLM tokens, including
     # trailing zeros; it has no text padding mask, so runtime must restore them.
     text_conditioning_length: 512
@@ -374,7 +379,7 @@ style_transfer:
     device: cuda
     # Fresh exact-self baseline. Do not inherit any A2.x connector state.
     initial_checkpoint: null
-    steps: 8000
+    steps: 2000
     # Trainable adapter weights and Adam moments stay FP32. Representation
     # modules need a higher LR than the stabilized zero-output path.
     learning_rate: 0.0001
@@ -527,20 +532,20 @@ style_transfer:
     style_interval_huber_beta: 0.01
     style_guided_effect_scale: 1.0
     style_effect_upper_scale: 1.5
-    # Eight thousand exact-self updates provide 128k target exposures at the
-    # effective batch of 16. Only after this gate passes do we introduce
-    # DEADiff-style same-artist/different-image pairs.
+    # First learn a reusable image-conditioning map from one representative
+    # target per artist. Only after this gate passes do we expand back to every
+    # image and introduce DEADiff-style same-artist/different-image pairs.
     curriculum:
       gate_only_steps: 0
-      self_reference_steps: 8000
-      target_mix_end_step: 8001
+      self_reference_steps: 2000
+      target_mix_end_step: 2001
       target_mix_end_probability: 0.5
       target_mix_min_references: 1
       target_mix_max_references: 4
-      target_anneal_end: 8002
+      target_anneal_end: 2002
       target_anneal_min_references: 1
       target_anneal_max_references: 8
-      oracle_distill_end: 8000
+      oracle_distill_end: 2000
     oracle_distill_weight: 0.0
     oracle_distill_probability: 0.25
     oracle_distill_scale_floor: 0.02
@@ -548,8 +553,8 @@ style_transfer:
     wandb:
       enabled: true
       project: anima-style-adapter
-      name: anima-style-transfer-ip-adapter-fullscale-exact-self-8k-v1
-      id: anima-style-transfer-ip-adapter-fullscale-exact-self-8k-v1
+      name: anima-style-transfer-ip-adapter-exposure-bootstrap-5k-v1
+      id: anima-style-transfer-ip-adapter-exposure-bootstrap-5k-v1
   diagnostics:
     checkpoint: checkpoints/step-0000500.pt
     batch_size: 4
