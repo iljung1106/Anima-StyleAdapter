@@ -280,7 +280,7 @@ tap_resampler_experiment:
 # and batches targets by exact latent shape. `style-smoke` forces two steps and
 # writes to a separate smoke directory; `style-train` uses `training.steps`.
 style_transfer:
-  output_directory: style_transfer_same_q_phase_a27_fullrank_kv_128_4k_v1
+  output_directory: style_transfer_same_q_phase_a28_style_output_delta_r128_4k_v1
   seed: 20260811
   loader:
     style_cache: style_features_l18_l24_siglip_l24
@@ -340,6 +340,11 @@ style_transfer:
     # Keep Anima's native full-rank K/V basis immutable. Only these explicit
     # low-rank block deltas adapt after the bridge starts to align.
     style_kv_delta_rank: 32
+    # A2.4--A2.7 increased style magnitude mostly orthogonal to the desired
+    # flow. Preserve native O, then add a block-specific style-only low-rank
+    # output correction so visual attention can rotate into Anima's residual
+    # space without perturbing the text branch.
+    style_output_delta_rank: 128
     aggregator_heads: 16
     aggregator_layers: 2
     aggregator_slot_mixer_layers: 1
@@ -367,10 +372,10 @@ style_transfer:
     # Fresh Adapter initialization. Do not reuse the successful 2k diagnostic
     # checkpoint or any older offline/bootstrap connector weights.
     initial_checkpoint: null
-    # Phase A2.7: A2.5 showed that opening only full-rank V was insufficient,
-    # while A2.6 ruled out matching the text path's 512-token denominator.
-    # Open native-initialized full-rank K and V together so Q can learn which
-    # visual slot to select as well as what value that slot should deliver.
+    # Phase A2.8: A2.7 opened full-rank K and V but still produced only
+    # +0.000526 ±0.001590 exact-self improvement while orthogonal energy grew.
+    # Isolate the new style-only output direction head with native K/V bases
+    # frozen and the existing rank-32 K/V corrections left trainable.
     steps: 4000
     # Trainable adapter weights and Adam moments stay FP32. Representation
     # modules need a higher LR than the stabilized zero-output path.
@@ -389,12 +394,12 @@ style_transfer:
     style_k_base_learning_rate: 0.000002
     style_v_base_learning_rate: 0.000005
     output_learning_rate: 0.0001
-    # Keep the explicit rank-32 deltas trainable while cautiously opening the
-    # active blocks' native-initialized full-rank K/V copies at separate LRs.
+    # Keep native-initialized full-rank K/V fixed in this output-head ablation.
+    # The explicit rank-32 K/V deltas remain trainable.
     freeze_style_kv: false
     freeze_style_alpha: true
-    train_full_rank_style_k: true
-    train_full_rank_style_v: true
+    train_full_rank_style_k: false
+    train_full_rank_style_v: false
     calibrate_bridge_output_rms_from_text: true
     bridge_rms_calibration_batches: 4
     calibrate_alpha_from_attention_rms: true
@@ -536,8 +541,8 @@ style_transfer:
     wandb:
       enabled: true
       project: anima-style-adapter
-      name: anima-style-transfer-same-q-phase-a27-fullrank-kv-128-4k-v1
-      id: anima-style-transfer-same-q-phase-a27-fullrank-kv-128-4k-v1
+      name: anima-style-transfer-same-q-phase-a28-style-output-delta-r128-4k-v1
+      id: anima-style-transfer-same-q-phase-a28-style-output-delta-r128-4k-v1
   diagnostics:
     checkpoint: ../style_transfer_same_q_phase_a22_midblocks_residual_4k_v1/checkpoints/step-0000250.pt
     batch_size: 4

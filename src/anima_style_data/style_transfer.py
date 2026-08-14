@@ -1982,7 +1982,11 @@ def _apply_adapter_freeze_policy(
     if bool(training.get("freeze_style_kv", False)):
         groups["style_kv"] = list(adapter.kv_parameters())
     if bool(training.get("freeze_style_alpha", False)):
-        groups["style_alpha"] = list(adapter.output_parameters())
+        groups["style_alpha"] = (
+            list(adapter.alpha_parameters())
+            if hasattr(adapter, "alpha_parameters")
+            else list(adapter.output_parameters())
+        )
     for parameters in groups.values():
         for parameter in parameters:
             parameter.requires_grad_(False)
@@ -5439,6 +5443,7 @@ def train_style_adapter(config: dict[str, Any], destination: Path, *, steps_over
                 f"gate={row['style_gate_abs_mean']:.4f} "
                 f"context_rms={row['style_context_rms']:.4f} "
                 f"block_res={row['style_block_residual_ratio_mean']:.4f} "
+                f"out_delta={row.get('style_output_delta_ratio_mean', 0.0):.4f} "
                 f"bridge=grad:{row['bridge_grad_norm']:.4g}/"
                 f"update:{row['bridge_update_norm']:.3g}/rel:{row['bridge_update_to_weight_ratio']:.3g} "
                 f"grads=agg:{row['aggregator_grad']:.4g}/kv:{row['shared_kv_grad']:.4g}/"

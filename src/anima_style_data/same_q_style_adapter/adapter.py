@@ -189,7 +189,7 @@ class StyleTokenBridge(nn.Module):
 
 
 class SameQFullRankStyleAdapter(nn.Module):
-    """Decoupled text/style attention with shared Q and native full-rank O."""
+    """Decoupled attention with shared Q, native O, and optional style-only ΔO."""
 
     def __init__(
         self,
@@ -211,6 +211,7 @@ class SameQFullRankStyleAdapter(nn.Module):
         bridge_init: str = "xavier",
         bridge_output_rms_init: float = 0.15,
         style_kv_delta_rank: int = 32,
+        style_output_delta_rank: int = 0,
         style_attention_context_length: int | None = None,
         active_blocks: list[int] | None = None,
     ) -> None:
@@ -249,6 +250,9 @@ class SameQFullRankStyleAdapter(nn.Module):
         self.style_kv_delta_rank = int(style_kv_delta_rank)
         if self.style_kv_delta_rank <= 0:
             raise ValueError("style_kv_delta_rank must be positive")
+        self.style_output_delta_rank = int(style_output_delta_rank)
+        if self.style_output_delta_rank < 0:
+            raise ValueError("style_output_delta_rank must be non-negative")
 
         if aggregator_mode == "minimal":
             self.aggregator = MinimalSlotSetAggregator(
@@ -283,12 +287,15 @@ class SameQFullRankStyleAdapter(nn.Module):
         self.style_k_up = nn.ModuleList()
         self.style_v_down = nn.ModuleList()
         self.style_v_up = nn.ModuleList()
+        self.style_o_down = nn.ModuleList()
+        self.style_o_up = nn.ModuleList()
         self.reference_effect_head = None
         self._initialized = False
         self._style_tokens: torch.Tensor | None = None
         self._style_context: torch.Tensor | None = None
         self._runtime_ratio: dict[int, torch.Tensor] = {}
         self._runtime_raw_ratio: dict[int, torch.Tensor] = {}
+        self._runtime_output_delta_ratio: dict[int, torch.Tensor] = {}
         self._runtime_style_context_rms: torch.Tensor | None = None
         self._alpha_calibration_sums: list[torch.Tensor] | None = None
         self._alpha_calibration_counts: list[int] | None = None
@@ -307,6 +314,8 @@ class SameQFullRankStyleAdapter(nn.Module):
         key_up: list[nn.Linear] = []
         value_down: list[nn.Linear] = []
         value_up: list[nn.Linear] = []
+        output_down: list[nn.Module] = []
+        output_up: list[nn.Module] = []
         parameter = self.bridge.projection.weight
         for index, block in enumerate(anima.blocks):
             cross_attention = block.cross_attn
@@ -352,6 +361,29 @@ class SameQFullRankStyleAdapter(nn.Module):
             ))
             nn.init.zeros_(key_up[-1].weight)
             nn.init.zeros_(value_up[-1].weight)
+            output_projection = cross_attention.output_proj
+            output_weight = output_projection.weight
+            if int(output_weight.shape[1]) != expected_output:
+                raise ValueError(
+                    f"Block {index} native O input width is {output_weight.shape[1]}, "
+                    f"attention output width is {expected_output}"
+                )
+            if self.style_output_delta_rank and bool(self.active_block_mask[index]):
+                output_down.append(nn.Linear(
+                    expected_output, self.style_output_delta_rank, bias=False,
+                    device=parameter.device, dtype=parameter.dtype,
+                ))
+                output_up.append(nn.Linear(
+                    self.style_output_delta_rank, int(output_weight.shape[0]), bias=False,
+                    device=parameter.device, dtype=parameter.dtype,
+                ))
+                # Native O already supplies a nonzero style path. Zeroing only
+                # this additive up projection preserves the exact A2.7 start
+                # while its gradient is live on the first optimization step.
+                nn.init.zeros_(output_up[-1].weight)
+            else:
+                output_down.append(nn.Identity())
+                output_up.append(nn.Identity())
         self.style_k = nn.ModuleList(keys)
         self.style_v = nn.ModuleList(values)
         self.style_k.requires_grad_(False)
@@ -360,6 +392,8 @@ class SameQFullRankStyleAdapter(nn.Module):
         self.style_k_up = nn.ModuleList(key_up)
         self.style_v_down = nn.ModuleList(value_down)
         self.style_v_up = nn.ModuleList(value_up)
+        self.style_o_down = nn.ModuleList(output_down)
+        self.style_o_up = nn.ModuleList(output_up)
         self._initialized = True
 
     def aggregate(
@@ -432,7 +466,11 @@ class SameQFullRankStyleAdapter(nn.Module):
     # These names keep the module easy to wire into the existing training
     # utilities while preserving the new architecture's functional grouping.
     def output_parameters(self) -> list[nn.Parameter]:
-        return self.alpha_parameters()
+        return (
+            self.alpha_parameters()
+            + list(self.style_o_down.parameters())
+            + list(self.style_o_up.parameters())
+        )
 
     def gate_parameters(self) -> list[nn.Parameter]:
         return []
@@ -443,6 +481,7 @@ class SameQFullRankStyleAdapter(nn.Module):
     def reset_runtime_stats(self) -> None:
         self._runtime_ratio.clear()
         self._runtime_raw_ratio.clear()
+        self._runtime_output_delta_ratio.clear()
         self._runtime_style_context_rms = None
 
     def runtime_stats(self) -> dict[str, float]:
@@ -463,6 +502,12 @@ class SameQFullRankStyleAdapter(nn.Module):
                 float(self._runtime_style_context_rms)
                 if self._runtime_style_context_rms is not None else 0.0
             ),
+            "style_output_delta_ratio_mean": float(
+                torch.stack(list(self._runtime_output_delta_ratio.values())).float().mean()
+            ) if self._runtime_output_delta_ratio else 0.0,
+            "style_output_delta_ratio_max": float(
+                torch.stack(list(self._runtime_output_delta_ratio.values())).float().max()
+            ) if self._runtime_output_delta_ratio else 0.0,
         }
 
     def begin_alpha_calibration(self) -> None:
@@ -633,7 +678,7 @@ class SameQFullRankStyleAdapter(nn.Module):
         cross_attention: nn.Module,
         attn_params: Any,
     ) -> torch.Tensor:
-        """Compute one Q, separate text/style softmaxes, and one native O."""
+        """Compute one Q, separate softmaxes, native O, and optional style ΔO."""
         if self._style_context is None:
             return cross_attention(normalized_x, attn_params, text_context)
         if not bool(self.active_block_mask[block_index]):
@@ -678,13 +723,24 @@ class SameQFullRankStyleAdapter(nn.Module):
             self._alpha_calibration_sums[block_index].add_(raw_ratio)
             assert self._alpha_calibration_counts is not None
             self._alpha_calibration_counts[block_index] += 1
-        style_delta = self.alpha[block_index].to(style_attended.dtype) * style_attended
+        alpha = self.alpha[block_index].to(style_attended.dtype)
+        style_delta = alpha * style_attended
         merged = text_attended + style_delta
         self._runtime_ratio[block_index] = (
             style_delta.detach().float().square().mean().sqrt()
             / text_attended.detach().float().square().mean().sqrt().clamp_min(1e-8)
         )
-        return cross_attention.output_dropout(cross_attention.output_proj(merged))
+        native_output = cross_attention.output_proj(merged)
+        if self.style_output_delta_rank:
+            output_delta = alpha * self.style_o_up[block_index](
+                self.style_o_down[block_index](style_attended)
+            )
+            self._runtime_output_delta_ratio[block_index] = (
+                output_delta.detach().float().square().mean().sqrt()
+                / native_output.detach().float().square().mean().sqrt().clamp_min(1e-8)
+            )
+            native_output = native_output + output_delta
+        return cross_attention.output_dropout(native_output)
 
 
 def _same_q_block_forward(

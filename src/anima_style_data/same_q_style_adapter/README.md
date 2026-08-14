@@ -14,14 +14,15 @@ Data flow per Anima block:
 Style K/V matrices start as full-rank copies of native text K/V. Their bases
 can be opened per active block at a low learning rate; block-specific low-rank
 deltas are available for cheaper corrections. The bridge ends with an
-affine-free LayerNorm scaled to the measured nonzero text-token RMS. There is
-no terminal `o_down/o_up` bottleneck: Anima's native full-rank O remains the
-only output projection.
+affine-free LayerNorm scaled to the measured nonzero text-token RMS. Anima's
+native full-rank O always remains in the path. An optional block-specific
+style-only low-rank `ΔO` is additive beside native O; it never replaces or
+bottlenecks the pretrained text/style output.
 
-Anima's post-LLM text context is always 512 positions and cross-attention gets
-no padding mask. A 128-slot style representation may therefore append 384
-exact zero context vectors *after* the learned bridge. These are attention
-padding, not the learned 128-slot null-style condition used for Style CFG.
+Anima's post-LLM text context is 512 positions, but the separate style softmax
+does not require that length. Production uses the 128 meaningful style slots
+directly. The learned 128-slot null-style condition used for Style CFG replaces
+those slots during dropout; it is not extra attention padding.
 
 Attach before constructing the optimizer so that copied K/V parameters are
 included:

@@ -72,6 +72,7 @@ def _adapter(
     connector_layers: int = 1,
     active_blocks: list[int] | None = None,
     style_attention_context_length: int | None = None,
+    style_output_delta_rank: int = 0,
 ):
     return SameQFullRankStyleAdapter(
         style_dim=6,
@@ -86,6 +87,7 @@ def _adapter(
         connector_layers=connector_layers,
         connector_heads=2,
         style_attention_context_length=style_attention_context_length,
+        style_output_delta_rank=style_output_delta_rank,
         active_blocks=active_blocks,
     )
 
@@ -330,9 +332,9 @@ def test_no_active_style_preserves_native_cross_attention_path():
     torch.testing.assert_close(actual, expected)
 
 
-def test_phase_a_freezes_native_kv_and_alpha_but_keeps_bridge_trainable():
+def test_phase_a_freezes_native_kv_and_alpha_but_keeps_direction_head_trainable():
     anima = _Anima().requires_grad_(False)
-    adapter = _adapter()
+    adapter = _adapter(style_output_delta_rank=2)
     adapter.initialize_from_anima(anima)
 
     counts = _apply_adapter_freeze_policy(
@@ -343,8 +345,37 @@ def test_phase_a_freezes_native_kv_and_alpha_but_keeps_bridge_trainable():
     assert counts["style_alpha"] == 2
     assert not any(parameter.requires_grad for parameter in adapter.kv_parameters())
     assert not adapter.alpha.requires_grad
+    assert all(parameter.requires_grad for parameter in adapter.style_o_down.parameters())
+    assert all(parameter.requires_grad for parameter in adapter.style_o_up.parameters())
     assert all(parameter.requires_grad for parameter in adapter.bridge_parameters())
     assert adapter.null_tokens.requires_grad
+
+
+def test_style_output_delta_preserves_native_start_and_learns_direction_immediately():
+    torch.manual_seed(31)
+    anima = _Anima().requires_grad_(False)
+    adapter = _adapter(style_output_delta_rank=2)
+    adapter.initialize_from_anima(anima)
+    adapter.set_style_tokens(torch.randn(2, 3, 6))
+    cross = anima.blocks[0].cross_attn
+    hidden = torch.randn(2, 5, 8)
+    text = torch.randn(2, 4, 6)
+
+    assert torch.count_nonzero(adapter.style_o_up[0].weight) == 0
+    output = adapter.merged_cross_attention(0, hidden, text, cross, None)
+    output.square().mean().backward()
+
+    # The additive head is initially an exact zero, but its up projection gets
+    # a first-step gradient. Native O still keeps Bridge/K/V gradients alive.
+    assert adapter.style_o_up[0].weight.grad is not None
+    assert adapter.style_o_up[0].weight.grad.norm() > 0
+    assert adapter.style_o_down[0].weight.grad is not None
+    torch.testing.assert_close(
+        adapter.style_o_down[0].weight.grad,
+        torch.zeros_like(adapter.style_o_down[0].weight.grad),
+    )
+    assert adapter.bridge.projection.weight.grad is not None
+    assert adapter.bridge.projection.weight.grad.norm() > 0
 
 
 def test_delta_only_policy_refreezes_native_kv_after_stage_transition():
