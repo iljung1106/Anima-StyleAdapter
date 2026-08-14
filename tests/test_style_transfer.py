@@ -8,6 +8,7 @@ torch = pytest.importorskip("torch")
 from torch import nn
 
 from anima_style_data.style_transfer import (
+    _anima_block_dtype_guard,
     _exact_self_residual_losses,
     ProductionStyleLoader,
     QueryConditionedReferenceHead,
@@ -508,6 +509,7 @@ def test_frozen_anima_optimizations_preserve_projection_outputs_in_activation_dt
         "low_precision_rmsnorm": 1,
         "fused_self_attention": 1,
         "fused_cross_attention": 1,
+        "block_dtype_guard": 0,
         "final_layer_dtype_guard": 0,
     }
     for actual, expected in zip(
@@ -524,6 +526,26 @@ def test_frozen_anima_optimizations_preserve_projection_outputs_in_activation_dt
     assert model.norm.weight.dtype == torch.bfloat16
     assert not hasattr(model.self_attention, "q_proj")
     assert hasattr(model.cross_attention, "q_proj")
+
+
+def test_native_anima_block_guard_casts_timestep_modulation_only():
+    block = nn.Module()
+    block.adaln_modulation_self_attn = nn.Sequential(
+        nn.SiLU(), nn.Linear(8, 24, dtype=torch.bfloat16)
+    )
+    image = torch.randn(2, 3, 8, dtype=torch.bfloat16)
+    timestep = torch.randn(2, 1, 8, dtype=torch.float32)
+    context = torch.randn(2, 5, 8, dtype=torch.bfloat16)
+    adaln = torch.randn(2, 1, 24, dtype=torch.float32)
+
+    args, kwargs = _anima_block_dtype_guard(
+        block, (image, timestep, context), {"adaln_lora_B_T_3D": adaln}
+    )
+
+    assert args[0] is image
+    assert args[1].dtype == torch.bfloat16
+    assert args[2] is context
+    assert kwargs["adaln_lora_B_T_3D"].dtype == torch.bfloat16
 
 
 def test_self_reference_curriculum_has_explicit_terminal_phase():

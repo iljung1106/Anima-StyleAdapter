@@ -1692,6 +1692,30 @@ def _final_layer_dtype_guard(
     return tuple(values), kwargs
 
 
+def _anima_block_dtype_guard(
+    module: nn.Module,
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+) -> tuple[tuple[Any, ...], dict[str, Any]]:
+    """Match FP32 timestep embeddings to frozen BF16 AdaLN matrices.
+
+    The adapter-patched block path already performs this cast. Native-context
+    conditioning does not patch blocks, so it needs the same contract at the
+    module boundary while retaining gradients with respect to text/style
+    context inputs.
+    """
+
+    values = list(args)
+    modulation = module.adaln_modulation_self_attn[-1]
+    dtype = modulation.weight.dtype
+    if len(values) > 1 and isinstance(values[1], torch.Tensor):
+        values[1] = values[1].to(dtype=dtype)
+    adaln = kwargs.get("adaln_lora_B_T_3D")
+    if isinstance(adaln, torch.Tensor):
+        kwargs["adaln_lora_B_T_3D"] = adaln.to(dtype=dtype)
+    return tuple(values), kwargs
+
+
 def _optimize_frozen_anima(
     anima: nn.Module,
     *,
@@ -1703,6 +1727,7 @@ def _optimize_frozen_anima(
         "low_precision_rmsnorm": 0,
         "fused_self_attention": 0,
         "fused_cross_attention": 0,
+        "block_dtype_guard": 0,
         "final_layer_dtype_guard": 0,
     }
     modules = list(anima.modules())
@@ -1734,6 +1759,14 @@ def _optimize_frozen_anima(
                 _final_layer_dtype_guard, with_kwargs=True
             )
             counts["final_layer_dtype_guard"] = 1
+        for block in getattr(anima, "blocks", []):
+            if "_native_context_dtype_guard" in block.__dict__:
+                continue
+            handle = block.register_forward_pre_hook(
+                _anima_block_dtype_guard, with_kwargs=True
+            )
+            block.__dict__["_native_context_dtype_guard"] = handle
+            counts["block_dtype_guard"] += 1
     if fuse_attention_projections:
         for module in modules:
             if not all(
