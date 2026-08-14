@@ -33,6 +33,23 @@ def test_style_tokenizer_is_reference_order_invariant_and_compact():
     )
 
 
+def test_style_tokenizer_accepts_bfloat16_cache_under_autocast():
+    tokenizer = AnimaStyleTokenizer(
+        source_dim=16,
+        context_dim=16,
+        output_tokens=2,
+        bottleneck_dim=8,
+        score_hidden_dim=4,
+    ).eval()
+    references = torch.randn(1, 1, 4, 16, dtype=torch.bfloat16)
+    with torch.autocast("cpu", dtype=torch.bfloat16):
+        output = tokenizer(references, torch.ones(1, 1, dtype=torch.bool))
+
+    assert output.shape == (1, 2, 16)
+    assert output.dtype == torch.bfloat16
+    assert torch.isfinite(output).all()
+
+
 def test_style_token_insertion_preserves_text_and_backpropagates():
     conditioning = torch.zeros(2, 8, 4)
     conditioning[0, :3] = 1

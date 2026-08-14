@@ -127,7 +127,7 @@ class AnimaStyleTokenizer(nn.Module):
         tokens = self.output_norm(tokens + self.slot_embedding)
         # Match the empirical RMS of nonzero post-LLM Anima context tokens.
         # This is a context-coordinate scale, not an output gate.
-        return tokens * self.log_output_rms.exp()
+        return (tokens * self.log_output_rms.exp()).to(dtype=references.dtype)
 
 
 def insert_style_tokens(
@@ -436,9 +436,12 @@ def _sample_tokenizer(
     lengths = torch.tensor(
         [item[3][4] for item in loaded], device=device, dtype=torch.long
     )
-    style_tokens = torch.cat([
-        tokenizer(item[3][2], item[3][3]) for item in loaded
-    ])
+    with torch.autocast(
+        device_type="cuda", dtype=torch.bfloat16, enabled=device.startswith("cuda")
+    ):
+        style_tokens = torch.cat([
+            tokenizer(item[3][2], item[3][3]) for item in loaded
+        ])
     full_text = insert_style_tokens(positive_text, lengths, style_tokens)
     null_raw = load_file(
         loaded[0][1].text_root / "null_conditioning.safetensors", device="cpu"
