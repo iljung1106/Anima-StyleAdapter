@@ -298,11 +298,14 @@ class ProductionStyleLoader:
         latent_batch = torch.stack(latents)
 
         conditions = []
+        condition_lengths = []
         for item in episodes:
             row = self.text_by_key[(item.target_id, item.text_variant)]
             shard = self.text_shards.get(str(row["cache_shard"]))
             start = int(row["token_offset"])
-            conditions.append(shard["conditioning"][start : start + int(row["token_length"])])
+            length = int(row["token_length"])
+            conditions.append(shard["conditioning"][start : start + length])
+            condition_lengths.append(length)
         condition_batch = _pad_text_conditions(conditions, self.text_conditioning_length)
 
         flat_references = [image_id for item in episodes for image_id in item.reference_ids]
@@ -345,6 +348,9 @@ class ProductionStyleLoader:
                 "episodes": episodes,
                 "latents": latent_batch.pin_memory(),
                 "conditioning": condition_batch.pin_memory(),
+                "conditioning_lengths": torch.tensor(
+                    condition_lengths, dtype=torch.long
+                ).pin_memory(),
                 "cached_reference_tokens": reference_tokens.pin_memory(),
                 "cached_target_tokens": target_tokens.pin_memory(),
                 "reference_positions": reference_positions,
@@ -403,6 +409,9 @@ class ProductionStyleLoader:
             "episodes": episodes,
             "latents": latent_batch.pin_memory(),
             "conditioning": condition_batch.pin_memory(),
+            "conditioning_lengths": torch.tensor(
+                condition_lengths, dtype=torch.long
+            ).pin_memory(),
             "features": {key: value.pin_memory() for key, value in features.items()},
             "feature_mask": feature_mask.pin_memory(),
             "feature_shapes": shapes,

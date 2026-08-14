@@ -88,6 +88,8 @@ def build_parser() -> argparse.ArgumentParser:
         ("style-overfit-sample", "Render every target from the completed exact-self overfit"),
         ("style-exact-self-generalize", "Train 96 targets and validate exact-self on 24 unseen targets"),
         ("style-exact-self-sample", "Render train and unseen targets from an exact-self checkpoint"),
+        ("style-tokenizer-train", "Train native-context StyleTokenizer from frozen Resampler tokens"),
+        ("style-tokenizer-smoke", "Run two real Anima StyleTokenizer training steps"),
         ("style-calibrate", "Measure empirical Anima artist-tag velocity effect ranges"),
         ("synthetic-teacher", "Generate and fully cache artist-tag teacher images"),
         ("synthetic-teacher-benchmark", "Validate SPEED and batched VAE before production"),
@@ -201,6 +203,17 @@ def main() -> None:
             "style-exact-self-generalize": train_exact_self_generalization,
             "style-exact-self-sample": sample_exact_self_generalization_checkpoint,
             "style-calibrate": calibrate_artist_tag_velocity,
+        }[args.command]
+        _run(stage, config, destination)
+    elif args.command in {"style-tokenizer-train", "style-tokenizer-smoke"}:
+        from .style_tokenizer import (
+            smoke_test_style_tokenizer,
+            train_style_tokenizer,
+        )
+
+        stage = {
+            "style-tokenizer-train": train_style_tokenizer,
+            "style-tokenizer-smoke": smoke_test_style_tokenizer,
         }[args.command]
         _run(stage, config, destination)
     elif args.command == "synthetic-teacher":
