@@ -939,6 +939,15 @@ def train_style_tokenizer_lr_probe(
     )
 
 
+def train_style_tokenizer_lr10x_scratch(
+    config: dict[str, Any], destination: Path
+) -> dict[str, Any]:
+    """Train the fair 10x-LR ablation from the original random seed."""
+    return train_style_tokenizer(
+        config, destination, config_section="style_tokenizer_lr10x_scratch"
+    )
+
+
 @torch.no_grad()
 def select_style_tokenizer_checkpoint(
     config: dict[str, Any], destination: Path

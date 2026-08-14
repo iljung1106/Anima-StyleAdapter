@@ -70,3 +70,9 @@ Phase A의 step 1,500 체크포인트를 별도 출력 디렉터리의
 step마다 같은 정성 패널을 만든다. heldout improvement와 direction cosine이
 빠르게 상승하지 않거나 wrong-artist와 구분되지 않거나 샘플이 붕괴하면 높은
 LR을 채택하지 않고 원래 Phase A를 재개한다.
+
+이 분기는 fine-tuning 안정성 실험이며 LR 학습 속도의 공정 비교는 아니다.
+별도의 scratch 분기는 원래 Phase A와 동일한 seed, 초기화, 데이터 순서,
+200-step warmup, cosine decay, 총 4,000 step을 사용하고 peak/min LR만 정확히
+10배인 `1e-3/1e-4`로 둔다. 두 run은 동일 step의 고정 validation과 500-step
+정성 패널로 비교한다.

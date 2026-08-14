@@ -91,6 +91,7 @@ def build_parser() -> argparse.ArgumentParser:
         ("style-tokenizer-train", "Train native-context StyleTokenizer from frozen Resampler tokens"),
         ("style-tokenizer-generalize", "Train StyleTokenizer with target-excluded same-artist references"),
         ("style-tokenizer-lr-probe", "Resume an isolated high-LR StyleTokenizer branch"),
+        ("style-tokenizer-lr10x-scratch", "Train the 10x-LR StyleTokenizer ablation from scratch"),
         ("style-tokenizer-select", "Re-evaluate and select a StyleTokenizer checkpoint"),
         ("style-tokenizer-smoke", "Run two real Anima StyleTokenizer training steps"),
         ("style-calibrate", "Measure empirical Anima artist-tag velocity effect ranges"),
@@ -211,6 +212,7 @@ def main() -> None:
     elif args.command in {
         "style-tokenizer-train", "style-tokenizer-generalize",
         "style-tokenizer-lr-probe",
+        "style-tokenizer-lr10x-scratch",
         "style-tokenizer-select",
         "style-tokenizer-smoke",
     }:
@@ -220,12 +222,14 @@ def main() -> None:
             train_style_tokenizer,
             train_style_tokenizer_generalization,
             train_style_tokenizer_lr_probe,
+            train_style_tokenizer_lr10x_scratch,
         )
 
         stage = {
             "style-tokenizer-train": train_style_tokenizer,
             "style-tokenizer-generalize": train_style_tokenizer_generalization,
             "style-tokenizer-lr-probe": train_style_tokenizer_lr_probe,
+            "style-tokenizer-lr10x-scratch": train_style_tokenizer_lr10x_scratch,
             "style-tokenizer-select": select_style_tokenizer_checkpoint,
             "style-tokenizer-smoke": smoke_test_style_tokenizer,
         }[args.command]
