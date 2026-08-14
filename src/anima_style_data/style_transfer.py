@@ -3803,7 +3803,7 @@ def compare_style_checkpoint_samples(
         float(value) for value in comparison_cfg.get("controlled_style_cfgs", [1.0, 2.0, 4.0])
     ]
     controlled_modes = [
-        str(value)
+        "null" if value is None else str(value)
         for value in comparison_cfg.get(
             "controlled_reference_modes",
             ["bypass", "null", "wrong_artist", "heldout", "mixed", "self"],
