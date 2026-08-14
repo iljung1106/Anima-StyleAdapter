@@ -79,14 +79,75 @@ correct-vs-wrong advantage가 양수이며, 정성 샘플에서 콘텐츠 누출
 Pareto 후보로 선택한다. 단일 noisy validation 지점만으로 고르지 않고 후보를
 더 큰 고정 validation 표본으로 재평가한다.
 
-완료 후 `style-tokenizer-select`는 step 1,500--8,000의 상위 8개 후보와
-마지막 체크포인트를 64개 고정 validation batch로 재평가한다. 선택 점수는
+완료 후 `style-tokenizer-select`는 마지막 체크포인트를 반드시 포함한
+step 1,500--8,000의 상위 8개 후보를 64개 고정 validation batch로
+재평가한다. 선택 점수는
 `heldout LCB95 + 0.25*self LCB95 + 0.5*(heldout-wrong)`이며, 선택된 후보는
 reference 1/2/4/8장 각각에 대해 추가로 heldout/wrong 검증한다.
 `style-tokenizer-export`는 선택 checkpoint에서 optimizer를 제거한
 `style_tokenizer.safetensors`, SHA-256·모델/입출력 계약·검증 지표를 담은
 `manifest.json`, 사용 설명을 담은 `README.md`를 생성하고 strict round-trip
 load를 확인한다.
+
+## Phase B production 결과 (2026-08-15)
+
+Fresh initialization, peak LR `1e-4` 설정으로 전체 8,000 optimizer step을
+완료했다. step 3,930에서 496 token보다 긴 caption이 16개 style slot을 남기지
+않아 중단된 문제는, 고정 512-token context의 마지막 16자리를 항상 style
+token에 예약하도록 수정한 뒤 step 3,750 state에서 재개했다. 수정 후 같은
+step을 통과했으며 최종 summary에는 정확히 8,000 step이 기록됐다. 전체
+resume 로그에는 Traceback, OOM, NaN이 없고 token RMS는 마지막까지 약
+`0.1486`으로 유지됐다.
+
+빠른 250-step validation으로 뽑은 8개 후보를 64개 고정 batch로 다시 평가한
+결과는 다음과 같다. 개선율은 frozen Anima의 flow MSE 대비 상대 개선율이며
+퍼센트로 표시한다.
+
+| step | self 개선 | heldout 개선 | wrong-artist 개선 | correct-wrong 우위 | 선택 점수 |
+|---:|---:|---:|---:|---:|---:|
+| 5,000 | +0.359% | +0.429% | +0.064% | +0.365%p | 0.005490 |
+| 5,250 | +0.370% | +0.446% | +0.038% | +0.408%p | 0.005775 |
+| 6,500 | +0.418% | +0.453% | +0.142% | +0.311%p | 0.005721 |
+| 7,000 | +0.389% | +0.441% | +0.070% | +0.372%p | 0.005733 |
+| 7,250 | +0.397% | +0.477% | +0.065% | +0.412%p | 0.006275 |
+| 7,500 | +0.410% | +0.468% | +0.079% | +0.389%p | 0.006198 |
+| **7,750** | **+0.401%** | **+0.518%** | **+0.081%** | **+0.436%p** | **0.006750** |
+| 8,000 | +0.359% | +0.516% | +0.094% | +0.422%p | 0.006540 |
+
+선택 규칙에 따라 step 7,750을 최종 모델로 선택했다. 이 후보의 self와
+heldout positive fraction은 각각 74.2%, 70.3%였고 wrong-artist는 54.3%였다.
+95% CI half-width는 self 0.117%p, heldout 0.132%p, wrong-artist 0.168%p다.
+즉 절대 flow 개선은 작지만, 더 큰 고정 표본에서도 올바른 reference가 잘못된
+작가보다 일관되게 유리하다.
+
+선택 모델의 reference 수별 32-batch 검증은 다음과 같다.
+
+| references | heldout 개선 | wrong-artist 개선 | correct-wrong 우위 | heldout positive fraction |
+|---:|---:|---:|---:|---:|
+| 1 | +0.175% | -0.073% | +0.248%p | 68.0% |
+| 2 | +0.495% | +0.104% | +0.391%p | 75.0% |
+| 4 | +0.486% | +0.133% | +0.353%p | 72.7% |
+| 8 | +0.554% | +0.255% | +0.298%p | 72.7% |
+
+독립 batch 추정이라 2/4/8 사이의 작은 순위 차이는 유의하다고 볼 수 없지만,
+multi-reference가 single-reference보다 heldout 개선을 크게 높이는 방향은
+확인된다. 작가 구분 우위는 2-reference가 가장 높고, 절대 heldout 개선은
+8-reference가 가장 높았다.
+
+step 7,750의 train/validation self/heldout 4개 768x768, 30-step 패널을
+확인했다. 순수 노이즈, 공통 출력, 색면 붕괴는 없었고 모든 조건에서 선화,
+채색, 명암, 형태가 reference에 따라 실제로 바뀌었다. heldout 패널은 인물,
+의상, 배경 구성을 대체로 유지했으며 self 패널은 예상대로 내용 복사 성향이
+더 강했다. 따라서 이 모델은 다음 Anima adapter 학습의 style-token source로
+사용할 수 있지만, StyleTokenizer 단독 출력만으로 완전한 화풍 재현이 끝난
+것으로 해석하지 않는다.
+
+배포 산출물은 `style_tokenizer.safetensors` 37.9 MB와 입출력 계약 및 선택
+지표를 담은 `manifest.json`, `README.md`다. strict state-dict round-trip과
+관련 테스트 10개를 통과했다. weight SHA-256은
+`0ce346f6225bec0e8773697ae14c8bd0e87bda44ff2cee60dc24e4608c937888`이다.
+null style은 learned token이 아니라 style token을 삽입하지 않은 원래 frozen
+Anima context이므로 정확한 base path를 유지한다.
 
 ## LR 10배 분기 실험
 
