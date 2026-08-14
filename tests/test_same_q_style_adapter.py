@@ -67,7 +67,7 @@ class _Anima(nn.Module):
         self.blocks = nn.ModuleList(_Block() for _ in range(blocks))
 
 
-def _adapter(connector_layers: int = 1):
+def _adapter(connector_layers: int = 1, active_blocks: list[int] | None = None):
     return SameQFullRankStyleAdapter(
         style_dim=6,
         context_dim=6,
@@ -80,6 +80,7 @@ def _adapter(connector_layers: int = 1):
         aggregator_bottleneck=3,
         connector_layers=connector_layers,
         connector_heads=2,
+        active_blocks=active_blocks,
     )
 
 
@@ -123,6 +124,34 @@ def test_alpha_calibration_matches_measured_raw_attention_ratio():
 
     for alpha, raw_ratio in zip(result["alpha"], result["raw_style_to_text_ratio"], strict=True):
         assert abs(alpha * raw_ratio - 0.02) < 1e-6
+
+
+def test_inactive_blocks_remain_native_and_are_excluded_from_calibration():
+    torch.manual_seed(19)
+    anima = _Anima().requires_grad_(False)
+    adapter = _adapter(connector_layers=0, active_blocks=[1])
+    adapter.initialize_from_anima(anima)
+    adapter.set_style_tokens(torch.randn(2, 3, 6))
+    hidden = torch.randn(2, 5, 8)
+    text = torch.randn(2, 4, 6)
+
+    torch.testing.assert_close(adapter.alpha, torch.tensor([0.0, 0.01]))
+    expected = anima.blocks[0].cross_attn(hidden, None, text)
+    actual = adapter.merged_cross_attention(
+        0, hidden, text, anima.blocks[0].cross_attn, None
+    )
+    torch.testing.assert_close(actual, expected)
+
+    adapter.begin_alpha_calibration()
+    adapter.merged_cross_attention(
+        1, hidden, text, anima.blocks[1].cross_attn, None
+    )
+    result = adapter.finish_alpha_calibration(0.02, maximum_alpha=1.0)
+
+    assert result["active_blocks"] == [1]
+    assert result["alpha"][0] == 0.0
+    assert result["raw_style_to_text_ratio"][0] == 0.0
+    assert abs(result["alpha"][1] * result["raw_style_to_text_ratio"][1] - 0.02) < 1e-6
 
 
 def test_reference_direction_ramp_stays_zero_until_activation():

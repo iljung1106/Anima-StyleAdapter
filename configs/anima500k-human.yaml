@@ -280,7 +280,7 @@ tap_resampler_experiment:
 # and batches targets by exact latent shape. `style-smoke` forces two steps and
 # writes to a separate smoke directory; `style-train` uses `training.steps`.
 style_transfer:
-  output_directory: style_transfer_same_q_phase_a21_calibrated_lora_4k_v1
+  output_directory: style_transfer_same_q_phase_a22_midblocks_residual_4k_v1
   seed: 20260811
   loader:
     style_cache: style_features_l18_l24_siglip_l24
@@ -315,6 +315,9 @@ style_transfer:
     slots: 128
     heads: 16
     blocks: 28
+    # A2.1 block ablation found early 0--6 and especially block 27 harmful,
+    # while 7--13 and 14--20 were the only individually positive intervals.
+    active_blocks: [7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]
     # Small but nonzero: bridge, connector, and full-rank K/V all receive a
     # gradient on the first step without introducing a second learned gate.
     alpha_init: 0.01
@@ -357,8 +360,8 @@ style_transfer:
     # Fresh Adapter initialization. Do not reuse the successful 2k diagnostic
     # checkpoint or any older offline/bootstrap connector weights.
     initial_checkpoint: null
-    # Phase A2.1: establish absolute exact-self flow improvement before
-    # reference discrimination. Never resume either failed A/A2 run.
+    # Phase A2.2: align only the empirically useful middle blocks before
+    # reference discrimination. Never resume any failed A2/A2.1 run.
     steps: 4000
     # Trainable adapter weights and Adam moments stay FP32. Representation
     # modules need a higher LR than the stabilized zero-output path.
@@ -449,7 +452,9 @@ style_transfer:
     # magnitude. Direct flow MSE is the acceptance metric; normalized residual
     # and cosine terms make its initially small correction easier to learn.
     style_flow_loss_weight: 1.0
-    exact_self_residual_weight: 0.10
+    # A2.1's 0.10 weight let orthogonal energy grow without reducing this
+    # normalized direct target. Make residual alignment the bootstrap task.
+    exact_self_residual_weight: 1.0
     # These two weights start at zero. After four statistically positive
     # self-validation checks they ramp toward the target values below.
     exact_self_direction_weight: 0.0
@@ -516,10 +521,10 @@ style_transfer:
     wandb:
       enabled: true
       project: anima-style-adapter
-      name: anima-style-transfer-same-q-phase-a21-calibrated-lora-4k-v1
-      id: anima-style-transfer-same-q-phase-a21-calibrated-lora-4k-v1
+      name: anima-style-transfer-same-q-phase-a22-midblocks-residual-4k-v1
+      id: anima-style-transfer-same-q-phase-a22-midblocks-residual-4k-v1
   diagnostics:
-    checkpoint: checkpoints/step-0000750.pt
+    checkpoint: ../style_transfer_same_q_phase_a21_calibrated_lora_4k_v1/checkpoints/step-0000750.pt
     batch_size: 4
     batches: 1
     timesteps: [0.2, 0.5, 0.8]

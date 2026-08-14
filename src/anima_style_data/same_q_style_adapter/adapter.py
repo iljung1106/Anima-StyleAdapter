@@ -189,6 +189,7 @@ class SameQFullRankStyleAdapter(nn.Module):
         connector_heads: int = 16,
         bridge_init: str = "xavier",
         style_kv_delta_rank: int = 32,
+        active_blocks: list[int] | None = None,
     ) -> None:
         super().__init__()
         if style_dim <= 0 or context_dim <= 0 or slots <= 0 or blocks <= 0:
@@ -200,6 +201,19 @@ class SameQFullRankStyleAdapter(nn.Module):
         self.slots = int(slots)
         self.heads = int(heads)
         self.blocks = int(blocks)
+        selected_blocks = (
+            list(range(self.blocks)) if active_blocks is None
+            else sorted({int(index) for index in active_blocks})
+        )
+        if not selected_blocks:
+            raise ValueError("At least one style block must be active")
+        if any(index < 0 or index >= self.blocks for index in selected_blocks):
+            raise ValueError(
+                f"active_blocks must be in [0, {self.blocks - 1}], got {selected_blocks}"
+            )
+        active_mask = torch.zeros(self.blocks, dtype=torch.bool)
+        active_mask[selected_blocks] = True
+        self.register_buffer("active_block_mask", active_mask, persistent=False)
         self.style_dropout = float(style_dropout)
         self.style_kv_delta_rank = int(style_kv_delta_rank)
         if self.style_kv_delta_rank <= 0:
@@ -226,7 +240,9 @@ class SameQFullRankStyleAdapter(nn.Module):
             connector_heads=connector_heads,
             init=bridge_init,
         )
-        self.alpha = nn.Parameter(torch.full((blocks,), float(alpha_init)))
+        self.alpha = nn.Parameter(
+            torch.full((blocks,), float(alpha_init)) * active_mask.float()
+        )
 
         # Populated from the real Anima blocks by initialize_from_anima().
         self.style_k = nn.ModuleList()
@@ -404,23 +420,27 @@ class SameQFullRankStyleAdapter(nn.Module):
     ) -> dict[str, list[float] | float]:
         if self._alpha_calibration_sums is None or self._alpha_calibration_counts is None:
             raise RuntimeError("Alpha calibration was not started")
-        if any(count == 0 for count in self._alpha_calibration_counts):
-            raise RuntimeError("Alpha calibration did not observe every Anima block")
+        active_indices = self.active_block_mask.nonzero(as_tuple=False).flatten().tolist()
+        if any(self._alpha_calibration_counts[index] == 0 for index in active_indices):
+            raise RuntimeError("Alpha calibration did not observe every active Anima block")
         raw = torch.stack([
-            total / count
+            total / count if count else total
             for total, count in zip(
                 self._alpha_calibration_sums,
                 self._alpha_calibration_counts,
                 strict=True,
             )
-        ]).clamp_min(1e-8)
-        calibrated = (float(target_ratio) / raw).clamp(
-            min=float(minimum_alpha), max=float(maximum_alpha)
-        )
+        ])
+        calibrated = torch.zeros_like(raw)
+        active = self.active_block_mask.to(device=raw.device)
+        calibrated[active] = (
+            float(target_ratio) / raw[active].clamp_min(1e-8)
+        ).clamp(min=float(minimum_alpha), max=float(maximum_alpha))
         with torch.no_grad():
             self.alpha.copy_(calibrated.to(self.alpha))
         result = {
             "target_style_to_text_ratio": float(target_ratio),
+            "active_blocks": active_indices,
             "raw_style_to_text_ratio": raw.detach().float().cpu().tolist(),
             "alpha": calibrated.detach().float().cpu().tolist(),
         }
@@ -483,6 +503,8 @@ class SameQFullRankStyleAdapter(nn.Module):
     ) -> torch.Tensor:
         """Compute one Q, separate text/style softmaxes, and one native O."""
         if self._style_context is None:
+            return cross_attention(normalized_x, attn_params, text_context)
+        if not bool(self.active_block_mask[block_index]):
             return cross_attention(normalized_x, attn_params, text_context)
 
         # compute_qkv is the native Anima path and may have fused frozen K/V.
