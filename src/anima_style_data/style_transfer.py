@@ -3837,7 +3837,8 @@ def compare_style_checkpoint_samples(
                 f"-self-style-cfg-{next(key[4:] for key in paths if key.startswith('cfg-'))}.png",
                 "-base.png",
             )
-            images = [("base", base)]
+            target = base.parent / base.name.replace("-base.png", "-cached-target.png")
+            images = [("target/reference", target), ("base", base)]
             row_metrics: dict[str, Any] = {}
             for key in sorted(value for value in paths if value.startswith("cfg-")):
                 path = Path(paths[key])
