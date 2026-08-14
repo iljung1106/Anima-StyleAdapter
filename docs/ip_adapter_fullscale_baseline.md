@@ -32,8 +32,13 @@ DiT architecture permits. It is a baseline, not the final style-only model.
 - One `LayerNorm -> Linear -> LayerNorm` bridge with no connector Transformer.
 - Full-rank blockwise style K/V copied from Anima and trainable from step 1.
 - Experimental rank-32 K/V deltas and rank-128 output delta disabled.
-- Fixed style scale `alpha=1.0`; no learned gate beyond Anima's native
-  `gate_cross(t)`.
+- Fixed, measured style scale; no learned gate beyond Anima's native
+  `gate_cross(t)`. A smoke run showed that literal `alpha=1` gives Anima a
+  style-attention RMS 7.2--7.6 times its text-attention RMS and increases flow
+  error by 96--127%. Before the first update, alpha is therefore calibrated per
+  block so the effective style/text attention RMS ratio is 1.0 (expected alpha
+  around 0.13--0.14). This is the Anima-equivalent of IP-Adapter's unit scale,
+  not another hand-picked gentle gate.
 
 ## Stage and gate
 

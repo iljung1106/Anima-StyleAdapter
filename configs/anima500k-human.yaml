@@ -320,10 +320,13 @@ style_transfer:
     heads: 16
     blocks: 28
     # Literature-faithful IP-Adapter baseline: train every native cross-attn
-    # block and add the independently normalized image attention at unit
-    # scale.  Previous alpha=0.01 runs were deliberately gentle but never
-    # established a useful direction on the production distribution.
+    # block and add the independently normalized image attention at the same
+    # effective RMS as text attention. Previous alpha=0.01 runs were gentle
+    # enough that they never established a useful direction.
     active_blocks: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27]
+    # This seed value is replaced by the measured RMS calibration before the
+    # first update. The first smoke measured raw style/text attention ratios of
+    # 7.2--7.6, so the expected calibrated alpha is around 0.13--0.14.
     alpha_init: 1.0
     bridge_init: xavier
     # Native Anima V has no input norm. The final affine-free bridge norm is
@@ -397,15 +400,16 @@ style_transfer:
     freeze_style_alpha: true
     train_full_rank_style_k: true
     train_full_rank_style_v: true
-    # Unit alpha is the controlled baseline, so skip the gentle A2.x
-    # style/text-ratio calibration. These bounds are dormant in this run.
+    # Scale=1 in the official SD implementation means comparable image/text
+    # branch magnitudes. Anima's 128 dense style tokens produced 7x the RMS of
+    # its 512-position text branch, so calibrate to the same *effective* ratio.
     calibrate_bridge_output_rms_from_text: false
     bridge_rms_calibration_batches: 4
-    calibrate_alpha_from_attention_rms: false
+    calibrate_alpha_from_attention_rms: true
     alpha_calibration_batches: 4
-    alpha_target_style_to_text_ratio: 0.03
-    alpha_minimum: 0.000001
-    alpha_maximum: 0.05
+    alpha_target_style_to_text_ratio: 1.0
+    alpha_minimum: 0.01
+    alpha_maximum: 1.0
     # Retained for later stages; the negative start step below keeps this group
     # frozen throughout exact-self connector bootstrap.
     resampler_learning_rate: 0.00001
