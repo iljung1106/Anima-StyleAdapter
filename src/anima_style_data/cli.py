@@ -89,6 +89,8 @@ def build_parser() -> argparse.ArgumentParser:
         ("style-exact-self-generalize", "Train 96 targets and validate exact-self on 24 unseen targets"),
         ("style-exact-self-sample", "Render train and unseen targets from an exact-self checkpoint"),
         ("style-tokenizer-train", "Train native-context StyleTokenizer from frozen Resampler tokens"),
+        ("style-tokenizer-generalize", "Train StyleTokenizer with target-excluded same-artist references"),
+        ("style-tokenizer-select", "Re-evaluate and select a StyleTokenizer checkpoint"),
         ("style-tokenizer-smoke", "Run two real Anima StyleTokenizer training steps"),
         ("style-calibrate", "Measure empirical Anima artist-tag velocity effect ranges"),
         ("synthetic-teacher", "Generate and fully cache artist-tag teacher images"),
@@ -205,14 +207,22 @@ def main() -> None:
             "style-calibrate": calibrate_artist_tag_velocity,
         }[args.command]
         _run(stage, config, destination)
-    elif args.command in {"style-tokenizer-train", "style-tokenizer-smoke"}:
+    elif args.command in {
+        "style-tokenizer-train", "style-tokenizer-generalize",
+        "style-tokenizer-select",
+        "style-tokenizer-smoke",
+    }:
         from .style_tokenizer import (
             smoke_test_style_tokenizer,
+            select_style_tokenizer_checkpoint,
             train_style_tokenizer,
+            train_style_tokenizer_generalization,
         )
 
         stage = {
             "style-tokenizer-train": train_style_tokenizer,
+            "style-tokenizer-generalize": train_style_tokenizer_generalization,
+            "style-tokenizer-select": select_style_tokenizer_checkpoint,
             "style-tokenizer-smoke": smoke_test_style_tokenizer,
         }[args.command]
         _run(stage, config, destination)

@@ -5,6 +5,7 @@ import gc
 import json
 import math
 import random
+import shutil
 import time
 from pathlib import Path
 from typing import Any
@@ -173,13 +174,40 @@ def _reference_tokens(
         )[:, None]
         mask = torch.ones(values.shape[:2], dtype=torch.bool, device=device)
         return values, mask
-    if mode != "heldout":
+    if mode not in {"heldout", "wrong_artist"}:
         raise ValueError(f"Unknown StyleTokenizer reference mode: {mode}")
     flat = batch["cached_reference_tokens"].to(
         device, dtype=torch.bfloat16, non_blocking=True
     )
     values = _pack_reference_tokens(flat, batch)
     mask = batch["reference_mask"].to(device, non_blocking=True)
+    if mode == "wrong_artist":
+        if values.shape[0] < 2:
+            raise ValueError("wrong_artist evaluation requires batch_size >= 2")
+        episodes = batch.get("episodes")
+        if episodes:
+            style_ids = [str(item.style_id) for item in episodes]
+            donors = []
+            for index, style_id in enumerate(style_ids):
+                donor = next(
+                    (
+                        (index + offset) % len(style_ids)
+                        for offset in range(1, len(style_ids))
+                        if style_ids[(index + offset) % len(style_ids)] != style_id
+                    ),
+                    None,
+                )
+                if donor is None:
+                    raise ValueError(
+                        "wrong_artist evaluation batch contains only one artist"
+                    )
+                donors.append(donor)
+            donor_indices = torch.tensor(donors, device=values.device)
+            values = values[donor_indices]
+            mask = mask[donor_indices]
+        else:
+            values = values.roll(1, dims=0)
+            mask = mask.roll(1, dims=0)
     return values, mask
 
 
@@ -567,10 +595,19 @@ def _save_checkpoint(
 
 
 def train_style_tokenizer(
-    config: dict[str, Any], destination: Path, *, steps_override: int | None = None
+    config: dict[str, Any],
+    destination: Path,
+    *,
+    steps_override: int | None = None,
+    config_section: str = "style_tokenizer",
 ) -> dict[str, Any]:
-    cfg = copy.deepcopy(config["style_tokenizer"])
+    cfg = copy.deepcopy(config[config_section])
     training_cfg = dict(cfg["training"])
+    reference_mode = str(training_cfg.get("reference_mode", "self"))
+    if reference_mode not in {"self", "heldout"}:
+        raise ValueError(
+            "StyleTokenizer training.reference_mode must be 'self' or 'heldout'"
+        )
     steps = int(steps_override or training_cfg["steps"])
     device = str(training_cfg.get("device", "cuda"))
     seed = int(cfg.get("seed", 20260815))
@@ -587,10 +624,17 @@ def train_style_tokenizer(
         config, cfg, split=str(cfg.get("train_split", "train"))
     )
     train_loader_cfg["gradient_accumulation_steps"] = accumulation
-    train_loader_cfg["reference_curriculum"] = {
-        "gate_only_steps": 0,
-        "self_reference_steps": steps + 1,
-    }
+    if reference_mode == "self":
+        train_loader_cfg["reference_curriculum"] = {
+            "gate_only_steps": 0,
+            "self_reference_steps": steps + 1,
+        }
+    else:
+        # ProductionStyleLoader always excludes the target from its ordinary
+        # same-style reference pool. Disabling the old adapter curriculum here
+        # therefore gives a genuinely target-excluded multi-reference batch.
+        train_loader_cfg["reference_curriculum"] = {}
+        train_loader_cfg["self_reference_target_images_per_style"] = 0
     validation_loader_cfg = _tokenizer_loader_config(
         config, cfg, split=str(cfg.get("validation_split", "validation"))
     )
@@ -610,6 +654,33 @@ def train_style_tokenizer(
         ),
     )
     tokenizer = AnimaStyleTokenizer(**dict(cfg["model"])).to(device)
+    output = destination / str(cfg["output_directory"])
+    output.mkdir(parents=True, exist_ok=True)
+    checkpoint_dir = output / "checkpoints"
+    checkpoint_dir.mkdir(exist_ok=True)
+    state_path = output / "training_state.pt"
+    initial_checkpoint: Path | None = None
+    initial_value = training_cfg.get("initial_checkpoint")
+    if initial_value:
+        initial_checkpoint = Path(str(initial_value))
+        if not initial_checkpoint.is_absolute():
+            initial_checkpoint = destination / initial_checkpoint
+        if not (bool(training_cfg.get("resume", True)) and state_path.exists()):
+            if not initial_checkpoint.exists():
+                raise FileNotFoundError(
+                    f"StyleTokenizer initial checkpoint does not exist: {initial_checkpoint}"
+                )
+            initial_state = torch.load(
+                initial_checkpoint, map_location="cpu", weights_only=False
+            )
+            initial_cache = dict(initial_state.get("resampler_cache", {}))
+            expected_sha = str(cache_summary.get("resampler_checkpoint_sha256", ""))
+            initial_sha = str(initial_cache.get("resampler_checkpoint_sha256", ""))
+            if expected_sha and initial_sha and expected_sha != initial_sha:
+                raise RuntimeError(
+                    "StyleTokenizer initial checkpoint uses a different Resampler cache"
+                )
+            tokenizer.load_state_dict(initial_state["tokenizer"], strict=True)
     trainable = sum(parameter.numel() for parameter in tokenizer.parameters())
     optimizer = torch.optim.AdamW(
         tokenizer.parameters(),
@@ -619,12 +690,7 @@ def train_style_tokenizer(
         weight_decay=float(training_cfg.get("weight_decay", 0.01)),
         fused=bool(training_cfg.get("fused_adamw", True) and device.startswith("cuda")),
     )
-    output = destination / str(cfg["output_directory"])
-    output.mkdir(parents=True, exist_ok=True)
-    checkpoint_dir = output / "checkpoints"
-    checkpoint_dir.mkdir(exist_ok=True)
     start_step = 0
-    state_path = output / "training_state.pt"
     if bool(training_cfg.get("resume", True)) and state_path.exists():
         state = torch.load(state_path, map_location="cpu", weights_only=False)
         tokenizer.load_state_dict(state["tokenizer"])
@@ -657,7 +723,14 @@ def train_style_tokenizer(
             name=str(wandb_cfg.get("name", "anima-style-tokenizer")),
             id=str(wandb_cfg.get("id", "anima-style-tokenizer-v1")),
             resume="allow" if start_step else "never",
-            config={"style_tokenizer": cfg, "trainable_parameters": trainable},
+            config={
+                "style_tokenizer": cfg,
+                "trainable_parameters": trainable,
+                "train_reference_mode": reference_mode,
+                "initial_checkpoint": (
+                    str(initial_checkpoint) if initial_checkpoint is not None else None
+                ),
+            },
         )
 
     total_microsteps = max(0, steps - start_step) * accumulation
@@ -717,7 +790,7 @@ def train_style_tokenizer(
                 )
                 loss, metrics = _forward_tokenizer_flow(
                     anima, tokenizer, batch, device, training_cfg,
-                    generator=generator, reference_mode="self",
+                    generator=generator, reference_mode=reference_mode,
                     measure_base=should_measure,
                 )
                 (loss / accumulation).backward()
@@ -776,11 +849,22 @@ def train_style_tokenizer(
                     batches=validation_batches, seed=seed ^ 0xC0FFEE,
                     reference_mode="heldout",
                 )
+                validation_wrong = _evaluate(
+                    anima, tokenizer, validation_loader, device, training_cfg,
+                    batches=validation_batches, seed=seed ^ 0xC0FFEE,
+                    reference_mode="wrong_artist",
+                )
+                reference_advantage = (
+                    validation_heldout["paired_flow_improvement"]
+                    - validation_wrong["paired_flow_improvement"]
+                )
                 row = {
                     "step": step, "train": train_metrics,
                     "train_self": train_self,
                     "validation_self": validation_self,
                     "validation_heldout": validation_heldout,
+                    "validation_wrong_artist": validation_wrong,
+                    "correct_vs_wrong_paired_advantage": reference_advantage,
                 }
                 history.append(row)
                 write_json(history_path, history)
@@ -790,6 +874,11 @@ def train_style_tokenizer(
                         **{f"train_self/{key}": value for key, value in train_self.items()},
                         **{f"validation_self/{key}": value for key, value in validation_self.items()},
                         **{f"validation_heldout/{key}": value for key, value in validation_heldout.items()},
+                        **{
+                            f"validation_wrong_artist/{key}": value
+                            for key, value in validation_wrong.items()
+                        },
+                        "validation/correct_vs_wrong_paired_advantage": reference_advantage,
                     }, step=step)
             if step % checkpoint_every == 0 or step == steps:
                 checkpoint = checkpoint_dir / f"step-{step:07d}.pt"
@@ -819,6 +908,10 @@ def train_style_tokenizer(
         "start_step": start_step,
         "trainable_parameters": trainable,
         "output_tokens": tokenizer.output_tokens,
+        "train_reference_mode": reference_mode,
+        "initial_checkpoint": (
+            str(initial_checkpoint) if initial_checkpoint is not None else None
+        ),
         "style_dropout": 0.0,
         "resampler_cache": cache_summary,
         "elapsed_s": time.perf_counter() - started,
@@ -826,6 +919,137 @@ def train_style_tokenizer(
     }
     write_json(output / "summary.json", result)
     return result
+
+
+def train_style_tokenizer_generalization(
+    config: dict[str, Any], destination: Path
+) -> dict[str, Any]:
+    """Continue a trained tokenizer with target-excluded references."""
+    return train_style_tokenizer(
+        config, destination, config_section="style_tokenizer_generalization"
+    )
+
+
+@torch.no_grad()
+def select_style_tokenizer_checkpoint(
+    config: dict[str, Any], destination: Path
+) -> dict[str, Any]:
+    """Re-evaluate the strongest checkpoints and materialize one selection."""
+    selection_cfg = dict(config["style_tokenizer_selection"])
+    source_section = str(selection_cfg.get("source_config_section", "style_tokenizer"))
+    source_cfg = copy.deepcopy(config[source_section])
+    output = destination / str(source_cfg["output_directory"])
+    history_path = output / "history.json"
+    history = json.loads(history_path.read_text(encoding="utf-8"))
+    minimum_step = int(selection_cfg.get("minimum_step", 500))
+    maximum_step = int(selection_cfg.get("maximum_step", 1 << 30))
+    eligible = [
+        row for row in history
+        if minimum_step <= int(row["step"]) <= maximum_step
+    ]
+    if not eligible:
+        raise RuntimeError("No StyleTokenizer validation checkpoints are eligible")
+
+    def provisional_score(row: dict[str, Any]) -> float:
+        heldout = row["validation_heldout"]
+        self_metrics = row["validation_self"]
+        return float(heldout["paired_flow_improvement"]) + 0.5 * float(
+            self_metrics["paired_flow_improvement"]
+        )
+
+    top_k = max(1, int(selection_cfg.get("top_k", 5)))
+    candidates = sorted(eligible, key=provisional_score, reverse=True)[:top_k]
+    latest = max(eligible, key=lambda row: int(row["step"]))
+    by_step = {int(row["step"]): row for row in candidates}
+    by_step[int(latest["step"])] = latest
+
+    training_cfg = dict(source_cfg["training"])
+    device = str(selection_cfg.get("device", training_cfg.get("device", "cuda")))
+    validation_loader_cfg = _tokenizer_loader_config(
+        config, source_cfg, split=str(source_cfg.get("validation_split", "validation"))
+    )
+    validation_loader = ProductionStyleLoader(destination, validation_loader_cfg)
+    resampler_checkpoint = str(config["style_transfer"]["resampler"]["checkpoint"])
+    cache_summary = _assert_resampler_cache_identity(
+        destination, validation_loader_cfg, resampler_checkpoint
+    )
+    anima = _resolve_anima_model(config, destination, device).requires_grad_(False).eval()
+    _optimize_frozen_anima(
+        anima,
+        low_precision_rmsnorm=bool(training_cfg.get("low_precision_rmsnorm", True)),
+        fuse_attention_projections=bool(
+            training_cfg.get("fuse_attention_projections", True)
+        ),
+    )
+    tokenizer = AnimaStyleTokenizer(**dict(source_cfg["model"])).to(device).eval()
+    batches = int(selection_cfg.get("validation_batches", 32))
+    seed = int(selection_cfg.get("seed", 20260817))
+    results = []
+    for step in sorted(by_step):
+        checkpoint = output / "checkpoints" / f"step-{step:07d}.pt"
+        state = torch.load(checkpoint, map_location="cpu", weights_only=False)
+        tokenizer.load_state_dict(state["tokenizer"], strict=True)
+        self_metrics = _evaluate(
+            anima, tokenizer, validation_loader, device, training_cfg,
+            batches=batches, seed=seed ^ 0xBEEF, reference_mode="self",
+        )
+        heldout = _evaluate(
+            anima, tokenizer, validation_loader, device, training_cfg,
+            batches=batches, seed=seed ^ 0xC0FFEE, reference_mode="heldout",
+        )
+        wrong = _evaluate(
+            anima, tokenizer, validation_loader, device, training_cfg,
+            batches=batches, seed=seed ^ 0xC0FFEE, reference_mode="wrong_artist",
+        )
+        advantage = (
+            heldout["paired_flow_improvement"]
+            - wrong["paired_flow_improvement"]
+        )
+        self_lcb = (
+            self_metrics["paired_flow_improvement"]
+            - self_metrics["paired_flow_improvement_ci95"]
+        )
+        heldout_lcb = (
+            heldout["paired_flow_improvement"]
+            - heldout["paired_flow_improvement_ci95"]
+        )
+        score = heldout_lcb + 0.5 * self_lcb + 0.5 * advantage
+        results.append({
+            "step": step,
+            "checkpoint": str(checkpoint),
+            "score": score,
+            "correct_vs_wrong_paired_advantage": advantage,
+            "validation_self": self_metrics,
+            "validation_heldout": heldout,
+            "validation_wrong_artist": wrong,
+        })
+        print(
+            f"style-tokenizer selection step={step} score={score:.6f} "
+            f"self={self_metrics['paired_flow_improvement']:.6f} "
+            f"heldout={heldout['paired_flow_improvement']:.6f} "
+            f"advantage={advantage:.6f}",
+            flush=True,
+        )
+    selected = max(results, key=lambda row: float(row["score"]))
+    selected_path = output / "checkpoints" / "selected.pt"
+    temporary = selected_path.with_suffix(".pt.tmp")
+    shutil.copyfile(Path(str(selected["checkpoint"])), temporary)
+    temporary.replace(selected_path)
+    summary = {
+        "source_config_section": source_section,
+        "selection_rule": (
+            "heldout_lcb95 + 0.5*self_lcb95 + "
+            "0.5*(heldout_improvement-wrong_artist_improvement)"
+        ),
+        "validation_batches": batches,
+        "candidate_count": len(results),
+        "candidates": results,
+        "selected_step": int(selected["step"]),
+        "selected_checkpoint": str(selected_path.resolve()),
+        "resampler_cache": cache_summary,
+    }
+    write_json(output / "selection.json", summary)
+    return summary
 
 
 def smoke_test_style_tokenizer(

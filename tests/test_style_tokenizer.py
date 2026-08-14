@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 
 torch = pytest.importorskip("torch")
 
 from anima_style_data.style_tokenizer import (
     AnimaStyleTokenizer,
+    _reference_tokens,
     insert_style_tokens,
 )
 
@@ -76,3 +79,45 @@ def test_style_token_insertion_rejects_full_context():
             torch.tensor([3]),
             torch.zeros(1, 2, 8),
         )
+
+
+def test_wrong_artist_references_rotate_complete_batch_entries():
+    batch = {
+        "cached_reference_tokens": torch.tensor([
+            [[1.0, 1.0]],
+            [[2.0, 2.0]],
+            [[3.0, 3.0]],
+        ]),
+        "reference_mask": torch.tensor([
+            [True, True],
+            [True, False],
+        ]),
+        "reference_positions": [(0, 0), (0, 1), (1, 0)],
+    }
+
+    heldout, heldout_mask = _reference_tokens(batch, "cpu", mode="heldout")
+    wrong, wrong_mask = _reference_tokens(batch, "cpu", mode="wrong_artist")
+
+    assert torch.equal(wrong, heldout.roll(1, dims=0))
+    assert torch.equal(wrong_mask, heldout_mask.roll(1, dims=0))
+
+
+def test_wrong_artist_references_skip_duplicate_artist_in_batch():
+    batch = {
+        "cached_reference_tokens": torch.tensor([
+            [[1.0]], [[2.0]], [[3.0]],
+        ]),
+        "reference_mask": torch.ones(3, 1, dtype=torch.bool),
+        "reference_positions": [(0, 0), (1, 0), (2, 0)],
+        "episodes": [
+            SimpleNamespace(style_id="artist-a"),
+            SimpleNamespace(style_id="artist-a"),
+            SimpleNamespace(style_id="artist-b"),
+        ],
+    }
+
+    wrong, _ = _reference_tokens(batch, "cpu", mode="wrong_artist")
+
+    assert torch.equal(
+        wrong.float().flatten(), torch.tensor([3.0, 3.0, 1.0])
+    )

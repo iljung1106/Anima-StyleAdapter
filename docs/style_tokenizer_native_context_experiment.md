@@ -40,3 +40,23 @@ learned null token과 style dropout은 사용하지 않는다. StyleTokenizer를
 
 첫 실험에서 paired flow improvement와 reference 의존성이 확인된 뒤에만
 target-excluded multi-reference curriculum이나 Resampler 상단 공동학습을 연다.
+
+## Phase B: target-excluded 일반화
+
+Phase A의 validation Pareto 최적 체크포인트를 `checkpoints/selected.pt`로
+고정한 뒤 새 optimizer로 이어서 학습한다.
+
+- target은 전체 train 이미지 풀에서 선택한다.
+- reference는 같은 작가의 다른 그림 1–8장이고 target을 포함하지 않는다.
+- frozen Resampler, frozen Anima, 16×1024 native-context 삽입 구조는 유지한다.
+- AdamW LR `5e-5`, 200-step warmup, cosine decay, 최대 8,000 step을 사용한다.
+- self/heldout뿐 아니라 같은 batch의 작가 reference를 순환시킨 wrong-artist
+  조건을 함께 검증한다. `heldout paired improvement - wrong-artist paired
+  improvement`가 양수여야 reference-specific style을 학습했다고 본다.
+- 500 step마다 self와 heldout 생성 패널을 보며 target content 복사 감소,
+  스타일 변화, 붕괴 여부를 함께 판단한다.
+
+최종 체크포인트는 heldout paired improvement와 direction cosine이 높고,
+correct-vs-wrong advantage가 양수이며, 정성 샘플에서 콘텐츠 누출이 낮은
+Pareto 후보로 선택한다. 단일 noisy validation 지점만으로 고르지 않고 후보를
+더 큰 고정 validation 표본으로 재평가한다.
