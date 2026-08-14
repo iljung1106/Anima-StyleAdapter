@@ -137,11 +137,15 @@ def insert_style_tokens(
     conditioning_lengths: torch.Tensor,
     style_tokens: torch.Tensor,
 ) -> torch.Tensor:
-    """Replace the first unused post-LLM positions while preserving length.
+    """Insert style tokens into the fixed 512-position Anima context.
 
     A no-style condition is simply `conditioning` itself. Consequently null
     style is exactly the frozen Anima base path and needs neither learned null
-    tokens nor style dropout.
+    tokens nor style dropout.  Most prompts leave trailing unused positions;
+    exceptionally long cached prompts do not.  In that case the final text
+    positions are deliberately replaced so the fixed-size context always
+    reserves the complete style-token set instead of failing partway through a
+    long production run.
     """
 
     if conditioning.ndim != 3 or style_tokens.ndim != 3:
@@ -155,13 +159,15 @@ def insert_style_tokens(
     )
     if lengths.shape != (conditioning.shape[0],):
         raise ValueError("conditioning_lengths must contain one value per sample")
-    positions = lengths[:, None] + torch.arange(
+    if bool((lengths < 0).any()):
+        raise ValueError("conditioning_lengths cannot be negative")
+    available_text = conditioning.shape[1] - style_tokens.shape[1]
+    if available_text < 0:
+        raise ValueError("Style token count exceeds the fixed context length")
+    insertion_starts = lengths.clamp(max=available_text)
+    positions = insertion_starts[:, None] + torch.arange(
         style_tokens.shape[1], device=conditioning.device
     )[None]
-    if bool((positions >= conditioning.shape[1]).any()):
-        raise ValueError(
-            "Cached text context does not have enough unused positions for style tokens"
-        )
     indices = positions[..., None].expand(-1, -1, conditioning.shape[-1])
     return conditioning.scatter(1, indices, style_tokens.to(conditioning.dtype))
 

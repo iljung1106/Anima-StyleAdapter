@@ -77,13 +77,16 @@ def test_style_token_insertion_preserves_text_and_backpropagates():
     assert torch.equal(style.grad, torch.ones_like(style))
 
 
-def test_style_token_insertion_rejects_full_context():
-    with pytest.raises(ValueError, match="enough unused positions"):
-        insert_style_tokens(
-            torch.zeros(1, 4, 8),
-            torch.tensor([3]),
-            torch.zeros(1, 2, 8),
-        )
+def test_style_token_insertion_reserves_tail_of_full_context():
+    conditioning = torch.arange(32, dtype=torch.float32).reshape(1, 4, 8)
+    style = torch.full((1, 2, 8), -1.0, requires_grad=True)
+
+    result = insert_style_tokens(conditioning, torch.tensor([4]), style)
+
+    assert torch.equal(result[:, :2], conditioning[:, :2])
+    assert torch.equal(result[:, 2:], style)
+    result.sum().backward()
+    assert torch.equal(style.grad, torch.ones_like(style))
 
 
 def test_wrong_artist_references_rotate_complete_batch_entries():
