@@ -967,7 +967,27 @@ def test_exact_self_residual_losses_are_zero_for_exact_target_velocity():
         target, bypass, target, noisy, clean, sigma,
     )
 
+    assert losses["normalized_mse"] == 0
     assert losses["normalized_huber"] == 0
     assert losses["direction"] == pytest.approx(0.0, abs=1e-6)
     assert losses["log_rms"] == 0
     assert losses["x0"] == pytest.approx(0.0, abs=1e-6)
+
+
+def test_normalized_residual_mse_is_exact_per_sample_flow_improvement_objective():
+    torch.manual_seed(101)
+    target = torch.randn(3, 4, 5, 5)
+    bypass = target + torch.randn_like(target) * 0.3
+    prediction = bypass + torch.randn_like(target) * 0.08
+    clean = torch.randn_like(target)
+    sigma = torch.full((3, 1, 1, 1), 0.5)
+    noisy = clean + sigma * target
+
+    losses = _exact_self_residual_losses(
+        prediction, bypass, target, noisy, clean, sigma, scale_floor=1e-8,
+    )
+    paired = _per_sample_flow_residual_metrics(
+        prediction, bypass, target
+    )["paired_improvement"].mean()
+
+    torch.testing.assert_close(1.0 - losses["normalized_mse"], paired)

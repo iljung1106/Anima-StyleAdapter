@@ -2287,6 +2287,7 @@ def _exact_self_residual_losses(
     student = prediction - bypass_prediction
     desired = target_velocity - bypass_prediction
     scale = desired.square().mean(dim=dimensions, keepdim=True).sqrt().clamp_min(scale_floor)
+    normalized_mse = F.mse_loss(student / scale, desired / scale)
     normalized_huber = F.smooth_l1_loss(
         student / scale, desired / scale, beta=huber_beta
     )
@@ -2301,6 +2302,7 @@ def _exact_self_residual_losses(
     predicted_x0 = noisy.float() - sigma.float() * prediction
     x0 = F.mse_loss(predicted_x0, clean_latent.float())
     return {
+        "normalized_mse": normalized_mse,
         "normalized_huber": normalized_huber,
         "direction": direction,
         "log_rms": log_rms,
@@ -2597,7 +2599,9 @@ def _forward_flow_loss(
         flow_loss = F.mse_loss(prediction, target_velocity)
         exact_self_losses = {
             key: flow_loss.new_zeros(())
-            for key in ("normalized_huber", "direction", "log_rms", "x0")
+            for key in (
+                "normalized_mse", "normalized_huber", "direction", "log_rms", "x0"
+            )
         }
         exact_self_residual_weight = float(
             loss_config.get("exact_self_residual_weight", 0.0)
@@ -2780,6 +2784,9 @@ def _forward_flow_loss(
         flow_weight = float(loss_config.get("style_flow_loss_weight", 1.0))
         loss = (
             flow_weight * flow_loss
+            + exact_self_fraction
+            * float(loss_config.get("exact_self_residual_mse_weight", 0.0))
+            * exact_self_losses["normalized_mse"]
             + exact_self_fraction * exact_self_residual_weight
             * exact_self_losses["normalized_huber"]
             + float(loss_config.get("exact_self_direction_weight", 0.0))
@@ -2815,6 +2822,9 @@ def _forward_flow_loss(
         "flow_loss": float(flow_loss.detach()),
         "exact_self_residual_loss": float(
             exact_self_losses["normalized_huber"].detach()
+        ),
+        "exact_self_residual_mse_loss": float(
+            exact_self_losses["normalized_mse"].detach()
         ),
         "exact_self_direction_loss": float(exact_self_losses["direction"].detach()),
         "exact_self_log_rms_loss": float(exact_self_losses["log_rms"].detach()),
@@ -5432,6 +5442,7 @@ def train_style_adapter(config: dict[str, Any], destination: Path, *, steps_over
                 f"phase={row['curriculum_phase']} "
                 f"refs={row['references']} shape={tuple(row['latent_shape'])} step_s={elapsed:.2f} "
                 f"data_wait_s={data_wait:.3f} output_ratio={row['style_output_ratio']:.4f} "
+                f"res_mse={row['exact_self_residual_mse_loss']:.4f} "
                 f"align=proj:{row['style_flow_desired_projection']:.4f}/"
                 f"cos:{row['style_flow_direction_cosine']:.4f}/"
                 f"orth:{row['style_flow_orthogonal_to_desired_ratio']:.4f} "

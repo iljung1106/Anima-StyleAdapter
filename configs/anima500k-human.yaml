@@ -280,7 +280,7 @@ tap_resampler_experiment:
 # and batches targets by exact latent shape. `style-smoke` forces two steps and
 # writes to a separate smoke directory; `style-train` uses `training.steps`.
 style_transfer:
-  output_directory: style_transfer_same_q_phase_a28_style_output_delta_r128_4k_v1
+  output_directory: style_transfer_same_q_phase_a29_normalized_mse_r128_4k_v1
   seed: 20260811
   loader:
     style_cache: style_features_l18_l24_siglip_l24
@@ -348,8 +348,10 @@ style_transfer:
     aggregator_heads: 16
     aggregator_layers: 2
     aggregator_slot_mixer_layers: 1
-    # Train a real unconditional style condition for Style CFG/inference.
-    style_dropout: 0.10
+    # Isolate exact-self direction learning first. Null-style dropout is
+    # re-enabled only after paired flow improvement is statistically positive;
+    # otherwise its shared weights learn an unrelated average correction.
+    style_dropout: 0.0
     # Native gate_cross(t) is applied once after the merged native O output.
   # Measure only the magnitude of Anima's native @artist intervention. Residual
   # directions are discarded. Weak artist tags and near-identical centered
@@ -372,10 +374,10 @@ style_transfer:
     # Fresh Adapter initialization. Do not reuse the successful 2k diagnostic
     # checkpoint or any older offline/bootstrap connector weights.
     initial_checkpoint: null
-    # Phase A2.8: A2.7 opened full-rank K and V but still produced only
-    # +0.000526 ±0.001590 exact-self improvement while orthogonal energy grew.
-    # Isolate the new style-only output direction head with native K/V bases
-    # frozen and the existing rank-32 K/V corrections left trainable.
+    # Phase A2.9: A2.8 proved the output head can raise projection, but its
+    # Smooth-L1 objective also let orthogonal energy reach 0.099 and made
+    # paired flow negative. Optimize the exact per-sample normalized L2 target
+    # while keeping attention coordinates fixed during direction bootstrap.
     steps: 4000
     # Trainable adapter weights and Adam moments stay FP32. Representation
     # modules need a higher LR than the stabilized zero-output path.
@@ -393,10 +395,10 @@ style_transfer:
     style_kv_learning_rate: 0.00005
     style_k_base_learning_rate: 0.000002
     style_v_base_learning_rate: 0.000005
-    output_learning_rate: 0.0001
-    # Keep native-initialized full-rank K/V fixed in this output-head ablation.
-    # The explicit rank-32 K/V deltas remain trainable.
-    freeze_style_kv: false
+    output_learning_rate: 0.00005
+    # Hold both native K/V and their rank-32 deltas fixed so Bridge + ΔO must
+    # learn useful flow direction without moving the attention coordinates.
+    freeze_style_kv: true
     freeze_style_alpha: true
     train_full_rank_style_k: false
     train_full_rank_style_v: false
@@ -474,7 +476,8 @@ style_transfer:
     style_flow_loss_weight: 1.0
     # A2.1's 0.10 weight let orthogonal energy grow without reducing this
     # normalized direct target. Make residual alignment the bootstrap task.
-    exact_self_residual_weight: 1.0
+    exact_self_residual_mse_weight: 1.0
+    exact_self_residual_weight: 0.10
     # These two weights start at zero. After four statistically positive
     # self-validation checks they ramp toward the target values below.
     exact_self_direction_weight: 0.0
@@ -541,8 +544,8 @@ style_transfer:
     wandb:
       enabled: true
       project: anima-style-adapter
-      name: anima-style-transfer-same-q-phase-a28-style-output-delta-r128-4k-v1
-      id: anima-style-transfer-same-q-phase-a28-style-output-delta-r128-4k-v1
+      name: anima-style-transfer-same-q-phase-a29-normalized-mse-r128-4k-v1
+      id: anima-style-transfer-same-q-phase-a29-normalized-mse-r128-4k-v1
   diagnostics:
     checkpoint: ../style_transfer_same_q_phase_a22_midblocks_residual_4k_v1/checkpoints/step-0000250.pt
     batch_size: 4
