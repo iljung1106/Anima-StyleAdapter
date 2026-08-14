@@ -280,7 +280,7 @@ tap_resampler_experiment:
 # and batches targets by exact latent shape. `style-smoke` forces two steps and
 # writes to a separate smoke directory; `style-train` uses `training.steps`.
 style_transfer:
-  output_directory: style_transfer_same_q_phase_a212_reference_centered_mse_r128_2k_v1
+  output_directory: style_transfer_ip_adapter_fullscale_exact_self_8k_v1
   seed: 20260811
   loader:
     style_cache: style_features_l18_l24_siglip_l24
@@ -319,12 +319,12 @@ style_transfer:
     style_attention_context_length: 128
     heads: 16
     blocks: 28
-    # A2.1 block ablation found early 0--6 and especially block 27 harmful,
-    # while 7--13 and 14--20 were the only individually positive intervals.
-    active_blocks: [7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]
-    # Small but nonzero: bridge, connector, and full-rank K/V all receive a
-    # gradient on the first step without introducing a second learned gate.
-    alpha_init: 0.01
+    # Literature-faithful IP-Adapter baseline: train every native cross-attn
+    # block and add the independently normalized image attention at unit
+    # scale.  Previous alpha=0.01 runs were deliberately gentle but never
+    # established a useful direction on the production distribution.
+    active_blocks: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27]
+    alpha_init: 1.0
     bridge_init: xavier
     # Native Anima V has no input norm. The final affine-free bridge norm is
     # scaled to the measured nonzero text-token RMS before alpha calibration.
@@ -333,26 +333,23 @@ style_transfer:
     # the one-reference reconstruction bootstrap.
     aggregator_mode: minimal
     aggregator_bottleneck: 256
-    # Keep the first clean same-Q baseline shallow. K/V themselves are 28
-    # block-specific full-rank copies of Anima's native text K/V projections.
-    connector_layers: 2
+    # The trained 128-token Resampler already performs the deep visual
+    # projection. Keep this baseline to the original IP-Adapter ingredients:
+    # one trainable bridge followed directly by copied blockwise K/V.
+    connector_layers: 0
     connector_heads: 16
     # Keep Anima's native full-rank K/V basis immutable. Only these explicit
     # low-rank block deltas adapt after the bridge starts to align.
     style_kv_delta_rank: 32
-    # A2.4--A2.7 increased style magnitude mostly orthogonal to the desired
-    # flow. Preserve native O, then add a block-specific style-only low-rank
-    # output correction so visual attention can rotate into Anima's residual
-    # space without perturbing the text branch.
-    style_output_delta_rank: 128
+    # Match IP-Adapter: the image attention is merged before Anima's existing
+    # full-rank O. No extra output head is trained in this baseline.
+    style_output_delta_rank: 0
     aggregator_heads: 16
     aggregator_layers: 2
     aggregator_slot_mixer_layers: 1
-    # A2.11 proved that premature null dropout learns the same common residual
-    # as correct and wrong references. Keep it disabled while the conditional
-    # path is centered; train null=no-op only after reference specificity is
-    # statistically established.
-    style_dropout: 0.0
+    # The official recipe drops the image condition for 5% of examples. This
+    # trains a usable null condition without dominating exact-self learning.
+    style_dropout: 0.05
     # Native gate_cross(t) is applied once after the merged native O output.
   # Measure only the magnitude of Anima's native @artist intervention. Residual
   # directions are discarded. Weak artist tags and near-identical centered
@@ -372,38 +369,36 @@ style_transfer:
     maximum_artist_similarity: 0.95
   training:
     device: cuda
-    # Phase A2.12: A2.11's correct/wrong/null diagnostic exposed a dominant
-    # reference-independent correction. Start from the clean A2.10 checkpoint
-    # and regress the exact flow residual through correct-minus-live-wrong.
-    # Its forward value remains the ordinary target error, while its common
-    # bridge/KV/O Jacobian cancels and only reference-specific updates survive.
-    initial_checkpoint: style_transfer_same_q_phase_a210_kv_delta_r128_2k_v1/checkpoints/step-0000500.pt
-    steps: 2000
+    # Fresh exact-self baseline. Do not inherit any A2.x connector state.
+    initial_checkpoint: null
+    steps: 8000
     # Trainable adapter weights and Adam moments stay FP32. Representation
     # modules need a higher LR than the stabilized zero-output path.
-    learning_rate: 0.00005
-    bridge_learning_rate: 0.00005
-    bridge_warmup_steps: 100
+    learning_rate: 0.0001
+    bridge_learning_rate: 0.0001
+    bridge_optimizer: adamw
+    bridge_betas: [0.9, 0.999]
+    bridge_warmup_steps: 250
     bridge_minimum_lr_ratio: 0.10
     bridge_adam_eps: 0.00000001
     bridge_weight_decay: 0.0
     adapter_adam_eps: 0.00000001
-    # Native gate_cross has |gate| ~= 2.3e2 on this model. Even a globally
-    # clipped 1e-3 first update is therefore destructive across 28 blocks;
-    # open the zero-init connector on the corresponding inverse scale.
-    representation_learning_rate: 0.00005
-    style_kv_learning_rate: 0.00005
-    style_k_base_learning_rate: 0.000002
-    style_v_base_learning_rate: 0.000005
-    output_learning_rate: 0.00003
-    # Keep native full-rank K/V fixed, but open their zero-initialized rank-32
-    # deltas now that Bridge + ΔO have a validated positive flow direction.
-    freeze_style_kv: false
+    # Use the official optimizer scale for the learned image projection and
+    # copied K/V. Native gate_cross(t) acts equally on text and style after the
+    # branches are merged and therefore does not replace IP-Adapter's scale.
+    representation_learning_rate: 0.0001
+    style_kv_learning_rate: 0.0001
+    style_k_base_learning_rate: 0.0001
+    style_v_base_learning_rate: 0.0001
+    output_learning_rate: 0.0001
+    # Train copied full-rank image K/V exactly as the original IP-Adapter does;
+    # freeze the experimental low-rank K/V deltas for a clean comparison.
+    freeze_style_kv: true
     freeze_style_alpha: true
-    train_full_rank_style_k: false
-    train_full_rank_style_v: false
-    # Preserve A2.9's learned bridge scale and alpha rather than recalibrating
-    # the loaded checkpoint as if this were a fresh initialization.
+    train_full_rank_style_k: true
+    train_full_rank_style_v: true
+    # Unit alpha is the controlled baseline, so skip the gentle A2.x
+    # style/text-ratio calibration. These bounds are dormant in this run.
     calibrate_bridge_output_rms_from_text: false
     bridge_rms_calibration_batches: 4
     calibrate_alpha_from_attention_rms: false
@@ -413,8 +408,8 @@ style_transfer:
     alpha_maximum: 0.05
     # Retained for later stages; the negative start step below keeps this group
     # frozen throughout exact-self connector bootstrap.
-    resampler_learning_rate: 0.00004
-    warmup_steps: 100
+    resampler_learning_rate: 0.00001
+    warmup_steps: 250
     minimum_lr_ratio: 0.10
     resampler_max_grad_norm: 1.0
     # First prove the new connector on exact-self inputs without moving the
@@ -468,18 +463,13 @@ style_transfer:
     train_sample_artists: 4
     validation_sample_artists: 4
     sample_batch_size: 4
-    resume: true
-    # Make the Adapter's useful residual dominate the gentle Resampler and
-    # magnitude auxiliaries. Direction normalization is strongest during the
-    # bootstrap, then fades as ordinary flow MSE takes over.
-    # Align direction before asking the residual to reproduce the full target
-    # magnitude. Direct flow MSE is the acceptance metric; normalized residual
-    # and cosine terms make its initially small correction easier to learn.
+    resume: false
+    # Use the same single denoising/flow regression objective as IP-Adapter.
+    # All A2.x normalized-direction, wrong-reference, and magnitude shaping
+    # losses are disabled so this run measures the injection path itself.
     style_flow_loss_weight: 1.0
-    # A2.1's 0.10 weight let orthogonal energy grow without reducing this
-    # normalized direct target. Make residual alignment the bootstrap task.
-    exact_self_residual_mse_weight: 1.0
-    exact_self_residual_weight: 0.10
+    exact_self_residual_mse_weight: 0.0
+    exact_self_residual_weight: 0.0
     # The normalized L2 target already supplies exact-self direction. Keep its
     # redundant cosine auxiliary off when the reference-specific loss opens.
     exact_self_direction_weight: 0.0
@@ -501,9 +491,9 @@ style_transfer:
     # A live wrong branch makes any reference-independent Jacobian cancel in the
     # correct-vs-wrong comparison. Use one row on every optimizer microstep;
     # two retained Anima graphs fit, while two wrong rows approach the H100 cap.
-    style_reference_rank_weight: 0.10
+    style_reference_rank_weight: 0.0
     style_reference_rank_margin: 0.005
-    style_reference_rank_probability: 1.0
+    style_reference_rank_probability: 0.0
     style_reference_rank_start_step: 0
     style_reference_rank_end_step: 0
     style_reference_direction_weight: 0.0
@@ -511,8 +501,8 @@ style_transfer:
     # older cosine-only objective is redundant and much weaker near zero.
     style_reference_direction_target_weight: 0.0
     style_reference_direction_epsilon: 0.05
-    style_reference_wrong_grad_samples: 1
-    style_reference_residual_mse_weight: 1.0
+    style_reference_wrong_grad_samples: 0
+    style_reference_residual_mse_weight: 0.0
     style_reference_residual_scale_floor: 0.001
     adaptive_reference_loss: false
     reference_loss_activation_validations: 1
@@ -531,19 +521,20 @@ style_transfer:
     style_interval_huber_beta: 0.01
     style_guided_effect_scale: 1.0
     style_effect_upper_scale: 1.5
-    # Keep exact-target self-reference for the complete bootstrap. This makes
-    # the one-reference Minimal Aggregator path an exact parameter-free bypass.
+    # Eight thousand exact-self updates provide 128k target exposures at the
+    # effective batch of 16. Only after this gate passes do we introduce
+    # DEADiff-style same-artist/different-image pairs.
     curriculum:
       gate_only_steps: 0
-      self_reference_steps: 2000
-      target_mix_end_step: 2000
+      self_reference_steps: 8000
+      target_mix_end_step: 8001
       target_mix_end_probability: 0.5
       target_mix_min_references: 1
       target_mix_max_references: 4
-      target_anneal_end: 2000
+      target_anneal_end: 8002
       target_anneal_min_references: 1
       target_anneal_max_references: 8
-      oracle_distill_end: 2000
+      oracle_distill_end: 8000
     oracle_distill_weight: 0.0
     oracle_distill_probability: 0.25
     oracle_distill_scale_floor: 0.02
@@ -551,8 +542,8 @@ style_transfer:
     wandb:
       enabled: true
       project: anima-style-adapter
-      name: anima-style-transfer-same-q-phase-a212-reference-centered-mse-r128-2k-v1
-      id: anima-style-transfer-same-q-phase-a212-reference-centered-mse-r128-2k-v1
+      name: anima-style-transfer-ip-adapter-fullscale-exact-self-8k-v1
+      id: anima-style-transfer-ip-adapter-fullscale-exact-self-8k-v1
   diagnostics:
     checkpoint: checkpoints/step-0000500.pt
     batch_size: 4

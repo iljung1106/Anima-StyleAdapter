@@ -5052,11 +5052,22 @@ def train_style_adapter(config: dict[str, Any], destination: Path, *, steps_over
         ],
         eps=float(training.get("adapter_adam_eps", 1e-6)),
     )
-    # The dense near-identity bridge gets its own optimizer. AdamW's
-    # coordinate-wise normalization made its first update large even after a
-    # small global-norm clip. RAdam behaves like a conservative SGD update
-    # while its moments are immature, then gains Adam-style adaptivity.
-    bridge_optimizer = torch.optim.RAdam(
+    # Keep the bridge optimizer selectable.  The conservative RAdam path is
+    # useful for tiny near-identity starts, while the literature-faithful
+    # IP-Adapter baseline trains its image projection and copied K/V with the
+    # same AdamW family from the first update.
+    bridge_optimizer_name = str(
+        training.get("bridge_optimizer", "radam")
+    ).lower()
+    bridge_optimizer_class = {
+        "adamw": torch.optim.AdamW,
+        "radam": torch.optim.RAdam,
+    }.get(bridge_optimizer_name)
+    if bridge_optimizer_class is None:
+        raise ValueError(
+            "style_transfer.training.bridge_optimizer must be adamw or radam"
+        )
+    bridge_optimizer = bridge_optimizer_class(
         bridge_parameters,
         lr=bridge_lr,
         betas=tuple(training.get("bridge_betas", (0.9, 0.999))),
@@ -5067,7 +5078,7 @@ def train_style_adapter(config: dict[str, Any], destination: Path, *, steps_over
     bridge_base_learning_rate = bridge_lr
     print(
         "style optimizer: FP32 trainable weights, BF16 autocast; adapter=AdamW "
-        f"bridge=RAdam(lr={bridge_lr:g},warmup={int(training.get('bridge_warmup_steps', 400))},"
+        f"bridge={bridge_optimizer_name}(lr={bridge_lr:g},warmup={int(training.get('bridge_warmup_steps', 400))},"
         f"eps={float(training.get('bridge_adam_eps', 1e-6)):g}) "
         f"representation_lr={representation_lr:g} style_kv_lr={style_kv_lr:g} "
         f"style_k_base_lr={style_k_base_lr:g}/"
