@@ -549,23 +549,14 @@ style_transfer:
       name: anima-style-transfer-same-q-phase-a210-kv-delta-r128-2k-v1
       id: anima-style-transfer-same-q-phase-a210-kv-delta-r128-2k-v1
   diagnostics:
-    checkpoint: ../style_transfer_same_q_phase_a22_midblocks_residual_4k_v1/checkpoints/step-0000250.pt
+    checkpoint: checkpoints/step-0000500.pt
     batch_size: 4
-    batches: 1
+    batches: 4
     timesteps: [0.2, 0.5, 0.8]
-    generate: false
-    alpha_block_ablation_batches: 8
-    alpha_block_groups:
-      all: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27]
-      early_0_6: [0, 1, 2, 3, 4, 5, 6]
-      middle_7_13: [7, 8, 9, 10, 11, 12, 13]
-      late_14_20: [14, 15, 16, 17, 18, 19, 20]
-      final_21_27: [21, 22, 23, 24, 25, 26, 27]
-      late_14_27: [14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27]
-      none: []
-      block_27_only: [27]
-      final_21_26: [21, 22, 23, 24, 25, 26]
-      all_without_27: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26]
+    generate: true
+    # A2.10 already fixes active blocks to 7--20. Skip the expensive historical
+    # block sweep and isolate reference dependence on identical noise/timesteps.
+    alpha_block_groups: {}
   overfit:
     # Fresh A0-1 capacity test: no failed connector checkpoint is reused.
     checkpoint: null
