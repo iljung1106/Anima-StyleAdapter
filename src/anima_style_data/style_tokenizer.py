@@ -503,7 +503,10 @@ def _sample_tokenizer(
         device=device, dtype=torch.bfloat16,
     )
     text_cfg = float(sample_cfg.get("text_cfg", 4.0))
-    style_cfg = float(sample_cfg.get("style_cfg", 1.0))
+    guidance_mode = str(sample_cfg.get("guidance_mode", "shared"))
+    if guidance_mode not in {"shared", "separate"}:
+        raise ValueError("StyleTokenizer guidance_mode must be 'shared' or 'separate'")
+    style_cfg = float(sample_cfg.get("style_cfg", text_cfg))
 
     def predict(x: torch.Tensor, context: torch.Tensor, timestep: torch.Tensor):
         return anima(
@@ -516,11 +519,15 @@ def _sample_tokenizer(
         for index in range(sample_steps):
             timestep = sigmas[index].to(torch.bfloat16)
             base = predict(x, null_text, timestep)
-            text_only = predict(x, positive_text, timestep)
-            velocity = base + text_cfg * (text_only - base)
-            if with_style:
+            if with_style and guidance_mode == "shared":
                 full = predict(x, full_text, timestep)
-                velocity = velocity + style_cfg * (full - text_only)
+                velocity = base + text_cfg * (full - base)
+            else:
+                text_only = predict(x, positive_text, timestep)
+                velocity = base + text_cfg * (text_only - base)
+                if with_style:
+                    full = predict(x, full_text, timestep)
+                    velocity = velocity + style_cfg * (full - text_only)
             x = (
                 x.float()
                 + velocity * (sigmas[index + 1] - sigmas[index]).float()
@@ -556,7 +563,14 @@ def _sample_tokenizer(
         styled_image.save(raw)
         _make_sample_sheet(
             styled_image, loader, item[0], base_generated=base_image,
-            generated_label=f"StyleTokenizer CFG {style_cfg:g} ({mode})",
+            generated_label=(
+                f"StyleTokenizer shared CFG {text_cfg:g} ({mode})"
+                if guidance_mode == "shared"
+                else (
+                    f"StyleTokenizer text CFG {text_cfg:g} / "
+                    f"style CFG {style_cfg:g} ({mode})"
+                )
+            ),
             sources=item[5],
         ).save(sheet)
         sheets.append(sheet)

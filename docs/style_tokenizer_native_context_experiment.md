@@ -23,9 +23,15 @@ attention과 학습 K/V 없이 Anima가 이미 사용하는 post-LLM context 공
 
 learned null token과 style dropout은 사용하지 않는다. StyleTokenizer를
 삽입하지 않은 원래 캐시 context가 frozen Anima의 정확한 no-style 조건이다.
-추론 시 style CFG는 다음 차이를 사용한다.
+스타일 토큰은 positive context의 일부이므로 기본 추론과 정성 샘플은 표준
+shared CFG를 쓴다.
 
-`full(text + style tokens) - text_only(original cached context)`
+`velocity = null + CFG * (full(text + style) - null)`
+
+따라서 기본 패널에는 별도 style CFG를 표시하지 않는다. 별도 style 강도를
+실험할 때만 `guidance_mode: separate`를 명시하고 text/style delta를 각각
+스케일한다. 이 선택적 3-forward 방식의 style delta는
+`full(text + style) - text_only`이다.
 
 ## 첫 실험
 

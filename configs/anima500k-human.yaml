@@ -739,7 +739,7 @@ style_tokenizer:
     flow_shift: 3.0
     seed: 20260815
     text_cfg: 4.0
-    style_cfg: 1.0
+    guidance_mode: shared
 
 # Phase B starts from the validation-selected exact-self checkpoint. Ordinary
 # ProductionStyleLoader references always exclude the target, so this stage
@@ -807,7 +807,7 @@ style_tokenizer_generalization:
     flow_shift: 3.0
     seed: 20260816
     text_cfg: 4.0
-    style_cfg: 1.0
+    guidance_mode: shared
 
 style_tokenizer_selection:
   source_config_section: style_tokenizer
@@ -883,7 +883,7 @@ style_tokenizer_lr_probe:
     flow_shift: 3.0
     seed: 20260815
     text_cfg: 4.0
-    style_cfg: 1.0
+    guidance_mode: shared
 
 # Fair LR comparison: identical initialization seed, data order, batch,
 # warmup, cosine schedule, and total steps as Phase A; only LR is 10x.
@@ -949,7 +949,7 @@ style_tokenizer_lr10x_scratch:
     flow_shift: 3.0
     seed: 20260815
     text_cfg: 4.0
-    style_cfg: 1.0
+    guidance_mode: shared
 
 # Cross-modal bootstrap corpus: 500 train artists × eight shared content prompts
 # × two shared seeds. Seven prompts explicitly contain 1girl. The 16 matching
