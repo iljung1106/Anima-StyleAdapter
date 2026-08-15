@@ -13,9 +13,20 @@ from anima_style_data.style_tokenizer import (
     _reference_tokens,
     _split_reference_views,
     _style_token_contrastive_loss,
+    _validation_selection_score,
     export_style_tokenizer_checkpoint,
     insert_style_tokens,
 )
+
+
+def test_continuation_selection_score_rewards_correct_artist_advantage():
+    row = {
+        "validation_self": {"paired_flow_improvement": 0.004},
+        "validation_heldout": {"paired_flow_improvement": 0.006},
+        "validation_wrong_artist": {"paired_flow_improvement": 0.001},
+    }
+
+    assert _validation_selection_score(row) == pytest.approx(0.0095)
 
 
 def test_style_tokenizer_is_reference_order_invariant_and_compact():

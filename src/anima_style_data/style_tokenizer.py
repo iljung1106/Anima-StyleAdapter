@@ -386,6 +386,17 @@ def _flow_metrics(
     }
 
 
+def _validation_selection_score(row: dict[str, Any]) -> float:
+    """Cheap validation score used only for continuation early stopping."""
+
+    heldout = float(row["validation_heldout"]["paired_flow_improvement"])
+    wrong = float(row["validation_wrong_artist"]["paired_flow_improvement"])
+    self_improvement = float(
+        row["validation_self"]["paired_flow_improvement"]
+    )
+    return heldout + 0.5 * (heldout - wrong) + 0.25 * self_improvement
+
+
 def _forward_tokenizer_flow(
     anima: nn.Module,
     tokenizer: AnimaStyleTokenizer,
@@ -975,6 +986,8 @@ def train_style_tokenizer(
     base_lr = float(training_cfg.get("learning_rate", 1e-4))
     warmup_steps = int(training_cfg.get("warmup_steps", 200))
     minimum_ratio = float(training_cfg.get("minimum_lr_ratio", 0.1))
+    continuation_start = int(training_cfg.get("continuation_start_step", steps + 1))
+    continuation_lr = training_cfg.get("continuation_learning_rate")
     log_every = int(training_cfg.get("log_every", 10))
     validation_every = int(training_cfg.get("validation_every", 250))
     checkpoint_every = int(training_cfg.get("checkpoint_every", 250))
@@ -1036,6 +1049,27 @@ def train_style_tokenizer(
     history_path = output / "history.json"
     if history_path.exists():
         history = json.loads(history_path.read_text(encoding="utf-8"))
+    early_stop_patience = max(0, int(training_cfg.get("early_stop_patience", 0)))
+    early_stop_min_delta = float(training_cfg.get("early_stop_min_delta", 0.0))
+    early_stop_start = int(
+        training_cfg.get("early_stop_start_step", continuation_start)
+    )
+    scored_history = [
+        _validation_selection_score(row)
+        for row in history
+        if all(
+            key in row
+            for key in (
+                "validation_self",
+                "validation_heldout",
+                "validation_wrong_artist",
+            )
+        )
+    ]
+    early_stop_best = max(scored_history, default=-math.inf)
+    early_stop_bad_validations = 0
+    completed_step = start_step
+    early_stopped = False
     started = time.perf_counter()
     vae = None
     sample_requests = [
@@ -1067,11 +1101,16 @@ def train_style_tokenizer(
                 }, step=start_step)
         for step in range(start_step + 1, steps + 1):
             step_started = time.perf_counter()
-            multiplier = _learning_rate_multiplier(
-                step, steps, warmup_steps, minimum_ratio
-            )
+            if continuation_lr is not None and step > continuation_start:
+                current_lr = float(continuation_lr)
+            else:
+                multiplier = _learning_rate_multiplier(
+                    step, steps, warmup_steps, minimum_ratio
+                )
+                current_lr = base_lr * multiplier
             for group in optimizer.param_groups:
-                group["lr"] = base_lr * multiplier
+                group["lr"] = current_lr
+            should_stop = False
             optimizer.zero_grad(set_to_none=True)
             micro_metrics = []
             token_contrastive_weight = _ramped_auxiliary_weight(
@@ -1202,6 +1241,20 @@ def train_style_tokenizer(
                     "validation_wrong_artist": validation_wrong,
                     "correct_vs_wrong_paired_advantage": reference_advantage,
                 }
+                selection_score = _validation_selection_score(row)
+                row["early_stop_selection_score"] = selection_score
+                improved = selection_score > early_stop_best + early_stop_min_delta
+                if improved:
+                    early_stop_best = selection_score
+                if early_stop_patience > 0 and step > early_stop_start:
+                    if improved:
+                        early_stop_bad_validations = 0
+                    else:
+                        early_stop_bad_validations += 1
+                    should_stop = early_stop_bad_validations >= early_stop_patience
+                row["early_stop_best_score"] = early_stop_best
+                row["early_stop_bad_validations"] = early_stop_bad_validations
+                row["early_stop_patience"] = early_stop_patience
                 history.append(row)
                 write_json(history_path, history)
                 print(f"style-tokenizer validation step={step} {row}", flush=True)
@@ -1215,6 +1268,9 @@ def train_style_tokenizer(
                             for key, value in validation_wrong.items()
                         },
                         "validation/correct_vs_wrong_paired_advantage": reference_advantage,
+                        "validation/early_stop_selection_score": selection_score,
+                        "validation/early_stop_best_score": early_stop_best,
+                        "validation/early_stop_bad_validations": early_stop_bad_validations,
                     }, step=step)
             if step % checkpoint_every == 0 or step == steps:
                 checkpoint = checkpoint_dir / f"step-{step:07d}.pt"
@@ -1226,7 +1282,9 @@ def train_style_tokenizer(
                     state_path, step=step, tokenizer=tokenizer,
                     optimizer=optimizer, cfg=cfg, resampler_cache=cache_summary,
                 )
-            if sample_every > 0 and (step % sample_every == 0 or step == steps):
+            if sample_every > 0 and (
+                step % sample_every == 0 or step == steps or should_stop
+            ):
                 sheets, vae = _sample_tokenizer(
                     anima, tokenizer, sample_requests, config, destination,
                     output, device, step, vae,
@@ -1237,12 +1295,27 @@ def train_style_tokenizer(
                     wandb_run.log({
                         "samples/panel": [wandb.Image(str(path)) for path in sheets]
                     }, step=step)
+            completed_step = step
+            if should_stop:
+                early_stopped = True
+                print(
+                    "style-tokenizer early-stop "
+                    f"step={step} best={early_stop_best:.6f} "
+                    f"bad_validations={early_stop_bad_validations}/"
+                    f"{early_stop_patience} min_delta={early_stop_min_delta:.6f}",
+                    flush=True,
+                )
+                break
     finally:
         if wandb_run is not None:
             wandb_run.finish()
     result = {
-        "steps": steps,
+        "steps": completed_step,
+        "requested_steps": steps,
         "start_step": start_step,
+        "early_stopped": early_stopped,
+        "early_stop_best_score": early_stop_best,
+        "early_stop_bad_validations": early_stop_bad_validations,
         "trainable_parameters": trainable,
         "output_tokens": tokenizer.output_tokens,
         "train_reference_mode": reference_mode,
