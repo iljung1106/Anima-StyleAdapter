@@ -11,6 +11,8 @@ from typing import Any
 
 import torch
 import torch.nn.functional as F
+from PIL import Image
+from safetensors.torch import load_file
 from torch import nn
 
 from .io import write_json
@@ -25,7 +27,10 @@ from .style_transfer import (
     ProductionStyleLoader,
     _create_and_attach_style_adapter,
     _learning_rate_multiplier,
+    _load_sampling_vae,
+    _make_sample_sheet,
     _optimize_frozen_anima,
+    _pad_text_conditions,
     _replace_reference_with_target,
     _resolve_anima_model,
     _sample_flow_timesteps,
@@ -655,6 +660,239 @@ def _calibrate_alpha(
     )
 
 
+def _select_sample_episodes(
+    loader: ProductionStyleLoader, count: int
+) -> list[int]:
+    selected: list[int] = []
+    seen: set[str] = set()
+    for episode_index in range(max(1000, count * 100)):
+        episode = loader.episodes_for_step(episode_index)[0]
+        if episode.style_id in seen:
+            continue
+        selected.append(episode_index)
+        seen.add(episode.style_id)
+        if len(selected) == count:
+            return selected
+    raise RuntimeError(f"Could select only {len(selected)}/{count} sample artists")
+
+
+def _pixels_to_image(value: torch.Tensor) -> Image.Image:
+    if value.ndim == 4:
+        value = value[:, 0]
+    pixels = (
+        (value.clamp(-1, 1) + 1) * 127.5
+    ).byte().permute(1, 2, 0).cpu().numpy()
+    return Image.fromarray(pixels)
+
+
+@torch.no_grad()
+def _sample_query_style_tokenizer_chunk(
+    anima: nn.Module,
+    adapter: nn.Module,
+    tokenizer: QueryStyleTokenizerV2,
+    requests: list[tuple[str, ProductionStyleLoader, int, int]],
+    config: dict[str, Any],
+    destination: Path,
+    output: Path,
+    device: str,
+    step: int,
+    vae: nn.Module | None,
+) -> tuple[list[tuple[str, Path]], nn.Module]:
+    sample_cfg = dict(config["query_style_tokenizer_v2"].get("sampling", {}))
+    batches = [
+        loader.load_step(episode_index)
+        for _, loader, episode_index, _ in requests
+    ]
+    positive_text = torch.cat([
+        batch["conditioning"][:1] for batch in batches
+    ]).to(device, dtype=torch.bfloat16)
+    positive_style = []
+    sources_by_request: list[list[tuple[str, int]]] = []
+    for batch in batches:
+        references, mask = _reference_inputs(batch, device, "heldout")
+        with torch.autocast(
+            device_type=torch.device(device).type,
+            dtype=torch.bfloat16,
+            enabled=torch.device(device).type == "cuda",
+        ):
+            positive_style.append(tokenizer(references, mask).tokens[:1])
+        episode = batch["episodes"][0]
+        sources_by_request.append(
+            [("target", int(episode.target_id))]
+            + [
+                (f"ref {index + 1}", int(image_id))
+                for index, image_id in enumerate(episode.reference_ids[:4])
+            ]
+        )
+    positive_style_context = torch.cat(positive_style)
+    batch_size = len(requests)
+    first_loader = requests[0][1]
+    null_text = load_file(
+        first_loader.text_root / "null_conditioning.safetensors", device="cpu"
+    )["empty_prompt"]
+    if null_text.ndim == 3:
+        null_text = null_text[0]
+    null_text = _pad_text_conditions(
+        [null_text] * batch_size, first_loader.text_conditioning_length
+    ).to(device, dtype=torch.bfloat16)
+
+    height = int(sample_cfg.get("height", 768))
+    width = int(sample_cfg.get("width", 768))
+    latent_h, latent_w = height // 8, width // 8
+    initial_noise = torch.cat([
+        torch.randn(
+            1, 16, 1, latent_h, latent_w,
+            generator=torch.Generator(device="cpu").manual_seed(sample_seed),
+            dtype=torch.float32,
+        )
+        for _, _, _, sample_seed in requests
+    ]).to(device=device, dtype=torch.bfloat16)
+    sample_steps = int(sample_cfg.get("steps", 30))
+    sigmas = torch.linspace(
+        1.0, 0.0, sample_steps + 1,
+        device=device, dtype=torch.bfloat16,
+    )
+    shift = float(sample_cfg.get("flow_shift", 3.0))
+    sigmas = sigmas * shift / (1 + (shift - 1) * sigmas)
+    padding_mask = torch.zeros(
+        batch_size, 1, latent_h, latent_w,
+        device=device, dtype=torch.bfloat16,
+    )
+    text_cfg = float(sample_cfg.get("text_cfg", 4.0))
+    style_cfg = float(sample_cfg.get("style_cfg", 1.0))
+
+    def predict(
+        x: torch.Tensor,
+        text: torch.Tensor,
+        timestep: torch.Tensor,
+        style: torch.Tensor | None,
+    ) -> torch.Tensor:
+        if style is None:
+            adapter.clear_style_tokens()
+        else:
+            adapter.set_style_context(style)
+        return anima(
+            x, timestep.expand(batch_size), context=text,
+            padding_mask=padding_mask, target_input_ids=None,
+        ).float()
+
+    def denoise(*, styled: bool) -> torch.Tensor:
+        x = initial_noise.clone()
+        for index in range(sample_steps):
+            timestep = sigmas[index].to(torch.bfloat16)
+            base = predict(x, null_text, timestep, None)
+            text_only = predict(x, positive_text, timestep, None)
+            velocity = base + text_cfg * (text_only - base)
+            if styled:
+                full = predict(
+                    x, positive_text, timestep, positive_style_context
+                )
+                velocity = velocity + style_cfg * (full - text_only)
+            x = (
+                x.float()
+                + velocity * (sigmas[index + 1] - sigmas[index]).float()
+            ).to(torch.bfloat16)
+        return x
+
+    try:
+        with torch.autocast(
+            device_type=torch.device(device).type,
+            dtype=torch.bfloat16,
+            enabled=torch.device(device).type == "cuda",
+        ):
+            base_latents = denoise(styled=False)
+            styled_latents = denoise(styled=True)
+    finally:
+        adapter.clear_style_tokens()
+    if not torch.isfinite(base_latents).all() or not torch.isfinite(styled_latents).all():
+        raise FloatingPointError("Non-finite latent in query-tokenizer sampling")
+
+    if vae is None:
+        vae = _load_sampling_vae(config, destination)
+    vae.to(device=device, dtype=torch.bfloat16)
+    generated_latents = torch.cat((base_latents, styled_latents), dim=0)
+    vae_batch_size = max(1, int(sample_cfg.get("vae_batch_size", 4)))
+    decoded = torch.cat([
+        vae.decode_to_pixels(
+            generated_latents[offset : offset + vae_batch_size]
+        ).float()
+        for offset in range(0, generated_latents.shape[0], vae_batch_size)
+    ])
+
+    step_directory = output / "samples" / f"step-{step:07d}"
+    step_directory.mkdir(parents=True, exist_ok=True)
+    records: list[tuple[str, Path]] = []
+    cfg_label = f"{style_cfg:g}".replace(".", "p")
+    for index, (request, batch, sources) in enumerate(
+        zip(requests, batches, sources_by_request, strict=True)
+    ):
+        split_name, loader, episode_index, _ = request
+        label = f"{split_name}-{index % 4}"
+        base_image = _pixels_to_image(decoded[index])
+        styled_image = _pixels_to_image(decoded[batch_size + index])
+        raw_path = step_directory / f"{label}-style-cfg-{cfg_label}.png"
+        sheet_path = step_directory / f"{label}-style-cfg-{cfg_label}-sheet.png"
+        base_image.save(step_directory / f"{label}-base.png")
+        styled_image.save(raw_path)
+        _make_sample_sheet(
+            styled_image,
+            loader,
+            {"episodes": [batch["episodes"][0]]},
+            base_generated=base_image,
+            generated_label=(
+                f"Query StyleTokenizer CFG {style_cfg:g} (heldout) — "
+                f"{batch['episodes'][0].style_id}"
+            ),
+            sources=sources,
+        ).save(sheet_path)
+        records.append((label, sheet_path))
+    return records, vae
+
+
+@torch.no_grad()
+def _sample_query_style_tokenizer(
+    anima: nn.Module,
+    adapter: nn.Module,
+    tokenizer: QueryStyleTokenizerV2,
+    requests: list[tuple[str, ProductionStyleLoader, int, int]],
+    config: dict[str, Any],
+    destination: Path,
+    output: Path,
+    device: str,
+    step: int,
+    vae: nn.Module | None,
+) -> tuple[list[tuple[str, Path]], nn.Module]:
+    tokenizer.eval()
+    adapter.eval()
+    anima.eval()
+    sample_cfg = dict(config["query_style_tokenizer_v2"].get("sampling", {}))
+    chunk_size = max(1, int(sample_cfg.get("batch_size", 4)))
+    records: list[tuple[str, Path]] = []
+    for offset in range(0, len(requests), chunk_size):
+        chunk_records, vae = _sample_query_style_tokenizer_chunk(
+            anima, adapter, tokenizer,
+            requests[offset : offset + chunk_size],
+            config, destination, output, device, step, vae,
+        )
+        records.extend(chunk_records)
+    write_json(
+        output / "samples" / f"step-{step:07d}" / "summary.json",
+        {
+            "step": step,
+            "panels": [
+                {"label": label, "path": str(path)}
+                for label, path in records
+            ],
+        },
+    )
+    vae.to("cpu")
+    if device.startswith("cuda"):
+        torch.cuda.empty_cache()
+    tokenizer.train()
+    adapter.train()
+    return records, vae
+
+
 def train_query_style_tokenizer(
     config: dict[str, Any],
     destination: Path,
@@ -802,6 +1040,7 @@ def train_query_style_tokenizer(
     validation_every = int(training_cfg.get("validation_every", 250))
     validation_batches = int(training_cfg.get("validation_batches", 8))
     checkpoint_every = int(training_cfg.get("checkpoint_every", 500))
+    sample_every = int(training_cfg.get("sample_every", 500))
     prefetch_workers = int(training_cfg.get("prefetch_workers", 2))
     prefetch_batches = int(training_cfg.get("prefetch_batches", 4))
     micro_start = start_step * accumulation
@@ -815,9 +1054,60 @@ def train_query_style_tokenizer(
         json.loads(history_path.read_text(encoding="utf-8"))
         if history_path.exists() else []
     )
+    sample_seed = int(cfg.get("sampling", {}).get("seed", seed ^ 0x5A17))
+    sample_requests = [
+        (
+            "train",
+            train_loader,
+            episode_index,
+            sample_seed + index * 10007,
+        )
+        for index, episode_index in enumerate(
+            _select_sample_episodes(train_loader, 4)
+        )
+    ] + [
+        (
+            "validation",
+            validation_loader,
+            episode_index,
+            sample_seed + (index + 4) * 10007,
+        )
+        for index, episode_index in enumerate(
+            _select_sample_episodes(validation_loader, 4)
+        )
+    ]
     started = time.perf_counter()
     completed_step = start_step
+    vae = None
     try:
+        # A run interrupted after checkpointing but before qualitative sampling
+        # recreates the missing fixed panel before consuming another batch.
+        resumed_sample_summary = (
+            output / "samples" / f"step-{start_step:07d}" / "summary.json"
+        )
+        if (
+            start_step > 0
+            and sample_every > 0
+            and start_step % sample_every == 0
+            and not resumed_sample_summary.exists()
+        ):
+            sample_records, vae = _sample_query_style_tokenizer(
+                anima, adapter, tokenizer, sample_requests,
+                config, destination, output, device, start_step, vae,
+            )
+            print(
+                f"query-style-tokenizer samples step={start_step} "
+                f"panels={len(sample_records)}",
+                flush=True,
+            )
+            if wandb_run is not None:
+                import wandb
+                wandb_run.log({
+                    "samples/panel": [
+                        wandb.Image(str(path), caption=label)
+                        for label, path in sample_records
+                    ]
+                }, step=start_step)
         for step in range(start_step + 1, steps + 1):
             step_started = time.perf_counter()
             lr_multiplier = _learning_rate_multiplier(
@@ -938,6 +1228,24 @@ def train_query_style_tokenizer(
                     state_path, step=step, tokenizer=tokenizer, adapter=adapter,
                     optimizer=optimizer, cfg=cfg, cache_summary=cache_summary,
                 )
+            if sample_every > 0 and (step % sample_every == 0 or step == steps):
+                sample_records, vae = _sample_query_style_tokenizer(
+                    anima, adapter, tokenizer, sample_requests,
+                    config, destination, output, device, step, vae,
+                )
+                print(
+                    f"query-style-tokenizer samples step={step} "
+                    f"panels={len(sample_records)}",
+                    flush=True,
+                )
+                if wandb_run is not None:
+                    import wandb
+                    wandb_run.log({
+                        "samples/panel": [
+                            wandb.Image(str(path), caption=label)
+                            for label, path in sample_records
+                        ]
+                    }, step=step)
             completed_step = step
     finally:
         if wandb_run is not None:
@@ -976,6 +1284,7 @@ def smoke_test_query_style_tokenizer(
         "validation_every": 2,
         "validation_batches": 1,
         "checkpoint_every": 2,
+        "sample_every": 0,
         "resume": False,
     })
     cfg["training"].setdefault("wandb", {})["enabled"] = False

@@ -56,3 +56,9 @@ K/V delta와 tokenizer는 첫 step부터 같이 학습한다. Style/text branch 
 Validation은 250 step마다 validation artist에 대해 exact-self,
 target-excluded heldout, wrong-artist를 같은 noise/timestep으로 비교한다.
 Checkpoint는 500 step마다 저장한다.
+
+Checkpoint 직후에는 고정된 train 작가 4명과 validation 작가 4명을
+`768 x 768`, 30-step으로 batch 생성한다. 각 sheet는 동일한 target prompt,
+초기 noise, target-excluded heldout reference를 유지하면서 frozen Anima
+base와 StyleTokenizer 출력을 나란히 표시한다. Text CFG는 4, 별도로 분리된
+style CFG는 1이며 W&B에도 8개 panel을 업로드한다.

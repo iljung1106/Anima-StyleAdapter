@@ -940,12 +940,23 @@ query_style_tokenizer_v2:
     validation_every: 250
     validation_batches: 8
     checkpoint_every: 500
+    sample_every: 500
     resume: true
     wandb:
       enabled: true
       project: anima-style-adapter
       name: query-style-tokenizer-v2-32slot-joint-20k-v1
       id: query-style-tokenizer-v2-32slot-joint-20k-v1
+  sampling:
+    width: 768
+    height: 768
+    steps: 30
+    flow_shift: 3.0
+    seed: 20260821
+    text_cfg: 4.0
+    style_cfg: 1.0
+    batch_size: 4
+    vae_batch_size: 4
 
 style_tokenizer_selection:
   source_config_section: style_tokenizer_generalization
