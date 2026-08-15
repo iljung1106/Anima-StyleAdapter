@@ -266,7 +266,7 @@ class ArtistDescriptorHead(nn.Module):
         descriptor_hidden = self.descriptor_pool(pooling).flatten(1)
         descriptor = F.normalize(
             self.descriptor_projection(descriptor_hidden).float(), dim=-1
-        ).to(tokens.dtype)
+        )
         summary_weights = self.summary_mixer.softmax(dim=-1)
         summary = torch.einsum("sp,bpd->bsd", summary_weights, pooling)
         return descriptor, self.summary_norm(self.summary_projection(summary))
@@ -735,7 +735,13 @@ def episodic_angular_prototype_loss(
         prototypes = F.normalize(prototypes / divisor, dim=-1)
         cosine = torch.matmul(prototypes, descriptor).clamp(-1 + 1e-6, 1 - 1e-6)
         positive = cosine[class_index]
-        angular_positive = torch.cos(torch.acos(positive) + margin)
+        # The equivalent acos formulation has an unbounded derivative near
+        # +/-1. Early in training the descriptor head can emit nearly identical
+        # vectors, so use the stable ArcFace identity and clamp its sine term.
+        sine = torch.sqrt((1.0 - positive.square()).clamp_min(1e-4))
+        angular_positive = (
+            positive * math.cos(margin) - sine * math.sin(margin)
+        )
         cosine = cosine.clone()
         cosine[class_index] = angular_positive
         logits.append(cosine * scale)

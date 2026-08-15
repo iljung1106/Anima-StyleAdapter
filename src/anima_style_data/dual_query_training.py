@@ -603,10 +603,22 @@ def train_dual_query_resampler(
                 enabled=device.startswith("cuda"),
             ):
                 loss, metrics = _losses(model, episode, training)
+            if not bool(torch.isfinite(loss)):
+                raise FloatingPointError(
+                    f"Non-finite dual-query loss at step {step + 1}: "
+                    + ", ".join(
+                        f"{key}={float(value.detach())}"
+                        for key, value in metrics.items()
+                    )
+                )
             loss.backward()
             grad_norm = torch.nn.utils.clip_grad_norm_(
                 model.parameters(), float(training.get("max_grad_norm", 1.0))
             )
+            if not bool(torch.isfinite(grad_norm)):
+                raise FloatingPointError(
+                    f"Non-finite dual-query gradient norm at step {step + 1}"
+                )
             optimizer.step()
             for key, value in metrics.items():
                 running[key] = running[key] + value.detach()
@@ -748,7 +760,7 @@ def smoke_test_dual_query_resampler(
         )
         loss.backward()
         optimizer.step()
-        losses.append(float(metrics["loss"]))
+        losses.append(float(metrics["loss"].detach()))
     summary = {
         "steps": 2,
         "losses": losses,

@@ -122,6 +122,21 @@ def test_prototype_loss_rejects_batches_without_support_images():
         episodic_angular_prototype_loss(descriptors, torch.tensor([0, 1, 1]))
 
 
+def test_angular_prototype_has_finite_gradient_for_collapsed_descriptors():
+    # A randomly initialized artist head commonly emits almost identical
+    # descriptors. This is the numerical boundary the pretraining loss must
+    # escape rather than producing an acos backward NaN.
+    descriptors = torch.ones(8, 16, requires_grad=True)
+    labels = torch.tensor([0, 0, 1, 1, 2, 2, 3, 3])
+
+    loss, _ = episodic_angular_prototype_loss(descriptors, labels)
+    loss.backward()
+
+    assert torch.isfinite(loss)
+    assert descriptors.grad is not None
+    assert torch.isfinite(descriptors.grad).all()
+
+
 def test_real_cache_contract_runs_one_training_and_validation_step(tmp_path):
     feature_root = tmp_path / "features"
     latent_root = tmp_path / "latents"
