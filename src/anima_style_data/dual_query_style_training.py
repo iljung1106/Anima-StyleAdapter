@@ -249,6 +249,101 @@ def _common_output_loss(
     }
 
 
+def _pilot_common_output_step(
+    anima: torch.nn.Module,
+    tokenizer: DualQuerySetStyleTokenizer,
+    batch: dict[str, Any],
+    device: str,
+    training: dict[str, Any],
+    *,
+    generator: torch.Generator,
+    step: int,
+) -> tuple[torch.Tensor, float, dict[str, torch.Tensor]]:
+    """Run one matched prompt/noise probe after normal microbatch backpropagation.
+
+    Keeping this forward outside `_forward_dual_query_flow` is important: an
+    Anima graph for the controlled artist batch does not fit beside the main
+    batch graph on an 80 GB H100. The caller runs it once per optimizer step
+    after all ordinary microbatch graphs have been released.
+    """
+
+    stage = _pilot_stage(step, training)
+    mode = "self" if bool(stage.get("exact_self", False)) else "heldout"
+    references, reference_mask = _reference_inputs(batch, device, mode)
+    rows = min(
+        int(training.get("common_output_batch_rows", 4)), references.shape[0]
+    )
+    latents = batch["latents"][0:1].to(
+        device, dtype=torch.bfloat16, non_blocking=True
+    )
+    conditioning = batch["conditioning"][0:1].to(
+        device, dtype=torch.bfloat16, non_blocking=True
+    )
+    conditioning_length = batch["conditioning_lengths"][0:1].to(
+        device, non_blocking=True
+    )
+    noise = torch.randn(
+        latents.shape, device=device, dtype=latents.dtype, generator=generator
+    )
+    timesteps = _sample_flow_timesteps(1, device, training, generator)
+    sigma = timesteps[:, None, None, None].to(latents.dtype)
+    noisy = (1 - sigma) * latents + sigma * noise
+    padding_mask = torch.zeros(
+        1, 1, latents.shape[-2], latents.shape[-1],
+        device=device, dtype=latents.dtype,
+    )
+    common_start = int(training.get("common_output_start_step", 1500))
+    weight = (
+        _linear_ramp(
+            step,
+            start_step=common_start,
+            end_step=common_start + int(training.get("common_output_ramp_steps", 1000)),
+            start=0.0,
+            end=float(training.get("common_output_weight", 0.002)),
+        )
+        if step >= common_start
+        else 0.0
+    )
+
+    def autocast_context():
+        return torch.autocast(
+            device_type=torch.device(device).type,
+            dtype=torch.bfloat16,
+            enabled=torch.device(device).type == "cuda",
+        )
+
+    with torch.no_grad(), autocast_context():
+        base_prediction = anima(
+            noisy.unsqueeze(2),
+            timesteps.to(latents.dtype),
+            context=conditioning,
+            padding_mask=padding_mask,
+            target_input_ids=None,
+        ).squeeze(2).float()
+    gradient_context = torch.enable_grad() if weight > 0 else torch.no_grad()
+    with gradient_context, autocast_context():
+        output = tokenizer(references[:rows], reference_mask[:rows])
+        styled = insert_style_tokens(
+            conditioning.expand(rows, -1, -1).clone(),
+            conditioning_length.expand(rows),
+            output.tokens,
+        )
+        prediction = anima(
+            noisy.expand(rows, -1, -1, -1).unsqueeze(2),
+            timesteps.expand(rows).to(latents.dtype),
+            context=styled,
+            padding_mask=padding_mask.expand(rows, -1, -1, -1),
+            target_input_ids=None,
+        ).squeeze(2).float()
+    loss, metrics = _common_output_loss(
+        prediction - base_prediction,
+        threshold=float(training.get("common_output_threshold", 0.70)),
+    )
+    metrics["common_output_loss"] = loss.detach()
+    metrics["common_output_weight"] = loss.new_tensor(weight)
+    return loss, weight, metrics
+
+
 def _forward_dual_query_flow(
     anima: torch.nn.Module,
     tokenizer: DualQuerySetStyleTokenizer,
@@ -497,47 +592,6 @@ def _forward_dual_query_flow(
         "controlled_artist_effect_rms": flow_loss.new_zeros(()),
         "controlled_common_rms": flow_loss.new_zeros(()),
     }
-    common_every = max(1, int(training.get("common_output_every", 8)))
-    if pilot_enabled and step % common_every == 0:
-        assert base_prediction is not None
-        rows = min(
-            int(training.get("common_output_batch_rows", 4)),
-            prediction.shape[0],
-        )
-        common_conditioning = conditioning[0:1].expand(rows, -1, -1).clone()
-        common_lengths = conditioning_lengths[0:1].expand(rows)
-        common_styled = insert_style_tokens(
-            common_conditioning, common_lengths, output.tokens[:rows]
-        )
-        common_start = int(training.get("common_output_start_step", 1500))
-        common_weight = (
-            _linear_ramp(
-                step,
-                start_step=common_start,
-                end_step=common_start + int(training.get("common_output_ramp_steps", 1000)),
-                start=0.0,
-                end=float(training.get("common_output_weight", 0.002)),
-            )
-            if step >= common_start
-            else 0.0
-        )
-        gradient_context = (
-            torch.enable_grad() if common_weight > 0 else torch.no_grad()
-        )
-        with gradient_context, autocast_context():
-            common_prediction = anima(
-                noisy[0:1].expand(rows, -1, -1, -1).unsqueeze(2),
-                timesteps[0:1].expand(rows).to(latents.dtype),
-                context=common_styled,
-                padding_mask=padding_mask[0:1].expand(rows, -1, -1, -1),
-                target_input_ids=None,
-            ).squeeze(2).float()
-        common_delta = common_prediction - base_prediction[0:1]
-        common_loss, common_metrics = _common_output_loss(
-            common_delta,
-            threshold=float(training.get("common_output_threshold", 0.70)),
-        )
-        total = total + common_weight * common_loss
 
     metrics = {
         "loss": total.detach(),
@@ -771,8 +825,11 @@ def _train_variant(
             optimizer.param_groups[0]["lr"] = base_lr * multiplier
             optimizer.zero_grad(set_to_none=True)
             micro_rows: list[dict[str, torch.Tensor]] = []
+            common_probe_batch = None
             for micro in range(accumulation):
                 batch = next(prefetched)
+                if micro == 0:
+                    common_probe_batch = batch
                 generator = torch.Generator(device=device).manual_seed(
                     seed + step * 100_003 + micro
                 )
@@ -801,6 +858,24 @@ def _train_variant(
                 )
                 (loss / accumulation).backward()
                 micro_rows.append(metrics)
+            common_every = max(1, int(training.get("common_output_every", 8)))
+            if pilot_enabled and step % common_every == 0:
+                assert common_probe_batch is not None
+                common_loss, common_weight, common_metrics = _pilot_common_output_step(
+                    anima,
+                    tokenizer,
+                    common_probe_batch,
+                    device,
+                    training,
+                    generator=torch.Generator(device=device).manual_seed(
+                        seed ^ 0xC011_0A7 ^ step
+                    ),
+                    step=step,
+                )
+                if common_weight > 0:
+                    (common_weight * common_loss).backward()
+                for row in micro_rows:
+                    row.update(common_metrics)
             grad_norm = torch.nn.utils.clip_grad_norm_(
                 tokenizer.parameters(), max_grad_norm
             )
@@ -1229,6 +1304,23 @@ def smoke_test_dual_query_style_tokenizer_pilot(
             loss = loss + float(training.get("subset_consistency_weight", 0.0)) * consistency
             metrics["subset_consistency"] = consistency.detach()
         loss.backward()
+        reported_loss = loss.detach()
+        if step % max(1, int(training.get("common_output_every", 8))) == 0:
+            common_loss, common_weight, common_metrics = _pilot_common_output_step(
+                anima,
+                tokenizer,
+                batch,
+                device,
+                training,
+                generator=torch.Generator(device=device).manual_seed(
+                    seed ^ 0xC011_0A7 ^ step
+                ),
+                step=step,
+            )
+            if common_weight > 0:
+                (common_weight * common_loss).backward()
+                reported_loss = reported_loss + common_weight * common_loss.detach()
+            metrics.update(common_metrics)
         gradients = [
             parameter.grad.detach().float()
             for parameter in tokenizer.parameters()
@@ -1240,7 +1332,7 @@ def smoke_test_dual_query_style_tokenizer_pilot(
         row = {
             "step": step,
             "phase": str(_pilot_stage(step, training)["name"]),
-            "loss": float(loss.detach()),
+            "loss": float(reported_loss),
             "grad_norm": float(grad_norm),
             "finite": bool(
                 torch.isfinite(loss).all()
