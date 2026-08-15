@@ -182,6 +182,31 @@ def test_variance_floor_pushes_back_before_descriptor_collapse():
     assert float(descriptors.grad.abs().sum()) > 0
 
 
+def test_frozen_input_teacher_provides_distinct_per_image_directions():
+    torch.manual_seed(29)
+    model = _small_resampler()
+    semantic = {
+        18: torch.randn(2, 12, 12),
+        24: torch.randn(2, 12, 12),
+    }
+    semantic[18][1].add_(2.0)
+    latents = torch.randn(2, 4, 8, 10)
+
+    descriptor, summary = model.frozen_input_teacher(
+        semantic,
+        torch.ones(2, 12, dtype=torch.bool),
+        latents,
+        torch.tensor([[8, 10], [8, 10]]),
+    )
+
+    assert descriptor.shape == (2, 16)
+    assert summary.shape == (2, 32)
+    assert torch.isfinite(descriptor).all()
+    assert torch.nn.functional.cosine_similarity(
+        descriptor[:1], descriptor[1:]
+    ).item() < 0.999
+
+
 def test_real_cache_contract_runs_one_training_and_validation_step(tmp_path):
     feature_root = tmp_path / "features"
     latent_root = tmp_path / "latents"

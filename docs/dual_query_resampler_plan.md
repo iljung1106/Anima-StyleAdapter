@@ -47,6 +47,8 @@ L = L_semantic_reconstruction
 
 초기 episodic descriptor가 모든 작가에 같은 값을 내는 대칭점에 들어가지 않도록 normalized descriptor의 dimension별 표준편차에 VICReg 방식의 하한을 둔다. 같은 항을 artist-summary descriptor에도 적용하고, summary에는 별도 prototype/SupCon을 약하게 건다. Training-only proxy는 진단 구현만 유지하되 production objective에서는 사용하지 않는다.
 
+초기 방향 신호로 C-RADIO L18/L24 masked spatial mean과 VAE channel mean/std를 concatenate한 뒤 고정 random projection한 descriptor를 사용한다. Student descriptor와 artist-summary descriptor에는 이 입력별 teacher 방향을 약하게 직접 정렬한다. 이 teacher는 학습 가능한 분류 head가 아니므로 공통 출력 쪽으로 이동할 수 없으며, prototype/SupCon이 같은 작가에서 유지되는 성분을 별도로 선택한다.
+
 위 가중치는 초기값이며 raw loss가 아닌 각 경로의 gradient norm과 validation Pareto를 기준으로 조정한다.
 
 ## 학습 단계

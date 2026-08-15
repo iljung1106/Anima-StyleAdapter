@@ -354,6 +354,18 @@ class DualQueryResampler(nn.Module):
             else None,
             persistent=True,
         )
+        teacher_input_dim = len(self.semantic_layers) * semantic_dim + 2 * vae_channels
+        self.register_buffer(
+            "teacher_projection",
+            torch.randn(teacher_input_dim, artist_descriptor_dim)
+            / math.sqrt(teacher_input_dim),
+            persistent=True,
+        )
+        self.register_buffer(
+            "summary_teacher_projection",
+            torch.randn(artist_descriptor_dim, dim) / math.sqrt(artist_descriptor_dim),
+            persistent=True,
+        )
         self.semantic_decoder_norm = nn.LayerNorm(dim)
         self.semantic_decoder_heads = nn.ModuleDict(
             {
@@ -388,6 +400,43 @@ class DualQueryResampler(nn.Module):
         loss = F.cross_entropy(logits, labels)
         top1 = (cosine.argmax(dim=1) == labels).float().mean()
         return loss, top1
+
+    @torch.no_grad()
+    def frozen_input_teacher(
+        self,
+        semantic_features: Mapping[int, torch.Tensor],
+        semantic_mask: torch.Tensor,
+        vae_latents: torch.Tensor,
+        vae_shapes: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Project deterministic C-RADIO/VAE statistics into descriptor targets."""
+        denominator = semantic_mask.sum(dim=1, keepdim=True).clamp_min(1).float()
+        components = []
+        for layer in self.semantic_layers:
+            mean = (
+                semantic_features[layer].float()
+                * semantic_mask.unsqueeze(-1).float()
+            ).sum(dim=1) / denominator
+            components.append(F.normalize(mean, dim=-1))
+        vae_statistics = []
+        for index, shape in enumerate(vae_shapes.detach().cpu().tolist()):
+            height, width = int(shape[0]), int(shape[1])
+            item = vae_latents[index, :, :height, :width].float()
+            vae_statistics.append(
+                torch.cat(
+                    (item.mean(dim=(1, 2)), item.std(dim=(1, 2), correction=0)),
+                    dim=0,
+                )
+            )
+        components.append(F.normalize(torch.stack(vae_statistics), dim=-1))
+        teacher_input = torch.cat(components, dim=-1)
+        descriptor = F.normalize(
+            teacher_input @ self.teacher_projection.float(), dim=-1
+        )
+        summary_descriptor = F.normalize(
+            descriptor @ self.summary_teacher_projection.float(), dim=-1
+        )
+        return descriptor, summary_descriptor
 
     def _semantic_bank(
         self,

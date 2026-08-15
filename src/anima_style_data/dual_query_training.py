@@ -401,6 +401,24 @@ def _losses(
         summary_descriptor,
         float(cfg.get("summary_variance_target", 0.02)),
     )
+    teacher_descriptor, summary_teacher_descriptor = model.frozen_input_teacher(
+        episode.semantic_features,
+        episode.semantic_mask,
+        episode.vae_latents,
+        episode.vae_shapes,
+    )
+    teacher_alignment = (
+        1.0
+        - F.cosine_similarity(
+            output.descriptor.float(), teacher_descriptor.float(), dim=-1
+        )
+    ).mean()
+    summary_teacher_alignment = (
+        1.0
+        - F.cosine_similarity(
+            summary_descriptor.float(), summary_teacher_descriptor.float(), dim=-1
+        )
+    ).mean()
     proxy = output.descriptor.new_zeros(())
     proxy_top1 = output.descriptor.new_zeros(())
     if model.artist_proxies is not None and bool((episode.class_labels >= 0).all()):
@@ -415,11 +433,14 @@ def _losses(
         + float(cfg.get("contrastive_fraction", 0.25)) * contrastive
         + float(cfg.get("artist_proxy_fraction", 0.50)) * proxy
         + float(cfg.get("descriptor_variance_weight", 50.0)) * variance
+        + float(cfg.get("input_teacher_weight", 1.0)) * teacher_alignment
         + float(cfg.get("summary_artist_fraction", 0.25))
         * (
             summary_prototype
             + float(cfg.get("contrastive_fraction", 0.25)) * summary_contrastive
             + float(cfg.get("descriptor_variance_weight", 50.0)) * summary_variance
+            + float(cfg.get("summary_teacher_weight", 1.0))
+            * summary_teacher_alignment
         )
     )
     diversity = token_diversity_loss(output.tokens)
@@ -445,6 +466,9 @@ def _losses(
         "summary_prototype": summary_prototype,
         "summary_supervised_contrastive": summary_contrastive,
         "summary_variance": summary_variance,
+        "input_teacher_alignment": teacher_alignment,
+        "summary_teacher_alignment": summary_teacher_alignment,
+        "teacher_dimension_std": teacher_descriptor.float().std(dim=0).mean(),
         "descriptor_dimension_std": output.descriptor.float().std(dim=0).mean(),
         "token_batch_std": output.tokens.float().std(dim=0).mean(),
         "token_diversity": diversity,

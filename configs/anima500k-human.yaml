@@ -141,7 +141,7 @@ style_features:
 # B-prime per-reference encoder. C-RADIO spatial features and Qwen Image VAE
 # latents remain separate K/V banks; learned spatial/global queries read both.
 dual_query_resampler:
-  output_directory: dual_query_resampler_bprime_v5
+  output_directory: dual_query_resampler_bprime_v6
   feature_directory: style_features_l18_l24_siglip_l24
   latent_directory: anima_latent_cache_qwen_2d
   seed: 20260815
@@ -194,6 +194,8 @@ dual_query_resampler:
     summary_variance_target: 0.02
     descriptor_variance_weight: 50.0
     summary_artist_fraction: 0.25
+    input_teacher_weight: 1.0
+    summary_teacher_weight: 1.0
     artist_head_lr_scale: 4.0
     prefetch_workers: 2
     prefetch_batches: 4
@@ -205,8 +207,8 @@ dual_query_resampler:
     wandb:
       enabled: true
       project: anima-style-adapter
-      name: dual-query-resampler-bprime-v5-vicreg
-      id: dual-query-resampler-bprime-v5-vicreg
+      name: dual-query-resampler-bprime-v6-input-teacher
+      id: dual-query-resampler-bprime-v6-input-teacher
 
 # External controlled benchmark. Each group contains one image from the shard
 # artist and three images of the same character(s) from different artists.
