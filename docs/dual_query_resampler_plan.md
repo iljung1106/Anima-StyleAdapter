@@ -45,7 +45,7 @@ L = L_semantic_reconstruction
   - hard negative는 가능하면 유사 캐릭터·일반 태그의 다른 작가에서 선택
 - 고정 5,000-class ArcFace head는 필수가 아니며, 추가하더라도 약한 보조 loss로만 사용한다.
 
-초기 episodic descriptor가 모든 작가에 같은 값을 내는 대칭점에 머물 경우에만, 선택된 train 작가 3,000명의 training-only CosFace proxy를 `0.5 × L_proxy`로 `L_artist` 안에 추가한다. Proxy는 validation의 unseen artist 평가에는 사용하지 않으며 사전학습 뒤 제거한다.
+초기 episodic descriptor가 모든 작가에 같은 값을 내는 대칭점에 머물 경우에만, 선택된 train 작가 3,000명의 training-only 고정 random CosFace proxy를 `L_proxy`로 `L_artist` 안에 추가한다. Proxy를 학습 가능하게 두어 공통 descriptor를 따라가는 우회로는 허용하지 않는다. Proxy는 validation의 unseen artist 평가에는 사용하지 않으며 사전학습 뒤 제거한다.
 
 위 가중치는 초기값이며 raw loss가 아닌 각 경로의 gradient norm과 validation Pareto를 기준으로 조정한다.
 

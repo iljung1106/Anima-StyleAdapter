@@ -163,7 +163,7 @@ def test_training_proxy_breaks_the_collapsed_descriptor_symmetry():
     assert descriptors.grad is not None
     assert torch.isfinite(descriptors.grad).all()
     assert float(descriptors.grad.abs().sum()) > 0
-    assert model.artist_proxies.grad is not None
+    assert model.artist_proxies.grad is None
 
 
 def test_real_cache_contract_runs_one_training_and_validation_step(tmp_path):

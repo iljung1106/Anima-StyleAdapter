@@ -347,10 +347,12 @@ class DualQueryResampler(nn.Module):
             summary_tokens=artist_summary_tokens,
             ff_dim=ff_dim,
         )
-        self.artist_proxies = (
-            nn.Parameter(torch.randn(artist_classes, artist_descriptor_dim) * 0.02)
+        self.register_buffer(
+            "artist_proxies",
+            F.normalize(torch.randn(artist_classes, artist_descriptor_dim), dim=-1)
             if artist_classes > 0
-            else None
+            else None,
+            persistent=True,
         )
         self.semantic_decoder_norm = nn.LayerNorm(dim)
         self.semantic_decoder_heads = nn.ModuleDict(
