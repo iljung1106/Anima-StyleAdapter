@@ -398,11 +398,12 @@ def _train_variant(
 
         base_id = str(wandb_cfg.get("id", "dual-query-style-tokenizer-v1"))
         base_name = str(wandb_cfg.get("name", base_id))
+        run_revision = str(training.get("wandb_run_revision", ""))
         wandb_run = wandb.init(
             project=str(wandb_cfg.get("project", "anima-style-adapter")),
             entity=wandb_cfg.get("entity"),
-            name=base_name + wandb_suffix,
-            id=base_id + wandb_suffix,
+            name=base_name + wandb_suffix + run_revision,
+            id=base_id + wandb_suffix + run_revision,
             resume="allow" if start_step else "never",
             config={
                 "dual_query_style_tokenizer": cfg,

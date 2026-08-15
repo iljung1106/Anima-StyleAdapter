@@ -339,6 +339,9 @@ dual_query_style_tokenizer:
     training_overrides:
       warmup_steps: 100
       direct_auxiliary_end_step: 250
+      # r1 was a pre-checkpoint validation/consistency dtype failure. Keep its
+      # W&B history immutable and give the corrected deterministic rerun a new ID.
+      wandb_run_revision: -r2
       validation_every: 250
       checkpoint_every: 500
       sample_every: 500
