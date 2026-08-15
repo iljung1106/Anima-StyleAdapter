@@ -59,6 +59,23 @@ shortcut을 막기 위해 반드시 target 방향으로 투영된 성분에 하�
 - 핵심 지표: paired flow improvement, correct-vs-wrong advantage,
   aligned coefficient, delta/desired RMS, direction cosine, orthogonal ratio
 
+### 고정 조건 작가 방향 일관성
+
+일반 flow loss의 content/noise/timestep 분산과 별도로 250 step마다 다음
+통제 실험을 수행한다.
+
+- validation 작가 8명에서 서로 겹치지 않는 reference 4장 묶음 A/B를 만든다.
+- 동일한 prompt, latent, noise와 timestep probe에 두 묶음을 각각 적용한다.
+- style-token을 넣지 않은 Anima velocity를 빼서 reference effect만 구한다.
+- probe별 작가 평균 방향을 빼 공통된 약한 출력이 높은 점수를 받지 못하게 한다.
+- `within_artist_centered_cosine`과 `between_artist_centered_cosine`의 차이,
+  artist retrieval top-1/margin을 주 지표로 사용한다.
+- `common_output_ratio`가 크거나 `reference_view_difference_ratio`가 크면
+  각각 작가 비의존 출력 또는 작품별 content 누출 가능성이 높다고 해석한다.
+
+이 값은 학습 loss로 바로 사용하지 않는다. 먼저 heldout reference에서 작가별
+공통 방향이 실제로 생기는지 판단하는 저분산 진단 지표로만 기록한다.
+
 ## Phase KV-J: 복제 K/V + joint softmax
 
 Phase T checkpoint가 self/heldout 수치와 정성 샘플에서 유효한 reference
@@ -81,4 +98,3 @@ Phase T checkpoint가 self/heldout 수치와 정성 샘플에서 유효한 refer
 joint-softmax 모델을 teacher로 삼아 진행한다. 분리 softmax는 Phase T와 함수가
 동일하지 않으므로 임의 alpha로 시작하지 않고 동일 noisy latent/timestep에서
 teacher velocity와 block residual을 증류한다.
-

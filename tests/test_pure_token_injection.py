@@ -7,6 +7,7 @@ torch = pytest.importorskip("torch")
 from anima_style_data.pure_token_injection import (
     _SamplingTokenView,
     _aligned_velocity_losses,
+    _controlled_direction_metrics,
 )
 from anima_style_data.query_style_tokenizer import QueryStyleTokenizerV2
 
@@ -100,3 +101,20 @@ def test_sampling_view_exposes_only_high_capacity_final_tokens():
 
     assert tokens.shape == (2, 4, 16)
     assert torch.isfinite(tokens).all()
+
+
+def test_controlled_direction_metrics_reward_repeatable_artist_effects():
+    first = torch.tensor([
+        [[[1.0, 0.0]]],
+        [[[-1.0, 0.0]]],
+    ])
+    second = first.clone()
+
+    metrics = _controlled_direction_metrics(first, second, ["a", "b"])
+
+    assert float(metrics["within_artist_centered_cosine"]) == pytest.approx(1.0)
+    assert float(metrics["between_artist_centered_cosine"]) == pytest.approx(-1.0)
+    assert float(metrics["within_between_margin"]) == pytest.approx(2.0)
+    assert float(metrics["artist_retrieval_top1"]) == pytest.approx(1.0)
+    assert float(metrics["common_output_ratio"]) == pytest.approx(0.0)
+    assert float(metrics["reference_view_difference_ratio"]) == pytest.approx(0.0)

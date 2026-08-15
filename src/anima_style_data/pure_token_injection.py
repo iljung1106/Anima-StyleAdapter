@@ -404,6 +404,200 @@ def _evaluate(
     return result
 
 
+@torch.no_grad()
+def _controlled_direction_metrics(
+    first_delta: torch.Tensor,
+    second_delta: torch.Tensor,
+    style_ids: list[str],
+) -> dict[str, torch.Tensor]:
+    """Compare disjoint reference views after removing their common effect."""
+
+    if first_delta.shape != second_delta.shape:
+        raise ValueError("Controlled direction views must have the same shape")
+    if first_delta.shape[0] != len(style_ids):
+        raise ValueError("style_ids must contain one value per artist row")
+    positive = torch.tensor(
+        [[left == right for right in style_ids] for left in style_ids],
+        dtype=torch.bool,
+        device=first_delta.device,
+    )
+    negative = ~positive
+    first_centered = first_delta - first_delta.mean(dim=0, keepdim=True)
+    second_centered = second_delta - second_delta.mean(dim=0, keepdim=True)
+    first_flat = F.normalize(first_centered.flatten(1), dim=1, eps=1e-8)
+    second_flat = F.normalize(second_centered.flatten(1), dim=1, eps=1e-8)
+    similarity = first_flat @ second_flat.T
+    matched = similarity.diagonal()
+    within = matched.mean()
+    between = (
+        similarity[negative].mean()
+        if bool(negative.any()) else similarity.new_zeros(())
+    )
+    predicted = similarity.argmax(dim=1).detach().cpu().tolist()
+    retrieval = similarity.new_tensor([
+        float(style_ids[index] == style_ids[row])
+        for row, index in enumerate(predicted)
+    ]).mean()
+    negative_max = similarity.masked_fill(positive, -torch.inf).max(dim=1).values
+    finite_negative = torch.isfinite(negative_max)
+    retrieval_margin = (
+        (matched[finite_negative] - negative_max[finite_negative]).mean()
+        if bool(finite_negative.any()) else similarity.new_zeros(())
+    )
+    artist_effect = 0.5 * (first_delta + second_delta)
+    dimensions = tuple(range(1, artist_effect.ndim))
+    effect_rms = artist_effect.square().mean(dim=dimensions).sqrt()
+    common_rms = artist_effect.mean(dim=0).square().mean().sqrt()
+    common_ratio = common_rms / effect_rms.mean().clamp_min(1e-8)
+    view_difference = (
+        (first_delta - second_delta).square().mean(dim=dimensions).sqrt()
+        / (
+            0.5 * (
+                first_delta.square().mean(dim=dimensions).sqrt()
+                + second_delta.square().mean(dim=dimensions).sqrt()
+            )
+        ).clamp_min(1e-8)
+    ).mean()
+    return {
+        "within_artist_centered_cosine": within,
+        "between_artist_centered_cosine": between,
+        "within_between_margin": within - between,
+        "artist_retrieval_top1": retrieval,
+        "artist_retrieval_margin": retrieval_margin,
+        "common_output_ratio": common_ratio,
+        "reference_view_difference_ratio": view_difference,
+        "artist_effect_rms": effect_rms.mean(),
+    }
+
+
+@torch.no_grad()
+def _evaluate_controlled_artist_consistency(
+    anima: nn.Module,
+    tokenizer: QueryStyleTokenizerV2,
+    loader: ProductionStyleLoader,
+    device: str,
+    evaluation_cfg: dict[str, Any],
+    *,
+    seed: int,
+) -> dict[str, float]:
+    """Measure reference-stable artist directions on matched flow probes.
+
+    Every artist is represented by two disjoint reference views. Both views
+    are applied to exactly the same prompt, latent, noise and timestep, so
+    content and flow-sampling noise cancel before direction comparison. The
+    per-probe artist mean is removed to prevent a reference-independent common
+    token effect from receiving a high consistency score.
+    """
+
+    tokenizer.eval()
+    probe_batch = loader.load_step(0)
+    references, reference_mask = _reference_inputs(
+        probe_batch, device, "heldout"
+    )
+    references_per_view = int(evaluation_cfg.get("references_per_view", 4))
+    required = references_per_view * 2
+    if reference_mask.shape[1] < required:
+        raise ValueError(
+            "Controlled consistency requires at least "
+            f"{required} references per artist"
+        )
+    first_mask = torch.zeros_like(reference_mask)
+    second_mask = torch.zeros_like(reference_mask)
+    first_mask[:, :required:2] = reference_mask[:, :required:2]
+    second_mask[:, 1:required:2] = reference_mask[:, 1:required:2]
+    if not bool(first_mask.any(dim=1).all() and second_mask.any(dim=1).all()):
+        raise ValueError("Controlled consistency received an incomplete reference view")
+
+    def autocast_context():
+        return torch.autocast(
+            device_type=torch.device(device).type,
+            dtype=torch.bfloat16,
+            enabled=torch.device(device).type == "cuda",
+        )
+
+    with autocast_context():
+        first_tokens = tokenizer(references, first_mask).tokens
+        second_tokens = tokenizer(references, second_mask).tokens
+    artists = references.shape[0]
+    style_ids = [str(item.style_id) for item in probe_batch["episodes"]]
+    timesteps = [
+        float(value)
+        for value in evaluation_cfg.get("timesteps", [0.2, 0.4, 0.65, 0.85])
+    ]
+    inference_batch = max(1, int(evaluation_cfg.get("inference_batch_size", 4)))
+    rows: list[dict[str, float]] = []
+    for probe_index, timestep_value in enumerate(timesteps):
+        row_index = probe_index % probe_batch["latents"].shape[0]
+        latent = probe_batch["latents"][row_index : row_index + 1].to(
+            device, dtype=torch.bfloat16, non_blocking=True
+        )
+        conditioning = probe_batch["conditioning"][row_index : row_index + 1].to(
+            device, dtype=torch.bfloat16, non_blocking=True
+        )
+        length = probe_batch["conditioning_lengths"][
+            row_index : row_index + 1
+        ].to(device, non_blocking=True)
+        generator = torch.Generator(device=device).manual_seed(
+            seed + probe_index * 10007
+        )
+        noise = torch.randn(
+            latent.shape, device=device, dtype=latent.dtype, generator=generator
+        )
+        timestep = torch.full(
+            (1,), timestep_value, device=device, dtype=latent.dtype
+        )
+        noisy = (1 - timestep_value) * latent + timestep_value * noise
+        padding_mask = torch.zeros(
+            1, 1, latent.shape[-2], latent.shape[-1],
+            device=device, dtype=latent.dtype,
+        )
+        with autocast_context():
+            base = anima(
+                noisy.unsqueeze(2), timestep,
+                context=conditioning, padding_mask=padding_mask,
+                target_input_ids=None,
+            ).squeeze(2).float()
+
+        all_tokens = torch.cat((first_tokens, second_tokens), dim=0)
+        all_conditioning = conditioning.expand(artists * 2, -1, -1).clone()
+        all_lengths = length.expand(artists * 2)
+        styled_conditioning = insert_style_tokens(
+            all_conditioning, all_lengths, all_tokens
+        )
+        predictions = []
+        for offset in range(0, artists * 2, inference_batch):
+            count = min(inference_batch, artists * 2 - offset)
+            with autocast_context():
+                prediction = anima(
+                    noisy.expand(count, -1, -1, -1).unsqueeze(2),
+                    timestep.expand(count),
+                    context=styled_conditioning[offset : offset + count],
+                    padding_mask=padding_mask.expand(count, -1, -1, -1),
+                    target_input_ids=None,
+                ).squeeze(2).float()
+            predictions.append(prediction)
+        delta = torch.cat(predictions, dim=0) - base
+        first_delta, second_delta = delta[:artists], delta[artists:]
+        rows.append({
+            key: float(value)
+            for key, value in _controlled_direction_metrics(
+                first_delta, second_delta, style_ids
+            ).items()
+        })
+
+    result = {
+        key: sum(row[key] for row in rows) / len(rows)
+        for key in rows[0]
+    }
+    result.update({
+        "artists": float(artists),
+        "probes": float(len(rows)),
+        "references_per_view": float(references_per_view),
+    })
+    tokenizer.train()
+    return result
+
+
 def _save_training_state(
     path: Path,
     *,
@@ -509,6 +703,24 @@ def train_pure_token_style_tokenizer(
     )
     train_loader = ProductionStyleLoader(destination, train_loader_cfg)
     validation_loader = ProductionStyleLoader(destination, validation_loader_cfg)
+    consistency_cfg = dict(cfg.get("consistency_evaluation", {}))
+    consistency_loader = None
+    if bool(consistency_cfg.get("enabled", False)):
+        consistency_loader_cfg = dict(validation_loader_cfg)
+        consistency_loader_cfg.update({
+            "batch_size": int(consistency_cfg.get("artists", 8)),
+            "min_references": int(
+                consistency_cfg.get("references_per_view", 4)
+            ) * 2,
+            "max_references": int(
+                consistency_cfg.get("references_per_view", 4)
+            ) * 2,
+            "artist_balanced": True,
+            "gradient_accumulation_steps": 1,
+        })
+        consistency_loader = ProductionStyleLoader(
+            destination, consistency_loader_cfg
+        )
     resampler_checkpoint = str(config["style_transfer"]["resampler"]["checkpoint"])
     cache_summary = _assert_resampler_cache_identity(
         destination, train_loader_cfg, resampler_checkpoint
@@ -584,14 +796,11 @@ def train_pure_token_style_tokenizer(
     log_every = int(training_cfg.get("log_every", 10))
     validation_every = int(training_cfg.get("validation_every", 250))
     validation_batches = int(training_cfg.get("validation_batches", 8))
+    consistency_every = int(
+        consistency_cfg.get("every", validation_every)
+    )
     checkpoint_every = int(training_cfg.get("checkpoint_every", 500))
     sample_every = int(training_cfg.get("sample_every", 500))
-    prefetched = train_loader.prefetch(
-        start_step * accumulation,
-        max(0, steps - start_step) * accumulation,
-        workers=int(training_cfg.get("prefetch_workers", 2)),
-        depth=int(training_cfg.get("prefetch_batches", 4)),
-    )
     history_path = output / "history.json"
     history = (
         json.loads(history_path.read_text(encoding="utf-8"))
@@ -612,6 +821,55 @@ def train_pure_token_style_tokenizer(
             _select_sample_episodes(validation_loader, 4)
         )
     ]
+    if start_step > 0 and consistency_loader is not None:
+        controlled = _evaluate_controlled_artist_consistency(
+            anima,
+            tokenizer,
+            consistency_loader,
+            device,
+            consistency_cfg,
+            seed=seed ^ 0xA77157,
+        )
+        prior_row = next(
+            (row for row in reversed(history) if int(row["step"]) == start_step),
+            None,
+        )
+        if prior_row is None:
+            prior_row = {"step": start_step}
+            history.append(prior_row)
+        prior_row["controlled_artist_consistency"] = controlled
+        write_json(history_path, history)
+        print(
+            f"pure-token controlled-consistency step={start_step} {controlled}",
+            flush=True,
+        )
+        if wandb_run is not None:
+            wandb_run.log({
+                f"validation_consistency/{key}": value
+                for key, value in controlled.items()
+            }, step=start_step)
+    if start_step > 0 and wandb_run is not None:
+        resumed_sheets = sorted(
+            (output / "samples" / f"step-{start_step:07d}").glob(
+                "*-sheet.png"
+            )
+        )
+        if resumed_sheets:
+            import wandb
+
+            wandb_run.log({
+                "samples/panel": [
+                    wandb.Image(str(path), caption=path.stem)
+                    for path in resumed_sheets
+                ]
+            }, step=start_step)
+
+    prefetched = train_loader.prefetch(
+        start_step * accumulation,
+        max(0, steps - start_step) * accumulation,
+        workers=int(training_cfg.get("prefetch_workers", 2)),
+        depth=int(training_cfg.get("prefetch_batches", 4)),
+    )
     completed_step = start_step
     started = time.perf_counter()
     try:
@@ -705,6 +963,20 @@ def train_pure_token_style_tokenizer(
                         - validation_wrong["paired_flow_improvement"]
                     ),
                 }
+                if (
+                    consistency_loader is not None
+                    and step % consistency_every == 0
+                ):
+                    row["controlled_artist_consistency"] = (
+                        _evaluate_controlled_artist_consistency(
+                            anima,
+                            tokenizer,
+                            consistency_loader,
+                            device,
+                            consistency_cfg,
+                            seed=seed ^ 0xA77157,
+                        )
+                    )
                 history.append(row)
                 write_json(history_path, history)
                 print(f"pure-token validation step={step} {row}", flush=True)
@@ -725,6 +997,12 @@ def train_pure_token_style_tokenizer(
                         "validation/correct_vs_wrong_paired_advantage": row[
                             "correct_vs_wrong_paired_advantage"
                         ],
+                        **{
+                            f"validation_consistency/{key}": value
+                            for key, value in row.get(
+                                "controlled_artist_consistency", {}
+                            ).items()
+                        },
                     }, step=step)
 
             if step % checkpoint_every == 0 or step == steps:
@@ -808,6 +1086,14 @@ def smoke_test_pure_token_style_tokenizer(
         "sample_every": 0,
         "resume": False,
         "wandb": {"enabled": False},
+    })
+    cfg["consistency_evaluation"].update({
+        "enabled": True,
+        "every": 2,
+        "artists": 2,
+        "references_per_view": 1,
+        "timesteps": [0.5],
+        "inference_batch_size": 2,
     })
     return train_pure_token_style_tokenizer(
         smoke, destination, steps_override=2
