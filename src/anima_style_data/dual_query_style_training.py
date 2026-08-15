@@ -115,8 +115,13 @@ def _subset_consistency(
     # A one-reference row has no second view; use the same reference so it
     # contributes zero without a Python-side split or CUDA synchronization.
     second_mask = torch.where(mask.sum(dim=1, keepdim=True) > 1, second_mask, first_mask)
-    first = tokenizer(references, first_mask).tokens
-    second = tokenizer(references, second_mask).tokens
+    with torch.autocast(
+        device_type=torch.device(device).type,
+        dtype=torch.bfloat16,
+        enabled=torch.device(device).type == "cuda",
+    ):
+        first = tokenizer(references, first_mask).tokens
+        second = tokenizer(references, second_mask).tokens
     return (
         1.0
         - F.cosine_similarity(first.float(), second.float(), dim=-1)
