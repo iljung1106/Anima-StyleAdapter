@@ -667,7 +667,9 @@ class DualQueryResampler(nn.Module):
                 decoded = decoded.flatten(2).transpose(1, 2)
                 if decoded.shape[1] < max_tokens:
                     decoded = F.pad(decoded, (0, 0, 0, max_tokens - decoded.shape[1]))
-                outputs[layer].index_copy_(0, indices, decoded)
+                outputs[layer].index_copy_(
+                    0, indices, decoded.to(outputs[layer].dtype)
+                )
         return outputs
 
     def decode_vae(
