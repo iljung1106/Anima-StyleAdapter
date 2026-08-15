@@ -1085,6 +1085,24 @@ style_tokenizer_checkpoint_comparison:
   small_checkpoint: style_tokenizer_native_context_16_multiref_contrastive_8k_v1/checkpoints/step-0004000.pt
   current_checkpoint: pure_token_style_tokenizer_v2_32slot_20k_v1/checkpoints/step-0004000.pt
 
+external_style_tokenizer_sheet:
+  output_directory: external_style_tokenizer_sheet_4k
+  reference_directory: external_style_tokenizer_sheet/references
+  device: cuda
+  small_checkpoint: style_tokenizer_native_context_16_multiref_contrastive_8k_v1/checkpoints/step-0004000.pt
+  current_checkpoint: pure_token_style_tokenizer_v2_32slot_20k_v1/checkpoints/step-0004000.pt
+  prompt: "masterpiece, best quality, score_7, safe, Aris (Blue Archive), cowboy shot, blue sky, smile,"
+  negative_prompt: "worst quality, low quality, score_1, score_2, score_3, artist name, blurry, jpeg artifacts,"
+  width: 832
+  height: 1248
+  cfg: 4.0
+  steps: 30
+  flow_shift: 3.0
+  seed: 20260822
+  batch_size: 4
+  vae_batch_size: 4
+  sheet_filename: style-tokenizer-comparison-3x8.png
+
 style_tokenizer_selection:
   source_config_section: style_tokenizer_generalization
   device: cuda
