@@ -229,9 +229,18 @@ def load_dual_query_external_sample(
     sheet_cfg, _, paths, output = _paths_and_config(config, destination)
     tokens_path = output / "reference_tokens.pt"
     text_path = output / "text_conditions.pt"
-    if not tokens_path.exists() or not text_path.exists():
+    metadata_path = output / "reference_tokens.json"
+    if not tokens_path.exists() or not text_path.exists() or not metadata_path.exists():
         raise FileNotFoundError(
             "Run dual-query-style-external-cache before Style Tokenizer training"
+        )
+    checkpoint = destination / str(
+        config["dual_query_style_tokenizer"]["resampler_checkpoint"]
+    )
+    recorded = json.loads(metadata_path.read_text(encoding="utf-8"))
+    if recorded != _signature(paths, checkpoint, config):
+        raise RuntimeError(
+            "Fixed external references were encoded by another model or preprocess"
         )
     tokens = torch.load(tokens_path, map_location="cpu", weights_only=True)
     text = torch.load(text_path, map_location="cpu", weights_only=True)

@@ -27,7 +27,7 @@
 1. query-only: reference별 80개 query token만 사용
 2. query+summary: 80개 query와 4개 artist-summary token을 함께 사용
 
-held-out paired-flow improvement, correct-vs-wrong 차이, 1/2/4/8-reference consistency, common-output ratio와 고정 prompt/seed 샘플을 기준으로 한 조건을 선택한다. Descriptor head와 artist loss는 두 조건에서 동일하며 summary 전달 여부만 바꾼다.
+held-out paired-flow improvement, correct-vs-wrong 차이와 고정 prompt/seed 샘플을 기준으로 한 조건을 선택한다. Style Tokenizer의 output-token artist contrastive loss는 두 조건에서 동일하며 summary 전달 여부만 바꾼다. 선택된 조건은 본학습에서 1/2/4/8-reference 지표와 common-output 계열 지표를 계속 추적한다.
 
 ## Anima 학습 커리큘럼
 
