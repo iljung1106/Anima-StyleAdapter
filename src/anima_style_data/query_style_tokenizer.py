@@ -967,7 +967,9 @@ def smoke_test_query_style_tokenizer(
     smoke_config = copy.deepcopy(config)
     cfg = smoke_config["query_style_tokenizer_v2"]
     cfg["output_directory"] = str(cfg["output_directory"]) + "_smoke"
-    cfg["loader"]["batch_size"] = 1
+    # Wrong-artist validation needs a second artist in the same exact-shape
+    # batch. This is also the intended production microbatch size.
+    cfg["loader"]["batch_size"] = 2
     cfg["training"].update({
         "steps": 2,
         "gradient_accumulation_steps": 1,

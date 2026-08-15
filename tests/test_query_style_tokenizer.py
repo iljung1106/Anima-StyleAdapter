@@ -39,7 +39,7 @@ def test_query_tokenizer_preserves_slots_and_is_reference_order_invariant():
 
     assert expected.shape == (2, 4, 16)
     assert torch.allclose(actual, expected, atol=1e-6, rtol=1e-5)
-    assert float(expected.float().square().mean().sqrt()) == pytest.approx(
+    assert float(expected.detach().float().square().mean().sqrt()) == pytest.approx(
         0.2, rel=0.05
     )
     assert not torch.allclose(expected[:, 0], expected[:, 1])
