@@ -1097,6 +1097,7 @@ external_style_tokenizer_sheet:
   width: 832
   height: 1024
   cfg: 4.0
+  style_multipliers: [1.0, 1.5, 2.0]
   steps: 30
   flow_shift: 3.0
   seed: 20260822

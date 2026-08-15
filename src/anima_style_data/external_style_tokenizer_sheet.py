@@ -241,6 +241,8 @@ def _denoise_batch(
     steps: int,
     flow_shift: float,
     cfg_scale: float,
+    style_context: torch.Tensor | None = None,
+    style_multiplier: float = 1.0,
 ) -> torch.Tensor:
     batch = positive.shape[0]
     x = initial_noise.expand(batch, -1, -1, -1, -1).clone()
@@ -252,6 +254,10 @@ def _denoise_batch(
         batch, 1, x.shape[-2], x.shape[-1], device=x.device, dtype=x.dtype
     )
     negative = negative.expand(batch, -1, -1)
+    if style_context is not None and style_context.shape[0] != batch:
+        raise ValueError(
+            f"Style context batch mismatch: {style_context.shape[0]} != {batch}"
+        )
     with torch.inference_mode(), torch.autocast(
         "cuda", dtype=torch.bfloat16, enabled=x.device.type == "cuda"
     ):
@@ -271,7 +277,25 @@ def _denoise_batch(
                 padding_mask=padding_mask,
                 target_input_ids=None,
             ).float()
-            velocity = unconditioned + cfg_scale * (conditioned - unconditioned)
+            if style_context is None:
+                velocity = unconditioned + cfg_scale * (
+                    conditioned - unconditioned
+                )
+            else:
+                styled = anima(
+                    x,
+                    timestep,
+                    context=style_context,
+                    padding_mask=padding_mask,
+                    target_input_ids=None,
+                ).float()
+                text_delta = conditioned - unconditioned
+                style_delta = styled - conditioned
+                velocity = (
+                    unconditioned
+                    + cfg_scale * text_delta
+                    + cfg_scale * style_multiplier * style_delta
+                )
             x = (
                 x.float()
                 + velocity * (sigmas[index + 1] - sigmas[index]).float()
@@ -288,7 +312,7 @@ def _generate_latents(
     current_tokens: torch.Tensor,
     cfg: dict[str, Any],
     device: str,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> dict[str, torch.Tensor]:
     width = int(cfg["width"])
     height = int(cfg["height"])
     seed = int(cfg["seed"])
@@ -319,7 +343,7 @@ def _generate_latents(
 
     lengths = torch.full((7,), length, device=device, dtype=torch.long)
 
-    def styled(values: torch.Tensor) -> torch.Tensor:
+    def styled(values: torch.Tensor, multiplier: float) -> torch.Tensor:
         contexts = insert_style_tokens(
             positive.expand(7, -1, -1).clone(),
             lengths,
@@ -328,25 +352,31 @@ def _generate_latents(
         parts = []
         for offset in range(0, 7, batch_size):
             part = contexts[offset : offset + batch_size]
+            text_part = positive.expand(part.shape[0], -1, -1)
             parts.append(
                 _denoise_batch(
                     anima,
                     initial_noise,
-                    part,
+                    text_part,
                     negative,
                     steps=steps,
                     flow_shift=flow_shift,
                     cfg_scale=cfg_scale,
+                    style_context=part,
+                    style_multiplier=multiplier,
                 ).to("cpu")
             )
         return torch.cat(parts)
 
-    small = (
-        styled(small_tokens)
-        if small_tokens is not None
-        else base.new_empty((0, *base.shape[1:]))
-    )
-    return base, small, styled(current_tokens)
+    groups = {"base": base}
+    if small_tokens is not None:
+        groups["small"] = styled(small_tokens, 1.0)
+    multipliers = [float(value) for value in cfg.get("style_multipliers", [1.0])]
+    if not multipliers or any(value <= 0 for value in multipliers):
+        raise ValueError("style_multipliers must contain positive values")
+    for multiplier in multipliers:
+        groups[f"large_{multiplier:g}x"] = styled(current_tokens, multiplier)
+    return groups
 
 
 def _to_image(value: torch.Tensor) -> Image.Image:
@@ -361,14 +391,14 @@ def _to_image(value: torch.Tensor) -> Image.Image:
 def _decode_latents(
     config: dict[str, Any],
     destination: Path,
-    groups: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    groups: dict[str, torch.Tensor],
     device: str,
     batch_size: int,
-) -> tuple[list[Image.Image], list[Image.Image], list[Image.Image]]:
+) -> dict[str, list[Image.Image]]:
     vae = _load_sampling_vae(config, destination).to(
         device=device, dtype=torch.bfloat16
     )
-    all_latents = torch.cat(groups)
+    all_latents = torch.cat(list(groups.values()))
     decoded = []
     with torch.inference_mode(), torch.autocast(
         "cuda", dtype=torch.bfloat16, enabled=device.startswith("cuda")
@@ -380,15 +410,13 @@ def _decode_latents(
                 )
             ).float()
             decoded.extend(_to_image(value) for value in values)
-    base_count, small_count, current_count = (len(group) for group in groups)
-    base_end = base_count
-    small_end = base_end + small_count
-    current_end = small_end + current_count
-    return (
-        decoded[:base_end],
-        decoded[base_end:small_end],
-        decoded[small_end:current_end],
-    )
+    result = {}
+    offset = 0
+    for name, latents in groups.items():
+        end = offset + len(latents)
+        result[name] = decoded[offset:end]
+        offset = end
+    return result
 
 
 def _fit_with_padding(image: Image.Image, size: tuple[int, int]) -> Image.Image:
@@ -522,7 +550,7 @@ def generate_external_style_tokenizer_sheet(
     gc.collect()
     if device.startswith("cuda"):
         torch.cuda.empty_cache()
-    base_images, small_images, current_images = _decode_latents(
+    decoded = _decode_latents(
         config,
         destination,
         latent_groups,
@@ -531,41 +559,43 @@ def generate_external_style_tokenizer_sheet(
     )
     raw = output / "generated"
     raw.mkdir(exist_ok=True)
+    base_images = decoded["base"]
+    small_images = decoded.get("small", [])
     base_images[0].save(raw / "no-style.png")
     for index, image in enumerate(small_images, start=1):
         image.save(raw / f"small-TestSample{index}.png")
-    for index, image in enumerate(current_images, start=1):
-        image.save(raw / f"large-TestSample{index}.png")
+    for group_name, images in decoded.items():
+        if not group_name.startswith("large_"):
+            continue
+        for index, image in enumerate(images, start=1):
+            image.save(raw / f"{group_name}-TestSample{index}.png")
 
     size = (int(cfg["width"]), int(cfg["height"]))
-    sheet = _make_sheet(
-        paths,
-        base_images[0],
-        small_images if include_small else None,
-        current_images,
-        size,
-    )
     expected = (size[0] * 8, size[1] * (3 if include_small else 2))
-    if sheet.size != expected:
-        raise RuntimeError(f"Unexpected final sheet size: {sheet.size} != {expected}")
-    sheet_path = output / str(cfg.get("sheet_filename", "comparison-3x8.png"))
-    sheet.save(sheet_path, compress_level=4)
-    summary = {
-        "sheet": str(sheet_path),
-        "sheet_width": sheet.width,
-        "sheet_height": sheet.height,
-        "cell_width": size[0],
-        "cell_height": size[1],
-        "prompt": str(cfg["prompt"]),
-        "negative_prompt": str(cfg["negative_prompt"]),
-        "cfg": float(cfg["cfg"]),
-        "steps": int(cfg["steps"]),
-        "seed": int(cfg["seed"]),
-        "small": small_metadata,
-        "current": current_metadata,
-        "references": [str(path) for path in paths],
-        "guidance_mode": "shared_text_and_style_cfg",
-        "large_pixel_rms_from_baseline": [
+    configured_sheet = Path(str(cfg.get("sheet_filename", "comparison-3x8.png")))
+    sheets = {}
+    pixel_rms = {}
+    for group_name, current_images in decoded.items():
+        if not group_name.startswith("large_"):
+            continue
+        sheet = _make_sheet(
+            paths,
+            base_images[0],
+            small_images if include_small else None,
+            current_images,
+            size,
+        )
+        if sheet.size != expected:
+            raise RuntimeError(
+                f"Unexpected final sheet size: {sheet.size} != {expected}"
+            )
+        suffix = group_name.removeprefix("large_")
+        sheet_path = output / (
+            f"{configured_sheet.stem}-style-{suffix}{configured_sheet.suffix}"
+        )
+        sheet.save(sheet_path, compress_level=4)
+        sheets[suffix] = str(sheet_path)
+        pixel_rms[suffix] = [
             float(
                 np.sqrt(
                     np.mean(
@@ -579,7 +609,27 @@ def generate_external_style_tokenizer_sheet(
                 / 255.0
             )
             for image in current_images
-        ],
+        ]
+    summary = {
+        "sheets": sheets,
+        "sheet_width": expected[0],
+        "sheet_height": expected[1],
+        "cell_width": size[0],
+        "cell_height": size[1],
+        "prompt": str(cfg["prompt"]),
+        "negative_prompt": str(cfg["negative_prompt"]),
+        "cfg": float(cfg["cfg"]),
+        "steps": int(cfg["steps"]),
+        "seed": int(cfg["seed"]),
+        "small": small_metadata,
+        "current": current_metadata,
+        "references": [str(path) for path in paths],
+        "guidance_mode": "text_cfg_with_explicit_style_delta_multiplier",
+        "style_multiplier_formula": (
+            "uncond + cfg*(text_cond-uncond) + "
+            "cfg*multiplier*(style_cond-text_cond)"
+        ),
+        "large_pixel_rms_from_baseline": pixel_rms,
     }
     (output / "summary.json").write_text(
         json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8"
