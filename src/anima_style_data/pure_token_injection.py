@@ -13,6 +13,10 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from .external_style_tokenizer_sheet import (
+    generate_live_external_style_sample,
+    prepare_live_external_style_sample,
+)
 from .io import write_json
 from .query_style_tokenizer import (
     QueryStyleTokenizerV2,
@@ -354,6 +358,12 @@ def _forward_pure_token_flow(
         "slot_diversity_loss": diversity_loss.detach(),
         "style_token_rms": output.tokens.detach().float().square().mean().sqrt(),
         "references": reference_mask.sum(dim=1).float().mean(),
+        "reference_count_1_fraction": (
+            reference_mask.sum(dim=1) == 1
+        ).float().mean(),
+        "reference_count_2_fraction": (
+            reference_mask.sum(dim=1) == 2
+        ).float().mean(),
         "target_inclusion": include_target.float().mean(),
         "target_probability": flow_loss.new_tensor(
             float(curriculum["target_probability"])
@@ -725,6 +735,12 @@ def train_pure_token_style_tokenizer(
     cache_summary = _assert_resampler_cache_identity(
         destination, train_loader_cfg, resampler_checkpoint
     )
+    external_sample_every = int(training_cfg.get("external_sample_every", 0))
+    external_sample = (
+        prepare_live_external_style_sample(config, destination, device)
+        if external_sample_every > 0
+        else None
+    )
 
     anima = _resolve_anima_model(config, destination, device).requires_grad_(False).eval()
     _optimize_frozen_anima(
@@ -1047,6 +1063,38 @@ def train_pure_token_style_tokenizer(
                             wandb.Image(str(path), caption=path.stem)
                             for path in sheets
                         ]
+                    }, step=step)
+            if (
+                external_sample is not None
+                and step % external_sample_every == 0
+            ):
+                external_report = generate_live_external_style_sample(
+                    external_sample,
+                    config,
+                    destination,
+                    anima,
+                    tokenizer,
+                    output,
+                    device,
+                    step,
+                )
+                print(
+                    "pure-token external-reference sample "
+                    f"step={step} sheet={external_report['sheet']} "
+                    f"pixel_rms={external_report['mean_pixel_rms_from_baseline']:.4f}",
+                    flush=True,
+                )
+                if wandb_run is not None:
+                    import wandb
+
+                    wandb_run.log({
+                        "samples/external_reference_1x": wandb.Image(
+                            external_report["sheet"],
+                            caption=f"external reference 1x step {step}",
+                        ),
+                        "samples/external_reference_mean_pixel_rms": (
+                            external_report["mean_pixel_rms_from_baseline"]
+                        ),
                     }, step=step)
             completed_step = step
     finally:

@@ -109,6 +109,7 @@ class ProductionStyleLoader:
         self.split = str(cfg.get("split", "train"))
         self.artist_balanced = bool(cfg.get("artist_balanced", False))
         self.reference_curriculum = dict(cfg.get("reference_curriculum", {}))
+        self.reference_count_weights = cfg.get("reference_count_weights")
         self.self_reference_target_images_per_style = max(
             0, int(cfg.get("self_reference_target_images_per_style", 0))
         )
@@ -253,9 +254,13 @@ class ProductionStyleLoader:
             )
             min_references = int(curriculum["min_references"])
             max_references = int(curriculum["max_references"])
+            reference_count_weights = curriculum.get("reference_count_weights")
         else:
             min_references = self.min_references
             max_references = self.max_references
+            reference_count_weights = getattr(
+                self, "reference_count_weights", None
+            )
             curriculum = None
         # Sampling bucket names uniformly would drastically overrepresent rare
         # extreme aspect ratios. Weight by eligible target count so each image
@@ -311,7 +316,10 @@ class ProductionStyleLoader:
             pool = [item for item in self.by_style[style_id] if item != target_id]
             upper = min(max_references, len(pool))
             lower = min(min_references, upper)
-            count = rng.randint(lower, upper)
+            counts, probabilities = _reference_count_distribution(
+                lower, upper, reference_count_weights
+            )
+            count = rng.choices(counts, weights=probabilities, k=1)[0]
             references = tuple(rng.sample(pool, count))
             variants = self.text_variants[target_id]
             episodes.append(
@@ -1987,6 +1995,30 @@ def _learning_rate_multiplier(
     return minimum_ratio + (1.0 - minimum_ratio) * cosine
 
 
+def _reference_count_distribution(
+    lower: int,
+    upper: int,
+    weights: list[float] | tuple[float, ...] | None,
+) -> tuple[list[int], list[float]]:
+    """Resolve configured per-count weights over the active curriculum range."""
+
+    counts = list(range(int(lower), int(upper) + 1))
+    if not counts:
+        raise ValueError("Reference count range must not be empty")
+    if weights is None:
+        probability = 1.0 / len(counts)
+        return counts, [probability] * len(counts)
+    if len(weights) < upper:
+        raise ValueError(
+            f"reference_count_weights needs at least {upper} values, got {len(weights)}"
+        )
+    selected = [float(weights[count - 1]) for count in counts]
+    if any(value < 0 for value in selected) or sum(selected) <= 0:
+        raise ValueError("Active reference_count_weights must be non-negative and nonzero")
+    total = sum(selected)
+    return counts, [value / total for value in selected]
+
+
 def _self_reference_curriculum_state(step: int, config: dict[str, Any]) -> dict[str, Any]:
     """Resolve the staged self-reference curriculum for one optimizer step."""
     if not config:
@@ -1999,6 +2031,7 @@ def _self_reference_curriculum_state(step: int, config: dict[str, Any]) -> dict[
             "self_reference_steps": 0,
             "min_references": 1,
             "max_references": 8,
+            "reference_count_weights": None,
         }
     gate_only_steps = max(0, int(config.get("gate_only_steps", 0)))
     self_reference_steps = max(gate_only_steps, int(config.get("self_reference_steps", 0)))
@@ -2064,6 +2097,7 @@ def _self_reference_curriculum_state(step: int, config: dict[str, Any]) -> dict[
         "self_reference_steps": self_reference_steps,
         "min_references": min_references,
         "max_references": max_references,
+        "reference_count_weights": config.get("reference_count_weights"),
     }
 
 

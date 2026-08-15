@@ -31,6 +31,7 @@ from anima_style_data.style_transfer import (
     _reference_flow_direction_loss,
     _reference_flow_rank_loss,
     _reference_flow_residual_mse_loss,
+    _reference_count_distribution,
     _resolve_training_resume_checkpoint,
     _save_training_state,
     _sample_flow_timesteps,
@@ -603,6 +604,22 @@ def test_full_training_curriculum_uses_requested_reference_ranges_and_two_ramps(
     final = _self_reference_curriculum_state(20000, config)
     assert final["phase"] == "target_excluded"
     assert final["target_probability"] == 0.0
+
+
+def test_reference_count_weights_are_renormalized_for_active_phase():
+    weights = [0.40, 0.25, 0.12, 0.08, 0.05, 0.04, 0.03, 0.03]
+
+    counts, probabilities = _reference_count_distribution(1, 4, weights)
+
+    assert counts == [1, 2, 3, 4]
+    assert probabilities == pytest.approx([
+        0.40 / 0.85,
+        0.25 / 0.85,
+        0.12 / 0.85,
+        0.08 / 0.85,
+    ])
+    _, final_probabilities = _reference_count_distribution(1, 8, weights)
+    assert final_probabilities == pytest.approx(weights)
 
 
 def test_target_inclusion_replaces_reference_instead_of_exceeding_total_count():

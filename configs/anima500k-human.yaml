@@ -1026,6 +1026,9 @@ pure_token_style_tokenizer_v2:
       target_anneal_end: 20000
       target_anneal_min_references: 1
       target_anneal_max_references: 8
+      # Favor the common one-reference use case while retaining enough
+      # multi-reference exposure to teach evidence aggregation.
+      reference_count_weights: [0.40, 0.25, 0.12, 0.08, 0.05, 0.04, 0.03, 0.03]
     # Standard flow MSE remains the primary objective. These target-conditioned
     # auxiliaries prevent the already-good frozen base from making a near-zero
     # conditional correction the safest solution during exact-self bootstrap.
@@ -1049,14 +1052,15 @@ pure_token_style_tokenizer_v2:
     validation_batches: 8
     checkpoint_every: 500
     sample_every: 500
+    external_sample_every: 1000
     resume: true
     wandb:
       enabled: true
       project: anima-style-adapter
-      # The first run logged through step 520 after saving step 500. Resume
-      # the checkpoint in a new run so W&B does not reject rewound steps.
-      name: pure-token-style-tokenizer-v2-32slot-resume500-consistency-v1
-      id: pure-token-style-tokenizer-v2-32slot-resume500-consistency-v1
+      # Resume the exact step-4000 optimizer/RNG state in a fresh W&B run;
+      # the prior run contains post-checkpoint logs that must not be rewound.
+      name: pure-token-style-tokenizer-v2-32slot-resume4000-external-samples-v1
+      id: pure-token-style-tokenizer-v2-32slot-resume4000-external-samples-v1
   consistency_evaluation:
     enabled: true
     every: 250
@@ -1097,7 +1101,7 @@ external_style_tokenizer_sheet:
   width: 832
   height: 1024
   cfg: 4.0
-  style_multipliers: [1.0, 1.5, 2.0]
+  style_multipliers: [1.0]
   steps: 30
   flow_shift: 3.0
   seed: 20260822

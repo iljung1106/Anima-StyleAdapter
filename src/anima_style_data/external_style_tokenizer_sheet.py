@@ -270,18 +270,36 @@ def _denoise_batch(
                 padding_mask=padding_mask,
                 target_input_ids=None,
             ).float()
-            conditioned = anima(
-                x,
-                timestep,
-                context=positive,
-                padding_mask=padding_mask,
-                target_input_ids=None,
-            ).float()
             if style_context is None:
+                conditioned = anima(
+                    x,
+                    timestep,
+                    context=positive,
+                    padding_mask=padding_mask,
+                    target_input_ids=None,
+                ).float()
                 velocity = unconditioned + cfg_scale * (
                     conditioned - unconditioned
                 )
+            elif style_multiplier == 1.0:
+                styled = anima(
+                    x,
+                    timestep,
+                    context=style_context,
+                    padding_mask=padding_mask,
+                    target_input_ids=None,
+                ).float()
+                velocity = unconditioned + cfg_scale * (
+                    styled - unconditioned
+                )
             else:
+                conditioned = anima(
+                    x,
+                    timestep,
+                    context=positive,
+                    padding_mask=padding_mask,
+                    target_input_ids=None,
+                ).float()
                 styled = anima(
                     x,
                     timestep,
@@ -492,6 +510,153 @@ def _make_sheet(
     return sheet
 
 
+def _pixel_rms_from_baseline(
+    base: Image.Image, images: list[Image.Image]
+) -> list[float]:
+    baseline = np.asarray(base, dtype=np.float32)
+    return [
+        float(
+            np.sqrt(
+                np.mean(
+                    (np.asarray(image, dtype=np.float32) - baseline) ** 2
+                )
+            )
+            / 255.0
+        )
+        for image in images
+    ]
+
+
+def prepare_live_external_style_sample(
+    config: dict[str, Any], destination: Path, device: str
+) -> dict[str, Any]:
+    """Load the fixed external-reference inputs once for periodic training QA."""
+
+    cfg = dict(config["external_style_tokenizer_sheet"])
+    cfg["include_small"] = False
+    cfg["style_multipliers"] = [1.0]
+    cache_output = destination / str(cfg["output_directory"])
+    cache_output.mkdir(parents=True, exist_ok=True)
+    reference_root = Path(str(cfg["reference_directory"]))
+    if not reference_root.is_absolute():
+        reference_root = destination / reference_root
+    paths = _reference_paths(reference_root)
+
+    token_cache = cache_output / "reference_resampler_tokens.pt"
+    reference_tokens = None
+    if token_cache.exists():
+        cached = torch.load(token_cache, map_location="cpu", weights_only=True)
+        if tuple(cached.shape) == (7, 128, 1024) and torch.isfinite(cached).all():
+            reference_tokens = cached
+            print("reused live external reference token cache", flush=True)
+    if reference_tokens is None:
+        reference_tokens = _extract_reference_tokens(
+            config, destination, paths, cache_output, device
+        )
+    positive, negative, length = _encode_text_conditions(
+        config, destination, cfg, cache_output, device
+    )
+    return {
+        "cfg": cfg,
+        "paths": paths,
+        "reference_tokens": reference_tokens,
+        "positive": positive,
+        "negative": negative,
+        "length": length,
+    }
+
+
+def generate_live_external_style_sample(
+    prepared: dict[str, Any],
+    config: dict[str, Any],
+    destination: Path,
+    anima: torch.nn.Module,
+    tokenizer: QueryStyleTokenizerV2,
+    training_output: Path,
+    device: str,
+    step: int,
+) -> dict[str, Any]:
+    """Render the fixed 1x external-reference sheet from an in-memory tokenizer."""
+
+    cfg = dict(prepared["cfg"])
+    cfg["style_multipliers"] = [1.0]
+    was_training = tokenizer.training
+    tokenizer.eval()
+    references = prepared["reference_tokens"][:, None].to(
+        device, dtype=torch.bfloat16, non_blocking=True
+    )
+    mask = torch.ones(7, 1, device=device, dtype=torch.bool)
+    try:
+        with torch.inference_mode(), torch.autocast(
+            "cuda", dtype=torch.bfloat16, enabled=device.startswith("cuda")
+        ):
+            output = tokenizer(references, mask)
+            tokens = output if isinstance(output, torch.Tensor) else output.tokens
+        current_tokens = tokens.to("cpu", dtype=torch.bfloat16).contiguous()
+    finally:
+        if was_training:
+            tokenizer.train()
+
+    latent_groups = _generate_latents(
+        anima,
+        prepared["positive"],
+        prepared["negative"],
+        int(prepared["length"]),
+        None,
+        current_tokens,
+        cfg,
+        device,
+    )
+    decoded = _decode_latents(
+        config,
+        destination,
+        latent_groups,
+        device,
+        int(cfg.get("vae_batch_size", 4)),
+    )
+    base = decoded["base"][0]
+    current = decoded["large_1x"]
+    output_dir = training_output / "external_reference_samples" / f"step-{step:07d}"
+    raw_dir = output_dir / "generated"
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    base.save(raw_dir / "no-style.png")
+    for index, image in enumerate(current, start=1):
+        image.save(raw_dir / f"large_1x-TestSample{index}.png")
+
+    size = (int(cfg["width"]), int(cfg["height"]))
+    sheet = _make_sheet(prepared["paths"], base, None, current, size)
+    expected = (size[0] * 8, size[1] * 2)
+    if sheet.size != expected:
+        raise RuntimeError(f"Unexpected live sheet size: {sheet.size} != {expected}")
+    sheet_path = output_dir / "style-tokenizer-external-1x.png"
+    sheet.save(sheet_path, compress_level=4)
+    rms = _pixel_rms_from_baseline(base, current)
+    summary = {
+        "step": step,
+        "sheet": str(sheet_path),
+        "sheet_width": sheet.width,
+        "sheet_height": sheet.height,
+        "cell_width": size[0],
+        "cell_height": size[1],
+        "prompt": str(cfg["prompt"]),
+        "negative_prompt": str(cfg["negative_prompt"]),
+        "cfg": float(cfg["cfg"]),
+        "style_multiplier": 1.0,
+        "steps": int(cfg["steps"]),
+        "seed": int(cfg["seed"]),
+        "pixel_rms_from_baseline": rms,
+        "mean_pixel_rms_from_baseline": float(np.mean(rms)),
+    }
+    (output_dir / "summary.json").write_text(
+        json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    del references, current_tokens, latent_groups, decoded
+    gc.collect()
+    if device.startswith("cuda"):
+        torch.cuda.empty_cache()
+    return summary
+
+
 def generate_external_style_tokenizer_sheet(
     config: dict[str, Any], destination: Path
 ) -> dict[str, Any]:
@@ -595,21 +760,9 @@ def generate_external_style_tokenizer_sheet(
         )
         sheet.save(sheet_path, compress_level=4)
         sheets[suffix] = str(sheet_path)
-        pixel_rms[suffix] = [
-            float(
-                np.sqrt(
-                    np.mean(
-                        (
-                            np.asarray(image, dtype=np.float32)
-                            - np.asarray(base_images[0], dtype=np.float32)
-                        )
-                        ** 2
-                    )
-                )
-                / 255.0
-            )
-            for image in current_images
-        ]
+        pixel_rms[suffix] = _pixel_rms_from_baseline(
+            base_images[0], current_images
+        )
     summary = {
         "sheets": sheets,
         "sheet_width": expected[0],
