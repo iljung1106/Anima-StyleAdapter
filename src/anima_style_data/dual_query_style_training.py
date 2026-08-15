@@ -19,15 +19,24 @@ from .dual_query_external_samples import load_dual_query_external_sample
 from .external_style_tokenizer_sheet import generate_live_external_style_sample
 from .io import write_json
 from .pure_token_injection import (
+    _aligned_velocity_losses,
+    _coefficient_floor,
     _evaluate,
-    _forward_pure_token_flow,
+    _reference_batch,
     _sample_panels,
 )
-from .query_style_tokenizer import _reference_inputs, _select_sample_episodes
+from .query_style_tokenizer import (
+    _artist_contrastive_loss,
+    _reference_inputs,
+    _select_sample_episodes,
+    _slot_diversity_loss,
+)
+from .style_tokenizer import _flow_metrics, insert_style_tokens
 from .style_transfer import (
     _learning_rate_multiplier,
     _optimize_frozen_anima,
     _resolve_anima_model,
+    _sample_flow_timesteps,
 )
 
 
@@ -112,6 +121,183 @@ def _subset_consistency(
         1.0
         - F.cosine_similarity(first.float(), second.float(), dim=-1)
     ).mean()
+
+
+def _forward_dual_query_flow(
+    anima: torch.nn.Module,
+    tokenizer: DualQuerySetStyleTokenizer,
+    batch: dict[str, Any],
+    device: str,
+    training: dict[str, Any],
+    *,
+    generator: torch.Generator,
+    step: int,
+    measure_base: bool,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    latents = batch["latents"].to(
+        device, dtype=torch.bfloat16, non_blocking=True
+    )
+    conditioning = batch["conditioning"].to(
+        device, dtype=torch.bfloat16, non_blocking=True
+    )
+    conditioning_lengths = batch["conditioning_lengths"].to(
+        device, non_blocking=True
+    )
+    references, reference_mask, include_target, curriculum = _reference_batch(
+        batch, device, "curriculum", step, training, generator
+    )
+    noise = torch.randn(
+        latents.shape, device=device, dtype=latents.dtype, generator=generator
+    )
+    timesteps = _sample_flow_timesteps(
+        latents.shape[0], device, training, generator
+    )
+    sigma = timesteps[:, None, None, None].to(latents.dtype)
+    noisy = (1 - sigma) * latents + sigma * noise
+    target = (noise - latents).float()
+    padding_mask = torch.zeros(
+        latents.shape[0], 1, latents.shape[-2], latents.shape[-1],
+        device=device, dtype=latents.dtype,
+    )
+
+    def autocast_context():
+        return torch.autocast(
+            device_type=torch.device(device).type,
+            dtype=torch.bfloat16,
+            enabled=torch.device(device).type == "cuda",
+        )
+
+    direct_active = step <= int(training.get("direct_auxiliary_end_step", 2000))
+    normalized_weight = (
+        float(training.get("normalized_residual_weight", 0.0))
+        if direct_active else 0.0
+    )
+    floor_weight = (
+        float(training.get("aligned_floor_weight", 0.0))
+        if direct_active else 0.0
+    )
+    needs_base = measure_base or normalized_weight > 0 or floor_weight > 0
+    base_prediction = None
+    # Run the no-grad baseline before retaining the styled graph. This avoids
+    # holding the trainable forward's activations during a second Anima pass.
+    if needs_base:
+        with torch.no_grad(), autocast_context():
+            base_prediction = anima(
+                noisy.unsqueeze(2), timesteps.to(latents.dtype),
+                context=conditioning, padding_mask=padding_mask,
+                target_input_ids=None,
+            ).squeeze(2).float()
+    with autocast_context():
+        output = tokenizer(references, reference_mask)
+        styled = insert_style_tokens(
+            conditioning, conditioning_lengths, output.tokens
+        )
+        prediction = anima(
+            noisy.unsqueeze(2), timesteps.to(latents.dtype),
+            context=styled, padding_mask=padding_mask, target_input_ids=None,
+        ).squeeze(2).float()
+    flow_loss = F.mse_loss(prediction, target)
+    total = flow_loss
+
+    normalized = flow_loss.new_zeros(())
+    floor = flow_loss.new_zeros(())
+    direct_metrics = {
+        "aligned_coefficient": flow_loss.new_zeros(()),
+        "aligned_floor_violation": flow_loss.new_zeros(()),
+        "target_auxiliary_fraction": include_target.float().mean(),
+    }
+    if normalized_weight > 0 or floor_weight > 0:
+        assert base_prediction is not None
+        normalized, floor, direct_metrics = _aligned_velocity_losses(
+            prediction,
+            base_prediction,
+            target,
+            include_target,
+            coefficient_floor=_coefficient_floor(step, training),
+            huber_beta=float(training.get("normalized_residual_huber_beta", 0.1)),
+            scale_floor=float(training.get("normalized_residual_scale_floor", 1e-4)),
+        )
+        total = total + normalized_weight * normalized + floor_weight * floor
+
+    diversity_weight = float(training.get("slot_diversity_weight", 0.0))
+    diversity = _slot_diversity_loss(output.tokens)
+    total = total + diversity_weight * diversity
+
+    contrastive = flow_loss.new_zeros(())
+    positive = flow_loss.new_zeros(())
+    negative = flow_loss.new_zeros(())
+    contrastive_weight = 0.0
+    contrastive_every = max(1, int(training.get("artist_contrastive_every", 2)))
+    if (
+        float(training.get("artist_contrastive_weight", 0.0)) > 0
+        and step % contrastive_every == 0
+        and output.tokens.shape[0] > 1
+    ):
+        heldout, heldout_mask = _reference_inputs(batch, device, "heldout")
+        target_tokens = batch["cached_target_tokens"].to(
+            device, dtype=torch.bfloat16, non_blocking=True
+        )
+        with autocast_context():
+            target_output = (
+                output
+                if bool(curriculum.get("target_only", False))
+                else tokenizer(
+                    target_tokens[:, None],
+                    torch.ones(
+                        target_tokens.shape[0], 1,
+                        device=device, dtype=torch.bool,
+                    ),
+                )
+            )
+            heldout_output = tokenizer(heldout, heldout_mask)
+        contrastive, contrastive_metrics = _artist_contrastive_loss(
+            target_output.tokens,
+            heldout_output.tokens,
+            [str(item.style_id) for item in batch["episodes"]],
+            float(training.get("artist_contrastive_temperature", 0.1)),
+        )
+        positive = contrastive_metrics["artist_positive_similarity"]
+        negative = contrastive_metrics["artist_negative_similarity"]
+        contrastive_weight = float(training["artist_contrastive_weight"])
+        total = total + contrastive_weight * contrastive
+
+    metrics = {
+        "loss": total.detach(),
+        "flow_loss": flow_loss.detach(),
+        "normalized_residual_loss": normalized.detach(),
+        "normalized_residual_weight": flow_loss.new_tensor(normalized_weight),
+        "aligned_floor_loss": floor.detach(),
+        "aligned_floor_weight": flow_loss.new_tensor(floor_weight),
+        **{key: value.detach() for key, value in direct_metrics.items()},
+        "artist_contrastive_loss": contrastive.detach(),
+        "artist_contrastive_weight": flow_loss.new_tensor(contrastive_weight),
+        "artist_positive_similarity": positive.detach(),
+        "artist_negative_similarity": negative.detach(),
+        "slot_diversity_loss": diversity.detach(),
+        "style_token_rms": output.tokens.detach().float().square().mean().sqrt(),
+        "references": reference_mask.sum(dim=1).float().mean(),
+        "reference_count_1_fraction": (
+            reference_mask.sum(dim=1) == 1
+        ).float().mean(),
+        "reference_count_2_fraction": (
+            reference_mask.sum(dim=1) == 2
+        ).float().mean(),
+        "target_inclusion": include_target.float().mean(),
+        "target_probability": flow_loss.new_tensor(
+            float(curriculum["target_probability"])
+        ),
+        "timestep_mean": timesteps.detach().mean(),
+    }
+    if base_prediction is not None:
+        metrics.update(
+            {
+                key: value.detach()
+                for key, value in _flow_metrics(
+                    prediction.detach(), base_prediction, target
+                ).items()
+            }
+        )
+    return total, metrics
 
 
 def _selection_score(row: dict[str, Any]) -> float:
@@ -252,6 +438,7 @@ def _train_variant(
     completed = start_step
     run_started = time.perf_counter()
     running: dict[str, float] = defaultdict(float)
+    running_counts: dict[str, int] = defaultdict(int)
     running_steps = 0
     try:
         for step in range(start_step + 1, steps + 1):
@@ -267,7 +454,7 @@ def _train_variant(
                 generator = torch.Generator(device=device).manual_seed(
                     seed + step * 100_003 + micro
                 )
-                loss, metrics = _forward_pure_token_flow(
+                loss, metrics = _forward_dual_query_flow(
                     anima,
                     tokenizer,
                     batch,
@@ -275,8 +462,7 @@ def _train_variant(
                     training,
                     generator=generator,
                     step=step,
-                    mode="curriculum",
-                    train_auxiliaries=True,
+                    measure_base=(step == 1 or step % log_every == 0),
                 )
                 consistency_weight = (
                     float(training.get("subset_consistency_weight", 0.0))
@@ -302,11 +488,17 @@ def _train_variant(
                     running[key] += float(
                         torch.stack([row[key] for row in micro_rows]).mean()
                     )
+                    running_counts[key] += 1
             running["grad_norm"] += float(grad_norm)
+            running_counts["grad_norm"] += 1
             running["step_s"] += time.perf_counter() - step_started
+            running_counts["step_s"] += 1
             running_steps += 1
             if step == 1 or step % log_every == 0:
-                averaged = {key: value / running_steps for key, value in running.items()}
+                averaged = {
+                    key: value / running_counts[key]
+                    for key, value in running.items()
+                }
                 averaged["learning_rate"] = float(optimizer.param_groups[0]["lr"])
                 print(
                     f"dual-query-style step={step}/{steps} "
@@ -325,6 +517,7 @@ def _train_variant(
                         step=step,
                     )
                 running.clear()
+                running_counts.clear()
                 running_steps = 0
 
             if validation_every and (step % validation_every == 0 or step == steps):

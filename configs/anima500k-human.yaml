@@ -304,6 +304,9 @@ dual_query_style_tokenizer:
       target_anneal_min_references: 1
       target_anneal_max_references: 8
     normalized_residual_weight: 0.05
+    # Direct residual alignment needs a frozen-Anima baseline forward. Keep it
+    # for the exact-self bootstrap, then use one styled forward per microbatch.
+    direct_auxiliary_end_step: 2000
     normalized_residual_huber_beta: 0.10
     normalized_residual_scale_floor: 0.0001
     aligned_floor_weight: 0.10
@@ -335,6 +338,7 @@ dual_query_style_tokenizer:
     steps: 1000
     training_overrides:
       warmup_steps: 100
+      direct_auxiliary_end_step: 250
       validation_every: 250
       checkpoint_every: 500
       sample_every: 500

@@ -188,7 +188,10 @@ def cache_dual_query_external_references(
                 torch.ones(1, count, device=device, dtype=torch.bool),
                 torch.tensor([semantic_shape], device=device),
                 latent.unsqueeze(0).to(device),
-                torch.tensor([latent.shape[-2:]], device=device),
+                torch.tensor(
+                    [[int(latent.shape[-2]), int(latent.shape[-1])]],
+                    device=device,
+                ),
                 torch.tensor([image_size], device=device),
                 reconstruct=False,
             )
