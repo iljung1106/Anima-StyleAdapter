@@ -118,3 +118,35 @@ Controlled probe에 동일 noisy latent·prompt·timestep을 사용하는 것은
 악화되거나, common/orthogonal 성분 증가와 생성 붕괴가 나타나면 중단하고
 마지막 안정 checkpoint로 되돌린다. 이 10k run은 최종 모델 확정이 아니라
 flow-level 작가 구분과 비붕괴 학습 가능성을 검증하는 pilot으로 취급한다.
+
+## 2k 런타임 개입
+
+v1은 1,500→1,750→2,000 validation에서 heldout paired improvement와
+correct-vs-wrong advantage가 함께 하락했다. 고정 reference sheet의 baseline 대비
+pixel RMS도 step 1,000의 `0.2191`에서 step 2,000의 `0.1595`로 감소했다.
+반면 controlled artist retrieval top-1은 `1.0`, common-output ratio는
+`0.9256→0.9233`이었다. 즉 tokenizer에는 작가 구분 정보가 남았지만 Anima가
+사용하는 flow 방향과 효과 크기가 약해진 것으로 판단한다.
+
+원시 학습 loss를 확인하면 step 2,000에서 normalized residual의 평균 기여는
+약 `0.0094`, token contrastive는 약 `0.0010`이지만 aligned floor는 약
+`0.00007`, cyclic direction/common 항은 각각 대략 `1e-5` 수준이었다. 또한
+기존 cyclic 구현은 cosine direction만 비교하고 실제 flow MSE advantage를
+직접 최적화하지 않았다.
+
+따라서 v1 step 1,500을 마지막 안정 초기값으로 보존하고 v2를 이어간다.
+
+- cyclic wrong-reference 항에 normalized correct-vs-wrong flow-improvement
+  ranking을 추가하며 wrong prediction은 계속 detach한다.
+- ranking 대상 행을 2→4, 최종 weight를 `0.00075→0.003`으로 높인다.
+- heldout aligned-floor weight를 `0.075→0.30`, bounded-effect weight를
+  `0.015→0.03`으로 높여 출력 축소 shortcut을 막는다.
+- 이미 포화된 token contrastive를 `0.01→0.005`, subset consistency를
+  `0.003→0.0015`로 낮춰 Anima가 사용하지 않는 토큰 방향이 주목적을
+  압도하지 않도록 한다.
+- common-output penalty와 나머지 커리큘럼은 그대로 유지한다.
+
+v1 산출물은 삭제하거나 덮어쓰지 않으며, v2는 별도 output/W&B run에서
+step 1,500 optimizer·RNG 상태를 복원한다. step 1,750/2,000/2,250의 같은
+validation과 step 2,000 fixed sheet로 개입 효과를 먼저 확인한 뒤 10k까지
+계속한다.

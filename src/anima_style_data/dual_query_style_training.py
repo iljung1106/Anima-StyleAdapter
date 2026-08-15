@@ -240,6 +240,32 @@ def _common_output_loss(
     }
 
 
+def _artist_flow_ranking_loss(
+    prediction: torch.Tensor,
+    wrong_prediction: torch.Tensor,
+    base_prediction: torch.Tensor,
+    target: torch.Tensor,
+    *,
+    margin: float,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Rank the correct reference above a detached wrong artist in flow space."""
+
+    dimensions = tuple(range(1, prediction.ndim))
+    base_error = (
+        (base_prediction - target).square().mean(dim=dimensions).clamp_min(1e-8)
+    )
+    correct_error = (prediction - target).square().mean(dim=dimensions)
+    wrong_error = (wrong_prediction.detach() - target).square().mean(dim=dimensions)
+    correct_improvement = (base_error - correct_error) / base_error.detach()
+    wrong_improvement = (base_error - wrong_error) / base_error.detach()
+    advantage = correct_improvement - wrong_improvement
+    return F.relu(float(margin) - advantage).mean(), {
+        "artist_correct_flow_improvement": correct_improvement.detach().mean(),
+        "artist_wrong_flow_improvement": wrong_improvement.detach().mean(),
+        "artist_flow_improvement_advantage": advantage.detach().mean(),
+    }
+
+
 def _pilot_common_output_step(
     anima: torch.nn.Module,
     tokenizer: DualQuerySetStyleTokenizer,
@@ -538,6 +564,10 @@ def _forward_dual_query_flow(
         "artist_wrong_direction_cosine": flow_loss.new_zeros(()),
         "artist_centered_direction_cosine": flow_loss.new_zeros(()),
         "artist_direction_ranking_loss": flow_loss.new_zeros(()),
+        "artist_flow_ranking_loss": flow_loss.new_zeros(()),
+        "artist_correct_flow_improvement": flow_loss.new_zeros(()),
+        "artist_wrong_flow_improvement": flow_loss.new_zeros(()),
+        "artist_flow_improvement_advantage": flow_loss.new_zeros(()),
     }
     ranking_start = int(training.get("wrong_ranking_start_step", 1000))
     ranking_every = max(1, int(training.get("wrong_ranking_every", 4)))
@@ -568,6 +598,18 @@ def _forward_dual_query_flow(
             margin=float(training.get("wrong_ranking_margin", 0.02)),
             centered_weight=float(training.get("wrong_centered_weight", 0.10)),
         )
+        flow_ranking, flow_ranking_metrics = _artist_flow_ranking_loss(
+            prediction[:rows],
+            wrong_prediction,
+            base_prediction[:rows],
+            target[:rows],
+            margin=float(training.get("wrong_flow_ranking_margin", 0.01)),
+        )
+        direction_metrics["artist_flow_ranking_loss"] = flow_ranking.detach()
+        direction_metrics.update(flow_ranking_metrics)
+        direction_loss = direction_loss + float(
+            training.get("wrong_flow_ranking_weight", 1.0)
+        ) * flow_ranking
         direction_weight = _linear_ramp(
             step,
             start_step=ranking_start,
@@ -714,6 +756,28 @@ def _train_variant(
     resume_state = None
     if bool(training.get("resume", True)) and state_path.exists():
         resume_state = torch.load(state_path, map_location="cpu", weights_only=False)
+    elif training.get("initial_checkpoint"):
+        initial_path = Path(str(training["initial_checkpoint"]))
+        if not initial_path.is_absolute():
+            initial_path = destination / initial_path
+        resume_state = torch.load(initial_path, map_location="cpu", weights_only=False)
+        initial_history = training.get("initial_history")
+        if initial_history and not history:
+            initial_history_path = Path(str(initial_history))
+            if not initial_history_path.is_absolute():
+                initial_history_path = destination / initial_history_path
+            source_history = json.loads(initial_history_path.read_text("utf-8"))
+            history = [
+                row
+                for row in source_history
+                if int(row.get("step", 0)) <= int(resume_state["step"])
+            ]
+        print(
+            f"initializing {output_name} from {initial_path} "
+            f"at step {int(resume_state['step'])}",
+            flush=True,
+        )
+    if resume_state is not None:
         recorded = bool(resume_state["config"]["model"]["include_artist_summary"])
         if recorded != include_artist_summary:
             raise RuntimeError("Cannot resume another artist-summary ablation branch")

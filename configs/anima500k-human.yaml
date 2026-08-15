@@ -360,7 +360,7 @@ dual_query_style_tokenizer:
   # Summary-ON 10k pilot. This is intentionally isolated from the historical
   # 20k/A-B settings above so checkpoints and W&B histories cannot cross-resume.
   pilot:
-    output_directory: dual_query_style_tokenizer_summary_on_10k_pilot_v1
+    output_directory: dual_query_style_tokenizer_summary_on_10k_pilot_v2
     steps: 10000
     training:
       device: cuda
@@ -370,6 +370,8 @@ dual_query_style_tokenizer:
       gradient_accumulation_steps: 4
       max_grad_norm: 1.0
       resume: true
+      initial_checkpoint: dual_query_style_tokenizer_summary_on_10k_pilot_v1/checkpoints/step-0001500.pt
+      initial_history: dual_query_style_tokenizer_summary_on_10k_pilot_v1/history.json
       reference_schedule:
         - name: exact_self
           end_step: 500
@@ -399,7 +401,7 @@ dual_query_style_tokenizer:
       exact_aligned_floor_weight: 0.25
       exact_aligned_floor_start: 0.02
       exact_aligned_floor_end: 0.15
-      heldout_aligned_floor_weight: 0.075
+      heldout_aligned_floor_weight: 0.30
       heldout_aligned_floor_start: 0.03
       heldout_aligned_floor_end: 0.06
       bounded_effect_every: 4
@@ -408,27 +410,29 @@ dual_query_style_tokenizer:
       exact_bounded_weight: 0.05
       heldout_bounded_min: 0.05
       heldout_bounded_max: 0.20
-      heldout_bounded_weight: 0.015
+      heldout_bounded_weight: 0.03
       bounded_orthogonal_maximum: 0.12
       bounded_orthogonal_weight: 0.25
       wrong_ranking_start_step: 1000
       wrong_ranking_ramp_steps: 1000
       wrong_ranking_every: 4
-      wrong_ranking_batch_rows: 2
-      wrong_ranking_weight: 0.00075
+      wrong_ranking_batch_rows: 4
+      wrong_ranking_weight: 0.003
       wrong_ranking_margin: 0.02
       wrong_centered_weight: 0.10
+      wrong_flow_ranking_margin: 0.01
+      wrong_flow_ranking_weight: 1.0
       common_output_start_step: 1500
       common_output_ramp_steps: 1000
       common_output_every: 8
       common_output_batch_rows: 4
       common_output_threshold: 0.70
       common_output_weight: 0.002
-      artist_contrastive_weight: 0.01
+      artist_contrastive_weight: 0.005
       artist_contrastive_temperature: 0.10
       artist_contrastive_every: 2
       slot_diversity_weight: 0.001
-      subset_consistency_weight: 0.003
+      subset_consistency_weight: 0.0015
       subset_consistency_start: 501
       log_every: 10
       validation_every: 250
@@ -446,8 +450,8 @@ dual_query_style_tokenizer:
       wandb:
         enabled: true
         project: anima-style-adapter
-        name: dual-query-style-tokenizer-summary-on-10k-pilot-v1
-        id: dual-query-style-tokenizer-summary-on-10k-pilot-v1
+        name: dual-query-style-tokenizer-summary-on-10k-pilot-v2
+        id: dual-query-style-tokenizer-summary-on-10k-pilot-v2
   fixed_reference_sampling:
     cache_directory: dual_query_external_reference_cache_v1
     device: cuda

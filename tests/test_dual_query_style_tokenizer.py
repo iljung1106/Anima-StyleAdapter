@@ -8,6 +8,7 @@ from anima_style_data.dual_query_style_tokenizer import (  # noqa: E402
     DualQuerySetStyleTokenizer,
 )
 from anima_style_data.dual_query_style_training import (  # noqa: E402
+    _artist_flow_ranking_loss,
     _bounded_aligned_effect_loss,
     _common_output_loss,
     _pilot_alignment_state,
@@ -155,3 +156,21 @@ def test_common_output_hinge_distinguishes_shared_and_centered_artist_effects():
     assert shared_loss > 0
     assert centered_metrics["common_output_ratio"] == pytest.approx(0.0, abs=1e-7)
     assert centered_loss.item() == pytest.approx(0.0, abs=1e-7)
+
+
+def test_artist_flow_ranking_prefers_the_correct_reference_without_moving_wrong():
+    target = torch.ones(2, 1, 2, 2)
+    base = torch.zeros_like(target)
+    correct = torch.full_like(target, 0.2, requires_grad=True)
+    wrong = torch.full_like(target, 0.4, requires_grad=True)
+
+    loss, metrics = _artist_flow_ranking_loss(
+        correct, wrong, base, target, margin=0.10
+    )
+    loss.backward()
+
+    assert loss > 0
+    assert metrics["artist_flow_improvement_advantage"] < 0
+    assert correct.grad is not None and correct.grad.abs().sum() > 0
+    assert torch.isfinite(correct.grad).all()
+    assert wrong.grad is None
