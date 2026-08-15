@@ -771,6 +771,8 @@ def train_dual_query_resampler(
                     f"proxy={logged['train/artist_proxy']:.4f}/"
                     f"{logged['train/artist_proxy_top1']:.3f} "
                     f"desc_std={logged['train/descriptor_dimension_std']:.4f} "
+                    f"teacher={logged['train/input_teacher_alignment']:.4f}/"
+                    f"{logged['train/teacher_dimension_std']:.4f} "
                     f"step_s={logged['perf/step_s']:.3f} "
                     f"wait_s={logged['perf/data_wait_s']:.3f}",
                     flush=True,

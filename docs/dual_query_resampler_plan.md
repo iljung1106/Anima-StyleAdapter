@@ -49,6 +49,8 @@ L = L_semantic_reconstruction
 
 초기 방향 신호로 C-RADIO L18/L24 masked spatial mean과 VAE channel mean/std를 concatenate한 뒤 고정 random projection한 descriptor를 사용한다. Student descriptor와 artist-summary descriptor에는 이 입력별 teacher 방향을 약하게 직접 정렬한다. 이 teacher는 학습 가능한 분류 head가 아니므로 공통 출력 쪽으로 이동할 수 없으며, prototype/SupCon이 같은 작가에서 유지되는 성분을 별도로 선택한다.
 
+실측 teacher 분포는 same-artist cosine `0.917`, different-artist `0.866`, 차원별 표준편차 `0.0147`이다. Bootstrap에서는 `L_artist` 내부 teacher weight를 `20`으로 두고 variance 하한은 descriptor `0.012`, summary `0.008`로 맞춘다. 정렬이 형성된 뒤 teacher weight 축소 여부는 held-out artist gap을 보고 결정한다.
+
 위 가중치는 초기값이며 raw loss가 아닌 각 경로의 gradient norm과 validation Pareto를 기준으로 조정한다.
 
 ## 학습 단계
