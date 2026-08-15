@@ -795,7 +795,9 @@ def smoke_test_pure_token_style_tokenizer(
     smoke = copy.deepcopy(config)
     cfg = smoke["pure_token_style_tokenizer_v2"]
     cfg["output_directory"] = "pure_token_style_tokenizer_v2_smoke"
-    cfg["loader"]["batch_size"] = 1
+    # Wrong-artist validation rotates donors within a batch and therefore
+    # requires at least two distinct rows even in the minimal real-Anima run.
+    cfg["loader"]["batch_size"] = 2
     cfg["training"].update({
         "steps": 2,
         "gradient_accumulation_steps": 1,
