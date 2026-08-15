@@ -141,7 +141,7 @@ style_features:
 # B-prime per-reference encoder. C-RADIO spatial features and Qwen Image VAE
 # latents remain separate K/V banks; learned spatial/global queries read both.
 dual_query_resampler:
-  output_directory: dual_query_resampler_bprime_v7
+  output_directory: dual_query_resampler_bprime_v8
   feature_directory: style_features_l18_l24_siglip_l24
   latent_directory: anima_latent_cache_qwen_2d
   seed: 20260815
@@ -160,16 +160,16 @@ dual_query_resampler:
     vae_dropout: 0.10
   training:
     device: cuda
-    steps: 20000
+    steps: 10000
     training_artist_count: 3000
     validation_artist_count: 150
     images_per_artist_limit: 15
-    artists_per_batch: 4
+    artists_per_batch: 16
     images_per_artist: 2
     train_split: train
     validation_split: validation
     learning_rate: 0.0001
-    warmup_steps: 500
+    warmup_steps: 250
     minimum_lr_ratio: 0.1
     weight_decay: 0.01
     betas: [0.9, 0.95]
@@ -177,11 +177,22 @@ dual_query_resampler:
     fused_adamw: true
     max_grad_norm: 1.0
     semantic_reconstruction_sample_tokens: 192
-    vae_reconstruction_weight: 0.10
-    artist_weight: 0.05
+    # Reconstruction remains active for the entire run. The VAE decoder now
+    # carries twice the previous weight so local appearance is not eclipsed by
+    # C-RADIO semantic reconstruction.
+    semantic_reconstruction_weight: 1.0
+    vae_reconstruction_weight: 0.20
+    # After the bootstrap, shift capacity toward artist-consistent structure.
+    artist_weight: 0.10
+    artist_weight_initial: 0.05
+    artist_weight_ramp_start: 250
+    artist_weight_ramp_end: 1000
     token_diversity_weight: 0.01
     prototype_scale: 16.0
     prototype_margin: 0.10
+    prototype_margin_initial: 0.0
+    prototype_margin_ramp_start: 250
+    prototype_margin_ramp_end: 1000
     contrastive_fraction: 0.25
     contrastive_temperature: 0.10
     # VICReg-style variance prevents the normalized artist descriptors from
@@ -192,10 +203,18 @@ dual_query_resampler:
     artist_proxy_margin: 0.10
     descriptor_variance_target: 0.012
     summary_variance_target: 0.008
+    descriptor_variance_epsilon: 0.000001
     descriptor_variance_weight: 50.0
     summary_artist_fraction: 0.25
-    input_teacher_weight: 20.0
-    summary_teacher_weight: 20.0
+    # A centered input teacher only breaks the initial common-direction
+    # collapse. It is removed once prototype supervision has a useful signal.
+    input_teacher_weight: 0.0
+    input_teacher_weight_initial: 20.0
+    input_teacher_weight_ramp_start: 250
+    input_teacher_weight_ramp_end: 1000
+    summary_teacher_weight: 0.0
+    teacher_center_samples: 4096
+    teacher_center_batch_size: 32
     artist_head_lr_scale: 4.0
     prefetch_workers: 2
     prefetch_batches: 4
@@ -207,8 +226,8 @@ dual_query_resampler:
     wandb:
       enabled: true
       project: anima-style-adapter
-      name: dual-query-resampler-bprime-v7-teacher-bootstrap
-      id: dual-query-resampler-bprime-v7-teacher-bootstrap
+      name: dual-query-resampler-bprime-v8-balanced-bootstrap
+      id: dual-query-resampler-bprime-v8-balanced-bootstrap
 
 # External controlled benchmark. Each group contains one image from the shard
 # artist and three images of the same character(s) from different artists.

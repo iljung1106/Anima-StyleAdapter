@@ -13,6 +13,7 @@ from anima_style_data.dual_query_resampler import (
 )
 from anima_style_data.dual_query_training import (
     _descriptor_variance_loss,
+    _scheduled_value,
     train_dual_query_resampler,
 )
 from anima_style_data.io import write_records
@@ -180,6 +181,32 @@ def test_variance_floor_pushes_back_before_descriptor_collapse():
     assert descriptors.grad is not None
     assert torch.isfinite(descriptors.grad).all()
     assert float(descriptors.grad.abs().sum()) > 0
+
+
+def test_small_summary_variance_target_is_not_hidden_by_epsilon():
+    descriptors = torch.ones(8, 16, requires_grad=True)
+
+    loss, dimension_std = _descriptor_variance_loss(
+        descriptors, 0.008, epsilon=1e-6
+    )
+
+    assert float(dimension_std.detach()) == pytest.approx(0.001)
+    assert float(loss.detach()) > 0
+
+
+def test_loss_schedule_uses_bootstrap_then_reaches_final_value():
+    config = {
+        "artist_weight": 0.10,
+        "artist_weight_initial": 0.05,
+        "artist_weight_ramp_start": 500,
+        "artist_weight_ramp_end": 2000,
+    }
+
+    assert _scheduled_value(config, "artist_weight", 500, 0.05) == 0.05
+    assert _scheduled_value(config, "artist_weight", 1250, 0.05) == pytest.approx(
+        0.075
+    )
+    assert _scheduled_value(config, "artist_weight", 2000, 0.05) == 0.10
 
 
 def test_frozen_input_teacher_provides_distinct_per_image_directions():

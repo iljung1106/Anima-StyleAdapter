@@ -338,18 +338,53 @@ def _vae_reconstruction_loss(
 
 
 def _descriptor_variance_loss(
-    descriptors: torch.Tensor, target_standard_deviation: float
+    descriptors: torch.Tensor,
+    target_standard_deviation: float,
+    *,
+    epsilon: float = 1e-6,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     centered = descriptors.float() - descriptors.float().mean(dim=0, keepdim=True)
-    dimension_std = torch.sqrt(centered.square().mean(dim=0) + 1e-4)
+    dimension_std = torch.sqrt(centered.square().mean(dim=0) + epsilon)
     return F.relu(target_standard_deviation - dimension_std).mean(), dimension_std.mean()
+
+
+def _scheduled_value(
+    cfg: Mapping[str, Any], name: str, step: int, default: float
+) -> float:
+    """Linearly interpolate a loss setting without hiding its final value."""
+    final = float(cfg.get(name, default))
+    initial = float(cfg.get(f"{name}_initial", final))
+    start = int(cfg.get(f"{name}_ramp_start", 0))
+    end = int(cfg.get(f"{name}_ramp_end", start))
+    if step <= start:
+        return initial
+    if step >= end:
+        return final
+    fraction = (step - start) / max(1, end - start)
+    return initial + fraction * (final - initial)
 
 
 def _losses(
     model: DualQueryResampler,
     episode: CacheEpisode,
     cfg: Mapping[str, Any],
+    *,
+    step: int = 0,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    prototype_margin = _scheduled_value(
+        cfg, "prototype_margin", step, 0.10
+    )
+    input_teacher_weight = _scheduled_value(
+        cfg, "input_teacher_weight", step, 1.0
+    )
+    summary_teacher_weight = _scheduled_value(
+        cfg, "summary_teacher_weight", step, 1.0
+    )
+    artist_weight = _scheduled_value(cfg, "artist_weight", step, 0.05)
+    semantic_weight = float(cfg.get("semantic_reconstruction_weight", 1.0))
+    vae_weight = float(cfg.get("vae_reconstruction_weight", 0.10))
+    diversity_weight = float(cfg.get("token_diversity_weight", 0.01))
+    variance_epsilon = float(cfg.get("descriptor_variance_epsilon", 1e-6))
     output = model.encode(
         episode.semantic_features,
         episode.semantic_mask,
@@ -372,7 +407,7 @@ def _losses(
         output.descriptor,
         episode.labels,
         scale=float(cfg.get("prototype_scale", 16.0)),
-        margin=float(cfg.get("prototype_margin", 0.10)),
+        margin=prototype_margin,
     )
     contrastive = supervised_contrastive_loss(
         output.descriptor,
@@ -382,6 +417,7 @@ def _losses(
     variance, stabilized_descriptor_std = _descriptor_variance_loss(
         output.descriptor,
         float(cfg.get("descriptor_variance_target", 0.03)),
+        epsilon=variance_epsilon,
     )
     summary_descriptor = F.normalize(
         output.artist_summary.float().mean(dim=1), dim=-1
@@ -390,7 +426,7 @@ def _losses(
         summary_descriptor,
         episode.labels,
         scale=float(cfg.get("prototype_scale", 16.0)),
-        margin=float(cfg.get("prototype_margin", 0.10)),
+        margin=prototype_margin,
     )
     summary_contrastive = supervised_contrastive_loss(
         summary_descriptor,
@@ -400,25 +436,32 @@ def _losses(
     summary_variance, _ = _descriptor_variance_loss(
         summary_descriptor,
         float(cfg.get("summary_variance_target", 0.02)),
+        epsilon=variance_epsilon,
     )
-    teacher_descriptor, summary_teacher_descriptor = model.frozen_input_teacher(
-        episode.semantic_features,
-        episode.semantic_mask,
-        episode.vae_latents,
-        episode.vae_shapes,
-    )
-    teacher_alignment = (
-        1.0
-        - F.cosine_similarity(
-            output.descriptor.float(), teacher_descriptor.float(), dim=-1
+    if input_teacher_weight > 0 or summary_teacher_weight > 0:
+        teacher_descriptor, summary_teacher_descriptor = model.frozen_input_teacher(
+            episode.semantic_features,
+            episode.semantic_mask,
+            episode.vae_latents,
+            episode.vae_shapes,
         )
-    ).mean()
-    summary_teacher_alignment = (
-        1.0
-        - F.cosine_similarity(
-            summary_descriptor.float(), summary_teacher_descriptor.float(), dim=-1
-        )
-    ).mean()
+        teacher_alignment = (
+            1.0
+            - F.cosine_similarity(
+                output.descriptor.float(), teacher_descriptor.float(), dim=-1
+            )
+        ).mean()
+        summary_teacher_alignment = (
+            1.0
+            - F.cosine_similarity(
+                summary_descriptor.float(), summary_teacher_descriptor.float(), dim=-1
+            )
+        ).mean()
+        teacher_dimension_std = teacher_descriptor.float().std(dim=0).mean()
+    else:
+        teacher_alignment = output.descriptor.new_zeros(())
+        summary_teacher_alignment = output.descriptor.new_zeros(())
+        teacher_dimension_std = output.descriptor.new_zeros(())
     proxy = output.descriptor.new_zeros(())
     proxy_top1 = output.descriptor.new_zeros(())
     if model.artist_proxies is not None and bool((episode.class_labels >= 0).all()):
@@ -433,22 +476,21 @@ def _losses(
         + float(cfg.get("contrastive_fraction", 0.25)) * contrastive
         + float(cfg.get("artist_proxy_fraction", 0.50)) * proxy
         + float(cfg.get("descriptor_variance_weight", 50.0)) * variance
-        + float(cfg.get("input_teacher_weight", 1.0)) * teacher_alignment
+        + input_teacher_weight * teacher_alignment
         + float(cfg.get("summary_artist_fraction", 0.25))
         * (
             summary_prototype
             + float(cfg.get("contrastive_fraction", 0.25)) * summary_contrastive
             + float(cfg.get("descriptor_variance_weight", 50.0)) * summary_variance
-            + float(cfg.get("summary_teacher_weight", 1.0))
-            * summary_teacher_alignment
+            + summary_teacher_weight * summary_teacher_alignment
         )
     )
     diversity = token_diversity_loss(output.tokens)
     total = (
-        semantic
-        + float(cfg.get("vae_reconstruction_weight", 0.10)) * vae
-        + float(cfg.get("artist_weight", 0.05)) * artist
-        + float(cfg.get("token_diversity_weight", 0.01)) * diversity
+        semantic_weight * semantic
+        + vae_weight * vae
+        + artist_weight * artist
+        + diversity_weight * diversity
     )
     metrics = {
         "loss": total,
@@ -468,10 +510,20 @@ def _losses(
         "summary_variance": summary_variance,
         "input_teacher_alignment": teacher_alignment,
         "summary_teacher_alignment": summary_teacher_alignment,
-        "teacher_dimension_std": teacher_descriptor.float().std(dim=0).mean(),
+        "teacher_dimension_std": teacher_dimension_std,
         "descriptor_dimension_std": output.descriptor.float().std(dim=0).mean(),
         "token_batch_std": output.tokens.float().std(dim=0).mean(),
         "token_diversity": diversity,
+        "semantic_reconstruction_weight": output.descriptor.new_tensor(semantic_weight),
+        "vae_reconstruction_weight": output.descriptor.new_tensor(vae_weight),
+        "artist_weight": output.descriptor.new_tensor(artist_weight),
+        "input_teacher_weight": output.descriptor.new_tensor(input_teacher_weight),
+        "summary_teacher_weight": output.descriptor.new_tensor(summary_teacher_weight),
+        "prototype_margin": output.descriptor.new_tensor(prototype_margin),
+        "weighted_semantic_reconstruction": semantic_weight * semantic,
+        "weighted_vae_reconstruction": vae_weight * vae,
+        "weighted_artist": artist_weight * artist,
+        "weighted_token_diversity": diversity_weight * diversity,
         **prototype_metrics,
     }
     return total, metrics
@@ -515,6 +567,59 @@ def _cosine_learning_rate(
 
 
 @torch.no_grad()
+def _fit_teacher_input_mean(
+    model: DualQueryResampler,
+    grouped: Mapping[str, list[dict[str, Any]]],
+    feature_root: Path,
+    latent_root: Path,
+    semantic_layers: tuple[int, ...],
+    *,
+    samples: int,
+    batch_size: int,
+    device: str,
+    seed: int,
+) -> dict[str, float | int]:
+    """Estimate a fixed train-set center for the bootstrap teacher."""
+    candidates = [row for artist in sorted(grouped) for row in grouped[artist]]
+    sample_count = min(max(0, samples), len(candidates))
+    if sample_count == 0:
+        model.teacher_input_mean.zero_()
+        return {"samples": 0, "mean_norm": 0.0}
+    selected = random.Random(seed ^ 0x4C31).sample(candidates, sample_count)
+    # Adjacent shard reads make the one-time centering pass substantially cheaper.
+    selected.sort(
+        key=lambda row: (
+            str(row["feature_shard"]),
+            str(row["latent_shard"]),
+            int(row["id"]),
+        )
+    )
+    total = torch.zeros_like(model.teacher_input_mean, device="cpu", dtype=torch.float64)
+    for offset in range(0, sample_count, max(1, batch_size)):
+        rows = [
+            {**row, "episode_label": 0}
+            for row in selected[offset : offset + max(1, batch_size)]
+        ]
+        episode = _load_cache_episode(
+            rows,
+            feature_root,
+            latent_root,
+            semantic_layers,
+            pin_memory=device.startswith("cuda"),
+        ).to(device)
+        statistics = model.teacher_input_statistics(
+            episode.semantic_features,
+            episode.semantic_mask,
+            episode.vae_latents,
+            episode.vae_shapes,
+        )
+        total.add_(statistics.double().sum(dim=0).cpu())
+    mean = (total / sample_count).float()
+    model.teacher_input_mean.copy_(mean.to(model.teacher_input_mean.device))
+    return {"samples": sample_count, "mean_norm": float(mean.norm())}
+
+
+@torch.no_grad()
 def _validate(
     model: DualQueryResampler,
     grouped: Mapping[str, list[dict[str, Any]]],
@@ -525,6 +630,7 @@ def _validate(
     *,
     device: str,
     seed: int,
+    step: int,
 ) -> dict[str, float]:
     model.eval()
     totals: dict[str, float] = defaultdict(float)
@@ -547,7 +653,7 @@ def _validate(
         with torch.autocast(
             device_type="cuda", dtype=torch.bfloat16, enabled=device.startswith("cuda")
         ):
-            _, metrics = _losses(model, episode, cfg)
+            _, metrics = _losses(model, episode, cfg, step=step)
         for key, value in metrics.items():
             totals[key] += float(value)
     model.train()
@@ -635,6 +741,7 @@ def train_dual_query_resampler(
     checkpoints = output / "checkpoints"
     checkpoints.mkdir(parents=True, exist_ok=True)
     state_path = output / "training_state.pt"
+    teacher_center_path = output / "teacher_input_center.pt"
     history_path = output / "validation_history.json"
     history = json.loads(history_path.read_text("utf-8")) if history_path.exists() else []
     start_step = 0
@@ -644,6 +751,54 @@ def train_dual_query_resampler(
         optimizer.load_state_dict(state["optimizer"])
         start_step = int(state["step"])
         print(f"resuming dual-query Resampler from step {start_step}", flush=True)
+
+    teacher_center_info: dict[str, float | int]
+    if start_step > 0:
+        teacher_center_info = {
+            "samples": int(training.get("teacher_center_samples", 0)),
+            "mean_norm": float(model.teacher_input_mean.float().norm()),
+        }
+    elif teacher_center_path.exists():
+        center = torch.load(teacher_center_path, map_location="cpu", weights_only=True)
+        model.teacher_input_mean.copy_(
+            center["mean"].to(model.teacher_input_mean.device)
+        )
+        teacher_center_info = {
+            "samples": int(center["samples"]),
+            "mean_norm": float(model.teacher_input_mean.float().norm()),
+        }
+        print(
+            "loaded teacher input center "
+            f"samples={teacher_center_info['samples']} "
+            f"mean_norm={teacher_center_info['mean_norm']:.4f}",
+            flush=True,
+        )
+    else:
+        print("estimating centered bootstrap teacher statistics", flush=True)
+        teacher_center_info = _fit_teacher_input_mean(
+            model,
+            train_groups,
+            feature_root,
+            latent_root,
+            semantic_layers,
+            samples=int(training.get("teacher_center_samples", 4096)),
+            batch_size=int(training.get("teacher_center_batch_size", 32)),
+            device=device,
+            seed=seed,
+        )
+        torch.save(
+            {
+                "mean": model.teacher_input_mean.detach().cpu(),
+                "samples": teacher_center_info["samples"],
+            },
+            teacher_center_path,
+        )
+        print(
+            "centered bootstrap teacher ready "
+            f"samples={teacher_center_info['samples']} "
+            f"mean_norm={teacher_center_info['mean_norm']:.4f}",
+            flush=True,
+        )
 
     wandb_run = None
     wandb_cfg = dict(training.get("wandb", {}))
@@ -665,6 +820,7 @@ def train_dual_query_resampler(
                 "validation_images": sum(
                     len(values) for values in validation_groups.values()
                 ),
+                "teacher_center": teacher_center_info,
             },
         )
 
@@ -724,7 +880,7 @@ def train_dual_query_resampler(
                 dtype=torch.bfloat16,
                 enabled=device.startswith("cuda"),
             ):
-                loss, metrics = _losses(model, episode, training)
+                loss, metrics = _losses(model, episode, training, step=step + 1)
             if not bool(torch.isfinite(loss)):
                 raise FloatingPointError(
                     f"Non-finite dual-query loss at step {step + 1}: "
@@ -768,11 +924,15 @@ def train_dual_query_resampler(
                     f"vae={logged['train/vae_reconstruction']:.4f} "
                     f"proto={logged['train/prototype']:.4f} "
                     f"top1={logged['train/prototype_top1']:.3f} "
+                    f"raw_top1={logged['train/prototype_raw_top1']:.3f} "
                     f"proxy={logged['train/artist_proxy']:.4f}/"
                     f"{logged['train/artist_proxy_top1']:.3f} "
                     f"desc_std={logged['train/descriptor_dimension_std']:.4f} "
                     f"teacher={logged['train/input_teacher_alignment']:.4f}/"
                     f"{logged['train/teacher_dimension_std']:.4f} "
+                    f"weights={logged['train/artist_weight']:.3f}/"
+                    f"{logged['train/input_teacher_weight']:.1f}/"
+                    f"{logged['train/prototype_margin']:.3f} "
                     f"step_s={logged['perf/step_s']:.3f} "
                     f"wait_s={logged['perf/data_wait_s']:.3f}",
                     flush=True,
@@ -792,12 +952,14 @@ def train_dual_query_resampler(
                     training,
                     device=device,
                     seed=seed,
+                    step=completed,
                 )
                 history.append({"step": completed, **validation})
                 write_json(history_path, history)
                 print(
                     f"validation step={completed} loss={validation['loss']:.4f} "
                     f"prototype_top1={validation['prototype_top1']:.3f} "
+                    f"raw_top1={validation['prototype_raw_top1']:.3f} "
                     f"positive={validation['prototype_positive_cosine']:.3f} "
                     f"hard_negative={validation['prototype_hard_negative_cosine']:.3f}",
                     flush=True,
@@ -832,6 +994,7 @@ def train_dual_query_resampler(
         "train_images": sum(len(values) for values in train_groups.values()),
         "validation_images": sum(len(values) for values in validation_groups.values()),
         "cache_images": len(rows),
+        "teacher_center": teacher_center_info,
         "output_directory": str(output.resolve()),
         "last_validation": history[-1] if history else None,
     }

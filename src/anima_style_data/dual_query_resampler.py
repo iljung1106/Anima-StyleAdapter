@@ -356,6 +356,11 @@ class DualQueryResampler(nn.Module):
         )
         teacher_input_dim = len(self.semantic_layers) * semantic_dim + 2 * vae_channels
         self.register_buffer(
+            "teacher_input_mean",
+            torch.zeros(teacher_input_dim),
+            persistent=True,
+        )
+        self.register_buffer(
             "teacher_projection",
             torch.randn(teacher_input_dim, artist_descriptor_dim)
             / math.sqrt(teacher_input_dim),
@@ -402,14 +407,14 @@ class DualQueryResampler(nn.Module):
         return loss, top1
 
     @torch.no_grad()
-    def frozen_input_teacher(
+    def teacher_input_statistics(
         self,
         semantic_features: Mapping[int, torch.Tensor],
         semantic_mask: torch.Tensor,
         vae_latents: torch.Tensor,
         vae_shapes: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Project deterministic C-RADIO/VAE statistics into descriptor targets."""
+    ) -> torch.Tensor:
+        """Build deterministic pooled C-RADIO/VAE statistics for centering."""
         denominator = semantic_mask.sum(dim=1, keepdim=True).clamp_min(1).float()
         components = []
         for layer in self.semantic_layers:
@@ -429,7 +434,24 @@ class DualQueryResampler(nn.Module):
                 )
             )
         components.append(F.normalize(torch.stack(vae_statistics), dim=-1))
-        teacher_input = torch.cat(components, dim=-1)
+        return torch.cat(components, dim=-1)
+
+    @torch.no_grad()
+    def frozen_input_teacher(
+        self,
+        semantic_features: Mapping[int, torch.Tensor],
+        semantic_mask: torch.Tensor,
+        vae_latents: torch.Tensor,
+        vae_shapes: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Project centered C-RADIO/VAE statistics into bootstrap targets."""
+        teacher_input = self.teacher_input_statistics(
+            semantic_features,
+            semantic_mask,
+            vae_latents,
+            vae_shapes,
+        )
+        teacher_input = teacher_input - self.teacher_input_mean.float()
         descriptor = F.normalize(
             teacher_input @ self.teacher_projection.float(), dim=-1
         )
@@ -802,6 +824,7 @@ def episodic_angular_prototype_loss(
         [descriptors[labels == value].sum(dim=0) for value in classes]
     )
     logits = []
+    raw_logits = []
     targets = []
     positive_values = []
     negative_values = []
@@ -814,6 +837,7 @@ def episodic_angular_prototype_loss(
         prototypes = F.normalize(prototypes / divisor, dim=-1)
         cosine = torch.matmul(prototypes, descriptor).clamp(-1 + 1e-6, 1 - 1e-6)
         positive = cosine[class_index]
+        raw_logits.append(cosine * scale)
         # The equivalent acos formulation has an unbounded derivative near
         # +/-1. Early in training the descriptor head can emit nearly identical
         # vectors, so use the stable ArcFace identity and clamp its sine term.
@@ -830,10 +854,14 @@ def episodic_angular_prototype_loss(
             torch.cat((cosine[:class_index], cosine[class_index + 1 :])).max()
         )
     logits_tensor = torch.stack(logits)
+    raw_logits_tensor = torch.stack(raw_logits)
     targets_tensor = torch.tensor(targets, device=labels.device, dtype=torch.long)
     loss = F.cross_entropy(logits_tensor, targets_tensor)
     metrics = {
         "prototype_top1": (logits_tensor.argmax(dim=1) == targets_tensor).float().mean(),
+        "prototype_raw_top1": (
+            raw_logits_tensor.argmax(dim=1) == targets_tensor
+        ).float().mean(),
         "prototype_positive_cosine": torch.stack(positive_values).mean(),
         "prototype_hard_negative_cosine": torch.stack(negative_values).mean(),
     }
