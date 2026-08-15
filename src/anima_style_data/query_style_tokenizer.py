@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import gc
 import json
 import math
 import random
@@ -697,7 +698,7 @@ def _sample_query_style_tokenizer_chunk(
     device: str,
     step: int,
     vae: nn.Module | None,
-) -> tuple[list[tuple[str, Path]], nn.Module]:
+) -> tuple[list[tuple[str, Path]], nn.Module | None]:
     sample_cfg = dict(config["query_style_tokenizer_v2"].get("sampling", {}))
     batches = [
         loader.load_step(episode_index)
@@ -885,12 +886,18 @@ def _sample_query_style_tokenizer(
             ],
         },
     )
+    # QwenImage's standalone VAE retains sizeable non-parameter CUDA state in
+    # this legacy implementation even after Module.to("cpu").  It is used only
+    # every 500 steps, so fully destroy it rather than carrying ~18 GiB into
+    # subsequent training updates.
     vae.to("cpu")
+    del vae
+    gc.collect()
     if device.startswith("cuda"):
         torch.cuda.empty_cache()
     tokenizer.train()
     adapter.train()
-    return records, vae
+    return records, None
 
 
 def train_query_style_tokenizer(
