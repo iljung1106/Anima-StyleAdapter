@@ -45,6 +45,8 @@ L = L_semantic_reconstruction
   - hard negative는 가능하면 유사 캐릭터·일반 태그의 다른 작가에서 선택
 - 고정 5,000-class ArcFace head는 필수가 아니며, 추가하더라도 약한 보조 loss로만 사용한다.
 
+초기 episodic descriptor가 모든 작가에 같은 값을 내는 대칭점에 머물 경우에만, 선택된 train 작가 3,000명의 training-only CosFace proxy를 `0.5 × L_proxy`로 `L_artist` 안에 추가한다. Proxy는 validation의 unseen artist 평가에는 사용하지 않으며 사전학습 뒤 제거한다.
+
 위 가중치는 초기값이며 raw loss가 아닌 각 경로의 gradient norm과 validation Pareto를 기준으로 조정한다.
 
 ## 학습 단계
@@ -73,4 +75,4 @@ Artist descriptor head와 artist loss는 두 조건 모두 유지한다. 차이�
 - 입력 캐시: `style_features_l18_l24_siglip_l24`와 `anima_latent_cache_qwen_2d`의 image ID 교집합
 - episode: 작가 4명 × 서로 다른 이미지 2장. 따라서 angular prototype과 supervised contrastive loss 모두 매 step 실제 positive support를 갖는다.
 - 첫 사전학습 inventory: train 작가 3,000명 × 15장 = 45,000장. 별도의 validation 작가 150명 × 15장 = 2,250장은 optimizer에 노출하지 않는다. 선택은 seed로 고정해 resume와 재실행에서 동일하게 유지한다.
-- 현재 production 구성은 reconstruction decoder와 artist head를 포함해 약 128.5M parameter다. C-RADIO와 Qwen VAE는 캐시만 사용하므로 학습 그래프에 포함되지 않는다.
+- 현재 사전학습 구성은 reconstruction decoder, artist head와 training-only proxy를 포함해 약 130.0M parameter다. C-RADIO와 Qwen VAE는 캐시만 사용하므로 학습 그래프에 포함되지 않는다.

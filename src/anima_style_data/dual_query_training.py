@@ -32,6 +32,7 @@ class CacheEpisode:
     vae_shapes: torch.Tensor
     image_sizes: torch.Tensor
     labels: torch.Tensor
+    class_labels: torch.Tensor
     image_ids: list[int]
 
     def to(self, device: str) -> "CacheEpisode":
@@ -53,6 +54,7 @@ class CacheEpisode:
             vae_shapes=move(self.vae_shapes),
             image_sizes=move(self.image_sizes),
             labels=move(self.labels),
+            class_labels=move(self.class_labels),
             image_ids=self.image_ids,
         )
 
@@ -227,6 +229,7 @@ def _load_cache_episode(
     vae_shapes = []
     image_sizes = []
     labels = []
+    class_labels = []
     image_ids = []
     for index, row in enumerate(rows):
         image_id = int(row["id"])
@@ -249,6 +252,7 @@ def _load_cache_episode(
         vae_shapes.append((height, width))
         image_sizes.append((int(row["image_height"]), int(row["image_width"])))
         labels.append(int(row["episode_label"]))
+        class_labels.append(int(row.get("artist_class_label", -1)))
         image_ids.append(image_id)
     episode = CacheEpisode(
         semantic_features=semantic,
@@ -258,6 +262,7 @@ def _load_cache_episode(
         vae_shapes=torch.tensor(vae_shapes, dtype=torch.long),
         image_sizes=torch.tensor(image_sizes, dtype=torch.long),
         labels=torch.tensor(labels, dtype=torch.long),
+        class_labels=torch.tensor(class_labels, dtype=torch.long),
         image_ids=image_ids,
     )
     if pin_memory:
@@ -270,6 +275,7 @@ def _load_cache_episode(
         episode.vae_shapes = episode.vae_shapes.pin_memory()
         episode.image_sizes = episode.image_sizes.pin_memory()
         episode.labels = episode.labels.pin_memory()
+        episode.class_labels = episode.class_labels.pin_memory()
     return episode
 
 
@@ -365,7 +371,20 @@ def _losses(
         episode.labels,
         temperature=float(cfg.get("contrastive_temperature", 0.10)),
     )
-    artist = prototype + float(cfg.get("contrastive_fraction", 0.25)) * contrastive
+    proxy = output.descriptor.new_zeros(())
+    proxy_top1 = output.descriptor.new_zeros(())
+    if model.artist_proxies is not None and bool((episode.class_labels >= 0).all()):
+        proxy, proxy_top1 = model.artist_proxy_loss(
+            output.descriptor,
+            episode.class_labels,
+            scale=float(cfg.get("artist_proxy_scale", 16.0)),
+            margin=float(cfg.get("artist_proxy_margin", 0.10)),
+        )
+    artist = (
+        prototype
+        + float(cfg.get("contrastive_fraction", 0.25)) * contrastive
+        + float(cfg.get("artist_proxy_fraction", 0.50)) * proxy
+    )
     diversity = token_diversity_loss(output.tokens)
     total = (
         semantic
@@ -382,6 +401,8 @@ def _losses(
         "artist": artist,
         "prototype": prototype,
         "supervised_contrastive": contrastive,
+        "artist_proxy": proxy,
+        "artist_proxy_top1": proxy_top1,
         "token_diversity": diversity,
         **prototype_metrics,
     }
@@ -403,6 +424,7 @@ def _model_from_config(cfg: Mapping[str, Any], semantic_dim: int, vae_channels: 
         artist_descriptor_dim=int(model_cfg.get("artist_descriptor_dim", 512)),
         artist_pooling_queries=int(model_cfg.get("artist_pooling_queries", 4)),
         artist_summary_tokens=int(model_cfg.get("artist_summary_tokens", 4)),
+        artist_classes=int(cfg.get("training", {}).get("training_artist_count", 0)),
         semantic_dropout=float(model_cfg.get("semantic_dropout", 0.05)),
         vae_dropout=float(model_cfg.get("vae_dropout", 0.10)),
     )
@@ -477,6 +499,12 @@ def train_dual_query_resampler(
         images_per_artist_limit=image_limit,
         seed=int(cfg.get("seed", 20260815)) ^ 0x2A11,
     )
+    train_groups = {
+        artist: [
+            {**row, "artist_class_label": class_index} for row in artist_rows
+        ]
+        for class_index, (artist, artist_rows) in enumerate(sorted(train_groups.items()))
+    }
     validation_split = str(training.get("validation_split", "validation"))
     validation_groups = _group_by_style(
         rows,
@@ -745,6 +773,7 @@ def smoke_test_dual_query_resampler(
             vae_shapes=torch.tensor([[8, 10]] * 4),
             image_sizes=torch.tensor([[64, 80]] * 4),
             labels=torch.tensor([0, 0, 1, 1]),
+            class_labels=torch.full((4,), -1, dtype=torch.long),
             image_ids=[0, 1, 2, 3],
         )
         optimizer.zero_grad(set_to_none=True)

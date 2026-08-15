@@ -137,6 +137,35 @@ def test_angular_prototype_has_finite_gradient_for_collapsed_descriptors():
     assert torch.isfinite(descriptors.grad).all()
 
 
+def test_training_proxy_breaks_the_collapsed_descriptor_symmetry():
+    model = DualQueryResampler(
+        semantic_layers=(18, 24),
+        semantic_dim=12,
+        vae_channels=4,
+        dim=32,
+        spatial_query_grid=2,
+        global_queries=2,
+        layers=1,
+        heads=4,
+        ff_dim=64,
+        artist_descriptor_dim=16,
+        artist_pooling_queries=2,
+        artist_summary_tokens=2,
+        artist_classes=4,
+    )
+    descriptors = torch.ones(4, 16, requires_grad=True)
+    labels = torch.arange(4)
+
+    loss, _ = model.artist_proxy_loss(descriptors, labels)
+    loss.backward()
+
+    assert torch.isfinite(loss)
+    assert descriptors.grad is not None
+    assert torch.isfinite(descriptors.grad).all()
+    assert float(descriptors.grad.abs().sum()) > 0
+    assert model.artist_proxies.grad is not None
+
+
 def test_real_cache_contract_runs_one_training_and_validation_step(tmp_path):
     feature_root = tmp_path / "features"
     latent_root = tmp_path / "latents"

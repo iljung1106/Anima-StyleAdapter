@@ -299,6 +299,7 @@ class DualQueryResampler(nn.Module):
         artist_descriptor_dim: int = 512,
         artist_pooling_queries: int = 4,
         artist_summary_tokens: int = 4,
+        artist_classes: int = 0,
         semantic_dropout: float = 0.05,
         vae_dropout: float = 0.10,
     ) -> None:
@@ -346,6 +347,11 @@ class DualQueryResampler(nn.Module):
             summary_tokens=artist_summary_tokens,
             ff_dim=ff_dim,
         )
+        self.artist_proxies = (
+            nn.Parameter(torch.randn(artist_classes, artist_descriptor_dim) * 0.02)
+            if artist_classes > 0
+            else None
+        )
         self.semantic_decoder_norm = nn.LayerNorm(dim)
         self.semantic_decoder_heads = nn.ModuleDict(
             {
@@ -358,6 +364,28 @@ class DualQueryResampler(nn.Module):
             ConvResidualBlock(dim), nn.Conv2d(dim, vae_channels, kernel_size=1)
         )
         self.global_decoder_bias = nn.Linear(dim, dim)
+
+    def artist_proxy_loss(
+        self,
+        descriptors: torch.Tensor,
+        labels: torch.Tensor,
+        *,
+        scale: float = 16.0,
+        margin: float = 0.10,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Training-only CosFace proxy loss that breaks episodic collapse."""
+        if self.artist_proxies is None:
+            raise RuntimeError("artist_classes must be positive to use proxy supervision")
+        descriptors = F.normalize(descriptors.float(), dim=-1)
+        proxies = F.normalize(self.artist_proxies.float(), dim=-1)
+        cosine = torch.matmul(descriptors, proxies.T)
+        target_margin = F.one_hot(
+            labels, num_classes=int(proxies.shape[0])
+        ).to(cosine.dtype)
+        logits = (cosine - margin * target_margin) * scale
+        loss = F.cross_entropy(logits, labels)
+        top1 = (cosine.argmax(dim=1) == labels).float().mean()
+        return loss, top1
 
     def _semantic_bank(
         self,
