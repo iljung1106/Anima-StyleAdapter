@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import math
+
 import pytest
 
 torch = pytest.importorskip("torch")
@@ -139,6 +141,96 @@ def test_angular_prototype_has_finite_gradient_for_collapsed_descriptors():
     assert torch.isfinite(loss)
     assert descriptors.grad is not None
     assert torch.isfinite(descriptors.grad).all()
+
+
+def test_vectorized_prototype_matches_leave_one_out_reference():
+    torch.manual_seed(17)
+    labels = torch.tensor([3, 3, 7, 7, 11, 11])
+    actual_descriptors = torch.randn(6, 12, requires_grad=True)
+    reference_descriptors = actual_descriptors.detach().clone().requires_grad_()
+
+    actual, actual_metrics = episodic_angular_prototype_loss(
+        actual_descriptors, labels, scale=8.0, margin=0.07
+    )
+
+    descriptors = torch.nn.functional.normalize(reference_descriptors.float(), dim=-1)
+    classes = torch.unique(labels, sorted=True)
+    class_sums = torch.stack(
+        [descriptors[labels == value].sum(dim=0) for value in classes]
+    )
+    logits = []
+    raw_logits = []
+    positives = []
+    hard_negatives = []
+    for descriptor, label in zip(descriptors, labels):
+        class_index = int(torch.nonzero(classes == label)[0, 0])
+        prototypes = class_sums.clone()
+        prototypes[class_index] -= descriptor
+        divisors = torch.tensor([2.0, 2.0, 2.0]).unsqueeze(1)
+        divisors[class_index] -= 1
+        prototypes = torch.nn.functional.normalize(prototypes / divisors, dim=-1)
+        cosine = (prototypes @ descriptor).clamp(-1 + 1e-6, 1 - 1e-6)
+        positive = cosine[class_index]
+        sine = torch.sqrt((1.0 - positive.square()).clamp_min(1e-4))
+        margin_cosine = cosine.clone()
+        margin_cosine[class_index] = (
+            positive * math.cos(0.07) - sine * math.sin(0.07)
+        )
+        logits.append(margin_cosine * 8.0)
+        raw_logits.append(cosine * 8.0)
+        positives.append(positive)
+        hard_negatives.append(
+            torch.cat((cosine[:class_index], cosine[class_index + 1 :])).max()
+        )
+    logits = torch.stack(logits)
+    raw_logits = torch.stack(raw_logits)
+    targets = torch.tensor([0, 0, 1, 1, 2, 2])
+    reference = torch.nn.functional.cross_entropy(logits, targets)
+
+    actual.backward()
+    reference.backward()
+
+    assert float(actual.detach()) == pytest.approx(
+        float(reference.detach()), rel=1e-6, abs=1e-6
+    )
+    assert float(actual_metrics["prototype_raw_top1"].detach()) == pytest.approx(
+        float((raw_logits.argmax(dim=1) == targets).float().mean())
+    )
+    assert float(actual_metrics["prototype_positive_cosine"].detach()) == pytest.approx(
+        float(torch.stack(positives).mean())
+    )
+    assert float(
+        actual_metrics["prototype_hard_negative_cosine"].detach()
+    ) == pytest.approx(
+        float(torch.stack(hard_negatives).mean())
+    )
+    assert torch.allclose(
+        actual_descriptors.grad, reference_descriptors.grad, atol=1e-6, rtol=1e-5
+    )
+
+
+def test_grouped_semantic_decoder_handles_mixed_grid_shapes():
+    torch.manual_seed(19)
+    model = _small_resampler().eval()
+    tokens = torch.randn(3, 20, 32)
+    shapes = torch.tensor([[2, 3], [3, 2], [2, 3]])
+
+    grouped = model.decode_semantic(tokens, shapes, max_tokens=6)
+    source = model._decoder_map(tokens)
+    expected = {18: [], 24: []}
+    for item, (height, width) in enumerate(shapes.tolist()):
+        resized = torch.nn.functional.interpolate(
+            source[item : item + 1],
+            size=(height, width),
+            mode="bilinear",
+            align_corners=False,
+        )
+        for layer in (18, 24):
+            decoded = model.semantic_decoder_heads[str(layer)](resized)
+            expected[layer].append(decoded.flatten(2).transpose(1, 2)[0])
+
+    for layer in (18, 24):
+        assert torch.allclose(grouped[layer], torch.stack(expected[layer]), atol=1e-6)
 
 
 def test_training_proxy_breaks_the_collapsed_descriptor_symmetry():

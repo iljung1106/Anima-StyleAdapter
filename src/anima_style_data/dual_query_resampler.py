@@ -31,19 +31,17 @@ def padded_grid_coordinates(
     dtype: torch.dtype,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Build continuous 2D coordinates and a validity mask for padded grids."""
-    coordinates = torch.zeros(
-        (int(shapes.shape[0]), length, 2), device=device, dtype=dtype
-    )
-    valid = torch.zeros((int(shapes.shape[0]), length), device=device, dtype=torch.bool)
-    for index, shape in enumerate(shapes.detach().cpu().tolist()):
-        height, width = (int(shape[0]), int(shape[1]))
-        tokens = height * width
-        if tokens > length:
-            raise ValueError(f"Grid {height}x{width} exceeds padded length {length}")
-        coordinates[index, :tokens] = normalized_grid(
-            height, width, device=device, dtype=dtype
-        )
-        valid[index, :tokens] = True
+    shapes = shapes.to(device=device)
+    height = shapes[:, 0:1]
+    width = shapes[:, 1:2]
+    positions = torch.arange(length, device=device).unsqueeze(0)
+    valid = positions < height * width
+    y = torch.div(positions, width, rounding_mode="floor")
+    x = positions.remainder(width)
+    x = 2.0 * x.float() / (width - 1).clamp_min(1).float() - 1.0
+    y = 2.0 * y.float() / (height - 1).clamp_min(1).float() - 1.0
+    coordinates = torch.stack((x, y), dim=-1).to(dtype)
+    coordinates.masked_fill_(~valid.unsqueeze(-1), 0)
     return coordinates, valid
 
 
@@ -113,8 +111,6 @@ class MultiheadCrossAttention(nn.Module):
             k = apply_2d_rope(k, context_coordinates)
         scores = torch.matmul(q.float(), k.float().transpose(-2, -1)) * self.scale
         if context_mask is not None:
-            if not bool(context_mask.any(dim=1).all()):
-                raise ValueError("Every sample must contain at least one valid context token")
             scores.masked_fill_(~context_mask[:, None, None, :], -torch.inf)
         attention = scores.softmax(dim=-1).to(v.dtype)
         output = torch.matmul(attention, v)
@@ -490,23 +486,21 @@ class DualQueryResampler(nn.Module):
         self, latents: torch.Tensor, vae_shapes: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         feature_map = self.vae_stem(latents)
-        batch, channels, height, width = feature_map.shape
+        batch, _, height, width = feature_map.shape
         context = feature_map.flatten(2).transpose(1, 2)
-        downsampled_shapes = torch.div(vae_shapes, 2, rounding_mode="floor").clamp_min(1)
-        coordinates = torch.zeros(
-            (batch, height * width, 2), device=latents.device, dtype=context.dtype
-        )
-        valid = torch.zeros(
-            (batch, height * width), device=latents.device, dtype=torch.bool
-        )
-        for index, shape in enumerate(downsampled_shapes.detach().cpu().tolist()):
-            item_height, item_width = int(shape[0]), int(shape[1])
-            item_grid = normalized_grid(
-                item_height, item_width, device=latents.device, dtype=context.dtype
-            ).view(item_height, item_width, 2)
-            grid = coordinates[index].view(height, width, 2)
-            grid[:item_height, :item_width] = item_grid
-            valid[index].view(height, width)[:item_height, :item_width] = True
+        downsampled_shapes = torch.div(
+            vae_shapes.to(latents.device), 2, rounding_mode="floor"
+        ).clamp_min(1)
+        positions = torch.arange(height * width, device=latents.device).unsqueeze(0)
+        grid_y = torch.div(positions, width, rounding_mode="floor")
+        grid_x = positions.remainder(width)
+        item_height = downsampled_shapes[:, 0:1]
+        item_width = downsampled_shapes[:, 1:2]
+        valid = (grid_y < item_height) & (grid_x < item_width)
+        x = 2.0 * grid_x.float() / (item_width - 1).clamp_min(1).float() - 1.0
+        y = 2.0 * grid_y.float() / (item_height - 1).clamp_min(1).float() - 1.0
+        coordinates = torch.stack((x, y), dim=-1).to(context.dtype)
+        coordinates.masked_fill_(~valid.unsqueeze(-1), 0)
         return context, valid, coordinates
 
     def _query_bank(
@@ -610,7 +604,11 @@ class DualQueryResampler(nn.Module):
         semantic_reconstruction = None
         vae_reconstruction = None
         if reconstruct:
-            semantic_reconstruction = self.decode_semantic(tokens, semantic_grid_shapes)
+            semantic_reconstruction = self.decode_semantic(
+                tokens,
+                semantic_grid_shapes,
+                max_tokens=int(semantic_mask.shape[1]),
+            )
             vae_reconstruction = self.decode_vae(tokens, vae_latents.shape[-2:])
         return PerReferenceOutput(
             tokens=tokens,
@@ -631,10 +629,19 @@ class DualQueryResampler(nn.Module):
         return spatial + global_bias[:, :, None, None]
 
     def decode_semantic(
-        self, tokens: torch.Tensor, grid_shapes: torch.Tensor
+        self,
+        tokens: torch.Tensor,
+        grid_shapes: torch.Tensor,
+        *,
+        max_tokens: int | None = None,
     ) -> dict[int, torch.Tensor]:
         source = self._decoder_map(tokens)
-        max_tokens = int((grid_shapes[:, 0] * grid_shapes[:, 1]).max().item())
+        shape_values = [
+            tuple(int(value) for value in shape)
+            for shape in grid_shapes.detach().cpu().tolist()
+        ]
+        if max_tokens is None:
+            max_tokens = max(height * width for height, width in shape_values)
         outputs = {
             layer: source.new_zeros(
                 (tokens.shape[0], max_tokens, head.out_channels)
@@ -644,17 +651,23 @@ class DualQueryResampler(nn.Module):
                 for layer in self.semantic_layers
             )
         }
-        for item, shape in enumerate(grid_shapes.detach().cpu().tolist()):
-            height, width = int(shape[0]), int(shape[1])
+        groups: dict[tuple[int, int], list[int]] = {}
+        for item, shape in enumerate(shape_values):
+            groups.setdefault(shape, []).append(item)
+        for (height, width), items in groups.items():
+            indices = torch.tensor(items, device=source.device, dtype=torch.long)
             resized = F.interpolate(
-                source[item : item + 1],
+                source.index_select(0, indices),
                 size=(height, width),
                 mode="bilinear",
                 align_corners=False,
             )
             for layer in self.semantic_layers:
                 decoded = self.semantic_decoder_heads[str(layer)](resized)
-                outputs[layer][item, : height * width] = decoded.flatten(2).transpose(1, 2)[0]
+                decoded = decoded.flatten(2).transpose(1, 2)
+                if decoded.shape[1] < max_tokens:
+                    decoded = F.pad(decoded, (0, 0, 0, max_tokens - decoded.shape[1]))
+                outputs[layer].index_copy_(0, indices, decoded)
         return outputs
 
     def decode_vae(
@@ -814,56 +827,41 @@ def episodic_angular_prototype_loss(
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """Leave-one-out angular prototypical classification within a batch."""
     descriptors = F.normalize(descriptors.float(), dim=-1)
-    classes = torch.unique(labels, sorted=True)
+    classes, inverse = torch.unique(labels, sorted=True, return_inverse=True)
     if len(classes) < 2:
         raise ValueError("Prototype loss needs at least two artists")
-    counts = torch.stack([(labels == value).sum() for value in classes])
+    counts = torch.bincount(inverse, minlength=len(classes))
     if bool((counts < 2).any()):
         raise ValueError("Prototype loss needs at least two images per artist")
-    class_sums = torch.stack(
-        [descriptors[labels == value].sum(dim=0) for value in classes]
+    batch = int(descriptors.shape[0])
+    class_sums = descriptors.new_zeros((len(classes), descriptors.shape[1]))
+    class_sums.index_add_(0, inverse, descriptors)
+    prototypes = class_sums.unsqueeze(0).expand(batch, -1, -1).clone()
+    batch_indices = torch.arange(batch, device=descriptors.device)
+    prototypes[batch_indices, inverse] -= descriptors
+    divisors = counts.to(descriptors.dtype).view(1, -1, 1).expand(batch, -1, -1).clone()
+    divisors[batch_indices, inverse] -= 1
+    prototypes = F.normalize(prototypes / divisors, dim=-1)
+    cosine = torch.einsum("bd,bcd->bc", descriptors, prototypes).clamp(
+        -1 + 1e-6, 1 - 1e-6
     )
-    logits = []
-    raw_logits = []
-    targets = []
-    positive_values = []
-    negative_values = []
-    for index, (descriptor, label) in enumerate(zip(descriptors, labels)):
-        class_index = int(torch.nonzero(classes == label, as_tuple=False)[0, 0])
-        prototypes = class_sums.clone()
-        prototypes[class_index] -= descriptor
-        divisor = counts.to(descriptors.dtype).unsqueeze(1)
-        divisor[class_index] -= 1
-        prototypes = F.normalize(prototypes / divisor, dim=-1)
-        cosine = torch.matmul(prototypes, descriptor).clamp(-1 + 1e-6, 1 - 1e-6)
-        positive = cosine[class_index]
-        raw_logits.append(cosine * scale)
-        # The equivalent acos formulation has an unbounded derivative near
-        # +/-1. Early in training the descriptor head can emit nearly identical
-        # vectors, so use the stable ArcFace identity and clamp its sine term.
-        sine = torch.sqrt((1.0 - positive.square()).clamp_min(1e-4))
-        angular_positive = (
-            positive * math.cos(margin) - sine * math.sin(margin)
-        )
-        cosine = cosine.clone()
-        cosine[class_index] = angular_positive
-        logits.append(cosine * scale)
-        targets.append(class_index)
-        positive_values.append(positive)
-        negative_values.append(
-            torch.cat((cosine[:class_index], cosine[class_index + 1 :])).max()
-        )
-    logits_tensor = torch.stack(logits)
-    raw_logits_tensor = torch.stack(raw_logits)
-    targets_tensor = torch.tensor(targets, device=labels.device, dtype=torch.long)
-    loss = F.cross_entropy(logits_tensor, targets_tensor)
+    positive = cosine[batch_indices, inverse]
+    raw_logits = cosine * scale
+    # The equivalent acos formulation has an unbounded derivative near +/-1.
+    sine = torch.sqrt((1.0 - positive.square()).clamp_min(1e-4))
+    angular_positive = positive * math.cos(margin) - sine * math.sin(margin)
+    margin_cosine = cosine.clone()
+    margin_cosine[batch_indices, inverse] = angular_positive
+    logits = margin_cosine * scale
+    loss = F.cross_entropy(logits, inverse)
+    hard_negative = cosine.masked_fill(
+        F.one_hot(inverse, num_classes=len(classes)).bool(), -torch.inf
+    ).max(dim=1).values
     metrics = {
-        "prototype_top1": (logits_tensor.argmax(dim=1) == targets_tensor).float().mean(),
-        "prototype_raw_top1": (
-            raw_logits_tensor.argmax(dim=1) == targets_tensor
-        ).float().mean(),
-        "prototype_positive_cosine": torch.stack(positive_values).mean(),
-        "prototype_hard_negative_cosine": torch.stack(negative_values).mean(),
+        "prototype_top1": (logits.argmax(dim=1) == inverse).float().mean(),
+        "prototype_raw_top1": (raw_logits.argmax(dim=1) == inverse).float().mean(),
+        "prototype_positive_cosine": positive.mean(),
+        "prototype_hard_negative_cosine": hard_negative.mean(),
     }
     return loss, metrics
 

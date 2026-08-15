@@ -318,13 +318,13 @@ def _vae_reconstruction_loss(
     shapes: torch.Tensor,
 ) -> torch.Tensor:
     height, width = prediction.shape[-2:]
-    valid = torch.zeros(
-        (prediction.shape[0], 1, height, width),
-        device=prediction.device,
-        dtype=torch.bool,
-    )
-    for index, shape in enumerate(shapes.detach().cpu().tolist()):
-        valid[index, :, : int(shape[0]), : int(shape[1])] = True
+    shapes = shapes.to(prediction.device)
+    y = torch.arange(height, device=prediction.device).view(1, height, 1)
+    x = torch.arange(width, device=prediction.device).view(1, 1, width)
+    valid = (
+        (y < shapes[:, 0].view(-1, 1, 1))
+        & (x < shapes[:, 1].view(-1, 1, 1))
+    ).unsqueeze(1)
     # A 2x low-pass target keeps the weak decoder focused on local appearance,
     # rather than turning the style encoder into a pixel-copy autoencoder.
     prediction_low = F.avg_pool2d(prediction.float(), 2, 2)
