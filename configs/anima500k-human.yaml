@@ -357,6 +357,97 @@ dual_query_style_tokenizer:
         target_anneal_end: 1000
         target_anneal_min_references: 1
         target_anneal_max_references: 8
+  # Summary-ON 10k pilot. This is intentionally isolated from the historical
+  # 20k/A-B settings above so checkpoints and W&B histories cannot cross-resume.
+  pilot:
+    output_directory: dual_query_style_tokenizer_summary_on_10k_pilot_v1
+    steps: 10000
+    training:
+      device: cuda
+      learning_rate: 0.0001
+      warmup_steps: 400
+      minimum_lr_ratio: 0.10
+      gradient_accumulation_steps: 4
+      max_grad_norm: 1.0
+      resume: true
+      reference_schedule:
+        - name: exact_self
+          end_step: 500
+          exact_self: true
+          max_references: 1
+          reference_count_weights: [1.0]
+        - name: heldout_1_2
+          end_step: 1000
+          exact_self: false
+          max_references: 2
+          reference_count_weights: [0.70, 0.30]
+        - name: heldout_1_4
+          end_step: 4000
+          exact_self: false
+          max_references: 4
+          reference_count_weights: [0.50, 0.30, 0.13, 0.07]
+        - name: heldout_1_8
+          end_step: 10000
+          exact_self: false
+          max_references: 8
+          reference_count_weights: [0.42, 0.28, 0.12, 0.075, 0.04, 0.025, 0.02, 0.02]
+      exact_self_end_step: 500
+      exact_normalized_residual_weight: 0.05
+      heldout_normalized_residual_weight: 0.015
+      normalized_residual_huber_beta: 0.10
+      normalized_residual_scale_floor: 0.0001
+      exact_aligned_floor_weight: 0.25
+      exact_aligned_floor_start: 0.02
+      exact_aligned_floor_end: 0.15
+      heldout_aligned_floor_weight: 0.075
+      heldout_aligned_floor_start: 0.03
+      heldout_aligned_floor_end: 0.06
+      bounded_effect_every: 4
+      exact_bounded_min: 0.08
+      exact_bounded_max: 0.25
+      exact_bounded_weight: 0.05
+      heldout_bounded_min: 0.05
+      heldout_bounded_max: 0.20
+      heldout_bounded_weight: 0.015
+      bounded_orthogonal_maximum: 0.12
+      bounded_orthogonal_weight: 0.25
+      wrong_ranking_start_step: 1000
+      wrong_ranking_ramp_steps: 1000
+      wrong_ranking_every: 4
+      wrong_ranking_batch_rows: 2
+      wrong_ranking_weight: 0.00075
+      wrong_ranking_margin: 0.02
+      wrong_centered_weight: 0.10
+      common_output_start_step: 1500
+      common_output_ramp_steps: 1000
+      common_output_every: 8
+      common_output_batch_rows: 4
+      common_output_threshold: 0.70
+      common_output_weight: 0.002
+      artist_contrastive_weight: 0.01
+      artist_contrastive_temperature: 0.10
+      artist_contrastive_every: 2
+      slot_diversity_weight: 0.001
+      subset_consistency_weight: 0.003
+      subset_consistency_start: 501
+      log_every: 10
+      validation_every: 250
+      validation_batches: 8
+      checkpoint_every: 500
+      sample_every: 500
+      fixed_sample_every: 1000
+      extended_evaluation_every: 1000
+      reference_evaluation_batches: 4
+      controlled_evaluation_artists: 4
+      controlled_evaluation:
+        references_per_view: 4
+        timesteps: [0.2, 0.4, 0.65, 0.85]
+        inference_batch_size: 4
+      wandb:
+        enabled: true
+        project: anima-style-adapter
+        name: dual-query-style-tokenizer-summary-on-10k-pilot-v1
+        id: dual-query-style-tokenizer-summary-on-10k-pilot-v1
   fixed_reference_sampling:
     cache_directory: dual_query_external_reference_cache_v1
     device: cuda
@@ -1338,7 +1429,7 @@ external_style_tokenizer_sheet:
   include_small: false
   small_checkpoint: style_tokenizer_native_context_16_multiref_contrastive_8k_v1/checkpoints/step-0004000.pt
   current_checkpoint: pure_token_style_tokenizer_v2_32slot_20k_v1/checkpoints/step-0004000.pt
-  prompt: "masterpiece, best quality, score_7, safe, Aris (Blue Archive), upper body shot, close up, blue sky, smile,"
+  prompt: "masterpiece, best quality, score_7, safe, Tateyama Ayano, upper body shot, close up, blue sky, smile,"
   negative_prompt: "worst quality, low quality, score_1, score_2, score_3, artist name, blurry, jpeg artifacts,"
   width: 832
   height: 1024

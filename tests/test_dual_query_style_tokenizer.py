@@ -7,6 +7,12 @@ torch = pytest.importorskip("torch")
 from anima_style_data.dual_query_style_tokenizer import (  # noqa: E402
     DualQuerySetStyleTokenizer,
 )
+from anima_style_data.dual_query_style_training import (  # noqa: E402
+    _bounded_aligned_effect_loss,
+    _common_output_loss,
+    _pilot_alignment_state,
+    _pilot_stage,
+)
 
 
 def _model(*, include_summary: bool) -> DualQuerySetStyleTokenizer:
@@ -78,3 +84,74 @@ def test_style_tokens_have_finite_gradient_and_configured_shape():
     assert output.tokens.shape == (3, 4, 32)
     assert torch.isfinite(output.tokens).all()
     assert torch.isfinite(references.grad).all()
+
+
+def test_pilot_schedule_and_alignment_switch_at_documented_boundaries():
+    training = {
+        "steps": 10_000,
+        "exact_self_end_step": 500,
+        "reference_schedule": [
+            {"name": "exact", "end_step": 500},
+            {"name": "one_two", "end_step": 1000},
+            {"name": "one_four", "end_step": 4000},
+            {"name": "one_eight", "end_step": 10_000},
+        ],
+    }
+
+    assert _pilot_stage(500, training)["name"] == "exact"
+    assert _pilot_stage(501, training)["name"] == "one_two"
+    assert _pilot_stage(4001, training)["name"] == "one_eight"
+    assert _pilot_alignment_state(500, training)["coefficient_floor"] == pytest.approx(0.15)
+    assert _pilot_alignment_state(501, training)["coefficient_floor"] == pytest.approx(0.03)
+    assert _pilot_alignment_state(10_000, training)["coefficient_floor"] == pytest.approx(0.06)
+
+
+def test_bounded_effect_rewards_in_range_alignment_and_penalizes_orthogonal_output():
+    base = torch.zeros(2, 1, 2, 2)
+    target = torch.ones_like(base)
+    aligned = 0.1 * target
+    orthogonal = aligned.clone()
+    orthogonal[:, :, 0, 0] += 0.4
+    orthogonal[:, :, 0, 1] -= 0.4
+    orthogonal[:, :, 1, 0] += 0.4
+    orthogonal[:, :, 1, 1] -= 0.4
+
+    aligned_loss, _ = _bounded_aligned_effect_loss(
+        aligned,
+        base,
+        target,
+        minimum=0.05,
+        maximum=0.20,
+        orthogonal_maximum=0.12,
+        orthogonal_weight=0.25,
+        scale_floor=1e-4,
+    )
+    orthogonal_loss, metrics = _bounded_aligned_effect_loss(
+        orthogonal,
+        base,
+        target,
+        minimum=0.05,
+        maximum=0.20,
+        orthogonal_maximum=0.12,
+        orthogonal_weight=0.25,
+        scale_floor=1e-4,
+    )
+
+    assert aligned_loss.item() == pytest.approx(0.0, abs=1e-7)
+    assert orthogonal_loss > aligned_loss
+    assert metrics["bounded_orthogonal_ratio"] > 0.12
+
+
+def test_common_output_hinge_distinguishes_shared_and_centered_artist_effects():
+    shared = torch.ones(4, 2, 2)
+    centered = torch.stack(
+        (torch.ones(2, 2), -torch.ones(2, 2), torch.eye(2), -torch.eye(2))
+    )
+
+    shared_loss, shared_metrics = _common_output_loss(shared, threshold=0.70)
+    centered_loss, centered_metrics = _common_output_loss(centered, threshold=0.70)
+
+    assert shared_metrics["common_output_ratio"] == pytest.approx(1.0)
+    assert shared_loss > 0
+    assert centered_metrics["common_output_ratio"] == pytest.approx(0.0, abs=1e-7)
+    assert centered_loss.item() == pytest.approx(0.0, abs=1e-7)

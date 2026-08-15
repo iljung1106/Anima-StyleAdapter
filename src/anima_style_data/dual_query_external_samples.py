@@ -244,6 +244,14 @@ def load_dual_query_external_sample(
         )
     tokens = torch.load(tokens_path, map_location="cpu", weights_only=True)
     text = torch.load(text_path, map_location="cpu", weights_only=True)
+    if (
+        text.get("prompt") != str(sheet_cfg["prompt"])
+        or text.get("negative_prompt") != str(sheet_cfg["negative_prompt"])
+    ):
+        raise RuntimeError(
+            "Fixed-reference prompt cache is stale; run "
+            "dual-query-style-external-cache before training"
+        )
     if tuple(tokens.shape) != (7, 84, 1024):
         raise RuntimeError(f"Unexpected fixed reference cache {tuple(tokens.shape)}")
     return {

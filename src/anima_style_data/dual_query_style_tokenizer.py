@@ -432,6 +432,9 @@ class DualQueryCachedStyleLoader(ProductionStyleLoader):
         self.reference_count_weights_by_phase = dict(
             cfg.get("reference_count_weights_by_phase", {})
         )
+        self.pilot_reference_schedule = list(
+            cfg.get("pilot_reference_schedule", [])
+        )
 
     @staticmethod
     def _pin(value: torch.Tensor) -> torch.Tensor:
@@ -439,6 +442,50 @@ class DualQueryCachedStyleLoader(ProductionStyleLoader):
 
     def episodes_for_step(self, step: int) -> list[StyleEpisode]:
         episodes = super().episodes_for_step(step)
+        if self.pilot_reference_schedule:
+            optimizer_step = step // self.gradient_accumulation_steps + 1
+            stage = next(
+                (
+                    item
+                    for item in self.pilot_reference_schedule
+                    if optimizer_step <= int(item["end_step"])
+                ),
+                self.pilot_reference_schedule[-1],
+            )
+            maximum = int(stage["max_references"])
+            weights = [float(value) for value in stage["reference_count_weights"]]
+            if maximum <= 0 or len(weights) != maximum or any(value < 0 for value in weights):
+                raise ValueError("Invalid pilot reference-count schedule")
+            total = sum(weights)
+            if total <= 0:
+                raise ValueError("Empty pilot reference-count distribution")
+            probabilities = [value / total for value in weights]
+            rng = random.Random(self.seed ^ 0xA17E_10C0 ^ (step * 1_000_003))
+            result = []
+            for episode in episodes:
+                pool = [
+                    image_id
+                    for image_id in self.by_style[episode.style_id]
+                    if image_id != episode.target_id
+                ]
+                upper = min(maximum, len(pool))
+                counts = list(range(1, upper + 1))
+                selected_weights = probabilities[:upper]
+                selected_total = sum(selected_weights)
+                selected_weights = [
+                    value / selected_total for value in selected_weights
+                ]
+                count = rng.choices(counts, weights=selected_weights, k=1)[0]
+                result.append(
+                    StyleEpisode(
+                        episode.target_id,
+                        tuple(rng.sample(pool, count)),
+                        episode.style_id,
+                        episode.latent_shape,
+                        episode.text_variant,
+                    )
+                )
+            return result
         if not self.reference_curriculum or not self.reference_count_weights_by_phase:
             return episodes
         optimizer_step = step // self.gradient_accumulation_steps + 1

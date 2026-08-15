@@ -21,6 +21,7 @@ from .io import write_json
 from .pure_token_injection import (
     _aligned_velocity_losses,
     _coefficient_floor,
+    _evaluate_controlled_artist_consistency,
     _evaluate,
     _reference_batch,
     _sample_panels,
@@ -31,7 +32,7 @@ from .query_style_tokenizer import (
     _select_sample_episodes,
     _slot_diversity_loss,
 )
-from .style_tokenizer import _flow_metrics, insert_style_tokens
+from .style_tokenizer import _artist_direction_loss, _flow_metrics, insert_style_tokens
 from .style_transfer import (
     _learning_rate_multiplier,
     _optimize_frozen_anima,
@@ -48,7 +49,13 @@ def _loader_config(
     result["split"] = split
     result["resampler_token_cache"] = str(cfg["cache"]["output_directory"])
     if split == str(cfg.get("train_split", "train")):
-        result["reference_curriculum"] = dict(cfg["training"]["curriculum"])
+        if bool(cfg["training"].get("pilot_enabled", False)):
+            result["reference_curriculum"] = {}
+            result["pilot_reference_schedule"] = copy.deepcopy(
+                cfg["training"]["reference_schedule"]
+            )
+        else:
+            result["reference_curriculum"] = dict(cfg["training"]["curriculum"])
         result["gradient_accumulation_steps"] = int(
             cfg["training"].get("gradient_accumulation_steps", 1)
         )
@@ -128,6 +135,120 @@ def _subset_consistency(
     ).mean()
 
 
+def _linear_ramp(
+    step: int, *, start_step: int, end_step: int, start: float, end: float
+) -> float:
+    if end_step <= start_step:
+        return float(end)
+    progress = min(1.0, max(0.0, (step - start_step) / (end_step - start_step)))
+    return float(start) + progress * (float(end) - float(start))
+
+
+def _pilot_stage(step: int, training: dict[str, Any]) -> dict[str, Any]:
+    schedule = list(training.get("reference_schedule", []))
+    if not schedule:
+        raise ValueError("pilot reference_schedule is required")
+    stage = next(
+        (item for item in schedule if step <= int(item["end_step"])),
+        schedule[-1],
+    )
+    return dict(stage)
+
+
+def _pilot_alignment_state(step: int, training: dict[str, Any]) -> dict[str, float]:
+    exact_end = int(training.get("exact_self_end_step", 500))
+    if step <= exact_end:
+        return {
+            "normalized_weight": float(
+                training.get("exact_normalized_residual_weight", 0.05)
+            ),
+            "floor_weight": float(training.get("exact_aligned_floor_weight", 0.25)),
+            "coefficient_floor": _linear_ramp(
+                step,
+                start_step=1,
+                end_step=exact_end,
+                start=float(training.get("exact_aligned_floor_start", 0.02)),
+                end=float(training.get("exact_aligned_floor_end", 0.15)),
+            ),
+            "bounded_min": float(training.get("exact_bounded_min", 0.08)),
+            "bounded_max": float(training.get("exact_bounded_max", 0.25)),
+            "bounded_weight": float(training.get("exact_bounded_weight", 0.05)),
+        }
+    steps = int(training.get("steps", 10_000))
+    return {
+        "normalized_weight": float(
+            training.get("heldout_normalized_residual_weight", 0.015)
+        ),
+        "floor_weight": float(training.get("heldout_aligned_floor_weight", 0.075)),
+        "coefficient_floor": _linear_ramp(
+            step,
+            start_step=exact_end + 1,
+            end_step=steps,
+            start=float(training.get("heldout_aligned_floor_start", 0.03)),
+            end=float(training.get("heldout_aligned_floor_end", 0.06)),
+        ),
+        "bounded_min": float(training.get("heldout_bounded_min", 0.05)),
+        "bounded_max": float(training.get("heldout_bounded_max", 0.20)),
+        "bounded_weight": float(training.get("heldout_bounded_weight", 0.015)),
+    }
+
+
+def _bounded_aligned_effect_loss(
+    prediction: torch.Tensor,
+    base_prediction: torch.Tensor,
+    target: torch.Tensor,
+    *,
+    minimum: float,
+    maximum: float,
+    orthogonal_maximum: float,
+    orthogonal_weight: float,
+    scale_floor: float,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Keep useful target projection in range without rewarding raw output norm."""
+
+    dimensions = tuple(range(1, prediction.ndim))
+    delta = prediction - base_prediction
+    desired = target - base_prediction
+    desired_power = desired.square().mean(dim=dimensions).clamp_min(
+        float(scale_floor) ** 2
+    )
+    coefficient = (delta * desired.detach()).mean(dim=dimensions) / desired_power
+    broadcast = coefficient.reshape(-1, *([1] * (delta.ndim - 1)))
+    orthogonal = delta - broadcast * desired.detach()
+    orthogonal_ratio = (
+        orthogonal.square().mean(dim=dimensions).sqrt() / desired_power.sqrt()
+    )
+    lower = F.relu(float(minimum) - coefficient).square()
+    upper = F.relu(coefficient - float(maximum)).square()
+    orthogonal_penalty = F.relu(
+        orthogonal_ratio - float(orthogonal_maximum)
+    ).square()
+    loss = (lower + upper + float(orthogonal_weight) * orthogonal_penalty).mean()
+    return loss, {
+        "bounded_aligned_coefficient": coefficient.detach().mean(),
+        "bounded_below_fraction": (coefficient.detach() < float(minimum)).float().mean(),
+        "bounded_above_fraction": (coefficient.detach() > float(maximum)).float().mean(),
+        "bounded_orthogonal_ratio": orthogonal_ratio.detach().mean(),
+    }
+
+
+def _common_output_loss(
+    deltas: torch.Tensor, *, threshold: float
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    if deltas.ndim < 2 or deltas.shape[0] < 2:
+        raise ValueError("Common-output probe needs at least two artist effects")
+    dimensions = tuple(range(1, deltas.ndim))
+    per_artist_rms = deltas.square().mean(dim=dimensions).sqrt()
+    common_rms = deltas.mean(dim=0).square().mean().sqrt()
+    denominator = per_artist_rms.mean().detach().clamp_min(1e-8)
+    ratio = common_rms / denominator
+    return F.relu(ratio - float(threshold)).square(), {
+        "common_output_ratio": ratio.detach(),
+        "controlled_artist_effect_rms": per_artist_rms.detach().mean(),
+        "controlled_common_rms": common_rms.detach(),
+    }
+
+
 def _forward_dual_query_flow(
     anima: torch.nn.Module,
     tokenizer: DualQuerySetStyleTokenizer,
@@ -148,9 +269,28 @@ def _forward_dual_query_flow(
     conditioning_lengths = batch["conditioning_lengths"].to(
         device, non_blocking=True
     )
-    references, reference_mask, include_target, curriculum = _reference_batch(
-        batch, device, "curriculum", step, training, generator
-    )
+    pilot_enabled = bool(training.get("pilot_enabled", False))
+    if pilot_enabled:
+        stage = _pilot_stage(step, training)
+        if bool(stage.get("exact_self", False)):
+            references, reference_mask = _reference_inputs(batch, device, "self")
+            include_target = torch.ones(
+                references.shape[0], dtype=torch.bool, device=device
+            )
+        else:
+            references, reference_mask = _reference_inputs(batch, device, "heldout")
+            include_target = torch.zeros(
+                references.shape[0], dtype=torch.bool, device=device
+            )
+        curriculum = {
+            "target_only": bool(stage.get("exact_self", False)),
+            "target_probability": float(bool(stage.get("exact_self", False))),
+            "phase": str(stage["name"]),
+        }
+    else:
+        references, reference_mask, include_target, curriculum = _reference_batch(
+            batch, device, "curriculum", step, training, generator
+        )
     noise = torch.randn(
         latents.shape, device=device, dtype=latents.dtype, generator=generator
     )
@@ -172,16 +312,27 @@ def _forward_dual_query_flow(
             enabled=torch.device(device).type == "cuda",
         )
 
-    direct_active = step <= int(training.get("direct_auxiliary_end_step", 2000))
-    normalized_weight = (
-        float(training.get("normalized_residual_weight", 0.0))
-        if direct_active else 0.0
-    )
-    floor_weight = (
-        float(training.get("aligned_floor_weight", 0.0))
-        if direct_active else 0.0
-    )
-    needs_base = measure_base or normalized_weight > 0 or floor_weight > 0
+    if pilot_enabled:
+        alignment = _pilot_alignment_state(step, training)
+        normalized_weight = alignment["normalized_weight"]
+        floor_weight = alignment["floor_weight"]
+    else:
+        direct_active = step <= int(training.get("direct_auxiliary_end_step", 2000))
+        normalized_weight = (
+            float(training.get("normalized_residual_weight", 0.0))
+            if direct_active else 0.0
+        )
+        floor_weight = (
+            float(training.get("aligned_floor_weight", 0.0))
+            if direct_active else 0.0
+        )
+        alignment = {
+            "coefficient_floor": _coefficient_floor(step, training),
+            "bounded_min": 0.0,
+            "bounded_max": 0.0,
+            "bounded_weight": 0.0,
+        }
+    needs_base = pilot_enabled or measure_base or normalized_weight > 0 or floor_weight > 0
     base_prediction = None
     # Run the no-grad baseline before retaining the styled graph. This avoids
     # holding the trainable forward's activations during a second Anima pass.
@@ -213,12 +364,15 @@ def _forward_dual_query_flow(
     }
     if normalized_weight > 0 or floor_weight > 0:
         assert base_prediction is not None
+        aligned_mask = (
+            torch.ones_like(include_target) if pilot_enabled else include_target
+        )
         normalized, floor, direct_metrics = _aligned_velocity_losses(
             prediction,
             base_prediction,
             target,
-            include_target,
-            coefficient_floor=_coefficient_floor(step, training),
+            aligned_mask,
+            coefficient_floor=float(alignment["coefficient_floor"]),
             huber_beta=float(training.get("normalized_residual_huber_beta", 0.1)),
             scale_floor=float(training.get("normalized_residual_scale_floor", 1e-4)),
         )
@@ -266,6 +420,125 @@ def _forward_dual_query_flow(
         contrastive_weight = float(training["artist_contrastive_weight"])
         total = total + contrastive_weight * contrastive
 
+    bounded_loss = flow_loss.new_zeros(())
+    bounded_weight = 0.0
+    bounded_metrics = {
+        "bounded_aligned_coefficient": flow_loss.new_zeros(()),
+        "bounded_below_fraction": flow_loss.new_zeros(()),
+        "bounded_above_fraction": flow_loss.new_zeros(()),
+        "bounded_orthogonal_ratio": flow_loss.new_zeros(()),
+    }
+    bounded_every = max(1, int(training.get("bounded_effect_every", 4)))
+    if pilot_enabled and step % bounded_every == 0:
+        assert base_prediction is not None
+        bounded_loss, bounded_metrics = _bounded_aligned_effect_loss(
+            prediction,
+            base_prediction,
+            target,
+            minimum=float(alignment["bounded_min"]),
+            maximum=float(alignment["bounded_max"]),
+            orthogonal_maximum=float(training.get("bounded_orthogonal_maximum", 0.12)),
+            orthogonal_weight=float(training.get("bounded_orthogonal_weight", 0.25)),
+            scale_floor=float(training.get("normalized_residual_scale_floor", 1e-4)),
+        )
+        bounded_weight = float(alignment["bounded_weight"])
+        total = total + bounded_weight * bounded_loss
+
+    direction_loss = flow_loss.new_zeros(())
+    direction_weight = 0.0
+    direction_metrics = {
+        "artist_correct_direction_cosine": flow_loss.new_zeros(()),
+        "artist_wrong_direction_cosine": flow_loss.new_zeros(()),
+        "artist_centered_direction_cosine": flow_loss.new_zeros(()),
+        "artist_direction_ranking_loss": flow_loss.new_zeros(()),
+    }
+    ranking_start = int(training.get("wrong_ranking_start_step", 1000))
+    ranking_every = max(1, int(training.get("wrong_ranking_every", 4)))
+    if pilot_enabled and step >= ranking_start and step % ranking_every == 0:
+        assert base_prediction is not None
+        wrong_references, wrong_mask = _reference_inputs(batch, device, "wrong_artist")
+        rows = min(
+            int(training.get("wrong_ranking_batch_rows", 2)),
+            prediction.shape[0],
+        )
+        with torch.no_grad(), autocast_context():
+            wrong_output = tokenizer(wrong_references[:rows], wrong_mask[:rows])
+            wrong_styled = insert_style_tokens(
+                conditioning[:rows], conditioning_lengths[:rows], wrong_output.tokens
+            )
+            wrong_prediction = anima(
+                noisy[:rows].unsqueeze(2),
+                timesteps[:rows].to(latents.dtype),
+                context=wrong_styled,
+                padding_mask=padding_mask[:rows],
+                target_input_ids=None,
+            ).squeeze(2).float()
+        direction_loss, direction_metrics = _artist_direction_loss(
+            prediction[:rows],
+            wrong_prediction,
+            base_prediction[:rows],
+            target[:rows],
+            margin=float(training.get("wrong_ranking_margin", 0.02)),
+            centered_weight=float(training.get("wrong_centered_weight", 0.10)),
+        )
+        direction_weight = _linear_ramp(
+            step,
+            start_step=ranking_start,
+            end_step=ranking_start + int(training.get("wrong_ranking_ramp_steps", 1000)),
+            start=0.0,
+            end=float(training.get("wrong_ranking_weight", 0.00075)),
+        )
+        total = total + direction_weight * direction_loss
+
+    common_loss = flow_loss.new_zeros(())
+    common_weight = 0.0
+    common_metrics = {
+        "common_output_ratio": flow_loss.new_zeros(()),
+        "controlled_artist_effect_rms": flow_loss.new_zeros(()),
+        "controlled_common_rms": flow_loss.new_zeros(()),
+    }
+    common_every = max(1, int(training.get("common_output_every", 8)))
+    if pilot_enabled and step % common_every == 0:
+        assert base_prediction is not None
+        rows = min(
+            int(training.get("common_output_batch_rows", 4)),
+            prediction.shape[0],
+        )
+        common_conditioning = conditioning[0:1].expand(rows, -1, -1).clone()
+        common_lengths = conditioning_lengths[0:1].expand(rows)
+        common_styled = insert_style_tokens(
+            common_conditioning, common_lengths, output.tokens[:rows]
+        )
+        common_start = int(training.get("common_output_start_step", 1500))
+        common_weight = (
+            _linear_ramp(
+                step,
+                start_step=common_start,
+                end_step=common_start + int(training.get("common_output_ramp_steps", 1000)),
+                start=0.0,
+                end=float(training.get("common_output_weight", 0.002)),
+            )
+            if step >= common_start
+            else 0.0
+        )
+        gradient_context = (
+            torch.enable_grad() if common_weight > 0 else torch.no_grad()
+        )
+        with gradient_context, autocast_context():
+            common_prediction = anima(
+                noisy[0:1].expand(rows, -1, -1, -1).unsqueeze(2),
+                timesteps[0:1].expand(rows).to(latents.dtype),
+                context=common_styled,
+                padding_mask=padding_mask[0:1].expand(rows, -1, -1, -1),
+                target_input_ids=None,
+            ).squeeze(2).float()
+        common_delta = common_prediction - base_prediction[0:1]
+        common_loss, common_metrics = _common_output_loss(
+            common_delta,
+            threshold=float(training.get("common_output_threshold", 0.70)),
+        )
+        total = total + common_weight * common_loss
+
     metrics = {
         "loss": total.detach(),
         "flow_loss": flow_loss.detach(),
@@ -273,12 +546,24 @@ def _forward_dual_query_flow(
         "normalized_residual_weight": flow_loss.new_tensor(normalized_weight),
         "aligned_floor_loss": floor.detach(),
         "aligned_floor_weight": flow_loss.new_tensor(floor_weight),
+        "aligned_coefficient_floor": flow_loss.new_tensor(
+            float(alignment["coefficient_floor"])
+        ),
         **{key: value.detach() for key, value in direct_metrics.items()},
         "artist_contrastive_loss": contrastive.detach(),
         "artist_contrastive_weight": flow_loss.new_tensor(contrastive_weight),
         "artist_positive_similarity": positive.detach(),
         "artist_negative_similarity": negative.detach(),
         "slot_diversity_loss": diversity.detach(),
+        "bounded_effect_loss": bounded_loss.detach(),
+        "bounded_effect_weight": flow_loss.new_tensor(bounded_weight),
+        **{key: value.detach() for key, value in bounded_metrics.items()},
+        "artist_direction_loss": direction_loss.detach(),
+        "artist_direction_weight": flow_loss.new_tensor(direction_weight),
+        **{key: value.detach() for key, value in direction_metrics.items()},
+        "common_output_loss": common_loss.detach(),
+        "common_output_weight": flow_loss.new_tensor(common_weight),
+        **{key: value.detach() for key, value in common_metrics.items()},
         "style_token_rms": output.tokens.detach().float().square().mean().sqrt(),
         "references": reference_mask.sum(dim=1).float().mean(),
         "reference_count_1_fraction": (
@@ -351,6 +636,37 @@ def _train_variant(
             config, cfg, split=str(cfg.get("validation_split", "validation"))
         ),
     )
+    pilot_enabled = bool(training.get("pilot_enabled", False))
+    reference_eval_loaders: dict[int, DualQueryCachedStyleLoader] = {}
+    controlled_loader = None
+    if pilot_enabled:
+        for count in (1, 2, 4, 8):
+            eval_loader_cfg = _loader_config(
+                config, cfg, split=str(cfg.get("validation_split", "validation"))
+            )
+            eval_loader_cfg.update(
+                {
+                    "min_references": count,
+                    "max_references": count,
+                    "reference_count_weights": None,
+                }
+            )
+            reference_eval_loaders[count] = DualQueryCachedStyleLoader(
+                destination, eval_loader_cfg
+            )
+        controlled_cfg = _loader_config(
+            config, cfg, split=str(cfg.get("validation_split", "validation"))
+        )
+        controlled_cfg.update(
+            {
+                "batch_size": int(training.get("controlled_evaluation_artists", 4)),
+                "min_references": 8,
+                "max_references": 8,
+                "reference_count_weights": None,
+                "artist_balanced": True,
+            }
+        )
+        controlled_loader = DualQueryCachedStyleLoader(destination, controlled_cfg)
     cache_summary = _cache_summary(destination, cfg)
     tokenizer = DualQuerySetStyleTokenizer(**dict(cfg["model"])).to(device)
     output = destination / output_name
@@ -552,6 +868,37 @@ def _train_variant(
                         - validation_wrong["paired_flow_improvement"]
                     ),
                 }
+                extended_every = int(
+                    training.get("extended_evaluation_every", 1000)
+                )
+                if pilot_enabled and step % extended_every == 0:
+                    reference_metrics = {
+                        str(count): _evaluate(
+                            anima,
+                            tokenizer,
+                            loader,
+                            device,
+                            training,
+                            step=step,
+                            batches=int(
+                                training.get("reference_evaluation_batches", 4)
+                            ),
+                            seed=(seed ^ 0x51A7) + count * 1009,
+                            mode="heldout",
+                        )
+                        for count, loader in reference_eval_loaders.items()
+                    }
+                    assert controlled_loader is not None
+                    controlled_metrics = _evaluate_controlled_artist_consistency(
+                        anima,
+                        tokenizer,
+                        controlled_loader,
+                        device,
+                        dict(training.get("controlled_evaluation", {})),
+                        seed=seed ^ 0xC017_2026,
+                    )
+                    row["reference_count_evaluation"] = reference_metrics
+                    row["controlled_artist_consistency"] = controlled_metrics
                 row["selection_score"] = _selection_score(row)
                 history.append(row)
                 write_json(history_path, history)
@@ -575,6 +922,21 @@ def _train_variant(
                                 "correct_vs_wrong_paired_advantage"
                             ],
                             "validation/selection_score": row["selection_score"],
+                            **(
+                                {
+                                    f"validation_references_{count}/{key}": value
+                                    for count, values in row.get(
+                                        "reference_count_evaluation", {}
+                                    ).items()
+                                    for key, value in values.items()
+                                }
+                            ),
+                            **{
+                                f"validation_controlled/{key}": value
+                                for key, value in row.get(
+                                    "controlled_artist_consistency", {}
+                                ).items()
+                            },
                         },
                         step=step,
                     )
@@ -689,6 +1051,39 @@ def train_dual_query_style_tokenizer(
         anima,
         include_artist_summary=bool(selected),
         output_name=str(cfg["output_directory"]),
+    )
+
+
+def train_dual_query_style_tokenizer_pilot(
+    config: dict[str, Any], destination: Path
+) -> dict[str, Any]:
+    """Run the summary-ON 10k pilot without mutating historical A/B settings."""
+
+    cfg = config["dual_query_style_tokenizer"]
+    pilot = copy.deepcopy(cfg["pilot"])
+    training_overrides = copy.deepcopy(pilot["training"])
+    training_overrides["pilot_enabled"] = True
+    training_overrides["steps"] = int(pilot.get("steps", 10_000))
+    device = str(training_overrides.get("device", cfg["training"].get("device", "cuda")))
+    anima = _resolve_anima_model(config, destination, device).requires_grad_(False).eval()
+    _optimize_frozen_anima(
+        anima,
+        low_precision_rmsnorm=bool(
+            training_overrides.get("low_precision_rmsnorm", True)
+        ),
+        fuse_attention_projections=bool(
+            training_overrides.get("fuse_attention_projections", True)
+        ),
+    )
+    return _train_variant(
+        config,
+        destination,
+        anima,
+        include_artist_summary=True,
+        output_name=str(pilot["output_directory"]),
+        steps_override=int(pilot.get("steps", 10_000)),
+        training_overrides=training_overrides,
+        wandb_suffix="-10k-pilot",
     )
 
 
