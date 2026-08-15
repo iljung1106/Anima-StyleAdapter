@@ -337,6 +337,14 @@ def _vae_reconstruction_loss(
     )
 
 
+def _descriptor_variance_loss(
+    descriptors: torch.Tensor, target_standard_deviation: float
+) -> tuple[torch.Tensor, torch.Tensor]:
+    centered = descriptors.float() - descriptors.float().mean(dim=0, keepdim=True)
+    dimension_std = torch.sqrt(centered.square().mean(dim=0) + 1e-4)
+    return F.relu(target_standard_deviation - dimension_std).mean(), dimension_std.mean()
+
+
 def _losses(
     model: DualQueryResampler,
     episode: CacheEpisode,
@@ -371,6 +379,28 @@ def _losses(
         episode.labels,
         temperature=float(cfg.get("contrastive_temperature", 0.10)),
     )
+    variance, stabilized_descriptor_std = _descriptor_variance_loss(
+        output.descriptor,
+        float(cfg.get("descriptor_variance_target", 0.03)),
+    )
+    summary_descriptor = F.normalize(
+        output.artist_summary.float().mean(dim=1), dim=-1
+    )
+    summary_prototype, _ = episodic_angular_prototype_loss(
+        summary_descriptor,
+        episode.labels,
+        scale=float(cfg.get("prototype_scale", 16.0)),
+        margin=float(cfg.get("prototype_margin", 0.10)),
+    )
+    summary_contrastive = supervised_contrastive_loss(
+        summary_descriptor,
+        episode.labels,
+        temperature=float(cfg.get("contrastive_temperature", 0.10)),
+    )
+    summary_variance, _ = _descriptor_variance_loss(
+        summary_descriptor,
+        float(cfg.get("summary_variance_target", 0.02)),
+    )
     proxy = output.descriptor.new_zeros(())
     proxy_top1 = output.descriptor.new_zeros(())
     if model.artist_proxies is not None and bool((episode.class_labels >= 0).all()):
@@ -384,6 +414,13 @@ def _losses(
         prototype
         + float(cfg.get("contrastive_fraction", 0.25)) * contrastive
         + float(cfg.get("artist_proxy_fraction", 0.50)) * proxy
+        + float(cfg.get("descriptor_variance_weight", 50.0)) * variance
+        + float(cfg.get("summary_artist_fraction", 0.25))
+        * (
+            summary_prototype
+            + float(cfg.get("contrastive_fraction", 0.25)) * summary_contrastive
+            + float(cfg.get("descriptor_variance_weight", 50.0)) * summary_variance
+        )
     )
     diversity = token_diversity_loss(output.tokens)
     total = (
@@ -403,6 +440,11 @@ def _losses(
         "supervised_contrastive": contrastive,
         "artist_proxy": proxy,
         "artist_proxy_top1": proxy_top1,
+        "descriptor_variance": variance,
+        "stabilized_descriptor_std": stabilized_descriptor_std,
+        "summary_prototype": summary_prototype,
+        "summary_supervised_contrastive": summary_contrastive,
+        "summary_variance": summary_variance,
         "descriptor_dimension_std": output.descriptor.float().std(dim=0).mean(),
         "token_batch_std": output.tokens.float().std(dim=0).mean(),
         "token_diversity": diversity,
@@ -426,7 +468,11 @@ def _model_from_config(cfg: Mapping[str, Any], semantic_dim: int, vae_channels: 
         artist_descriptor_dim=int(model_cfg.get("artist_descriptor_dim", 512)),
         artist_pooling_queries=int(model_cfg.get("artist_pooling_queries", 4)),
         artist_summary_tokens=int(model_cfg.get("artist_summary_tokens", 4)),
-        artist_classes=int(cfg.get("training", {}).get("training_artist_count", 0)),
+        artist_classes=(
+            int(cfg.get("training", {}).get("training_artist_count", 0))
+            if float(cfg.get("training", {}).get("artist_proxy_fraction", 0.0)) > 0
+            else 0
+        ),
         semantic_dropout=float(model_cfg.get("semantic_dropout", 0.05)),
         vae_dropout=float(model_cfg.get("vae_dropout", 0.10)),
     )
@@ -538,7 +584,29 @@ def train_dual_query_resampler(
     }
     if device.startswith("cuda") and bool(training.get("fused_adamw", True)):
         optimizer_kwargs["fused"] = True
-    optimizer = torch.optim.AdamW(model.parameters(), **optimizer_kwargs)
+    artist_parameter_ids = {id(parameter) for parameter in model.artist_head.parameters()}
+    optimizer = torch.optim.AdamW(
+        [
+            {
+                "params": [
+                    parameter
+                    for parameter in model.parameters()
+                    if id(parameter) not in artist_parameter_ids
+                    and parameter.requires_grad
+                ],
+                "lr_scale": 1.0,
+            },
+            {
+                "params": [
+                    parameter
+                    for parameter in model.artist_head.parameters()
+                    if parameter.requires_grad
+                ],
+                "lr_scale": float(training.get("artist_head_lr_scale", 4.0)),
+            },
+        ],
+        **optimizer_kwargs,
+    )
     output = destination / str(cfg.get("output_directory", "dual_query_resampler_bprime"))
     checkpoints = output / "checkpoints"
     checkpoints.mkdir(parents=True, exist_ok=True)
@@ -625,7 +693,7 @@ def train_dual_query_resampler(
                 minimum_ratio=float(training.get("minimum_lr_ratio", 0.1)),
             )
             for group in optimizer.param_groups:
-                group["lr"] = learning_rate
+                group["lr"] = learning_rate * float(group.get("lr_scale", 1.0))
             optimizer.zero_grad(set_to_none=True)
             with torch.autocast(
                 device_type="cuda",
@@ -665,6 +733,7 @@ def train_dual_query_resampler(
                 logged.update(
                     {
                         "train/learning_rate": learning_rate,
+                        "train/artist_head_learning_rate": optimizer.param_groups[1]["lr"],
                         "perf/step_s": elapsed / log_every,
                         "perf/data_wait_s": float(running["data_wait_s"]) / log_every,
                     }

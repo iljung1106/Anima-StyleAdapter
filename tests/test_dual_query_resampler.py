@@ -11,7 +11,10 @@ from anima_style_data.dual_query_resampler import (
     supervised_contrastive_loss,
     token_diversity_loss,
 )
-from anima_style_data.dual_query_training import train_dual_query_resampler
+from anima_style_data.dual_query_training import (
+    _descriptor_variance_loss,
+    train_dual_query_resampler,
+)
 from anima_style_data.io import write_records
 from safetensors.torch import save_file
 
@@ -164,6 +167,19 @@ def test_training_proxy_breaks_the_collapsed_descriptor_symmetry():
     assert torch.isfinite(descriptors.grad).all()
     assert float(descriptors.grad.abs().sum()) > 0
     assert model.artist_proxies.grad is None
+
+
+def test_variance_floor_pushes_back_before_descriptor_collapse():
+    torch.manual_seed(23)
+    descriptors = (torch.ones(8, 16) + 1e-3 * torch.randn(8, 16)).requires_grad_()
+
+    loss, dimension_std = _descriptor_variance_loss(descriptors, 0.03)
+    loss.backward()
+
+    assert dimension_std < 0.03
+    assert descriptors.grad is not None
+    assert torch.isfinite(descriptors.grad).all()
+    assert float(descriptors.grad.abs().sum()) > 0
 
 
 def test_real_cache_contract_runs_one_training_and_validation_step(tmp_path):
