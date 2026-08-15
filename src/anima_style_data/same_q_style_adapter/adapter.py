@@ -422,6 +422,30 @@ class SameQFullRankStyleAdapter(nn.Module):
             self._style_context.detach().float().square().mean().sqrt()
         )
 
+    def set_style_context(self, context: torch.Tensor) -> None:
+        """Use already aligned native-context tokens without the legacy bridge.
+
+        The query StyleTokenizer is itself the visual-to-Anima connector.  It
+        therefore emits the final 1024-D context directly; sending those
+        tokens through the older bridge would add an unnecessary bottleneck
+        and make the two experiments impossible to compare cleanly.
+        """
+        if context.ndim != 3:
+            raise ValueError("style context must have shape [batch, slots, dim]")
+        if context.shape[1:] != (self.slots, self.context_dim):
+            raise ValueError(
+                "Expected direct style context shape "
+                f"[batch, {self.slots}, {self.context_dim}], got {tuple(context.shape)}"
+            )
+        parameter = self.alpha
+        self._style_tokens = None
+        self._style_context = context.to(
+            device=parameter.device, dtype=parameter.dtype
+        )
+        self._runtime_style_context_rms = (
+            self._style_context.detach().float().square().mean().sqrt()
+        )
+
     def clear_style_tokens(self) -> None:
         self._style_tokens = None
         self._style_context = None

@@ -831,6 +831,120 @@ style_tokenizer_generalization:
     text_cfg: 4.0
     guidance_mode: shared
 
+# High-capacity StyleTokenizer v2.  Every reference keeps 32 independently
+# queried tokens until the set-pooling stage; no single global descriptor is
+# formed.  The resulting 32x1024 context enters a separate Same-Q style
+# attention in every Anima block. Native K/V initialize the style projections,
+# only rank-32 deltas are trained, and Anima's full-rank O is shared with text.
+query_style_tokenizer_v2:
+  output_directory: query_style_tokenizer_v2_32slot_joint_20k_v1
+  seed: 20260821
+  train_split: train
+  validation_split: validation
+  loader:
+    batch_size: 2
+    min_references: 1
+    max_references: 8
+    artist_balanced: true
+    self_reference_target_images_per_style: 0
+    text_conditioning_length: 512
+    text_lru_shards: 2
+    latent_lru_shards: 2
+    resampler_token_cache: production_resampler_tokens_l18_l24_siglip_l24
+  model:
+    source_dim: 1024
+    context_dim: 1024
+    source_tokens: 128
+    output_tokens: 32
+    heads: 16
+    per_reference_layers: 3
+    per_reference_ff_dim: 2048
+    cross_slot_layers: 2
+    cross_slot_ff_dim: 4096
+    reconstruction_layers: 1
+    reconstruction_ff_dim: 2048
+    reference_score_dim: 256
+    output_rms_init: 0.15
+  adapter:
+    architecture: same_q_full_rank
+    style_dim: 1024
+    context_dim: 1024
+    slots: 32
+    heads: 16
+    blocks: 28
+    alpha_init: 1.0
+    style_dropout: 0.0
+    aggregator_mode: minimal
+    aggregator_bottleneck: 64
+    connector_layers: 0
+    connector_heads: 16
+    bridge_init: xavier
+    bridge_output_rms_init: 0.15
+    style_kv_delta_rank: 32
+    style_output_delta_rank: 0
+    style_attention_context_length: 32
+  training:
+    device: cuda
+    steps: 20000
+    learning_rate: 0.0001
+    kv_learning_rate: 0.00005
+    betas: [0.9, 0.999]
+    adam_eps: 0.00000001
+    weight_decay: 0.01
+    warmup_steps: 500
+    minimum_lr_ratio: 0.10
+    max_grad_norm: 1.0
+    gradient_accumulation_steps: 8
+    fused_adamw: true
+    allow_tf32: true
+    low_precision_rmsnorm: true
+    fuse_attention_projections: true
+    timestep_sampling: shift
+    sigmoid_scale: 1.0
+    sigmoid_bias: 0.0
+    discrete_flow_shift: 3.0
+    prefetch_workers: 2
+    prefetch_batches: 4
+    # 0-2k exact target; 2k-8k target inclusion 1.0->0.5 with 1-4 refs;
+    # 8k-20k inclusion 0.5->0 with 1-8 target-excluded references.
+    curriculum:
+      gate_only_steps: 0
+      self_reference_steps: 2000
+      target_mix_end_step: 8000
+      target_mix_end_probability: 0.5
+      target_mix_min_references: 1
+      target_mix_max_references: 4
+      target_anneal_end: 20000
+      target_anneal_min_references: 1
+      target_anneal_max_references: 8
+    # Reconstruction is deliberately auxiliary: it protects visual detail in
+    # each reference's 32 slots but decays as flow and artist alignment mature.
+    reconstruction_weight: 0.02
+    reconstruction_final_weight: 0.005
+    reconstruction_decay_steps: 8000
+    reconstruction_huber_beta: 0.1
+    artist_contrastive_weight: 0.01
+    artist_contrastive_temperature: 0.10
+    artist_contrastive_every: 2
+    slot_diversity_weight: 0.001
+    # Calibrate a noticeable but non-destructive style branch once, then keep
+    # alpha fixed so shrinking the branch cannot solve the training objective.
+    alpha_calibration_batches: 2
+    alpha_target_style_to_text_ratio: 0.25
+    alpha_minimum: 0.00001
+    alpha_maximum: 1.0
+    train_alpha: false
+    log_every: 10
+    validation_every: 250
+    validation_batches: 8
+    checkpoint_every: 500
+    resume: true
+    wandb:
+      enabled: true
+      project: anima-style-adapter
+      name: query-style-tokenizer-v2-32slot-joint-20k-v1
+      id: query-style-tokenizer-v2-32slot-joint-20k-v1
+
 style_tokenizer_selection:
   source_config_section: style_tokenizer_generalization
   device: cuda

@@ -97,6 +97,8 @@ def build_parser() -> argparse.ArgumentParser:
         ("style-tokenizer-export", "Export the selected StyleTokenizer inference bundle"),
         ("style-tokenizer-compare-artists", "Render different artists with one prompt and seed"),
         ("style-tokenizer-smoke", "Run two real Anima StyleTokenizer training steps"),
+        ("query-style-tokenizer-train", "Jointly train the 32-slot query StyleTokenizer and Anima style K/V"),
+        ("query-style-tokenizer-smoke", "Run two real Anima query StyleTokenizer training steps"),
         ("style-calibrate", "Measure empirical Anima artist-tag velocity effect ranges"),
         ("synthetic-teacher", "Generate and fully cache artist-tag teacher images"),
         ("synthetic-teacher-benchmark", "Validate SPEED and batched VAE before production"),
@@ -243,6 +245,19 @@ def main() -> None:
             "style-tokenizer-compare-artists": compare_style_tokenizer_artists,
             "style-tokenizer-smoke": smoke_test_style_tokenizer,
             "style-tokenizer-generalize-smoke": smoke_test_style_tokenizer_generalization,
+        }[args.command]
+        _run(stage, config, destination)
+    elif args.command in {
+        "query-style-tokenizer-train", "query-style-tokenizer-smoke",
+    }:
+        from .query_style_tokenizer import (
+            smoke_test_query_style_tokenizer,
+            train_query_style_tokenizer,
+        )
+
+        stage = {
+            "query-style-tokenizer-train": train_query_style_tokenizer,
+            "query-style-tokenizer-smoke": smoke_test_query_style_tokenizer,
         }[args.command]
         _run(stage, config, destination)
     elif args.command == "synthetic-teacher":
