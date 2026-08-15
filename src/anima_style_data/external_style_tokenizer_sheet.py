@@ -284,7 +284,7 @@ def _generate_latents(
     positive: torch.Tensor,
     negative: torch.Tensor,
     length: int,
-    small_tokens: torch.Tensor,
+    small_tokens: torch.Tensor | None,
     current_tokens: torch.Tensor,
     cfg: dict[str, Any],
     device: str,
@@ -341,7 +341,12 @@ def _generate_latents(
             )
         return torch.cat(parts)
 
-    return base, styled(small_tokens), styled(current_tokens)
+    small = (
+        styled(small_tokens)
+        if small_tokens is not None
+        else base.new_empty((0, *base.shape[1:]))
+    )
+    return base, small, styled(current_tokens)
 
 
 def _to_image(value: torch.Tensor) -> Image.Image:
@@ -375,7 +380,15 @@ def _decode_latents(
                 )
             ).float()
             decoded.extend(_to_image(value) for value in values)
-    return decoded[:1], decoded[1:8], decoded[8:15]
+    base_count, small_count, current_count = (len(group) for group in groups)
+    base_end = base_count
+    small_end = base_end + small_count
+    current_end = small_end + current_count
+    return (
+        decoded[:base_end],
+        decoded[base_end:small_end],
+        decoded[small_end:current_end],
+    )
 
 
 def _fit_with_padding(image: Image.Image, size: tuple[int, int]) -> Image.Image:
@@ -420,7 +433,7 @@ def _label(image: Image.Image, lines: list[str], *, align: str = "left") -> None
 def _make_sheet(
     paths: list[Path],
     base: Image.Image,
-    small: list[Image.Image],
+    small: list[Image.Image] | None,
     current: list[Image.Image],
     size: tuple[int, int],
 ) -> Image.Image:
@@ -430,9 +443,14 @@ def _make_sheet(
             cell = _fit_with_padding(image, size)
         _label(cell, [f"TestSample {index}"], align="right")
         reference_cells.append(cell)
-    rows = [reference_cells, small, current]
-    row_names = ["REFERENCE ORIGINALS", "SMALL TOKENIZER", "LARGE TOKENIZER"]
-    sheet = Image.new("RGB", (size[0] * 8, size[1] * 3), "white")
+    rows = [reference_cells]
+    row_names = ["REFERENCE ORIGINALS"]
+    if small is not None:
+        rows.append(small)
+        row_names.append("SMALL TOKENIZER")
+    rows.append(current)
+    row_names.append("LARGE TOKENIZER")
+    sheet = Image.new("RGB", (size[0] * 8, size[1] * len(rows)), "white")
     for row_index, (name, values) in enumerate(zip(row_names, rows, strict=True)):
         baseline = base.copy()
         _label(baseline, [name, "NO STYLE BASELINE"])
@@ -461,25 +479,26 @@ def generate_external_style_tokenizer_sheet(
     reference_tokens = _extract_reference_tokens(
         config, destination, paths, output, device
     )
-    small_tokens, small_metadata = _load_tokenizer_tokens(
-        destination / str(cfg["small_checkpoint"]),
-        AnimaStyleTokenizer,
-        reference_tokens,
-        device,
-    )
+    include_small = bool(cfg.get("include_small", True))
+    small_tokens = None
+    small_metadata = None
+    if include_small:
+        small_tokens, small_metadata = _load_tokenizer_tokens(
+            destination / str(cfg["small_checkpoint"]),
+            AnimaStyleTokenizer,
+            reference_tokens,
+            device,
+        )
     current_tokens, current_metadata = _load_tokenizer_tokens(
         destination / str(cfg["current_checkpoint"]),
         QueryStyleTokenizerV2,
         reference_tokens,
         device,
     )
-    save_file(
-        {
-            "small": small_tokens,
-            "current": current_tokens,
-        },
-        output / "style_tokens.safetensors",
-    )
+    saved_tokens = {"current": current_tokens}
+    if small_tokens is not None:
+        saved_tokens["small"] = small_tokens
+    save_file(saved_tokens, output / "style_tokens.safetensors")
     positive, negative, length = _encode_text_conditions(
         config, destination, cfg, output, device
     )
@@ -520,9 +539,13 @@ def generate_external_style_tokenizer_sheet(
 
     size = (int(cfg["width"]), int(cfg["height"]))
     sheet = _make_sheet(
-        paths, base_images[0], small_images, current_images, size
+        paths,
+        base_images[0],
+        small_images if include_small else None,
+        current_images,
+        size,
     )
-    expected = (size[0] * 8, size[1] * 3)
+    expected = (size[0] * 8, size[1] * (3 if include_small else 2))
     if sheet.size != expected:
         raise RuntimeError(f"Unexpected final sheet size: {sheet.size} != {expected}")
     sheet_path = output / str(cfg.get("sheet_filename", "comparison-3x8.png"))
@@ -541,6 +564,22 @@ def generate_external_style_tokenizer_sheet(
         "small": small_metadata,
         "current": current_metadata,
         "references": [str(path) for path in paths],
+        "guidance_mode": "shared_text_and_style_cfg",
+        "large_pixel_rms_from_baseline": [
+            float(
+                np.sqrt(
+                    np.mean(
+                        (
+                            np.asarray(image, dtype=np.float32)
+                            - np.asarray(base_images[0], dtype=np.float32)
+                        )
+                        ** 2
+                    )
+                )
+                / 255.0
+            )
+            for image in current_images
+        ],
     }
     (output / "summary.json").write_text(
         json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8"
