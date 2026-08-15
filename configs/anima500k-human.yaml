@@ -138,6 +138,65 @@ style_features:
     max_side: 512
     max_pixels: 262144
 
+# B-prime per-reference encoder. C-RADIO spatial features and Qwen Image VAE
+# latents remain separate K/V banks; learned spatial/global queries read both.
+dual_query_resampler:
+  output_directory: dual_query_resampler_bprime_v1
+  feature_directory: style_features_l18_l24_siglip_l24
+  latent_directory: anima_latent_cache_qwen_2d
+  seed: 20260815
+  model:
+    semantic_layers: [18, 24]
+    dim: 1024
+    spatial_query_grid: 8
+    global_queries: 16
+    layers: 4
+    heads: 16
+    ff_dim: 4096
+    artist_descriptor_dim: 512
+    artist_pooling_queries: 4
+    artist_summary_tokens: 4
+    semantic_dropout: 0.05
+    vae_dropout: 0.10
+  training:
+    device: cuda
+    steps: 20000
+    training_artist_count: 3000
+    validation_artist_count: 150
+    images_per_artist_limit: 15
+    artists_per_batch: 4
+    images_per_artist: 2
+    train_split: train
+    validation_split: validation
+    learning_rate: 0.0001
+    warmup_steps: 500
+    minimum_lr_ratio: 0.1
+    weight_decay: 0.01
+    betas: [0.9, 0.95]
+    epsilon: 0.00000001
+    fused_adamw: true
+    max_grad_norm: 1.0
+    semantic_reconstruction_sample_tokens: 192
+    vae_reconstruction_weight: 0.10
+    artist_weight: 0.05
+    token_diversity_weight: 0.01
+    prototype_scale: 16.0
+    prototype_margin: 0.10
+    contrastive_fraction: 0.25
+    contrastive_temperature: 0.10
+    prefetch_workers: 2
+    prefetch_batches: 4
+    log_every: 20
+    validation_every: 250
+    validation_batches: 8
+    checkpoint_every: 500
+    resume: true
+    wandb:
+      enabled: true
+      project: anima-style-adapter
+      name: dual-query-resampler-bprime-v1
+      id: dual-query-resampler-bprime-v1
+
 # External controlled benchmark. Each group contains one image from the shard
 # artist and three images of the same character(s) from different artists.
 stylenet_benchmark:

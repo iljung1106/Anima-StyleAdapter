@@ -101,6 +101,8 @@ def build_parser() -> argparse.ArgumentParser:
         ("query-style-tokenizer-smoke", "Run two real Anima query StyleTokenizer training steps"),
         ("pure-token-style-tokenizer-train", "Train the 32-slot tokenizer by native text-context injection"),
         ("pure-token-style-tokenizer-smoke", "Smoke-test native-context pure token injection"),
+        ("dual-query-resampler-train", "Pretrain the C-RADIO/Qwen-VAE dual-query Resampler"),
+        ("dual-query-resampler-smoke", "Run two synthetic dual-query Resampler steps"),
         ("style-calibrate", "Measure empirical Anima artist-tag velocity effect ranges"),
         ("synthetic-teacher", "Generate and fully cache artist-tag teacher images"),
         ("synthetic-teacher-benchmark", "Validate SPEED and batched VAE before production"),
@@ -274,6 +276,20 @@ def main() -> None:
         stage = {
             "pure-token-style-tokenizer-train": train_pure_token_style_tokenizer,
             "pure-token-style-tokenizer-smoke": smoke_test_pure_token_style_tokenizer,
+        }[args.command]
+        _run(stage, config, destination)
+    elif args.command in {
+        "dual-query-resampler-train",
+        "dual-query-resampler-smoke",
+    }:
+        from .dual_query_training import (
+            smoke_test_dual_query_resampler,
+            train_dual_query_resampler,
+        )
+
+        stage = {
+            "dual-query-resampler-train": train_dual_query_resampler,
+            "dual-query-resampler-smoke": smoke_test_dual_query_resampler,
         }[args.command]
         _run(stage, config, destination)
     elif args.command == "synthetic-teacher":
