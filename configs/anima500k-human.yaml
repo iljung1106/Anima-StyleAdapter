@@ -945,8 +945,12 @@ query_style_tokenizer_v2:
     wandb:
       enabled: true
       project: anima-style-adapter
-      name: query-style-tokenizer-v2-32slot-joint-20k-v1
-      id: query-style-tokenizer-v2-32slot-joint-20k-v1
+      # The sampler retrofit intentionally resumed from step 500 after the
+      # original run had already logged through step 740. W&B rejects
+      # out-of-order explicit steps, so keep that pilot intact and record the
+      # reproducible resume branch under its own run identity.
+      name: query-style-tokenizer-v2-32slot-resume500-samples-v1
+      id: query-style-tokenizer-v2-32slot-resume500-samples-v1
   sampling:
     width: 768
     height: 768
