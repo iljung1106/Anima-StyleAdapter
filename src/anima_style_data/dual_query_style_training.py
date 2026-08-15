@@ -332,6 +332,7 @@ def _pilot_common_output_step(
     )
     metrics["common_output_loss"] = loss.detach()
     metrics["common_output_weight"] = loss.new_tensor(weight)
+    metrics["common_output_weighted_loss"] = (weight * loss).detach()
     return loss, weight, metrics
 
 
@@ -576,14 +577,6 @@ def _forward_dual_query_flow(
         )
         total = total + direction_weight * direction_loss
 
-    common_loss = flow_loss.new_zeros(())
-    common_weight = 0.0
-    common_metrics = {
-        "common_output_ratio": flow_loss.new_zeros(()),
-        "controlled_artist_effect_rms": flow_loss.new_zeros(()),
-        "controlled_common_rms": flow_loss.new_zeros(()),
-    }
-
     metrics = {
         "loss": total.detach(),
         "flow_loss": flow_loss.detach(),
@@ -606,9 +599,6 @@ def _forward_dual_query_flow(
         "artist_direction_loss": direction_loss.detach(),
         "artist_direction_weight": flow_loss.new_tensor(direction_weight),
         **{key: value.detach() for key, value in direction_metrics.items()},
-        "common_output_loss": common_loss.detach(),
-        "common_output_weight": flow_loss.new_tensor(common_weight),
-        **{key: value.detach() for key, value in common_metrics.items()},
         "style_token_rms": output.tokens.detach().float().square().mean().sqrt(),
         "references": reference_mask.sum(dim=1).float().mean(),
         "reference_count_1_fraction": (
