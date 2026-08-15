@@ -55,7 +55,7 @@ shortcut을 막기 위해 반드시 target 방향으로 투영된 성분에 하�
 - validation: 250 step마다 train-self, validation-self, heldout, wrong-artist
 - checkpoint와 8개 정성 샘플: 500 step마다
 - 샘플: train artist 4명 + validation artist 4명, 768 x 768, 30 steps,
-  text CFG 4, style CFG 1
+  text와 style token을 하나의 조건으로 묶은 shared CFG 4
 - 핵심 지표: paired flow improvement, correct-vs-wrong advantage,
   aligned coefficient, delta/desired RMS, direction cosine, orthogonal ratio
 

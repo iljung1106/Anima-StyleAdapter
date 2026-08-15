@@ -1071,8 +1071,7 @@ pure_token_style_tokenizer_v2:
     flow_shift: 3.0
     seed: 20260822
     text_cfg: 4.0
-    style_cfg: 1.0
-    guidance_mode: separate
+    guidance_mode: shared
     batch_size: 4
     vae_batch_size: 4
 
