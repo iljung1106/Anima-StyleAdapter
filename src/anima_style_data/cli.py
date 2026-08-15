@@ -103,6 +103,11 @@ def build_parser() -> argparse.ArgumentParser:
         ("pure-token-style-tokenizer-smoke", "Smoke-test native-context pure token injection"),
         ("dual-query-resampler-train", "Pretrain the C-RADIO/Qwen-VAE dual-query Resampler"),
         ("dual-query-resampler-smoke", "Run two synthetic dual-query Resampler steps"),
+        ("dual-query-style-cache", "Cache frozen Dual-query Resampler outputs"),
+        ("dual-query-style-external-cache", "Cache the seven fixed external references"),
+        ("dual-query-style-ablate", "Compare artist-summary token delivery"),
+        ("dual-query-style-train", "Train the multi-reference Dual-query Style Tokenizer"),
+        ("dual-query-style-smoke", "Smoke-test the Dual-query Style Tokenizer"),
         ("style-calibrate", "Measure empirical Anima artist-tag velocity effect ranges"),
         ("synthetic-teacher", "Generate and fully cache artist-tag teacher images"),
         ("synthetic-teacher-benchmark", "Validate SPEED and batched VAE before production"),
@@ -290,6 +295,29 @@ def main() -> None:
         stage = {
             "dual-query-resampler-train": train_dual_query_resampler,
             "dual-query-resampler-smoke": smoke_test_dual_query_resampler,
+        }[args.command]
+        _run(stage, config, destination)
+    elif args.command in {
+        "dual-query-style-cache",
+        "dual-query-style-external-cache",
+        "dual-query-style-ablate",
+        "dual-query-style-train",
+        "dual-query-style-smoke",
+    }:
+        from .dual_query_style_tokenizer import cache_dual_query_style_tokens
+        from .dual_query_external_samples import cache_dual_query_external_references
+        from .dual_query_style_training import (
+            compare_artist_summary_tokens,
+            smoke_test_dual_query_style_tokenizer,
+            train_dual_query_style_tokenizer,
+        )
+
+        stage = {
+            "dual-query-style-cache": cache_dual_query_style_tokens,
+            "dual-query-style-external-cache": cache_dual_query_external_references,
+            "dual-query-style-ablate": compare_artist_summary_tokens,
+            "dual-query-style-train": train_dual_query_style_tokenizer,
+            "dual-query-style-smoke": smoke_test_dual_query_style_tokenizer,
         }[args.command]
         _run(stage, config, destination)
     elif args.command == "synthetic-teacher":

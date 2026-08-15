@@ -229,6 +229,150 @@ dual_query_resampler:
       name: dual-query-resampler-bprime-v8-balanced-bootstrap
       id: dual-query-resampler-bprime-v8-balanced-bootstrap
 
+# Frozen Dual-query Resampler outputs are materialized once, then a compact
+# permutation-invariant tokenizer learns native Anima context tokens. This is
+# intentionally separate from every earlier StyleTokenizer/IP-Adapter runner.
+dual_query_style_tokenizer:
+  output_directory: dual_query_style_tokenizer_v1_20k
+  seed: 20260816
+  train_split: train
+  validation_split: validation
+  resampler_checkpoint: dual_query_resampler_bprime_v8/checkpoints/step-010000.pt
+  cache:
+    output_directory: dual_query_reference_tokens_v8_step10000
+    device: cuda
+    batch_size: 64
+    shard_rows: 512
+    reader_workers: 8
+    prefetch_batches: 16
+    writer_workers: 2
+    pending_writes: 4
+  loader:
+    batch_size: 4
+    min_references: 1
+    max_references: 8
+    artist_balanced: true
+    self_reference_target_images_per_style: 0
+    text_conditioning_length: 512
+    text_lru_shards: 4
+    latent_lru_shards: 4
+    token_lru_shards: 8
+    reference_count_weights_by_phase:
+      exact_self: [1.0]
+      target_mix: [0.45, 0.30, 0.15, 0.10]
+      target_excluded: [0.30, 0.24, 0.16, 0.10, 0.07, 0.05, 0.04, 0.04]
+  model:
+    dim: 1024
+    query_tokens: 80
+    artist_summary_tokens: 4
+    include_artist_summary: true
+    output_tokens: 32
+    heads: 16
+    cross_layers: 1
+    cross_slot_layers: 2
+    ff_dim: 4096
+    output_rms_init: 0.15
+  training:
+    device: cuda
+    steps: 20000
+    learning_rate: 0.0001
+    betas: [0.9, 0.999]
+    adam_eps: 0.00000001
+    weight_decay: 0.01
+    warmup_steps: 500
+    minimum_lr_ratio: 0.10
+    max_grad_norm: 1.0
+    gradient_accumulation_steps: 4
+    fused_adamw: true
+    allow_tf32: true
+    low_precision_rmsnorm: true
+    fuse_attention_projections: true
+    timestep_sampling: shift
+    sigmoid_scale: 1.0
+    sigmoid_bias: 0.0
+    discrete_flow_shift: 3.0
+    prefetch_workers: 2
+    prefetch_batches: 6
+    curriculum:
+      gate_only_steps: 0
+      self_reference_steps: 2000
+      target_mix_end_step: 8000
+      target_mix_end_probability: 0.5
+      target_mix_min_references: 1
+      target_mix_max_references: 4
+      target_anneal_end: 20000
+      target_anneal_min_references: 1
+      target_anneal_max_references: 8
+    normalized_residual_weight: 0.05
+    normalized_residual_huber_beta: 0.10
+    normalized_residual_scale_floor: 0.0001
+    aligned_floor_weight: 0.10
+    aligned_floor_start: 0.02
+    aligned_floor_end: 0.10
+    aligned_floor_ramp_steps: 1000
+    reconstruction_weight: 0.0
+    reconstruction_final_weight: 0.0
+    artist_contrastive_weight: 0.01
+    artist_contrastive_temperature: 0.10
+    artist_contrastive_every: 2
+    slot_diversity_weight: 0.001
+    subset_consistency_weight: 0.005
+    subset_consistency_start: 2001
+    log_every: 10
+    validation_every: 250
+    validation_batches: 8
+    checkpoint_every: 500
+    sample_every: 500
+    fixed_sample_every: 1000
+    resume: true
+    wandb:
+      enabled: true
+      project: anima-style-adapter
+      name: dual-query-style-tokenizer-v1
+      id: dual-query-style-tokenizer-v1
+  ablation:
+    output_directory: dual_query_style_tokenizer_summary_ablation_v1
+    steps: 1000
+    training_overrides:
+      warmup_steps: 100
+      validation_every: 250
+      checkpoint_every: 500
+      sample_every: 500
+      fixed_sample_every: 1000
+      subset_consistency_start: 251
+      curriculum:
+        gate_only_steps: 0
+        self_reference_steps: 250
+        target_mix_end_step: 750
+        target_mix_end_probability: 0.5
+        target_mix_min_references: 1
+        target_mix_max_references: 4
+        target_anneal_end: 1000
+        target_anneal_min_references: 1
+        target_anneal_max_references: 8
+  fixed_reference_sampling:
+    cache_directory: dual_query_external_reference_cache_v1
+    device: cuda
+    generation:
+      output_directory: dual_query_external_reference_cache_v1
+      width: 832
+      height: 1024
+      cfg: 4.0
+      steps: 30
+      flow_shift: 3.0
+      batch_size: 4
+      vae_batch_size: 4
+  sampling:
+    width: 768
+    height: 768
+    steps: 30
+    flow_shift: 3.0
+    seed: 20260816
+    text_cfg: 4.0
+    guidance_mode: shared
+    batch_size: 4
+    vae_batch_size: 4
+
 # External controlled benchmark. Each group contains one image from the shard
 # artist and three images of the same character(s) from different artists.
 stylenet_benchmark:
