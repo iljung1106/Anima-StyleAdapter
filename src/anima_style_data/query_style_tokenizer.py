@@ -1115,6 +1115,26 @@ def train_query_style_tokenizer(
                         for label, path in sample_records
                     ]
                 }, step=start_step)
+        elif (
+            start_step > 0
+            and sample_every > 0
+            and start_step % sample_every == 0
+            and resumed_sample_summary.exists()
+            and wandb_run is not None
+        ):
+            # A checkpoint rewind intentionally starts a fresh W&B run.  Reuse
+            # the already-rendered panels so that the new run still has its
+            # qualitative baseline without paying for another diffusion pass.
+            import wandb
+            sample_summary = json.loads(
+                resumed_sample_summary.read_text(encoding="utf-8")
+            )
+            wandb_run.log({
+                "samples/panel": [
+                    wandb.Image(panel["path"], caption=panel["label"])
+                    for panel in sample_summary["panels"]
+                ]
+            }, step=start_step)
         for step in range(start_step + 1, steps + 1):
             step_started = time.perf_counter()
             lr_multiplier = _learning_rate_multiplier(
