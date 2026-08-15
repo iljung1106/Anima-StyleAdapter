@@ -853,7 +853,7 @@ def episodic_angular_prototype_loss(
     sine = torch.sqrt((1.0 - positive.square()).clamp_min(1e-4))
     angular_positive = positive * math.cos(margin) - sine * math.sin(margin)
     margin_cosine = cosine.clone()
-    margin_cosine[batch_indices, inverse] = angular_positive
+    margin_cosine[batch_indices, inverse] = angular_positive.to(margin_cosine.dtype)
     logits = margin_cosine * scale
     loss = F.cross_entropy(logits, inverse)
     hard_negative = cosine.masked_fill(

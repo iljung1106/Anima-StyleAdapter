@@ -197,16 +197,28 @@ def test_vectorized_prototype_matches_leave_one_out_reference():
         float((raw_logits.argmax(dim=1) == targets).float().mean())
     )
     assert float(actual_metrics["prototype_positive_cosine"].detach()) == pytest.approx(
-        float(torch.stack(positives).mean())
+        float(torch.stack(positives).mean().detach())
     )
     assert float(
         actual_metrics["prototype_hard_negative_cosine"].detach()
     ) == pytest.approx(
-        float(torch.stack(hard_negatives).mean())
+        float(torch.stack(hard_negatives).mean().detach())
     )
     assert torch.allclose(
         actual_descriptors.grad, reference_descriptors.grad, atol=1e-6, rtol=1e-5
     )
+
+
+def test_vectorized_prototype_supports_autocast():
+    descriptors = torch.randn(6, 12, requires_grad=True)
+    labels = torch.tensor([3, 3, 7, 7, 11, 11])
+    with torch.autocast("cpu", dtype=torch.bfloat16):
+        loss, metrics = episodic_angular_prototype_loss(descriptors, labels)
+    loss.backward()
+
+    assert torch.isfinite(loss)
+    assert torch.isfinite(metrics["prototype_hard_negative_cosine"])
+    assert torch.isfinite(descriptors.grad).all()
 
 
 def test_grouped_semantic_decoder_handles_mixed_grid_shapes():
