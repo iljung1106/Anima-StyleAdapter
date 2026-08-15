@@ -38,6 +38,10 @@ class _TokenView(nn.Module):
         super().__init__()
         self.tokenizer = tokenizer
 
+    @property
+    def log_output_rms(self) -> torch.Tensor:
+        return self.tokenizer.log_output_rms
+
     def forward(
         self, references: torch.Tensor, reference_mask: torch.Tensor
     ) -> torch.Tensor:
