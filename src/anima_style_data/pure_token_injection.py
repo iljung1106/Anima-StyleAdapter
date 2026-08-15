@@ -109,6 +109,23 @@ def _aligned_velocity_losses(
 
 
 def _coefficient_floor(step: int, training_cfg: dict[str, Any]) -> float:
+    if bool(training_cfg.get("pilot_enabled", False)):
+        exact_end = int(training_cfg.get("exact_self_end_step", 500))
+        if step <= exact_end:
+            start_step = 1
+            end_step = exact_end
+            start = float(training_cfg.get("exact_aligned_floor_start", 0.02))
+            end = float(training_cfg.get("exact_aligned_floor_end", 0.15))
+        else:
+            start_step = exact_end + 1
+            end_step = int(training_cfg.get("steps", 10_000))
+            start = float(training_cfg.get("heldout_aligned_floor_start", 0.03))
+            end = float(training_cfg.get("heldout_aligned_floor_end", 0.06))
+        progress = min(
+            1.0,
+            max(0.0, (step - start_step) / max(1, end_step - start_step)),
+        )
+        return start + progress * (end - start)
     start = float(training_cfg.get("aligned_floor_start", 0.05))
     end = float(training_cfg.get("aligned_floor_end", 0.25))
     ramp_steps = max(1, int(training_cfg.get("aligned_floor_ramp_steps", 500)))
@@ -130,7 +147,26 @@ def _reference_batch(
     curriculum = _self_reference_curriculum_state(
         step, dict(training_cfg.get("curriculum", {}))
     )
+    if bool(training_cfg.get("pilot_enabled", False)):
+        schedule = list(training_cfg.get("reference_schedule", []))
+        if not schedule:
+            raise ValueError("pilot reference_schedule is required")
+        stage = next(
+            (item for item in schedule if step <= int(item["end_step"])),
+            schedule[-1],
+        )
+        curriculum = {
+            "target_only": bool(stage.get("exact_self", False)),
+            "target_probability": float(bool(stage.get("exact_self", False))),
+            "phase": str(stage["name"]),
+        }
     if mode == "self":
+        if bool(training_cfg.get("pilot_enabled", False)):
+            curriculum = {
+                **curriculum,
+                "target_only": True,
+                "target_probability": 1.0,
+            }
         return (
             target_tokens[:, None],
             torch.ones(
@@ -141,6 +177,12 @@ def _reference_batch(
         )
     if mode in {"heldout", "wrong_artist"}:
         references, mask = _reference_inputs(batch, device, mode)
+        if bool(training_cfg.get("pilot_enabled", False)):
+            curriculum = {
+                **curriculum,
+                "target_only": False,
+                "target_probability": 0.0,
+            }
         return (
             references,
             mask,

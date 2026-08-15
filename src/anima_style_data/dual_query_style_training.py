@@ -163,29 +163,20 @@ def _pilot_alignment_state(step: int, training: dict[str, Any]) -> dict[str, flo
                 training.get("exact_normalized_residual_weight", 0.05)
             ),
             "floor_weight": float(training.get("exact_aligned_floor_weight", 0.25)),
-            "coefficient_floor": _linear_ramp(
-                step,
-                start_step=1,
-                end_step=exact_end,
-                start=float(training.get("exact_aligned_floor_start", 0.02)),
-                end=float(training.get("exact_aligned_floor_end", 0.15)),
+            "coefficient_floor": _coefficient_floor(
+                step, {**training, "pilot_enabled": True}
             ),
             "bounded_min": float(training.get("exact_bounded_min", 0.08)),
             "bounded_max": float(training.get("exact_bounded_max", 0.25)),
             "bounded_weight": float(training.get("exact_bounded_weight", 0.05)),
         }
-    steps = int(training.get("steps", 10_000))
     return {
         "normalized_weight": float(
             training.get("heldout_normalized_residual_weight", 0.015)
         ),
         "floor_weight": float(training.get("heldout_aligned_floor_weight", 0.075)),
-        "coefficient_floor": _linear_ramp(
-            step,
-            start_step=exact_end + 1,
-            end_step=steps,
-            start=float(training.get("heldout_aligned_floor_start", 0.03)),
-            end=float(training.get("heldout_aligned_floor_end", 0.06)),
+        "coefficient_floor": _coefficient_floor(
+            step, {**training, "pilot_enabled": True}
         ),
         "bounded_min": float(training.get("heldout_bounded_min", 0.05)),
         "bounded_max": float(training.get("heldout_bounded_max", 0.20)),
