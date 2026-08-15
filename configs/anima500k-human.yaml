@@ -842,7 +842,9 @@ query_style_tokenizer_v2:
   train_split: train
   validation_split: validation
   loader:
-    batch_size: 2
+    # H100 real-Anima benchmark: batch 4 reached 5.84 images/s versus 3.49
+    # images/s for batch 2, while completing forward/backward and validation.
+    batch_size: 4
     min_references: 1
     max_references: 8
     artist_balanced: true
@@ -894,7 +896,7 @@ query_style_tokenizer_v2:
     warmup_steps: 500
     minimum_lr_ratio: 0.10
     max_grad_norm: 1.0
-    gradient_accumulation_steps: 8
+    gradient_accumulation_steps: 4
     fused_adamw: true
     allow_tf32: true
     low_precision_rmsnorm: true
