@@ -1176,3 +1176,85 @@ def smoke_test_dual_query_style_tokenizer(
     summary = {"variants": results, "finite": all(row["finite_gradient"] for row in results.values())}
     write_json(destination / "dual_query_style_tokenizer_smoke.json", summary)
     return summary
+
+
+def smoke_test_dual_query_style_tokenizer_pilot(
+    config: dict[str, Any], destination: Path
+) -> dict[str, Any]:
+    """Exercise exact, ranking, and common-output pilot branches on real caches."""
+
+    cfg = copy.deepcopy(config["dual_query_style_tokenizer"])
+    pilot = copy.deepcopy(cfg["pilot"])
+    training = copy.deepcopy(cfg["training"])
+    training.update(copy.deepcopy(pilot["training"]))
+    training["pilot_enabled"] = True
+    training["steps"] = int(pilot.get("steps", 10_000))
+    cfg["training"] = training
+    device = str(training.get("device", "cuda"))
+    seed = int(cfg.get("seed", 20260816))
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    loader = DualQueryCachedStyleLoader(
+        destination,
+        _loader_config(config, cfg, split=str(cfg.get("train_split", "train"))),
+    )
+    cache_summary = _cache_summary(destination, cfg)
+    anima = _resolve_anima_model(config, destination, device).requires_grad_(False).eval()
+    _optimize_frozen_anima(
+        anima,
+        low_precision_rmsnorm=bool(training.get("low_precision_rmsnorm", True)),
+        fuse_attention_projections=bool(
+            training.get("fuse_attention_projections", True)
+        ),
+    )
+    tokenizer = DualQuerySetStyleTokenizer(**dict(cfg["model"])).to(device).train()
+    accumulation = max(1, int(training.get("gradient_accumulation_steps", 1)))
+    rows = []
+    for step in (1, 1000, 1504):
+        tokenizer.zero_grad(set_to_none=True)
+        batch = loader.load_step((step - 1) * accumulation)
+        loss, metrics = _forward_dual_query_flow(
+            anima,
+            tokenizer,
+            batch,
+            device,
+            training,
+            generator=torch.Generator(device=device).manual_seed(seed + step),
+            step=step,
+            measure_base=True,
+        )
+        if step >= int(training.get("subset_consistency_start", 501)):
+            consistency = _subset_consistency(tokenizer, batch, device)
+            loss = loss + float(training.get("subset_consistency_weight", 0.0)) * consistency
+            metrics["subset_consistency"] = consistency.detach()
+        loss.backward()
+        gradients = [
+            parameter.grad.detach().float()
+            for parameter in tokenizer.parameters()
+            if parameter.grad is not None
+        ]
+        grad_norm = torch.stack(
+            [gradient.square().sum() for gradient in gradients]
+        ).sum().sqrt()
+        row = {
+            "step": step,
+            "phase": str(_pilot_stage(step, training)["name"]),
+            "loss": float(loss.detach()),
+            "grad_norm": float(grad_norm),
+            "finite": bool(
+                torch.isfinite(loss).all()
+                and torch.isfinite(grad_norm).all()
+                and all(torch.isfinite(gradient).all() for gradient in gradients)
+            ),
+            "metrics": {key: float(value) for key, value in metrics.items()},
+        }
+        rows.append(row)
+        print(f"dual-query pilot smoke {row}", flush=True)
+    summary = {
+        "finite": all(row["finite"] for row in rows),
+        "rows": rows,
+        "cache": cache_summary,
+    }
+    write_json(destination / "dual_query_style_tokenizer_pilot_smoke.json", summary)
+    return summary
