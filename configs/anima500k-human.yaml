@@ -360,7 +360,7 @@ dual_query_style_tokenizer:
   # Summary-ON 10k pilot. This is intentionally isolated from the historical
   # 20k/A-B settings above so checkpoints and W&B histories cannot cross-resume.
   exact_self_teacher:
-    output_directory: dual_query_style_tokenizer_exact_self_teacher_3k_v1
+    output_directory: dual_query_style_tokenizer_exact_self_teacher_3k_v2
     steps: 3000
     training:
       device: cuda
@@ -385,7 +385,7 @@ dual_query_style_tokenizer:
       exact_aligned_floor_end: 0.15
       bounded_effect_every: 4
       exact_bounded_min: 0.08
-      exact_bounded_max: 0.25
+      exact_bounded_max: 1.25
       exact_bounded_weight: 0.05
       bounded_orthogonal_maximum: 0.12
       bounded_orthogonal_weight: 0.25
@@ -412,8 +412,8 @@ dual_query_style_tokenizer:
       wandb:
         enabled: true
         project: anima-style-adapter
-        name: dual-query-style-tokenizer-exact-self-teacher-3k-v1
-        id: dual-query-style-tokenizer-exact-self-teacher-3k-v1
+        name: dual-query-style-tokenizer-exact-self-teacher-3k-v2
+        id: dual-query-style-tokenizer-exact-self-teacher-3k-v2
   pilot:
     output_directory: dual_query_style_tokenizer_summary_on_10k_pilot_v4_scratch
     steps: 10000
@@ -459,10 +459,10 @@ dual_query_style_tokenizer:
       heldout_aligned_floor_end: 0.02
       bounded_effect_every: 4
       exact_bounded_min: 0.08
-      exact_bounded_max: 0.25
+      exact_bounded_max: 1.25
       exact_bounded_weight: 0.05
       heldout_bounded_min: 0.01
-      heldout_bounded_max: 0.15
+      heldout_bounded_max: 1.25
       heldout_bounded_weight: 0.01
       bounded_orthogonal_maximum: 0.12
       bounded_orthogonal_weight: 0.25

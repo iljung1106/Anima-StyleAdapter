@@ -167,7 +167,7 @@ def _pilot_alignment_state(step: int, training: dict[str, Any]) -> dict[str, flo
                 step, {**training, "pilot_enabled": True}
             ),
             "bounded_min": float(training.get("exact_bounded_min", 0.08)),
-            "bounded_max": float(training.get("exact_bounded_max", 0.25)),
+            "bounded_max": float(training.get("exact_bounded_max", 1.25)),
             "bounded_weight": float(training.get("exact_bounded_weight", 0.05)),
         }
     return {
@@ -179,7 +179,7 @@ def _pilot_alignment_state(step: int, training: dict[str, Any]) -> dict[str, flo
             step, {**training, "pilot_enabled": True}
         ),
         "bounded_min": float(training.get("heldout_bounded_min", 0.05)),
-        "bounded_max": float(training.get("heldout_bounded_max", 0.20)),
+        "bounded_max": float(training.get("heldout_bounded_max", 1.25)),
         "bounded_weight": float(training.get("heldout_bounded_weight", 0.015)),
     }
 

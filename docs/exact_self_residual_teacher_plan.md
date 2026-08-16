@@ -8,6 +8,9 @@
 - Optimize flow MSE, normalized target-residual alignment, an absolute aligned
   coefficient floor, and a bounded orthogonal residual. Disable wrong-reference,
   artist-contrastive, subset-consistency, and functional losses in this stage.
+- The aligned projection coefficient is allowed up to 1.25. Do not restore the
+  historical 0.25 upper bound in either the teacher or the heldout student: the
+  student must be able to reproduce the full detached teacher residual magnitude.
 - Validate self, heldout, and wrong-artist references every 250 steps. Render four
   train and four validation targets in both self and heldout modes every 500 steps.
 
