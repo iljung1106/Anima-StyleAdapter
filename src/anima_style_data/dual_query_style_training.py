@@ -15,6 +15,9 @@ from .dual_query_style_tokenizer import (
     DualQueryCachedStyleLoader,
     DualQuerySetStyleTokenizer,
 )
+from .hierarchical_dual_query_style_tokenizer import (
+    HierarchicalDualQueryStyleTokenizer,
+)
 from .dual_query_external_samples import load_dual_query_external_sample
 from .external_style_tokenizer_sheet import generate_live_external_style_sample
 from .io import write_json
@@ -28,6 +31,7 @@ from .pure_token_injection import (
 )
 from .query_style_tokenizer import (
     _artist_contrastive_loss,
+    _linear_weight,
     _reference_inputs,
     _select_sample_episodes,
     _slot_diversity_loss,
@@ -86,7 +90,7 @@ def _save_state(
     path: Path,
     *,
     step: int,
-    tokenizer: DualQuerySetStyleTokenizer,
+    tokenizer: torch.nn.Module,
     optimizer: torch.optim.Optimizer,
     cfg: dict[str, Any],
     cache_summary: dict[str, Any],
@@ -111,7 +115,7 @@ def _save_state(
 
 
 def _subset_consistency(
-    tokenizer: DualQuerySetStyleTokenizer,
+    tokenizer: torch.nn.Module,
     batch: dict[str, Any],
     device: str,
 ) -> torch.Tensor:
@@ -381,7 +385,7 @@ def _artist_flow_ranking_loss(
 
 def _pilot_functional_probe_step(
     anima: torch.nn.Module,
-    tokenizer: DualQuerySetStyleTokenizer,
+    tokenizer: torch.nn.Module,
     batch: dict[str, Any],
     device: str,
     training: dict[str, Any],
@@ -562,7 +566,7 @@ def _pilot_functional_probe_step(
 
 def _forward_dual_query_flow(
     anima: torch.nn.Module,
-    tokenizer: DualQuerySetStyleTokenizer,
+    tokenizer: torch.nn.Module,
     batch: dict[str, Any],
     device: str,
     training: dict[str, Any],
@@ -623,6 +627,13 @@ def _forward_dual_query_flow(
             enabled=torch.device(device).type == "cuda",
         )
 
+    reconstruction_weight = _linear_weight(
+        step,
+        start=float(training.get("reconstruction_weight", 0.0)),
+        end=float(training.get("reconstruction_final_weight", 0.0)),
+        end_step=int(training.get("reconstruction_decay_steps", 10_000)),
+    )
+
     if pilot_enabled:
         alignment = _pilot_alignment_state(step, training)
         normalized_weight = alignment["normalized_weight"]
@@ -655,7 +666,11 @@ def _forward_dual_query_flow(
                 target_input_ids=None,
             ).squeeze(2).float()
     with autocast_context():
-        output = tokenizer(references, reference_mask)
+        output = tokenizer(
+            references,
+            reference_mask,
+            reconstruct=reconstruction_weight > 0,
+        )
         styled = insert_style_tokens(
             conditioning, conditioning_lengths, output.tokens
         )
@@ -665,6 +680,30 @@ def _forward_dual_query_flow(
         ).squeeze(2).float()
     flow_loss = F.mse_loss(prediction, target)
     total = flow_loss
+
+    reconstruction = flow_loss.new_zeros(())
+    reconstruction_huber = flow_loss.new_zeros(())
+    reconstruction_cosine = flow_loss.new_zeros(())
+    if reconstruction_weight > 0:
+        if output.reconstruction is None or output.reconstruction_target is None:
+            raise RuntimeError("Configured reconstruction requires a tokenizer decoder")
+        reconstruction_huber = F.smooth_l1_loss(
+            output.reconstruction.float(),
+            output.reconstruction_target.float(),
+            beta=float(training.get("reconstruction_huber_beta", 0.1)),
+        )
+        reconstruction_cosine = (
+            1.0
+            - F.cosine_similarity(
+                output.reconstruction.float(),
+                output.reconstruction_target.float(),
+                dim=-1,
+            )
+        ).mean()
+        reconstruction = reconstruction_huber + float(
+            training.get("reconstruction_cosine_weight", 0.25)
+        ) * reconstruction_cosine
+        total = total + reconstruction_weight * reconstruction
 
     normalized = flow_loss.new_zeros(())
     floor = flow_loss.new_zeros(())
@@ -690,7 +729,8 @@ def _forward_dual_query_flow(
         total = total + normalized_weight * normalized + floor_weight * floor
 
     diversity_weight = float(training.get("slot_diversity_weight", 0.0))
-    diversity = _slot_diversity_loss(output.tokens)
+    diversity_source = getattr(output, "diversity_tokens", output.tokens)
+    diversity = _slot_diversity_loss(diversity_source)
     total = total + diversity_weight * diversity
 
     contrastive = flow_loss.new_zeros(())
@@ -721,8 +761,8 @@ def _forward_dual_query_flow(
             )
             heldout_output = tokenizer(heldout, heldout_mask)
         contrastive, contrastive_metrics = _artist_contrastive_loss(
-            target_output.tokens,
-            heldout_output.tokens,
+            getattr(target_output, "artist_tokens", target_output.tokens),
+            getattr(heldout_output, "artist_tokens", heldout_output.tokens),
             [str(item.style_id) for item in batch["episodes"]],
             float(training.get("artist_contrastive_temperature", 0.1)),
         )
@@ -851,6 +891,13 @@ def _forward_dual_query_flow(
     metrics = {
         "loss": total.detach(),
         "flow_loss": flow_loss.detach(),
+        "reconstruction_loss": reconstruction.detach(),
+        "reconstruction_huber_loss": reconstruction_huber.detach(),
+        "reconstruction_cosine_loss": reconstruction_cosine.detach(),
+        "reconstruction_weight": flow_loss.new_tensor(reconstruction_weight),
+        "reconstruction_weighted_loss": (
+            reconstruction_weight * reconstruction
+        ).detach(),
         "normalized_residual_loss": normalized.detach(),
         "normalized_residual_weight": flow_loss.new_tensor(normalized_weight),
         "normalized_residual_weighted_loss": (
@@ -935,8 +982,11 @@ def _train_variant(
     steps_override: int | None = None,
     training_overrides: dict[str, Any] | None = None,
     wandb_suffix: str = "",
+    cfg_override: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    cfg = copy.deepcopy(config["dual_query_style_tokenizer"])
+    cfg = copy.deepcopy(
+        cfg_override if cfg_override is not None else config["dual_query_style_tokenizer"]
+    )
     cfg["model"]["include_artist_summary"] = bool(include_artist_summary)
     training = dict(cfg["training"])
     if training_overrides:
@@ -981,6 +1031,7 @@ def _train_variant(
                     "min_references": count,
                     "max_references": count,
                     "reference_count_weights": None,
+                    "pilot_reference_schedule": [],
                 }
             )
             reference_eval_loaders[count] = DualQueryCachedStyleLoader(
@@ -995,6 +1046,7 @@ def _train_variant(
                 "min_references": 8,
                 "max_references": 8,
                 "reference_count_weights": None,
+                "pilot_reference_schedule": [],
                 "artist_balanced": True,
             }
         )
@@ -1022,7 +1074,14 @@ def _train_variant(
             )
             functional_loader = DualQueryCachedStyleLoader(destination, functional_cfg)
     cache_summary = _cache_summary(destination, cfg)
-    tokenizer = DualQuerySetStyleTokenizer(**dict(cfg["model"])).to(device)
+    model_cfg = dict(cfg["model"])
+    architecture = str(model_cfg.pop("architecture", "flat_set"))
+    if architecture == "flat_set":
+        tokenizer = DualQuerySetStyleTokenizer(**model_cfg).to(device)
+    elif architecture == "hierarchical":
+        tokenizer = HierarchicalDualQueryStyleTokenizer(**model_cfg).to(device)
+    else:
+        raise ValueError(f"Unknown Dual-query StyleTokenizer architecture {architecture!r}")
     output = destination / output_name
     checkpoints = output / "checkpoints"
     checkpoints.mkdir(parents=True, exist_ok=True)
@@ -1079,8 +1138,10 @@ def _train_variant(
     parameters = sum(parameter.numel() for parameter in tokenizer.parameters())
     print(
         "dual-query StyleTokenizer "
+        f"architecture={architecture} "
         f"summary={include_artist_summary} trainable={parameters / 1e6:.2f}M "
-        "output=32x1024 injection=native-text-context",
+        f"output={tokenizer.output_tokens}x{tokenizer.dim} "
+        "injection=native-text-context",
         flush=True,
     )
     wandb_run = None
@@ -1557,6 +1618,37 @@ def train_dual_query_exact_self_teacher(
         steps_override=int(teacher.get("steps", 3_000)),
         training_overrides=training_overrides,
         wandb_suffix="-exact-self-teacher",
+    )
+
+
+def train_hierarchical_dual_query_style_tokenizer(
+    config: dict[str, Any], destination: Path
+) -> dict[str, Any]:
+    """Train the target-excluded hierarchical 16-token production candidate."""
+
+    cfg = copy.deepcopy(config["hierarchical_dual_query_style_tokenizer"])
+    effective_config = copy.deepcopy(config)
+    effective_config["dual_query_style_tokenizer"] = cfg
+    training = dict(cfg["training"])
+    device = str(training.get("device", "cuda"))
+    anima = _resolve_anima_model(effective_config, destination, device).requires_grad_(
+        False
+    ).eval()
+    _optimize_frozen_anima(
+        anima,
+        low_precision_rmsnorm=bool(training.get("low_precision_rmsnorm", True)),
+        fuse_attention_projections=bool(
+            training.get("fuse_attention_projections", True)
+        ),
+    )
+    return _train_variant(
+        effective_config,
+        destination,
+        anima,
+        include_artist_summary=True,
+        output_name=str(cfg["output_directory"]),
+        steps_override=int(training.get("steps", 10_000)),
+        cfg_override=cfg,
     )
 
 

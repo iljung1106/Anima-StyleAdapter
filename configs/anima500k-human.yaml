@@ -544,6 +544,175 @@ dual_query_style_tokenizer:
     batch_size: 4
     vae_batch_size: 4
 
+# Hierarchical successor to the flat 84R-token Set Decoder. Every reference is
+# read independently into aligned slots before references are pooled. The run
+# is target-excluded from step one and injects 16 unconstrained native-context
+# tokens through frozen Anima's original K/V/O path.
+hierarchical_dual_query_style_tokenizer:
+  output_directory: hierarchical_dual_query_style_tokenizer_v1_10k
+  seed: 20260816
+  train_split: train
+  validation_split: validation
+  resampler_checkpoint: dual_query_resampler_bprime_v8/checkpoints/step-010000.pt
+  cache:
+    output_directory: dual_query_reference_tokens_v8_step10000
+  loader:
+    batch_size: 4
+    min_references: 1
+    max_references: 8
+    artist_balanced: true
+    self_reference_target_images_per_style: 0
+    text_conditioning_length: 512
+    text_lru_shards: 4
+    latent_lru_shards: 4
+    token_lru_shards: 8
+  model:
+    architecture: hierarchical
+    dim: 1024
+    spatial_tokens: 64
+    global_tokens: 16
+    artist_summary_tokens: 4
+    include_artist_summary: true
+    output_tokens: 16
+    heads: 16
+    per_reference_layers: 1
+    per_reference_ff_dim: 4096
+    reference_score_dim: 256
+    reconstruction_layers: 1
+    reconstruction_ff_dim: 2048
+    initial_output_rms: 0.15
+  training:
+    device: cuda
+    steps: 10000
+    learning_rate: 0.0001
+    betas: [0.9, 0.999]
+    adam_eps: 0.00000001
+    weight_decay: 0.01
+    warmup_steps: 500
+    minimum_lr_ratio: 0.10
+    max_grad_norm: 1.0
+    gradient_accumulation_steps: 4
+    fused_adamw: true
+    allow_tf32: true
+    low_precision_rmsnorm: true
+    fuse_attention_projections: true
+    timestep_sampling: shift
+    sigmoid_scale: 1.0
+    sigmoid_bias: 0.0
+    discrete_flow_shift: 3.0
+    prefetch_workers: 2
+    prefetch_batches: 6
+    resume: true
+    pilot_enabled: true
+    # No stage contains the target image. The first 500 steps emphasize one or
+    # two references; one-reference episodes remain common through the run.
+    reference_schedule:
+      - name: target_excluded_1_2
+        end_step: 500
+        exact_self: false
+        min_references: 1
+        max_references: 2
+        reference_count_weights: [0.65, 0.35]
+      - name: target_excluded_1_4
+        end_step: 2000
+        exact_self: false
+        min_references: 1
+        max_references: 4
+        reference_count_weights: [0.50, 0.30, 0.13, 0.07]
+      - name: target_excluded_1_8
+        end_step: 10000
+        exact_self: false
+        min_references: 1
+        max_references: 8
+        reference_count_weights: [0.45, 0.30, 0.10, 0.06, 0.035, 0.025, 0.02, 0.01]
+    exact_self_end_step: 0
+    heldout_normalized_residual_weight: 0.10
+    normalized_residual_huber_beta: 0.10
+    normalized_residual_scale_floor: 0.0001
+    heldout_aligned_floor_weight: 0.0
+    heldout_bounded_weight: 0.0
+    reconstruction_weight: 0.010
+    reconstruction_final_weight: 0.005
+    reconstruction_decay_steps: 10000
+    reconstruction_huber_beta: 0.10
+    reconstruction_cosine_weight: 0.25
+    artist_contrastive_weight: 0.005
+    artist_contrastive_temperature: 0.10
+    artist_contrastive_every: 2
+    slot_diversity_weight: 0.002
+    subset_consistency_weight: 0.010
+    subset_consistency_start: 501
+    subset_consistency_every: 4
+    wrong_ranking_start_step: 1000
+    wrong_ranking_ramp_steps: 1000
+    wrong_ranking_every: 4
+    wrong_ranking_batch_rows: 4
+    wrong_ranking_weight: 0.01
+    wrong_ranking_margin: 0.02
+    wrong_centered_weight: 0.10
+    wrong_flow_ranking_margin: 0.01
+    wrong_flow_ranking_weight: 1.0
+    functional_probe_enabled: true
+    functional_probe_start_step: 501
+    functional_probe_ramp_steps: 500
+    functional_probe_every: 4
+    functional_probe_batch_rows: 4
+    functional_probe_references: 4
+    functional_prefetch_workers: 1
+    functional_prefetch_batches: 2
+    same_artist_functional_weight: 0.02
+    same_artist_functional_direction_fraction: 0.75
+    same_artist_functional_huber_beta: 0.10
+    centered_artist_effect_weight: 0.01
+    centered_artist_effect_floor_start: 0.30
+    centered_artist_effect_floor_end: 0.50
+    centered_artist_effect_floor_end_step: 4000
+    common_output_threshold_start: 0.70
+    common_output_threshold_end: 0.60
+    common_output_threshold_end_step: 10000
+    common_output_weight: 0.01
+    sample_modes: [heldout]
+    log_every: 10
+    validation_every: 250
+    validation_batches: 8
+    checkpoint_every: 500
+    sample_every: 500
+    fixed_sample_every: 1000
+    extended_evaluation_every: 1000
+    reference_evaluation_batches: 4
+    controlled_evaluation_artists: 4
+    controlled_evaluation:
+      references_per_view: 4
+      timesteps: [0.2, 0.4, 0.65, 0.85]
+      inference_batch_size: 4
+    wandb:
+      enabled: true
+      project: anima-style-adapter
+      name: hierarchical-dual-query-style-tokenizer-v1-10k
+      id: hierarchical-dual-query-style-tokenizer-v1-10k
+  fixed_reference_sampling:
+    cache_directory: dual_query_external_reference_cache_v1
+    device: cuda
+    generation:
+      output_directory: dual_query_external_reference_cache_v1
+      width: 832
+      height: 1024
+      cfg: 4.0
+      steps: 30
+      flow_shift: 3.0
+      batch_size: 4
+      vae_batch_size: 4
+  sampling:
+    width: 768
+    height: 768
+    steps: 30
+    flow_shift: 3.0
+    seed: 20260816
+    text_cfg: 4.0
+    guidance_mode: shared
+    batch_size: 4
+    vae_batch_size: 4
+
 # External controlled benchmark. Each group contains one image from the shard
 # artist and three images of the same character(s) from different artists.
 stylenet_benchmark:

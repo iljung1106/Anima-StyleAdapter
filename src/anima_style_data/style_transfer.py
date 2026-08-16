@@ -90,6 +90,17 @@ def _pad_text_conditions(
     return batch
 
 
+def _pilot_reference_schedule_state(
+    optimizer_step: int, schedule: list[dict[str, Any]]
+) -> dict[str, Any]:
+    if not schedule:
+        raise ValueError("pilot reference schedule cannot be empty")
+    return next(
+        (item for item in schedule if optimizer_step <= int(item["end_step"])),
+        schedule[-1],
+    )
+
+
 class ProductionStyleLoader:
     """Deterministic same-style target/reference episodes over frozen caches.
 
@@ -109,6 +120,9 @@ class ProductionStyleLoader:
         self.split = str(cfg.get("split", "train"))
         self.artist_balanced = bool(cfg.get("artist_balanced", False))
         self.reference_curriculum = dict(cfg.get("reference_curriculum", {}))
+        self.pilot_reference_schedule = [
+            dict(item) for item in cfg.get("pilot_reference_schedule", [])
+        ]
         self.reference_count_weights = cfg.get("reference_count_weights")
         self.self_reference_target_images_per_style = max(
             0, int(cfg.get("self_reference_target_images_per_style", 0))
@@ -247,7 +261,15 @@ class ProductionStyleLoader:
     def episodes_for_step(self, step: int) -> list[StyleEpisode]:
         rng = random.Random(self.seed + step * 1_000_003)
         reference_curriculum = getattr(self, "reference_curriculum", {})
-        if reference_curriculum:
+        pilot_schedule = getattr(self, "pilot_reference_schedule", [])
+        if pilot_schedule:
+            optimizer_step = step // getattr(self, "gradient_accumulation_steps", 1) + 1
+            stage = _pilot_reference_schedule_state(optimizer_step, pilot_schedule)
+            min_references = int(stage.get("min_references", 1))
+            max_references = int(stage.get("max_references", self.max_references))
+            reference_count_weights = stage.get("reference_count_weights")
+            curriculum = None
+        elif reference_curriculum:
             optimizer_step = step // getattr(self, "gradient_accumulation_steps", 1) + 1
             curriculum = _self_reference_curriculum_state(
                 optimizer_step, reference_curriculum
