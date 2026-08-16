@@ -1734,12 +1734,10 @@ def train_hierarchical_dual_query_style_tokenizer(
     )
 
 
-def train_compact_dual_query_style_tokenizer(
-    config: dict[str, Any], destination: Path
+def _train_compact_dual_query_style_tokenizer_section(
+    config: dict[str, Any], destination: Path, section: str
 ) -> dict[str, Any]:
-    """Train the successful small tokenizer architecture on Dual-query caches."""
-
-    cfg = copy.deepcopy(config["compact_dual_query_style_tokenizer"])
+    cfg = copy.deepcopy(config[section])
     effective_config = copy.deepcopy(config)
     effective_config["dual_query_style_tokenizer"] = cfg
     training = dict(cfg["training"])
@@ -1765,12 +1763,30 @@ def train_compact_dual_query_style_tokenizer(
     )
 
 
-def smoke_test_compact_dual_query_style_tokenizer(
+def train_compact_dual_query_style_tokenizer(
     config: dict[str, Any], destination: Path
 ) -> dict[str, Any]:
-    """Exercise two real-cache compact-tokenizer optimizer steps."""
+    """Train the flow-dominant compact baseline on Dual-query caches."""
 
-    cfg = copy.deepcopy(config["compact_dual_query_style_tokenizer"])
+    return _train_compact_dual_query_style_tokenizer_section(
+        config, destination, "compact_dual_query_style_tokenizer"
+    )
+
+
+def train_aligned_compact_dual_query_style_tokenizer(
+    config: dict[str, Any], destination: Path
+) -> dict[str, Any]:
+    """Train the reference-balanced, functionally aligned compact tokenizer."""
+
+    return _train_compact_dual_query_style_tokenizer_section(
+        config, destination, "aligned_compact_dual_query_style_tokenizer"
+    )
+
+
+def _smoke_test_compact_dual_query_style_tokenizer_section(
+    config: dict[str, Any], destination: Path, section: str
+) -> dict[str, Any]:
+    cfg = copy.deepcopy(config[section])
     cfg["output_directory"] = str(cfg["output_directory"]) + "_smoke"
     training = dict(cfg["training"])
     training.update(
@@ -1808,6 +1824,26 @@ def smoke_test_compact_dual_query_style_tokenizer(
         output_name=str(cfg["output_directory"]),
         steps_override=2,
         cfg_override=cfg,
+    )
+
+
+def smoke_test_compact_dual_query_style_tokenizer(
+    config: dict[str, Any], destination: Path
+) -> dict[str, Any]:
+    """Exercise two real-cache compact-tokenizer optimizer steps."""
+
+    return _smoke_test_compact_dual_query_style_tokenizer_section(
+        config, destination, "compact_dual_query_style_tokenizer"
+    )
+
+
+def smoke_test_aligned_compact_dual_query_style_tokenizer(
+    config: dict[str, Any], destination: Path
+) -> dict[str, Any]:
+    """Exercise the aligned compact recipe on real production caches."""
+
+    return _smoke_test_compact_dual_query_style_tokenizer_section(
+        config, destination, "aligned_compact_dual_query_style_tokenizer"
     )
 
 
