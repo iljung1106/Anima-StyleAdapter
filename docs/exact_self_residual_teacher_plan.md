@@ -12,6 +12,10 @@
   This supervises the full useful residual magnitude and cannot be satisfied by
   increasing an orthogonal output norm. Ramp the auxiliary coefficient floor to
   0.50 as a second, one-sided safeguard against a weak-output shortcut.
+- After the v3 500-step diagnostic showed nearly collinear slots and mostly
+  orthogonal velocity growth, v4 doubles normalized residual and projection
+  supervision, doubles the floor weight, increases slot diversity tenfold, and
+  applies the bounded orthogonal check every step with a 0.03 tolerance.
 - The aligned projection coefficient is allowed up to 1.25. Do not restore the
   historical 0.25 upper bound in either the teacher or the heldout student: the
   student must be able to reproduce the full detached teacher residual magnitude.
