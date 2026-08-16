@@ -9,6 +9,7 @@ from anima_style_data.dual_query_style_tokenizer import (  # noqa: E402
 )
 from anima_style_data.dual_query_style_training import (  # noqa: E402
     _artist_flow_ranking_loss,
+    _aligned_projection_target_loss,
     _bounded_aligned_effect_loss,
     _centered_artist_effect_loss,
     _common_output_loss,
@@ -143,6 +144,33 @@ def test_bounded_effect_rewards_in_range_alignment_and_penalizes_orthogonal_outp
     assert aligned_loss.item() == pytest.approx(0.0, abs=1e-7)
     assert orthogonal_loss > aligned_loss
     assert metrics["bounded_orthogonal_ratio"] > 0.12
+
+
+def test_projection_target_matches_useful_residual_magnitude():
+    base = torch.zeros(2, 1, 2, 2)
+    target = torch.ones_like(base)
+
+    exact_loss, exact_metrics = _aligned_projection_target_loss(
+        target,
+        base,
+        target,
+        coefficient_target=1.0,
+        huber_beta=0.1,
+        scale_floor=1e-4,
+    )
+    weak_loss, weak_metrics = _aligned_projection_target_loss(
+        0.1 * target,
+        base,
+        target,
+        coefficient_target=1.0,
+        huber_beta=0.1,
+        scale_floor=1e-4,
+    )
+
+    assert exact_loss.item() == pytest.approx(0.0, abs=1e-7)
+    assert exact_metrics["projection_target_coefficient"] == pytest.approx(1.0)
+    assert weak_loss > exact_loss
+    assert weak_metrics["projection_target_coefficient"] == pytest.approx(0.1)
 
 
 def test_common_output_hinge_distinguishes_shared_and_centered_artist_effects():

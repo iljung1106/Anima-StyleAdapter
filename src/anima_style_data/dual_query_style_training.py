@@ -223,6 +223,38 @@ def _bounded_aligned_effect_loss(
     }
 
 
+def _aligned_projection_target_loss(
+    prediction: torch.Tensor,
+    base_prediction: torch.Tensor,
+    target: torch.Tensor,
+    *,
+    coefficient_target: float,
+    huber_beta: float,
+    scale_floor: float,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Match useful residual magnitude without rewarding orthogonal output norm."""
+
+    dimensions = tuple(range(1, prediction.ndim))
+    delta = prediction - base_prediction
+    desired = target - base_prediction
+    desired_power = desired.square().mean(dim=dimensions).clamp_min(
+        float(scale_floor) ** 2
+    )
+    coefficient = (delta * desired.detach()).mean(dim=dimensions) / desired_power
+    expected = torch.full_like(coefficient, float(coefficient_target))
+    loss = F.smooth_l1_loss(
+        coefficient,
+        expected,
+        beta=float(huber_beta),
+    )
+    return loss, {
+        "projection_target_coefficient": coefficient.detach().mean(),
+        "projection_target_absolute_error": (
+            coefficient.detach() - float(coefficient_target)
+        ).abs().mean(),
+    }
+
+
 def _common_output_loss(
     deltas: torch.Tensor, *, threshold: float
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
@@ -723,6 +755,37 @@ def _forward_dual_query_flow(
         bounded_weight = float(alignment["bounded_weight"])
         total = total + bounded_weight * bounded_loss
 
+    projection_target_loss = flow_loss.new_zeros(())
+    projection_target_weight = 0.0
+    projection_target_metrics = {
+        "projection_target_coefficient": flow_loss.new_zeros(()),
+        "projection_target_absolute_error": flow_loss.new_zeros(()),
+    }
+    exact_end = int(training.get("exact_self_end_step", 500))
+    if pilot_enabled and step <= exact_end:
+        projection_target_weight = float(
+            training.get("exact_projection_target_weight", 0.0)
+        )
+        if projection_target_weight > 0:
+            assert base_prediction is not None
+            projection_target_loss, projection_target_metrics = (
+                _aligned_projection_target_loss(
+                    prediction,
+                    base_prediction,
+                    target,
+                    coefficient_target=float(
+                        training.get("exact_projection_target", 1.0)
+                    ),
+                    huber_beta=float(
+                        training.get("exact_projection_target_huber_beta", 0.1)
+                    ),
+                    scale_floor=float(
+                        training.get("normalized_residual_scale_floor", 1e-4)
+                    ),
+                )
+            )
+            total = total + projection_target_weight * projection_target_loss
+
     direction_loss = flow_loss.new_zeros(())
     direction_weight = 0.0
     direction_metrics = {
@@ -814,6 +877,15 @@ def _forward_dual_query_flow(
         "bounded_effect_weight": flow_loss.new_tensor(bounded_weight),
         "bounded_effect_weighted_loss": (bounded_weight * bounded_loss).detach(),
         **{key: value.detach() for key, value in bounded_metrics.items()},
+        "projection_target_loss": projection_target_loss.detach(),
+        "projection_target_weight": flow_loss.new_tensor(projection_target_weight),
+        "projection_target_weighted_loss": (
+            projection_target_weight * projection_target_loss
+        ).detach(),
+        **{
+            key: value.detach()
+            for key, value in projection_target_metrics.items()
+        },
         "artist_direction_loss": direction_loss.detach(),
         "artist_direction_weight": flow_loss.new_tensor(direction_weight),
         "artist_direction_weighted_loss": (

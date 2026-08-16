@@ -8,6 +8,10 @@
 - Optimize flow MSE, normalized target-residual alignment, an absolute aligned
   coefficient floor, and a bounded orthogonal residual. Disable wrong-reference,
   artist-contrastive, subset-consistency, and functional losses in this stage.
+- Regress the aligned projection coefficient to 1.0 with a Smooth L1 objective.
+  This supervises the full useful residual magnitude and cannot be satisfied by
+  increasing an orthogonal output norm. Ramp the auxiliary coefficient floor to
+  0.50 as a second, one-sided safeguard against a weak-output shortcut.
 - The aligned projection coefficient is allowed up to 1.25. Do not restore the
   historical 0.25 upper bound in either the teacher or the heldout student: the
   student must be able to reproduce the full detached teacher residual magnitude.
