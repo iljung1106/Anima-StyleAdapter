@@ -1203,6 +1203,7 @@ def _train_variant(
         depth=int(training.get("prefetch_batches", 4)),
     )
     functional_every = max(1, int(training.get("functional_probe_every", 2)))
+    functional_start = int(training.get("functional_probe_start_step", 501))
     functional_prefetched = None
     if functional_probe_enabled:
         assert functional_loader is not None
@@ -1272,7 +1273,11 @@ def _train_variant(
                 ]
                 (loss / accumulation).backward()
                 micro_rows.append(metrics)
-            if functional_probe_enabled and step % functional_every == 0:
+            if (
+                functional_probe_enabled
+                and step >= functional_start
+                and step % functional_every == 0
+            ):
                 assert functional_prefetched is not None
                 functional_batch = next(functional_prefetched)
                 functional_loss, functional_metrics = _pilot_functional_probe_step(
