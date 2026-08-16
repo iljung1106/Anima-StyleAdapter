@@ -18,6 +18,7 @@ from .dual_query_style_tokenizer import (
 from .hierarchical_dual_query_style_tokenizer import (
     HierarchicalDualQueryStyleTokenizer,
 )
+from .compact_dual_query_style_tokenizer import CompactDualQueryStyleTokenizer
 from .dual_query_external_samples import load_dual_query_external_sample
 from .external_style_tokenizer_sheet import generate_live_external_style_sample
 from .io import write_json
@@ -36,7 +37,13 @@ from .query_style_tokenizer import (
     _select_sample_episodes,
     _slot_diversity_loss,
 )
-from .style_tokenizer import _artist_direction_loss, _flow_metrics, insert_style_tokens
+from .style_tokenizer import (
+    _artist_direction_loss,
+    _flow_metrics,
+    _split_reference_views,
+    _style_token_contrastive_loss,
+    insert_style_tokens,
+)
 from .style_transfer import (
     _learning_rate_multiplier,
     _optimize_frozen_anima,
@@ -654,7 +661,34 @@ def _forward_dual_query_flow(
             "bounded_max": 0.0,
             "bounded_weight": 0.0,
         }
-    needs_base = pilot_enabled or measure_base or normalized_weight > 0 or floor_weight > 0
+    bounded_every = max(1, int(training.get("bounded_effect_every", 4)))
+    bounded_active = (
+        pilot_enabled
+        and float(alignment["bounded_weight"]) > 0
+        and step % bounded_every == 0
+    )
+    exact_end = int(training.get("exact_self_end_step", 500))
+    projection_active = (
+        pilot_enabled
+        and step <= exact_end
+        and float(training.get("exact_projection_target_weight", 0.0)) > 0
+    )
+    ranking_start = int(training.get("wrong_ranking_start_step", 1000))
+    ranking_every = max(1, int(training.get("wrong_ranking_every", 4)))
+    ranking_active = (
+        pilot_enabled
+        and step >= ranking_start
+        and step % ranking_every == 0
+        and float(training.get("wrong_ranking_weight", 0.0)) > 0
+    )
+    needs_base = (
+        measure_base
+        or normalized_weight > 0
+        or floor_weight > 0
+        or bounded_active
+        or projection_active
+        or ranking_active
+    )
     base_prediction = None
     # Run the no-grad baseline before retaining the styled graph. This avoids
     # holding the trainable forward's activations during a second Anima pass.
@@ -771,6 +805,43 @@ def _forward_dual_query_flow(
         contrastive_weight = float(training["artist_contrastive_weight"])
         total = total + contrastive_weight * contrastive
 
+    token_contrastive = flow_loss.new_zeros(())
+    token_contrastive_weight = 0.0
+    token_positive = flow_loss.new_zeros(())
+    token_negative = flow_loss.new_zeros(())
+    token_margin = flow_loss.new_zeros(())
+    configured_token_weight = float(training.get("token_contrastive_weight", 0.0))
+    token_contrastive_start = int(training.get("token_contrastive_start_step", 1))
+    if configured_token_weight > 0 and step >= token_contrastive_start:
+        eligible, first_mask, second_mask = _split_reference_views(reference_mask)
+        if int(eligible.sum()) >= 2:
+            selected = references[eligible]
+            with autocast_context():
+                first_tokens = tokenizer(selected, first_mask).tokens
+                second_tokens = tokenizer(selected, second_mask).tokens
+            selected_indices = eligible.nonzero(as_tuple=False).flatten().tolist()
+            style_ids = [
+                str(batch["episodes"][index].style_id) for index in selected_indices
+            ]
+            token_contrastive, token_metrics = _style_token_contrastive_loss(
+                first_tokens,
+                second_tokens,
+                style_ids,
+                float(training.get("token_contrastive_temperature", 0.10)),
+            )
+            token_contrastive_weight = _linear_ramp(
+                step,
+                start_step=token_contrastive_start,
+                end_step=token_contrastive_start
+                + int(training.get("token_contrastive_ramp_steps", 1000)),
+                start=0.0,
+                end=configured_token_weight,
+            )
+            total = total + token_contrastive_weight * token_contrastive
+            token_positive = token_metrics["token_positive_similarity"]
+            token_negative = token_metrics["token_negative_similarity"]
+            token_margin = token_metrics["token_similarity_margin"]
+
     bounded_loss = flow_loss.new_zeros(())
     bounded_weight = 0.0
     bounded_metrics = {
@@ -779,8 +850,7 @@ def _forward_dual_query_flow(
         "bounded_above_fraction": flow_loss.new_zeros(()),
         "bounded_orthogonal_ratio": flow_loss.new_zeros(()),
     }
-    bounded_every = max(1, int(training.get("bounded_effect_every", 4)))
-    if pilot_enabled and step % bounded_every == 0:
+    if bounded_active:
         assert base_prediction is not None
         bounded_loss, bounded_metrics = _bounded_aligned_effect_loss(
             prediction,
@@ -801,7 +871,6 @@ def _forward_dual_query_flow(
         "projection_target_coefficient": flow_loss.new_zeros(()),
         "projection_target_absolute_error": flow_loss.new_zeros(()),
     }
-    exact_end = int(training.get("exact_self_end_step", 500))
     if pilot_enabled and step <= exact_end:
         projection_target_weight = float(
             training.get("exact_projection_target_weight", 0.0)
@@ -838,9 +907,7 @@ def _forward_dual_query_flow(
         "artist_wrong_flow_improvement": flow_loss.new_zeros(()),
         "artist_flow_improvement_advantage": flow_loss.new_zeros(()),
     }
-    ranking_start = int(training.get("wrong_ranking_start_step", 1000))
-    ranking_every = max(1, int(training.get("wrong_ranking_every", 4)))
-    if pilot_enabled and step >= ranking_start and step % ranking_every == 0:
+    if ranking_active:
         assert base_prediction is not None
         wrong_references, wrong_mask = _reference_inputs(batch, device, "wrong_artist")
         rows = min(
@@ -917,6 +984,14 @@ def _forward_dual_query_flow(
         ).detach(),
         "artist_positive_similarity": positive.detach(),
         "artist_negative_similarity": negative.detach(),
+        "token_contrastive_loss": token_contrastive.detach(),
+        "token_contrastive_weight": flow_loss.new_tensor(token_contrastive_weight),
+        "token_contrastive_weighted_loss": (
+            token_contrastive_weight * token_contrastive
+        ).detach(),
+        "token_positive_similarity": token_positive.detach(),
+        "token_negative_similarity": token_negative.detach(),
+        "token_similarity_margin": token_margin.detach(),
         "slot_diversity_loss": diversity.detach(),
         "slot_diversity_weight": flow_loss.new_tensor(diversity_weight),
         "slot_diversity_weighted_loss": (diversity_weight * diversity).detach(),
@@ -1080,6 +1155,8 @@ def _train_variant(
         tokenizer = DualQuerySetStyleTokenizer(**model_cfg).to(device)
     elif architecture == "hierarchical":
         tokenizer = HierarchicalDualQueryStyleTokenizer(**model_cfg).to(device)
+    elif architecture == "compact":
+        tokenizer = CompactDualQueryStyleTokenizer(**model_cfg).to(device)
     else:
         raise ValueError(f"Unknown Dual-query StyleTokenizer architecture {architecture!r}")
     output = destination / output_name
@@ -1653,6 +1730,83 @@ def train_hierarchical_dual_query_style_tokenizer(
         include_artist_summary=True,
         output_name=str(cfg["output_directory"]),
         steps_override=int(training.get("steps", 10_000)),
+        cfg_override=cfg,
+    )
+
+
+def train_compact_dual_query_style_tokenizer(
+    config: dict[str, Any], destination: Path
+) -> dict[str, Any]:
+    """Train the successful small tokenizer architecture on Dual-query caches."""
+
+    cfg = copy.deepcopy(config["compact_dual_query_style_tokenizer"])
+    effective_config = copy.deepcopy(config)
+    effective_config["dual_query_style_tokenizer"] = cfg
+    training = dict(cfg["training"])
+    device = str(training.get("device", "cuda"))
+    anima = _resolve_anima_model(effective_config, destination, device).requires_grad_(
+        False
+    ).eval()
+    _optimize_frozen_anima(
+        anima,
+        low_precision_rmsnorm=bool(training.get("low_precision_rmsnorm", True)),
+        fuse_attention_projections=bool(
+            training.get("fuse_attention_projections", True)
+        ),
+    )
+    return _train_variant(
+        effective_config,
+        destination,
+        anima,
+        include_artist_summary=True,
+        output_name=str(cfg["output_directory"]),
+        steps_override=int(training.get("steps", 8_000)),
+        cfg_override=cfg,
+    )
+
+
+def smoke_test_compact_dual_query_style_tokenizer(
+    config: dict[str, Any], destination: Path
+) -> dict[str, Any]:
+    """Exercise two real-cache compact-tokenizer optimizer steps."""
+
+    cfg = copy.deepcopy(config["compact_dual_query_style_tokenizer"])
+    cfg["output_directory"] = str(cfg["output_directory"]) + "_smoke"
+    training = dict(cfg["training"])
+    training.update(
+        {
+            "steps": 2,
+            "resume": False,
+            "log_every": 1,
+            "validation_every": 0,
+            "checkpoint_every": 0,
+            "sample_every": 0,
+            "fixed_sample_every": 0,
+            "extended_evaluation_every": 0,
+            "wandb": {"enabled": False},
+        }
+    )
+    cfg["training"] = training
+    effective_config = copy.deepcopy(config)
+    effective_config["dual_query_style_tokenizer"] = cfg
+    device = str(training.get("device", "cuda"))
+    anima = _resolve_anima_model(effective_config, destination, device).requires_grad_(
+        False
+    ).eval()
+    _optimize_frozen_anima(
+        anima,
+        low_precision_rmsnorm=bool(training.get("low_precision_rmsnorm", True)),
+        fuse_attention_projections=bool(
+            training.get("fuse_attention_projections", True)
+        ),
+    )
+    return _train_variant(
+        effective_config,
+        destination,
+        anima,
+        include_artist_summary=True,
+        output_name=str(cfg["output_directory"]),
+        steps_override=2,
         cfg_override=cfg,
     )
 

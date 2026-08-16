@@ -113,6 +113,14 @@ def build_parser() -> argparse.ArgumentParser:
             "dual-query-style-hierarchical-train",
             "Train the target-excluded hierarchical 16-token Style Tokenizer",
         ),
+        (
+            "dual-query-style-compact-train",
+            "Train the small native-context tokenizer on Dual-query tokens",
+        ),
+        (
+            "dual-query-style-compact-smoke",
+            "Smoke-test the compact Dual-query Style Tokenizer",
+        ),
         ("dual-query-style-pilot-smoke", "Exercise all 10k pilot loss branches on real caches"),
         ("dual-query-style-smoke", "Smoke-test the Dual-query Style Tokenizer"),
         ("style-calibrate", "Measure empirical Anima artist-tag velocity effect ranges"),
@@ -312,6 +320,8 @@ def main() -> None:
         "dual-query-style-pilot",
         "dual-query-style-exact-teacher",
         "dual-query-style-hierarchical-train",
+        "dual-query-style-compact-train",
+        "dual-query-style-compact-smoke",
         "dual-query-style-pilot-smoke",
         "dual-query-style-smoke",
     }:
@@ -324,6 +334,8 @@ def main() -> None:
             train_dual_query_style_tokenizer,
             train_dual_query_exact_self_teacher,
             train_hierarchical_dual_query_style_tokenizer,
+            train_compact_dual_query_style_tokenizer,
+            smoke_test_compact_dual_query_style_tokenizer,
             train_dual_query_style_tokenizer_pilot,
         )
 
@@ -336,6 +348,12 @@ def main() -> None:
             "dual-query-style-exact-teacher": train_dual_query_exact_self_teacher,
             "dual-query-style-hierarchical-train": (
                 train_hierarchical_dual_query_style_tokenizer
+            ),
+            "dual-query-style-compact-train": (
+                train_compact_dual_query_style_tokenizer
+            ),
+            "dual-query-style-compact-smoke": (
+                smoke_test_compact_dual_query_style_tokenizer
             ),
             "dual-query-style-pilot-smoke": smoke_test_dual_query_style_tokenizer_pilot,
             "dual-query-style-smoke": smoke_test_dual_query_style_tokenizer,

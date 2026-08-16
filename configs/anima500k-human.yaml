@@ -714,6 +714,135 @@ hierarchical_dual_query_style_tokenizer:
     batch_size: 4
     vae_batch_size: 4
 
+# Controlled bridge experiment: keep the frozen Dual-query Resampler cache but
+# restore the exact compact native-context tokenizer and flow-dominant recipe
+# that produced the strongest previous StyleTokenizer. This isolates the new
+# Resampler representation from the hierarchical tokenizer and auxiliary-loss
+# changes; it is not initialized from either prior tokenizer checkpoint.
+compact_dual_query_style_tokenizer:
+  output_directory: compact_dual_query_style_tokenizer_small_baseline_8k_v1
+  seed: 20260818
+  train_split: train
+  validation_split: validation
+  resampler_checkpoint: dual_query_resampler_bprime_v8/checkpoints/step-010000.pt
+  cache:
+    output_directory: dual_query_reference_tokens_v8_step10000
+  loader:
+    batch_size: 4
+    min_references: 1
+    max_references: 8
+    artist_balanced: true
+    self_reference_target_images_per_style: 0
+    text_conditioning_length: 512
+    text_lru_shards: 4
+    latent_lru_shards: 4
+    token_lru_shards: 8
+  model:
+    architecture: compact
+    source_dim: 1024
+    context_dim: 1024
+    query_tokens: 80
+    artist_summary_tokens: 4
+    include_artist_summary: true
+    output_tokens: 16
+    bottleneck_dim: 512
+    score_hidden_dim: 256
+    output_rms_init: 0.15
+  training:
+    device: cuda
+    steps: 8000
+    learning_rate: 0.0001
+    betas: [0.9, 0.999]
+    adam_eps: 0.00000001
+    weight_decay: 0.01
+    warmup_steps: 200
+    minimum_lr_ratio: 0.20
+    max_grad_norm: 1.0
+    gradient_accumulation_steps: 4
+    fused_adamw: true
+    allow_tf32: true
+    low_precision_rmsnorm: true
+    fuse_attention_projections: true
+    timestep_sampling: shift
+    sigmoid_scale: 1.0
+    sigmoid_bias: 0.0
+    discrete_flow_shift: 3.0
+    prefetch_workers: 2
+    prefetch_batches: 6
+    resume: true
+    pilot_enabled: true
+    reference_schedule:
+      - name: target_excluded_1_8
+        end_step: 8000
+        exact_self: false
+        min_references: 1
+        max_references: 8
+        reference_count_weights: [0.125, 0.125, 0.125, 0.125, 0.125, 0.125, 0.125, 0.125]
+    exact_self_end_step: 0
+    heldout_normalized_residual_weight: 0.0
+    heldout_aligned_floor_weight: 0.0
+    heldout_bounded_weight: 0.0
+    exact_projection_target_weight: 0.0
+    reconstruction_weight: 0.0
+    reconstruction_final_weight: 0.0
+    artist_contrastive_weight: 0.0
+    slot_diversity_weight: 0.0
+    subset_consistency_weight: 0.0
+    token_contrastive_weight: 0.00075
+    token_contrastive_temperature: 0.10
+    token_contrastive_start_step: 1
+    token_contrastive_ramp_steps: 1000
+    wrong_ranking_start_step: 1500
+    wrong_ranking_ramp_steps: 1000
+    wrong_ranking_every: 4
+    wrong_ranking_batch_rows: 2
+    wrong_ranking_weight: 0.00075
+    wrong_ranking_margin: 0.02
+    wrong_centered_weight: 0.25
+    wrong_flow_ranking_weight: 0.0
+    functional_probe_enabled: false
+    sample_modes: [heldout]
+    log_every: 10
+    validation_every: 250
+    validation_batches: 8
+    checkpoint_every: 250
+    sample_every: 500
+    fixed_sample_every: 1000
+    extended_evaluation_every: 1000
+    reference_evaluation_batches: 4
+    controlled_evaluation_artists: 4
+    controlled_evaluation:
+      references_per_view: 4
+      timesteps: [0.2, 0.4, 0.65, 0.85]
+      inference_batch_size: 4
+    wandb:
+      enabled: true
+      project: anima-style-adapter
+      name: compact-dual-query-style-tokenizer-small-baseline-8k-v1
+      id: compact-dual-query-style-tokenizer-small-baseline-8k-v1
+  fixed_reference_sampling:
+    cache_directory: dual_query_external_reference_cache_v1
+    device: cuda
+    generation:
+      output_directory: dual_query_external_reference_cache_v1
+      width: 832
+      height: 1024
+      cfg: 4.0
+      steps: 30
+      flow_shift: 3.0
+      batch_size: 4
+      vae_batch_size: 4
+  sampling:
+    width: 768
+    height: 768
+    steps: 30
+    flow_shift: 3.0
+    seed: 20260818
+    text_cfg: 4.0
+    guidance_mode: shared
+    batch_size: 4
+    vae_batch_size: 4
+
 # External controlled benchmark. Each group contains one image from the shard
 # artist and three images of the same character(s) from different artists.
 stylenet_benchmark:
