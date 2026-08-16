@@ -893,6 +893,9 @@ def _train_variant(
         ),
     )
     pilot_enabled = bool(training.get("pilot_enabled", False))
+    functional_probe_enabled = pilot_enabled and bool(
+        training.get("functional_probe_enabled", True)
+    )
     reference_eval_loaders: dict[int, DualQueryCachedStyleLoader] = {}
     controlled_loader = None
     functional_loader = None
@@ -924,25 +927,28 @@ def _train_variant(
             }
         )
         controlled_loader = DualQueryCachedStyleLoader(destination, controlled_cfg)
-        functional_cfg = _loader_config(
-            config, cfg, split=str(cfg.get("train_split", "train"))
-        )
-        functional_cfg.update(
-            {
-                "batch_size": int(training.get("functional_probe_batch_rows", 4)),
-                "min_references": int(
-                    training.get("functional_probe_references", 4)
-                ),
-                "max_references": int(
-                    training.get("functional_probe_references", 4)
-                ),
-                "reference_count_weights": None,
-                "reference_curriculum": {},
-                "pilot_reference_schedule": [],
-                "artist_balanced": True,
-            }
-        )
-        functional_loader = DualQueryCachedStyleLoader(destination, functional_cfg)
+        if functional_probe_enabled:
+            functional_cfg = _loader_config(
+                config, cfg, split=str(cfg.get("train_split", "train"))
+            )
+            functional_cfg.update(
+                {
+                    "batch_size": int(
+                        training.get("functional_probe_batch_rows", 4)
+                    ),
+                    "min_references": int(
+                        training.get("functional_probe_references", 4)
+                    ),
+                    "max_references": int(
+                        training.get("functional_probe_references", 4)
+                    ),
+                    "reference_count_weights": None,
+                    "reference_curriculum": {},
+                    "pilot_reference_schedule": [],
+                    "artist_balanced": True,
+                }
+            )
+            functional_loader = DualQueryCachedStyleLoader(destination, functional_cfg)
     cache_summary = _cache_summary(destination, cfg)
     tokenizer = DualQuerySetStyleTokenizer(**dict(cfg["model"])).to(device)
     output = destination / output_name
@@ -1037,12 +1043,20 @@ def _train_variant(
     checkpoint_every = int(training.get("checkpoint_every", 500))
     sample_every = int(training.get("sample_every", 500))
     fixed_sample_every = int(training.get("fixed_sample_every", 1000))
+    sample_modes = [str(mode) for mode in training.get("sample_modes", ["heldout"])]
+    unsupported_modes = set(sample_modes) - {"self", "heldout", "wrong_artist"}
+    if unsupported_modes:
+        raise ValueError(f"Unsupported sample modes: {sorted(unsupported_modes)}")
+    train_sample_episodes = _select_sample_episodes(train_loader, 4)
+    validation_sample_episodes = _select_sample_episodes(validation_loader, 4)
     sample_requests = [
-        (f"train-{index}", train_loader, episode, "heldout")
-        for index, episode in enumerate(_select_sample_episodes(train_loader, 4))
+        (f"train-{mode}-{index}", train_loader, episode, mode)
+        for mode in sample_modes
+        for index, episode in enumerate(train_sample_episodes)
     ] + [
-        (f"validation-{index}", validation_loader, episode, "heldout")
-        for index, episode in enumerate(_select_sample_episodes(validation_loader, 4))
+        (f"validation-{mode}-{index}", validation_loader, episode, mode)
+        for mode in sample_modes
+        for index, episode in enumerate(validation_sample_episodes)
     ]
     fixed_prepared = (
         load_dual_query_external_sample(config, destination)
@@ -1057,7 +1071,7 @@ def _train_variant(
     )
     functional_every = max(1, int(training.get("functional_probe_every", 2)))
     functional_prefetched = None
-    if pilot_enabled:
+    if functional_probe_enabled:
         assert functional_loader is not None
         functional_batches = (steps - start_step + functional_every - 1) // functional_every
         functional_prefetched = functional_loader.prefetch(
@@ -1125,7 +1139,7 @@ def _train_variant(
                 ]
                 (loss / accumulation).backward()
                 micro_rows.append(metrics)
-            if pilot_enabled and step % functional_every == 0:
+            if functional_probe_enabled and step % functional_every == 0:
                 assert functional_prefetched is not None
                 functional_batch = next(functional_prefetched)
                 functional_loss, functional_metrics = _pilot_functional_probe_step(
@@ -1435,6 +1449,42 @@ def train_dual_query_style_tokenizer_pilot(
         steps_override=int(pilot.get("steps", 10_000)),
         training_overrides=training_overrides,
         wandb_suffix="-10k-pilot",
+    )
+
+
+def train_dual_query_exact_self_teacher(
+    config: dict[str, Any], destination: Path
+) -> dict[str, Any]:
+    """Train an isolated exact-self model before enabling residual distillation."""
+
+    cfg = config["dual_query_style_tokenizer"]
+    teacher = copy.deepcopy(cfg["exact_self_teacher"])
+    training_overrides = copy.deepcopy(teacher["training"])
+    training_overrides["pilot_enabled"] = True
+    training_overrides["functional_probe_enabled"] = False
+    training_overrides["steps"] = int(teacher.get("steps", 3_000))
+    device = str(
+        training_overrides.get("device", cfg["training"].get("device", "cuda"))
+    )
+    anima = _resolve_anima_model(config, destination, device).requires_grad_(False).eval()
+    _optimize_frozen_anima(
+        anima,
+        low_precision_rmsnorm=bool(
+            training_overrides.get("low_precision_rmsnorm", True)
+        ),
+        fuse_attention_projections=bool(
+            training_overrides.get("fuse_attention_projections", True)
+        ),
+    )
+    return _train_variant(
+        config,
+        destination,
+        anima,
+        include_artist_summary=True,
+        output_name=str(teacher["output_directory"]),
+        steps_override=int(teacher.get("steps", 3_000)),
+        training_overrides=training_overrides,
+        wandb_suffix="-exact-self-teacher",
     )
 
 

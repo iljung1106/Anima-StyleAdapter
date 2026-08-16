@@ -359,6 +359,61 @@ dual_query_style_tokenizer:
         target_anneal_max_references: 8
   # Summary-ON 10k pilot. This is intentionally isolated from the historical
   # 20k/A-B settings above so checkpoints and W&B histories cannot cross-resume.
+  exact_self_teacher:
+    output_directory: dual_query_style_tokenizer_exact_self_teacher_3k_v1
+    steps: 3000
+    training:
+      device: cuda
+      learning_rate: 0.0001
+      warmup_steps: 400
+      minimum_lr_ratio: 0.10
+      gradient_accumulation_steps: 4
+      max_grad_norm: 1.0
+      resume: true
+      reference_schedule:
+        - name: exact_self_teacher
+          end_step: 3000
+          exact_self: true
+          max_references: 1
+          reference_count_weights: [1.0]
+      exact_self_end_step: 3000
+      exact_normalized_residual_weight: 0.05
+      normalized_residual_huber_beta: 0.10
+      normalized_residual_scale_floor: 0.0001
+      exact_aligned_floor_weight: 0.25
+      exact_aligned_floor_start: 0.02
+      exact_aligned_floor_end: 0.15
+      bounded_effect_every: 4
+      exact_bounded_min: 0.08
+      exact_bounded_max: 0.25
+      exact_bounded_weight: 0.05
+      bounded_orthogonal_maximum: 0.12
+      bounded_orthogonal_weight: 0.25
+      wrong_ranking_start_step: 3001
+      wrong_ranking_weight: 0.0
+      functional_probe_enabled: false
+      artist_contrastive_weight: 0.0
+      slot_diversity_weight: 0.0005
+      subset_consistency_weight: 0.0
+      sample_modes: [self, heldout]
+      log_every: 10
+      validation_every: 250
+      validation_batches: 8
+      checkpoint_every: 500
+      sample_every: 500
+      fixed_sample_every: 1000
+      extended_evaluation_every: 1000
+      reference_evaluation_batches: 4
+      controlled_evaluation_artists: 4
+      controlled_evaluation:
+        references_per_view: 4
+        timesteps: [0.2, 0.4, 0.65, 0.85]
+        inference_batch_size: 4
+      wandb:
+        enabled: true
+        project: anima-style-adapter
+        name: dual-query-style-tokenizer-exact-self-teacher-3k-v1
+        id: dual-query-style-tokenizer-exact-self-teacher-3k-v1
   pilot:
     output_directory: dual_query_style_tokenizer_summary_on_10k_pilot_v4_scratch
     steps: 10000

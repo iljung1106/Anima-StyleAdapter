@@ -108,6 +108,7 @@ def build_parser() -> argparse.ArgumentParser:
         ("dual-query-style-ablate", "Compare artist-summary token delivery"),
         ("dual-query-style-train", "Train the multi-reference Dual-query Style Tokenizer"),
         ("dual-query-style-pilot", "Run the summary-ON 10k Dual-query Style Tokenizer pilot"),
+        ("dual-query-style-exact-teacher", "Train the isolated 3k exact-self residual teacher"),
         ("dual-query-style-pilot-smoke", "Exercise all 10k pilot loss branches on real caches"),
         ("dual-query-style-smoke", "Smoke-test the Dual-query Style Tokenizer"),
         ("style-calibrate", "Measure empirical Anima artist-tag velocity effect ranges"),
@@ -305,6 +306,7 @@ def main() -> None:
         "dual-query-style-ablate",
         "dual-query-style-train",
         "dual-query-style-pilot",
+        "dual-query-style-exact-teacher",
         "dual-query-style-pilot-smoke",
         "dual-query-style-smoke",
     }:
@@ -315,6 +317,7 @@ def main() -> None:
             smoke_test_dual_query_style_tokenizer,
             smoke_test_dual_query_style_tokenizer_pilot,
             train_dual_query_style_tokenizer,
+            train_dual_query_exact_self_teacher,
             train_dual_query_style_tokenizer_pilot,
         )
 
@@ -324,6 +327,7 @@ def main() -> None:
             "dual-query-style-ablate": compare_artist_summary_tokens,
             "dual-query-style-train": train_dual_query_style_tokenizer,
             "dual-query-style-pilot": train_dual_query_style_tokenizer_pilot,
+            "dual-query-style-exact-teacher": train_dual_query_exact_self_teacher,
             "dual-query-style-pilot-smoke": smoke_test_dual_query_style_tokenizer_pilot,
             "dual-query-style-smoke": smoke_test_dual_query_style_tokenizer,
         }[args.command]
