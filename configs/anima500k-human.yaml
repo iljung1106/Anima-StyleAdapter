@@ -603,6 +603,7 @@ hierarchical_dual_query_style_tokenizer:
     prefetch_workers: 2
     prefetch_batches: 6
     resume: true
+    wandb_run_revision: -r2
     pilot_enabled: true
     # No stage contains the target image. The first 500 steps emphasize one or
     # two references; one-reference episodes remain common through the run.
