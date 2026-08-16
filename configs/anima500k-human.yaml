@@ -360,7 +360,7 @@ dual_query_style_tokenizer:
   # Summary-ON 10k pilot. This is intentionally isolated from the historical
   # 20k/A-B settings above so checkpoints and W&B histories cannot cross-resume.
   pilot:
-    output_directory: dual_query_style_tokenizer_summary_on_10k_pilot_v3
+    output_directory: dual_query_style_tokenizer_summary_on_10k_pilot_v4_scratch
     steps: 10000
     training:
       device: cuda
@@ -370,8 +370,6 @@ dual_query_style_tokenizer:
       gradient_accumulation_steps: 4
       max_grad_norm: 1.0
       resume: true
-      initial_checkpoint: dual_query_style_tokenizer_summary_on_10k_pilot_v1/checkpoints/step-0001500.pt
-      initial_history: dual_query_style_tokenizer_summary_on_10k_pilot_v1/history.json
       reference_schedule:
         - name: exact_self
           end_step: 500
@@ -463,8 +461,8 @@ dual_query_style_tokenizer:
       wandb:
         enabled: true
         project: anima-style-adapter
-        name: dual-query-style-tokenizer-summary-on-10k-pilot-v3
-        id: dual-query-style-tokenizer-summary-on-10k-pilot-v3
+        name: dual-query-style-tokenizer-summary-on-10k-pilot-v4-scratch
+        id: dual-query-style-tokenizer-summary-on-10k-pilot-v4-scratch
   fixed_reference_sampling:
     cache_directory: dual_query_external_reference_cache_v1
     device: cuda

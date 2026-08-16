@@ -197,3 +197,18 @@ centered ratio는 증가하지만 heldout flow와 정성 샘플이 나빠지면 
 off-manifold artist direction으로 진단한다. v3도 fixed-reference의 작가별
 차이와 안정성을 회복하지 못하면 수치상 paired-flow improvement만으로
 10k까지 계속하지 않는다.
+
+### v3 초기화 교정
+
+첫 v3 시도는 과거 계획대로 v1 step 1,500의 tokenizer·optimizer·RNG에서
+재개했으나 step 1,710 부근에서 중단했다. 이 방식은 새 objective의 exact-self
+bootstrap과 functional ramp를 건너뛰며, 기존의 강한 residual/token objective가
+만든 optimizer moment와 표현을 새 loss가 먼저 되돌려야 한다. 실제로 초기
+same-artist functional cosine이 약 `0.88→0.71`로 급락하여 새 설계 자체와
+과거 가중치 제거 과도기를 구분할 수 없었다.
+
+따라서 이 시도는 진단용으로만 보존하고 최종 v3 검증은
+`dual_query_style_tokenizer_summary_on_10k_pilot_v4_scratch`에서 수행한다.
+Frozen Anima와 frozen Resampler token cache만 재사용하고, StyleTokenizer와
+AdamW optimizer는 step 0에서 새로 초기화한다. 어떠한 과거 StyleTokenizer
+checkpoint, optimizer state, history 또는 RNG도 불러오지 않는다.
