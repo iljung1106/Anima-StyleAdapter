@@ -1116,6 +1116,13 @@ def _train_variant(
                 metrics["subset_consistency_weighted_loss"] = (
                     consistency_weight * consistency
                 ).detach()
+                metrics["loss"] = loss.detach()
+                metrics["main_auxiliary_weighted_loss"] = (
+                    loss.detach() - metrics["flow_loss"]
+                )
+                metrics["total_auxiliary_weighted_loss"] = metrics[
+                    "main_auxiliary_weighted_loss"
+                ]
                 (loss / accumulation).backward()
                 micro_rows.append(metrics)
             if pilot_enabled and step % functional_every == 0:
@@ -1136,6 +1143,10 @@ def _train_variant(
                     functional_loss.backward()
                 for row in micro_rows:
                     row.update(functional_metrics)
+                    row["loss"] = row["loss"] + functional_loss.detach()
+                    row["total_auxiliary_weighted_loss"] = (
+                        row["loss"] - row["flow_loss"]
+                    )
             grad_norm = torch.nn.utils.clip_grad_norm_(
                 tokenizer.parameters(), max_grad_norm
             )
