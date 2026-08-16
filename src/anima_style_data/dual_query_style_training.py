@@ -1802,6 +1802,34 @@ def _smoke_test_compact_dual_query_style_tokenizer_section(
             "wandb": {"enabled": False},
         }
     )
+    if section == "aligned_compact_dual_query_style_tokenizer":
+        # Exercise every delayed objective with two disjoint two-reference
+        # views instead of letting a two-step smoke test cover only flow MSE.
+        training.update(
+            {
+                "reference_schedule": [
+                    {
+                        "name": "smoke_four_references",
+                        "end_step": 2,
+                        "exact_self": False,
+                        "min_references": 1,
+                        "max_references": 4,
+                        "reference_count_weights": [0.0, 0.0, 0.0, 1.0],
+                    }
+                ],
+                "token_contrastive_start_step": 1,
+                "token_contrastive_ramp_steps": 0,
+                "wrong_ranking_start_step": 1,
+                "wrong_ranking_ramp_steps": 0,
+                "wrong_ranking_every": 1,
+                "artist_contrastive_every": 1,
+                "subset_consistency_start": 1,
+                "subset_consistency_every": 1,
+                "functional_probe_start_step": 1,
+                "functional_probe_ramp_steps": 0,
+                "functional_probe_every": 1,
+            }
+        )
     cfg["training"] = training
     effective_config = copy.deepcopy(config)
     effective_config["dual_query_style_tokenizer"] = cfg
