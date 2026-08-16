@@ -10,9 +10,11 @@ from anima_style_data.dual_query_style_tokenizer import (  # noqa: E402
 from anima_style_data.dual_query_style_training import (  # noqa: E402
     _artist_flow_ranking_loss,
     _bounded_aligned_effect_loss,
+    _centered_artist_effect_loss,
     _common_output_loss,
     _pilot_alignment_state,
     _pilot_stage,
+    _same_artist_functional_loss,
 )
 
 
@@ -156,6 +158,52 @@ def test_common_output_hinge_distinguishes_shared_and_centered_artist_effects():
     assert shared_loss > 0
     assert centered_metrics["common_output_ratio"] == pytest.approx(0.0, abs=1e-7)
     assert centered_loss.item() == pytest.approx(0.0, abs=1e-7)
+
+
+def test_same_artist_functional_loss_matches_direction_and_magnitude():
+    first = torch.stack((torch.ones(2, 2), torch.eye(2)))
+    matching = first.clone()
+    mismatching = torch.stack((-torch.ones(2, 2), 3.0 * torch.eye(2)))
+    valid = torch.ones(2, dtype=torch.bool)
+
+    matching_loss, matching_metrics = _same_artist_functional_loss(
+        first,
+        matching,
+        valid,
+        direction_fraction=0.75,
+        huber_beta=0.10,
+    )
+    mismatching_loss, mismatching_metrics = _same_artist_functional_loss(
+        first,
+        mismatching,
+        valid,
+        direction_fraction=0.75,
+        huber_beta=0.10,
+    )
+
+    assert matching_loss.item() == pytest.approx(0.0, abs=1e-7)
+    assert matching_metrics["functional_same_artist_cosine"] == pytest.approx(1.0)
+    assert mismatching_loss > matching_loss
+    assert mismatching_metrics["functional_same_artist_cosine"] < 1.0
+    assert mismatching_metrics["functional_same_artist_log_rms_error"] > 0
+
+
+def test_centered_effect_floor_rejects_a_shared_artist_output():
+    shared = torch.ones(4, 2, 2)
+    distinct = torch.stack(
+        (torch.ones(2, 2), -torch.ones(2, 2), torch.eye(2), -torch.eye(2))
+    )
+
+    shared_loss, shared_metrics = _centered_artist_effect_loss(shared, floor=0.50)
+    distinct_loss, distinct_metrics = _centered_artist_effect_loss(
+        distinct, floor=0.50
+    )
+
+    assert shared_metrics["functional_centered_effect_ratio"] == pytest.approx(0.0)
+    assert shared_loss > 0
+    assert distinct_metrics["functional_centered_effect_ratio"] > 0.50
+    assert distinct_loss.item() == pytest.approx(0.0, abs=1e-7)
+    assert distinct_metrics["functional_between_artist_cosine"] < 1.0
 
 
 def test_artist_flow_ranking_prefers_the_correct_reference_without_moving_wrong():

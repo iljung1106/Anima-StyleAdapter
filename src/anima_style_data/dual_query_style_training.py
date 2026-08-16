@@ -240,6 +240,87 @@ def _common_output_loss(
     }
 
 
+def _same_artist_functional_loss(
+    first_deltas: torch.Tensor,
+    second_deltas: torch.Tensor,
+    valid: torch.Tensor,
+    *,
+    direction_fraction: float,
+    huber_beta: float,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Match two disjoint reference views in frozen-Anima velocity space."""
+
+    if first_deltas.shape != second_deltas.shape:
+        raise ValueError("Functional reference views must have the same shape")
+    if valid.shape != first_deltas.shape[:1]:
+        raise ValueError("Functional reference-view validity has the wrong shape")
+    dimensions = tuple(range(1, first_deltas.ndim))
+    first_flat = first_deltas.flatten(1)
+    second_flat = second_deltas.detach().flatten(1)
+    cosine = F.cosine_similarity(first_flat, second_flat, dim=-1)
+    direction = 1.0 - cosine
+    first_rms = first_deltas.square().mean(dim=dimensions).sqrt().clamp_min(1e-8)
+    second_rms = (
+        second_deltas.detach().square().mean(dim=dimensions).sqrt().clamp_min(1e-8)
+    )
+    log_rms_error = (first_rms.log() - second_rms.log()).abs()
+    magnitude = F.smooth_l1_loss(
+        first_rms.log(),
+        second_rms.log(),
+        beta=float(huber_beta),
+        reduction="none",
+    )
+    weights = valid.to(direction.dtype)
+    denominator = weights.sum().clamp_min(1.0)
+    direction_loss = (direction * weights).sum() / denominator
+    magnitude_loss = (magnitude * weights).sum() / denominator
+    fraction = float(direction_fraction)
+    loss = fraction * direction_loss + (1.0 - fraction) * magnitude_loss
+    return loss, {
+        "functional_same_artist_cosine": (cosine.detach() * weights).sum()
+        / denominator,
+        "functional_same_artist_direction_loss": direction_loss.detach(),
+        "functional_same_artist_magnitude_loss": magnitude_loss.detach(),
+        "functional_same_artist_log_rms_error": (
+            log_rms_error.detach() * weights
+        ).sum()
+        / denominator,
+        "functional_same_artist_valid_fraction": weights.mean().detach(),
+    }
+
+
+def _centered_artist_effect_loss(
+    deltas: torch.Tensor, *, floor: float
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Prevent reference-specific effects from collapsing into their global mean."""
+
+    if deltas.ndim < 2 or deltas.shape[0] < 2:
+        raise ValueError("Centered artist-effect probe needs at least two artists")
+    dimensions = tuple(range(1, deltas.ndim))
+    common = deltas.mean(dim=0, keepdim=True)
+    centered = deltas - common
+    effect_rms = deltas.square().mean(dim=dimensions).sqrt()
+    centered_rms = centered.square().mean(dim=dimensions).sqrt()
+    denominator = effect_rms.mean().detach().clamp_min(1e-8)
+    ratio = centered_rms.mean() / denominator
+    flat = F.normalize(deltas.flatten(1), dim=-1)
+    similarities = flat @ flat.transpose(0, 1)
+    off_diagonal = ~torch.eye(
+        deltas.shape[0], device=deltas.device, dtype=torch.bool
+    )
+    between_cosine = similarities.masked_select(off_diagonal).mean()
+    pairwise_rms = (
+        deltas[:, None] - deltas[None, :]
+    ).square().mean(dim=tuple(range(2, deltas.ndim + 1))).sqrt()
+    pairwise_rms = pairwise_rms.masked_select(off_diagonal).mean()
+    return F.relu(float(floor) - ratio).square(), {
+        "functional_centered_effect_ratio": ratio.detach(),
+        "functional_centered_effect_rms": centered_rms.detach().mean(),
+        "functional_between_artist_cosine": between_cosine.detach(),
+        "functional_between_artist_pairwise_rms": pairwise_rms.detach(),
+    }
+
+
 def _artist_flow_ranking_loss(
     prediction: torch.Tensor,
     wrong_prediction: torch.Tensor,
@@ -266,7 +347,7 @@ def _artist_flow_ranking_loss(
     }
 
 
-def _pilot_common_output_step(
+def _pilot_functional_probe_step(
     anima: torch.nn.Module,
     tokenizer: DualQuerySetStyleTokenizer,
     batch: dict[str, Any],
@@ -275,21 +356,26 @@ def _pilot_common_output_step(
     *,
     generator: torch.Generator,
     step: int,
-) -> tuple[torch.Tensor, float, dict[str, torch.Tensor]]:
-    """Run one matched prompt/noise probe after normal microbatch backpropagation.
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Train reference identity on matched prompt/noise/timestep Anima effects.
 
     Keeping this forward outside `_forward_dual_query_flow` is important: an
     Anima graph for the controlled artist batch does not fit beside the main
-    batch graph on an 80 GB H100. The caller runs it once per optimizer step
-    after all ordinary microbatch graphs have been released.
+    batch graph on an 80 GB H100. The second reference view is a detached
+    target, so only one controlled Anima graph is retained at a time.
     """
 
-    stage = _pilot_stage(step, training)
-    mode = "self" if bool(stage.get("exact_self", False)) else "heldout"
-    references, reference_mask = _reference_inputs(batch, device, mode)
+    references, reference_mask = _reference_inputs(batch, device, "heldout")
     rows = min(
-        int(training.get("common_output_batch_rows", 4)), references.shape[0]
+        int(training.get("functional_probe_batch_rows", 4)), references.shape[0]
     )
+    references = references[:rows]
+    reference_mask = reference_mask[:rows]
+    positions = torch.arange(reference_mask.shape[1], device=device).unsqueeze(0)
+    first_mask = reference_mask & positions.remainder(2).eq(0)
+    second_mask = reference_mask & positions.remainder(2).eq(1)
+    valid_views = reference_mask.sum(dim=1).ge(2)
+    second_mask = torch.where(valid_views[:, None], second_mask, first_mask)
     latents = batch["latents"][0:1].to(
         device, dtype=torch.bfloat16, non_blocking=True
     )
@@ -309,17 +395,38 @@ def _pilot_common_output_step(
         1, 1, latents.shape[-2], latents.shape[-1],
         device=device, dtype=latents.dtype,
     )
-    common_start = int(training.get("common_output_start_step", 1500))
-    weight = (
-        _linear_ramp(
-            step,
-            start_step=common_start,
-            end_step=common_start + int(training.get("common_output_ramp_steps", 1000)),
-            start=0.0,
-            end=float(training.get("common_output_weight", 0.002)),
+    start = int(training.get("functional_probe_start_step", 501))
+    ramp_end = start + int(training.get("functional_probe_ramp_steps", 500))
+
+    def weight(name: str, default: float) -> float:
+        return (
+            _linear_ramp(
+                step,
+                start_step=start,
+                end_step=ramp_end,
+                start=0.0,
+                end=float(training.get(name, default)),
+            )
+            if step >= start
+            else 0.0
         )
-        if step >= common_start
-        else 0.0
+
+    same_weight = weight("same_artist_functional_weight", 0.02)
+    centered_weight = weight("centered_artist_effect_weight", 0.03)
+    common_weight = weight("common_output_weight", 0.03)
+    threshold = _linear_ramp(
+        step,
+        start_step=start,
+        end_step=int(training.get("common_output_threshold_end_step", 10_000)),
+        start=float(training.get("common_output_threshold_start", 0.60)),
+        end=float(training.get("common_output_threshold_end", 0.55)),
+    )
+    centered_floor = _linear_ramp(
+        step,
+        start_step=start,
+        end_step=int(training.get("centered_artist_effect_floor_end_step", 4_000)),
+        start=float(training.get("centered_artist_effect_floor_start", 0.35)),
+        end=float(training.get("centered_artist_effect_floor_end", 0.55)),
     )
 
     def autocast_context():
@@ -337,9 +444,23 @@ def _pilot_common_output_step(
             padding_mask=padding_mask,
             target_input_ids=None,
         ).squeeze(2).float()
-    gradient_context = torch.enable_grad() if weight > 0 else torch.no_grad()
+        second_output = tokenizer(references, second_mask)
+        second_styled = insert_style_tokens(
+            conditioning.expand(rows, -1, -1).clone(),
+            conditioning_length.expand(rows),
+            second_output.tokens,
+        )
+        second_prediction = anima(
+            noisy.expand(rows, -1, -1, -1).unsqueeze(2),
+            timesteps.expand(rows).to(latents.dtype),
+            context=second_styled,
+            padding_mask=padding_mask.expand(rows, -1, -1, -1),
+            target_input_ids=None,
+        ).squeeze(2).float()
+    active = same_weight + centered_weight + common_weight > 0
+    gradient_context = torch.enable_grad() if active else torch.no_grad()
     with gradient_context, autocast_context():
-        output = tokenizer(references[:rows], reference_mask[:rows])
+        output = tokenizer(references, first_mask)
         styled = insert_style_tokens(
             conditioning.expand(rows, -1, -1).clone(),
             conditioning_length.expand(rows),
@@ -352,14 +473,59 @@ def _pilot_common_output_step(
             padding_mask=padding_mask.expand(rows, -1, -1, -1),
             target_input_ids=None,
         ).squeeze(2).float()
-    loss, metrics = _common_output_loss(
-        prediction - base_prediction,
-        threshold=float(training.get("common_output_threshold", 0.70)),
+    first_deltas = prediction - base_prediction
+    second_deltas = second_prediction - base_prediction
+    common_loss, common_metrics = _common_output_loss(
+        first_deltas, threshold=threshold
     )
-    metrics["common_output_loss"] = loss.detach()
-    metrics["common_output_weight"] = loss.new_tensor(weight)
-    metrics["common_output_weighted_loss"] = (weight * loss).detach()
-    return loss, weight, metrics
+    same_loss, same_metrics = _same_artist_functional_loss(
+        first_deltas,
+        second_deltas,
+        valid_views,
+        direction_fraction=float(
+            training.get("same_artist_functional_direction_fraction", 0.75)
+        ),
+        huber_beta=float(training.get("same_artist_functional_huber_beta", 0.10)),
+    )
+    centered_loss, centered_metrics = _centered_artist_effect_loss(
+        first_deltas, floor=centered_floor
+    )
+    total = (
+        same_weight * same_loss
+        + centered_weight * centered_loss
+        + common_weight * common_loss
+    )
+    cadence = max(1, int(training.get("functional_probe_every", 2)))
+    metrics = {
+        **common_metrics,
+        **same_metrics,
+        **centered_metrics,
+        "functional_same_artist_loss": same_loss.detach(),
+        "functional_same_artist_weight": same_loss.new_tensor(same_weight),
+        "functional_same_artist_weighted_loss": (same_weight * same_loss).detach(),
+        "functional_same_artist_per_step_loss": (
+            same_weight * same_loss / cadence
+        ).detach(),
+        "functional_centered_effect_loss": centered_loss.detach(),
+        "functional_centered_effect_weight": centered_loss.new_tensor(centered_weight),
+        "functional_centered_effect_floor": centered_loss.new_tensor(centered_floor),
+        "functional_centered_effect_weighted_loss": (
+            centered_weight * centered_loss
+        ).detach(),
+        "functional_centered_effect_per_step_loss": (
+            centered_weight * centered_loss / cadence
+        ).detach(),
+        "common_output_loss": common_loss.detach(),
+        "common_output_weight": common_loss.new_tensor(common_weight),
+        "common_output_threshold": common_loss.new_tensor(threshold),
+        "common_output_weighted_loss": (common_weight * common_loss).detach(),
+        "common_output_per_step_loss": (
+            common_weight * common_loss / cadence
+        ).detach(),
+        "functional_probe_weighted_loss": total.detach(),
+        "functional_probe_per_step_loss": (total / cadence).detach(),
+    }
+    return total, metrics
 
 
 def _forward_dual_query_flow(
@@ -624,22 +790,35 @@ def _forward_dual_query_flow(
         "flow_loss": flow_loss.detach(),
         "normalized_residual_loss": normalized.detach(),
         "normalized_residual_weight": flow_loss.new_tensor(normalized_weight),
+        "normalized_residual_weighted_loss": (
+            normalized_weight * normalized
+        ).detach(),
         "aligned_floor_loss": floor.detach(),
         "aligned_floor_weight": flow_loss.new_tensor(floor_weight),
+        "aligned_floor_weighted_loss": (floor_weight * floor).detach(),
         "aligned_coefficient_floor": flow_loss.new_tensor(
             float(alignment["coefficient_floor"])
         ),
         **{key: value.detach() for key, value in direct_metrics.items()},
         "artist_contrastive_loss": contrastive.detach(),
         "artist_contrastive_weight": flow_loss.new_tensor(contrastive_weight),
+        "artist_contrastive_weighted_loss": (
+            contrastive_weight * contrastive
+        ).detach(),
         "artist_positive_similarity": positive.detach(),
         "artist_negative_similarity": negative.detach(),
         "slot_diversity_loss": diversity.detach(),
+        "slot_diversity_weight": flow_loss.new_tensor(diversity_weight),
+        "slot_diversity_weighted_loss": (diversity_weight * diversity).detach(),
         "bounded_effect_loss": bounded_loss.detach(),
         "bounded_effect_weight": flow_loss.new_tensor(bounded_weight),
+        "bounded_effect_weighted_loss": (bounded_weight * bounded_loss).detach(),
         **{key: value.detach() for key, value in bounded_metrics.items()},
         "artist_direction_loss": direction_loss.detach(),
         "artist_direction_weight": flow_loss.new_tensor(direction_weight),
+        "artist_direction_weighted_loss": (
+            direction_weight * direction_loss
+        ).detach(),
         **{key: value.detach() for key, value in direction_metrics.items()},
         "style_token_rms": output.tokens.detach().float().square().mean().sqrt(),
         "references": reference_mask.sum(dim=1).float().mean(),
@@ -716,6 +895,7 @@ def _train_variant(
     pilot_enabled = bool(training.get("pilot_enabled", False))
     reference_eval_loaders: dict[int, DualQueryCachedStyleLoader] = {}
     controlled_loader = None
+    functional_loader = None
     if pilot_enabled:
         for count in (1, 2, 4, 8):
             eval_loader_cfg = _loader_config(
@@ -744,6 +924,25 @@ def _train_variant(
             }
         )
         controlled_loader = DualQueryCachedStyleLoader(destination, controlled_cfg)
+        functional_cfg = _loader_config(
+            config, cfg, split=str(cfg.get("train_split", "train"))
+        )
+        functional_cfg.update(
+            {
+                "batch_size": int(training.get("functional_probe_batch_rows", 4)),
+                "min_references": int(
+                    training.get("functional_probe_references", 4)
+                ),
+                "max_references": int(
+                    training.get("functional_probe_references", 4)
+                ),
+                "reference_count_weights": None,
+                "reference_curriculum": {},
+                "pilot_reference_schedule": [],
+                "artist_balanced": True,
+            }
+        )
+        functional_loader = DualQueryCachedStyleLoader(destination, functional_cfg)
     cache_summary = _cache_summary(destination, cfg)
     tokenizer = DualQuerySetStyleTokenizer(**dict(cfg["model"])).to(device)
     output = destination / output_name
@@ -856,6 +1055,17 @@ def _train_variant(
         workers=int(training.get("prefetch_workers", 2)),
         depth=int(training.get("prefetch_batches", 4)),
     )
+    functional_every = max(1, int(training.get("functional_probe_every", 2)))
+    functional_prefetched = None
+    if pilot_enabled:
+        assert functional_loader is not None
+        functional_batches = (steps - start_step + functional_every - 1) // functional_every
+        functional_prefetched = functional_loader.prefetch(
+            start_step // functional_every,
+            functional_batches,
+            workers=int(training.get("functional_prefetch_workers", 1)),
+            depth=int(training.get("functional_prefetch_batches", 2)),
+        )
     completed = start_step
     run_started = time.perf_counter()
     running: dict[str, float] = defaultdict(float)
@@ -870,11 +1080,8 @@ def _train_variant(
             optimizer.param_groups[0]["lr"] = base_lr * multiplier
             optimizer.zero_grad(set_to_none=True)
             micro_rows: list[dict[str, torch.Tensor]] = []
-            common_probe_batch = None
             for micro in range(accumulation):
                 batch = next(prefetched)
-                if micro == 0:
-                    common_probe_batch = batch
                 generator = torch.Generator(device=device).manual_seed(
                     seed + step * 100_003 + micro
                 )
@@ -890,7 +1097,12 @@ def _train_variant(
                 )
                 consistency_weight = (
                     float(training.get("subset_consistency_weight", 0.0))
-                    if step >= int(training.get("subset_consistency_start", 2001))
+                    if (
+                        step >= int(training.get("subset_consistency_start", 2001))
+                        and step
+                        % max(1, int(training.get("subset_consistency_every", 4)))
+                        == 0
+                    )
                     else 0.0
                 )
                 consistency = loss.new_zeros(())
@@ -901,15 +1113,18 @@ def _train_variant(
                 metrics["subset_consistency_weight"] = loss.new_tensor(
                     consistency_weight
                 )
+                metrics["subset_consistency_weighted_loss"] = (
+                    consistency_weight * consistency
+                ).detach()
                 (loss / accumulation).backward()
                 micro_rows.append(metrics)
-            common_every = max(1, int(training.get("common_output_every", 8)))
-            if pilot_enabled and step % common_every == 0:
-                assert common_probe_batch is not None
-                common_loss, common_weight, common_metrics = _pilot_common_output_step(
+            if pilot_enabled and step % functional_every == 0:
+                assert functional_prefetched is not None
+                functional_batch = next(functional_prefetched)
+                functional_loss, functional_metrics = _pilot_functional_probe_step(
                     anima,
                     tokenizer,
-                    common_probe_batch,
+                    functional_batch,
                     device,
                     training,
                     generator=torch.Generator(device=device).manual_seed(
@@ -917,10 +1132,10 @@ def _train_variant(
                     ),
                     step=step,
                 )
-                if common_weight > 0:
-                    (common_weight * common_loss).backward()
+                if functional_loss.requires_grad:
+                    functional_loss.backward()
                 for row in micro_rows:
-                    row.update(common_metrics)
+                    row.update(functional_metrics)
             grad_norm = torch.nn.utils.clip_grad_norm_(
                 tokenizer.parameters(), max_grad_norm
             )
@@ -948,6 +1163,11 @@ def _train_variant(
                     f"loss={averaged['loss']:.5f} "
                     f"flow={averaged['flow_loss']:.5f} "
                     f"paired={averaged.get('paired_flow_improvement', 0.0):.5f} "
+                    f"same={averaged.get('functional_same_artist_cosine', 0.0):.3f} "
+                    f"between={averaged.get('functional_between_artist_cosine', 0.0):.3f} "
+                    f"common={averaged.get('common_output_ratio', 0.0):.3f} "
+                    f"centered={averaged.get('functional_centered_effect_ratio', 0.0):.3f} "
+                    f"func_w={averaged.get('functional_probe_per_step_loss', 0.0):.5f} "
                     f"refs={averaged['references']:.2f} "
                     f"target={averaged['target_inclusion']:.3f} "
                     f"step_s={averaged['step_s']:.3f}",
@@ -1319,6 +1539,21 @@ def smoke_test_dual_query_style_tokenizer_pilot(
         destination,
         _loader_config(config, cfg, split=str(cfg.get("train_split", "train"))),
     )
+    functional_cfg = _loader_config(
+        config, cfg, split=str(cfg.get("train_split", "train"))
+    )
+    functional_cfg.update(
+        {
+            "batch_size": int(training.get("functional_probe_batch_rows", 4)),
+            "min_references": int(training.get("functional_probe_references", 4)),
+            "max_references": int(training.get("functional_probe_references", 4)),
+            "reference_count_weights": None,
+            "reference_curriculum": {},
+            "pilot_reference_schedule": [],
+            "artist_balanced": True,
+        }
+    )
+    functional_loader = DualQueryCachedStyleLoader(destination, functional_cfg)
     cache_summary = _cache_summary(destination, cfg)
     anima = _resolve_anima_model(config, destination, device).requires_grad_(False).eval()
     _optimize_frozen_anima(
@@ -1350,11 +1585,12 @@ def smoke_test_dual_query_style_tokenizer_pilot(
             metrics["subset_consistency"] = consistency.detach()
         loss.backward()
         reported_loss = loss.detach()
-        if step % max(1, int(training.get("common_output_every", 8))) == 0:
-            common_loss, common_weight, common_metrics = _pilot_common_output_step(
+        if step % max(1, int(training.get("functional_probe_every", 2))) == 0:
+            functional_batch = functional_loader.load_step(step)
+            functional_loss, functional_metrics = _pilot_functional_probe_step(
                 anima,
                 tokenizer,
-                batch,
+                functional_batch,
                 device,
                 training,
                 generator=torch.Generator(device=device).manual_seed(
@@ -1362,10 +1598,10 @@ def smoke_test_dual_query_style_tokenizer_pilot(
                 ),
                 step=step,
             )
-            if common_weight > 0:
-                (common_weight * common_loss).backward()
-                reported_loss = reported_loss + common_weight * common_loss.detach()
-            metrics.update(common_metrics)
+            if functional_loss.requires_grad:
+                functional_loss.backward()
+                reported_loss = reported_loss + functional_loss.detach()
+            metrics.update(functional_metrics)
         gradients = [
             parameter.grad.detach().float()
             for parameter in tokenizer.parameters()

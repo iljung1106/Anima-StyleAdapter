@@ -150,3 +150,50 @@ v1 산출물은 삭제하거나 덮어쓰지 않으며, v2는 별도 output/W&B 
 step 1,500 optimizer·RNG 상태를 복원한다. step 1,750/2,000/2,250의 같은
 validation과 step 2,000 fixed sheet로 개입 효과를 먼저 확인한 뒤 10k까지
 계속한다.
+
+## v2 정성 붕괴와 v3 기능 공간 교정
+
+v2는 step 7,610에서 중단했다. heldout paired-flow improvement와
+correct-vs-wrong advantage는 양수였지만, 고정 외부 reference sheet에서는
+레퍼런스와 무관한 약하고 잘못된 변화가 반복되었다. 같은 prompt·seed의 최종
+이미지 delta를 측정하면 전체 변화의 약 `77–86%`가 reference 사이에 공통이었다.
+반면 tokenizer 출력은 step이 증가할수록 reference 사이 구분이 커졌다. 이는
+token collapse가 아니라, token 차이가 Frozen Anima가 스타일로 사용하는
+방향에 정렬되지 않은 기능적 붕괴다.
+
+v2의 target-excluded normalized residual은 매 step 약 `0.0097`의 weighted
+loss를 만들었지만 common-output 항은 8 step 평균 약 `1e-5`였다. 레퍼런스로
+예측할 수 없는 content/noise 성분이 섞인 target residual을 강하게 회귀하면서
+dataset-average residual이 가장 쉬운 해가 된 것으로 판단한다.
+
+v3는 v1 step 1,500을 다시 초기값으로 사용하고 다음처럼 교정한다.
+
+- target-excluded normalized residual `0.015→0.0015`
+- heldout aligned-floor weight `0.30→0.04`, coefficient floor `0.01→0.02`
+- bounded aligned effect `0.03→0.01`, 허용 구간 `0.01–0.15`
+- token contrastive `0.005/every 2→0.001/every 4`
+- correct-vs-wrong flow ranking `0.003/every 4→0.01/every 2`
+- common-output `0.002/every 8→0.03/every 2`, threshold `0.60→0.55`
+- 같은 작가의 서로 겹치지 않는 두 reference view가 동일한 controlled
+  prompt·noise·timestep에서 만드는 Frozen Anima velocity residual의 방향과
+  크기를 맞추는 functional consistency `0.02/every 2`
+- 전체 작가 공통 residual을 뺀 centered artist effect ratio에 `0.35→0.55`
+  하한을 두는 loss `0.03/every 2`
+
+Functional probe는 작가 4명과 작가별 reference 4장을 사용한다. 두 view 중
+하나는 detach된 목표로 계산하여 H100에서 두 개의 Anima backward graph를
+동시에 보존하지 않는다. 로그에는 각 raw/weighted/per-step loss 외에 다음을
+반드시 기록한다.
+
+- same-artist functional cosine과 magnitude 오차
+- between-artist functional cosine과 pairwise RMS
+- common-output ratio와 common RMS
+- centered artist-effect ratio와 RMS
+- 전체 functional probe의 cadence-adjusted weighted contribution
+
+`same-artist cosine↑`와 함께 `between-artist cosine/common ratio↑`가 나타나면
+공통 출력 붕괴, effect RMS가 함께 감소하면 약한 출력 붕괴,
+centered ratio는 증가하지만 heldout flow와 정성 샘플이 나빠지면 임의의
+off-manifold artist direction으로 진단한다. v3도 fixed-reference의 작가별
+차이와 안정성을 회복하지 못하면 수치상 paired-flow improvement만으로
+10k까지 계속하지 않는다.
