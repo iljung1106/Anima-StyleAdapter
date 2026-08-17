@@ -109,6 +109,22 @@ def build_parser() -> argparse.ArgumentParser:
             "native-centered-teacher-cache",
             "Cache centered native @artist velocity targets",
         ),
+        (
+            "dual-domain-centered-teacher-cache",
+            "Cache 500-artist centered native flow targets",
+        ),
+        (
+            "synthetic-dual-query-style-cache",
+            "Cache Dual-query Resampler tokens for synthetic references",
+        ),
+        (
+            "dual-domain-style-distill",
+            "Train human and synthetic native-effect distillation from scratch",
+        ),
+        (
+            "dual-domain-style-distill-smoke",
+            "Smoke-test independent human and synthetic distillation",
+        ),
         ("dual-query-style-ablate", "Compare artist-summary token delivery"),
         ("dual-query-style-train", "Train the multi-reference Dual-query Style Tokenizer"),
         ("dual-query-style-pilot", "Run the summary-ON 10k Dual-query Style Tokenizer pilot"),
@@ -336,6 +352,10 @@ def main() -> None:
         "dual-query-style-cache",
         "dual-query-style-external-cache",
         "native-centered-teacher-cache",
+        "dual-domain-centered-teacher-cache",
+        "synthetic-dual-query-style-cache",
+        "dual-domain-style-distill",
+        "dual-domain-style-distill-smoke",
         "dual-query-style-ablate",
         "dual-query-style-train",
         "dual-query-style-pilot",
@@ -350,9 +370,15 @@ def main() -> None:
         "dual-query-style-pilot-smoke",
         "dual-query-style-smoke",
     }:
-        from .dual_query_style_tokenizer import cache_dual_query_style_tokens
+        from .dual_query_style_tokenizer import (
+            cache_dual_query_style_tokens,
+            cache_synthetic_dual_query_style_tokens,
+        )
         from .dual_query_external_samples import cache_dual_query_external_references
-        from .native_centered_teacher import cache_native_centered_teacher
+        from .native_centered_teacher import (
+            cache_dual_domain_centered_teacher,
+            cache_native_centered_teacher,
+        )
         from .dual_query_style_training import (
             compare_artist_summary_tokens,
             smoke_test_dual_query_style_tokenizer,
@@ -367,12 +393,24 @@ def main() -> None:
             train_native_teacher_compact_continuation,
             smoke_test_native_teacher_compact_continuation,
             train_dual_query_style_tokenizer_pilot,
+            train_dual_domain_native_distillation,
+            smoke_test_dual_domain_native_distillation,
         )
 
         stage = {
             "dual-query-style-cache": cache_dual_query_style_tokens,
             "dual-query-style-external-cache": cache_dual_query_external_references,
             "native-centered-teacher-cache": cache_native_centered_teacher,
+            "dual-domain-centered-teacher-cache": (
+                cache_dual_domain_centered_teacher
+            ),
+            "synthetic-dual-query-style-cache": (
+                cache_synthetic_dual_query_style_tokens
+            ),
+            "dual-domain-style-distill": train_dual_domain_native_distillation,
+            "dual-domain-style-distill-smoke": (
+                smoke_test_dual_domain_native_distillation
+            ),
             "dual-query-style-ablate": compare_artist_summary_tokens,
             "dual-query-style-train": train_dual_query_style_tokenizer,
             "dual-query-style-pilot": train_dual_query_style_tokenizer_pilot,

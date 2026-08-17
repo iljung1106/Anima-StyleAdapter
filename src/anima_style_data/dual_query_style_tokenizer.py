@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import math
@@ -9,7 +10,7 @@ import time
 from collections import OrderedDict, defaultdict
 from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 import torch
 from safetensors.torch import load_file, save_file
@@ -401,6 +402,69 @@ def cache_dual_query_style_tokens(
     return summary
 
 
+def cache_synthetic_dual_query_style_tokens(
+    config: dict[str, Any], destination: Path
+) -> dict[str, Any]:
+    """Cache the current frozen Dual-query Resampler for synthetic references."""
+
+    cfg = dict(config["synthetic_teacher"])
+    root = destination / str(cfg["output_directory"])
+    manifest_path = root / "manifest.parquet"
+    feature_manifest = root / "style_features" / "manifest.parquet"
+    if not manifest_path.exists() or not feature_manifest.exists():
+        raise FileNotFoundError(
+            "Run synthetic-teacher before caching synthetic Dual-query tokens"
+        )
+    latent_root = root / "latents"
+    latent_manifest = latent_root / "manifest.parquet"
+    source_rows = [
+        row
+        for row in read_records(manifest_path)
+        if str(row.get("kind")) == "artist"
+    ]
+    compatibility_rows = [
+        {
+            "id": int(row["id"]),
+            "artist": str(row["artist"]),
+            "style_id": str(row["style_id"]),
+            "split": "synthetic_teacher",
+            "teacher_split": (
+                "test"
+                if str(row["artist_split"]) == "meta_test"
+                else str(row["artist_split"])
+            ),
+            "cache_shard": str(row["latent_shard"]),
+            "row_index": int(row["latent_row"]),
+            "latent_height": int(row["latent_height"]),
+            "latent_width": int(row["latent_width"]),
+            "target_height": int(row["height"]),
+            "target_width": int(row["width"]),
+        }
+        for row in source_rows
+    ]
+    write_records(latent_manifest, compatibility_rows)
+
+    effective = copy.deepcopy(config)
+    effective["dual_query_resampler"]["feature_directory"] = str(
+        root / "style_features"
+    )
+    effective["dual_query_resampler"]["latent_directory"] = str(latent_root)
+    tokenizer_cfg = effective["dual_query_style_tokenizer"]
+    tokenizer_cfg["cache"] = {
+        **dict(tokenizer_cfg["cache"]),
+        "output_directory": str(
+            Path(cfg["output_directory"])
+            / str(cfg["dual_query_token_cache"]["output_directory"])
+        ),
+        **{
+            key: value
+            for key, value in dict(cfg["dual_query_token_cache"]).items()
+            if key != "output_directory"
+        },
+    }
+    return cache_dual_query_style_tokens(effective, destination)
+
+
 class _FullTokenShardLRU:
     def __init__(self, root: Path, capacity: int) -> None:
         self.root = root
@@ -417,6 +481,112 @@ class _FullTokenShardLRU:
             while len(self.values) > self.capacity:
                 self.values.popitem(last=False)
             return cached
+
+
+class CachedTeacherReferenceLoader:
+    """Artist-balanced reference-only loader for a cached image domain."""
+
+    def __init__(
+        self,
+        token_root: Path,
+        *,
+        split: str,
+        style_ids: list[str],
+        batch_size: int,
+        references: int,
+        seed: int,
+        token_lru_shards: int = 8,
+    ) -> None:
+        self.token_root = token_root
+        self.batch_size = int(batch_size)
+        self.references = int(references)
+        self.seed = int(seed)
+        if self.batch_size <= 0 or self.references <= 0:
+            raise ValueError("Teacher batch and reference counts must be positive")
+        allowed = set(style_ids)
+        grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        for row in read_records(token_root / "manifest.parquet"):
+            style_id = str(row["style_id"])
+            if str(row.get("split", "train")) == split and style_id in allowed:
+                grouped[style_id].append(row)
+        self.by_style = {
+            style_id: sorted(rows, key=lambda row: int(row["id"]))
+            for style_id, rows in grouped.items()
+            if len(rows) >= self.references
+        }
+        missing = sorted(allowed - set(self.by_style))
+        if missing:
+            raise RuntimeError(
+                f"Reference cache {token_root} is missing {len(missing)} "
+                f"teacher artists for split {split!r}"
+            )
+        self.styles = sorted(self.by_style)
+        self.shards = _FullTokenShardLRU(token_root, token_lru_shards)
+
+    @staticmethod
+    def _pin(value: torch.Tensor) -> torch.Tensor:
+        return value.pin_memory() if torch.cuda.is_available() else value
+
+    def load_step(self, step: int) -> dict[str, Any]:
+        rng = random.Random(self.seed + int(step) * 1_000_003)
+        styles = (
+            rng.sample(self.styles, self.batch_size)
+            if len(self.styles) >= self.batch_size
+            else [rng.choice(self.styles) for _ in range(self.batch_size)]
+        )
+        selected = [
+            rng.sample(self.by_style[style_id], self.references)
+            for style_id in styles
+        ]
+        rows = [row for group in selected for row in group]
+        grouped_rows: dict[str, list[tuple[int, dict[str, Any]]]] = defaultdict(list)
+        for index, row in enumerate(rows):
+            grouped_rows[str(row["token_shard"])].append((index, row))
+        values: list[torch.Tensor | None] = [None] * len(rows)
+        for shard_name, shard_rows in grouped_rows.items():
+            shard = self.shards.get(shard_name)
+            for index, row in shard_rows:
+                values[index] = shard[int(row["token_row"])]
+        if any(value is None for value in values):
+            raise RuntimeError("Teacher reference token load is incomplete")
+        tokens = torch.stack([value for value in values if value is not None])
+        episodes = [
+            StyleEpisode(
+                target_id=-1,
+                reference_ids=tuple(int(row["id"]) for row in group),
+                style_id=style_id,
+                latent_shape=(0, 0),
+                text_variant=0,
+            )
+            for style_id, group in zip(styles, selected, strict=True)
+        ]
+        positions = [
+            (batch_index, reference_index)
+            for batch_index in range(self.batch_size)
+            for reference_index in range(self.references)
+        ]
+        mask = torch.ones(
+            self.batch_size, self.references, dtype=torch.bool
+        )
+        return {
+            "episodes": episodes,
+            "cached_reference_tokens": self._pin(tokens),
+            "reference_positions": positions,
+            "reference_mask": self._pin(mask),
+        }
+
+    def prefetch(
+        self, start_step: int, steps: int, workers: int = 1, depth: int = 4
+    ) -> Iterator[dict[str, Any]]:
+        with ThreadPoolExecutor(max_workers=max(1, workers)) as executor:
+            futures: dict[int, Future[dict[str, Any]]] = {}
+            next_step = int(start_step)
+            stop = int(start_step) + int(steps)
+            for step in range(int(start_step), stop):
+                while next_step < stop and len(futures) < max(1, depth):
+                    futures[next_step] = executor.submit(self.load_step, next_step)
+                    next_step += 1
+                yield futures.pop(step).result()
 
 
 class DualQueryCachedStyleLoader(ProductionStyleLoader):

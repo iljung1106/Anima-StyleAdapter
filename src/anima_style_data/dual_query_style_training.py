@@ -12,6 +12,7 @@ import torch
 import torch.nn.functional as F
 
 from .dual_query_style_tokenizer import (
+    CachedTeacherReferenceLoader,
     DualQueryCachedStyleLoader,
     DualQuerySetStyleTokenizer,
 )
@@ -432,6 +433,8 @@ def _native_centered_teacher_step(
     training: dict[str, Any],
     *,
     step: int,
+    metric_prefix: str = "native_teacher",
+    probe_index_override: int | None = None,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     references, reference_mask = _reference_inputs(batch, device, "heldout")
     rows = min(
@@ -449,7 +452,11 @@ def _native_centered_teacher_step(
     tensors = bank.tensors
     contents = int(tensors["noisy_inputs"].shape[0])
     timestep_count = int(tensors["noisy_inputs"].shape[1])
-    probe_index = max(0, step - int(training.get("native_teacher_start_step", 0)))
+    probe_index = (
+        int(probe_index_override)
+        if probe_index_override is not None
+        else max(0, step - int(training.get("native_teacher_start_step", 0)))
+    )
     content_index = probe_index % contents
     timestep_index = (probe_index // contents) % timestep_count
     noisy = tensors["noisy_inputs"][content_index, timestep_index].to(
@@ -524,7 +531,64 @@ def _native_centered_teacher_step(
             "native_teacher_timestep": timestep.detach().float(),
         }
     )
+    if metric_prefix != "native_teacher":
+        metrics = {
+            key.replace("native_teacher", metric_prefix, 1): value
+            for key, value in metrics.items()
+        }
     return weighted, metrics
+
+
+def _domain_teacher_training(
+    training: dict[str, Any], domain: dict[str, Any]
+) -> dict[str, Any]:
+    result = dict(training)
+    for key in (
+        "start_step",
+        "ramp_steps",
+        "weight",
+        "direction_weight",
+        "magnitude_weight",
+        "huber_beta",
+        "scale_floor",
+        "batch_rows",
+        "references",
+    ):
+        if key in domain:
+            result[f"native_teacher_{key}"] = domain[key]
+    return result
+
+
+def _evaluate_native_teacher_domain(
+    anima: torch.nn.Module,
+    tokenizer: torch.nn.Module,
+    bank: NativeCenteredTeacherBank,
+    loader: Any,
+    device: str,
+    training: dict[str, Any],
+    *,
+    metric_prefix: str,
+    batches: int,
+) -> dict[str, float]:
+    totals: dict[str, float] = defaultdict(float)
+    counts: dict[str, int] = defaultdict(int)
+    with torch.no_grad():
+        for index in range(max(1, int(batches))):
+            _, metrics = _native_centered_teacher_step(
+                anima,
+                tokenizer,
+                bank,
+                loader.load_step(index),
+                device,
+                training,
+                step=int(training.get("native_teacher_start_step", 1)),
+                metric_prefix=metric_prefix,
+                probe_index_override=index,
+            )
+            for key, value in metrics.items():
+                totals[key] += float(value)
+                counts[key] += 1
+    return {key: value / counts[key] for key, value in totals.items()}
 
 
 def _artist_flow_ranking_loss(
@@ -1242,6 +1306,26 @@ def _train_variant(
             torch.backends.cuda.matmul.allow_tf32 = True
             torch.set_float32_matmul_precision("high")
 
+    dual_domain_cfg = dict(training.get("dual_domain_teacher", {}))
+    dual_domain_enabled = bool(dual_domain_cfg.get("enabled", False))
+    dual_domain_bank = None
+    if dual_domain_enabled:
+        dual_domain_bank = NativeCenteredTeacherBank.load(
+            config,
+            destination,
+            config_key=str(
+                dual_domain_cfg.get(
+                    "bank_config_key", "dual_domain_native_teacher"
+                )
+            ),
+        )
+        heldout_teacher_styles = [
+            str(value)
+            for key in ("validation_style_ids", "test_style_ids")
+            for value in dual_domain_bank.summary.get(key, [])
+        ]
+        cfg.setdefault("loader", {})["excluded_style_ids"] = heldout_teacher_styles
+
     train_loader = DualQueryCachedStyleLoader(
         destination,
         _loader_config(config, cfg, split=str(cfg.get("train_split", "train"))),
@@ -1350,6 +1434,78 @@ def _train_variant(
         )
         if native_teacher_loader is None:
             raise RuntimeError("Native centered teacher has no training artists")
+    dual_domain_train_loaders: dict[str, Any] = {}
+    dual_domain_validation_loaders: dict[str, Any] = {}
+    dual_domain_training: dict[str, dict[str, Any]] = {}
+    if dual_domain_enabled:
+        assert dual_domain_bank is not None
+        train_style_ids = [
+            str(value) for value in dual_domain_bank.summary["train_style_ids"]
+        ]
+        validation_style_ids = [
+            str(value)
+            for value in dual_domain_bank.summary["validation_style_ids"]
+        ]
+        human_cfg = dict(dual_domain_cfg["human"])
+        synthetic_cfg = dict(dual_domain_cfg["synthetic"])
+
+        def build_human_domain(style_ids: list[str]):
+            loader_cfg = _loader_config(
+                config,
+                cfg,
+                split=str(human_cfg.get("source_split", "train")),
+            )
+            references = int(human_cfg.get("references", 4))
+            loader_cfg.update(
+                {
+                    "batch_size": int(human_cfg.get("batch_rows", 4)),
+                    "min_references": references,
+                    "max_references": references,
+                    "artist_balanced": True,
+                    "gradient_accumulation_steps": 1,
+                    "reference_curriculum": {},
+                    "pilot_reference_schedule": [],
+                    "allowed_style_ids": style_ids,
+                    "excluded_style_ids": [],
+                }
+            )
+            return DualQueryCachedStyleLoader(destination, loader_cfg)
+
+        synthetic_root = destination / str(
+            dual_domain_cfg["synthetic_reference_cache"]
+        )
+        dual_domain_train_loaders["human_teacher"] = build_human_domain(
+            train_style_ids
+        )
+        dual_domain_validation_loaders["human_teacher"] = build_human_domain(
+            validation_style_ids
+        )
+        dual_domain_train_loaders["synthetic_teacher"] = (
+            CachedTeacherReferenceLoader(
+                synthetic_root,
+                split="train",
+                style_ids=train_style_ids,
+                batch_size=int(synthetic_cfg.get("batch_rows", 4)),
+                references=int(synthetic_cfg.get("references", 4)),
+                seed=seed ^ 0x51A7_0001,
+                token_lru_shards=int(synthetic_cfg.get("token_lru_shards", 8)),
+            )
+        )
+        dual_domain_validation_loaders["synthetic_teacher"] = (
+            CachedTeacherReferenceLoader(
+                synthetic_root,
+                split="validation",
+                style_ids=validation_style_ids,
+                batch_size=int(synthetic_cfg.get("batch_rows", 4)),
+                references=int(synthetic_cfg.get("references", 4)),
+                seed=seed ^ 0x51A7_0002,
+                token_lru_shards=int(synthetic_cfg.get("token_lru_shards", 8)),
+            )
+        )
+        dual_domain_training = {
+            "human_teacher": _domain_teacher_training(training, human_cfg),
+            "synthetic_teacher": _domain_teacher_training(training, synthetic_cfg),
+        }
     cache_summary = _cache_summary(destination, cfg)
     model_cfg = dict(cfg["model"])
     architecture = str(model_cfg.pop("architecture", "flat_set"))
@@ -1512,6 +1668,17 @@ def _train_variant(
             workers=int(training.get("native_teacher_prefetch_workers", 1)),
             depth=int(training.get("native_teacher_prefetch_batches", 2)),
         )
+    dual_domain_prefetched: dict[str, Any] = {}
+    if dual_domain_enabled:
+        remaining = max(0, steps - start_step)
+        for domain, loader in dual_domain_train_loaders.items():
+            domain_cfg = dict(dual_domain_cfg[domain.removesuffix("_teacher")])
+            dual_domain_prefetched[domain] = loader.prefetch(
+                start_step,
+                remaining,
+                workers=int(domain_cfg.get("prefetch_workers", 1)),
+                depth=int(domain_cfg.get("prefetch_batches", 4)),
+            )
     completed = start_step
     run_started = time.perf_counter()
     running: dict[str, float] = defaultdict(float)
@@ -1622,6 +1789,27 @@ def _train_variant(
                     row["total_auxiliary_weighted_loss"] = (
                         row["loss"] - row["flow_loss"]
                     )
+            if dual_domain_enabled:
+                assert dual_domain_bank is not None
+                for domain in ("human_teacher", "synthetic_teacher"):
+                    domain_loss, domain_metrics = _native_centered_teacher_step(
+                        anima,
+                        tokenizer,
+                        dual_domain_bank,
+                        next(dual_domain_prefetched[domain]),
+                        device,
+                        dual_domain_training[domain],
+                        step=step,
+                        metric_prefix=domain,
+                    )
+                    if domain_loss.requires_grad:
+                        domain_loss.backward()
+                    for row in micro_rows:
+                        row.update(domain_metrics)
+                        row["loss"] = row["loss"] + domain_loss.detach()
+                        row["total_auxiliary_weighted_loss"] = (
+                            row["loss"] - row["flow_loss"]
+                        )
             grad_norm = torch.nn.utils.clip_grad_norm_(
                 tokenizer.parameters(), max_grad_norm
             )
@@ -1656,6 +1844,10 @@ def _train_variant(
                     f"func_w={averaged.get('functional_probe_per_step_loss', 0.0):.5f} "
                     f"teacher_cos={averaged.get('native_teacher_cosine', 0.0):.3f} "
                     f"teacher_proj={averaged.get('native_teacher_projection_coefficient', 0.0):.3f} "
+                    f"human_cos={averaged.get('human_teacher_cosine', 0.0):.3f} "
+                    f"human_proj={averaged.get('human_teacher_projection_coefficient', 0.0):.3f} "
+                    f"synth_cos={averaged.get('synthetic_teacher_cosine', 0.0):.3f} "
+                    f"synth_proj={averaged.get('synthetic_teacher_projection_coefficient', 0.0):.3f} "
                     f"refs={averaged['references']:.2f} "
                     f"target={averaged['target_inclusion']:.3f} "
                     f"step_s={averaged['step_s']:.3f}",
@@ -1720,6 +1912,24 @@ def _train_variant(
                         key: float(value)
                         for key, value in teacher_validation.items()
                     }
+                if dual_domain_enabled:
+                    assert dual_domain_bank is not None
+                    teacher_validation_batches = int(
+                        dual_domain_cfg.get("validation_batches", 16)
+                    )
+                    for domain in ("human_teacher", "synthetic_teacher"):
+                        row[f"validation_{domain}"] = (
+                            _evaluate_native_teacher_domain(
+                                anima,
+                                tokenizer,
+                                dual_domain_bank,
+                                dual_domain_validation_loaders[domain],
+                                device,
+                                dual_domain_training[domain],
+                                metric_prefix=domain,
+                                batches=teacher_validation_batches,
+                            )
+                        )
                 extended_every = int(
                     training.get("extended_evaluation_every", 1000)
                 )
@@ -1778,6 +1988,18 @@ def _train_variant(
                                 f"validation_native_teacher/{key}": value
                                 for key, value in row.get(
                                     "validation_native_teacher", {}
+                                ).items()
+                            },
+                            **{
+                                f"validation_human_teacher/{key}": value
+                                for key, value in row.get(
+                                    "validation_human_teacher", {}
+                                ).items()
+                            },
+                            **{
+                                f"validation_synthetic_teacher/{key}": value
+                                for key, value in row.get(
+                                    "validation_synthetic_teacher", {}
                                 ).items()
                             },
                             **(
@@ -2131,6 +2353,65 @@ def smoke_test_native_teacher_compact_continuation(
     config: dict[str, Any], destination: Path
 ) -> dict[str, Any]:
     return _run_native_teacher_continuation(config, destination, smoke=True)
+
+
+def _run_dual_domain_native_distillation(
+    config: dict[str, Any], destination: Path, *, smoke: bool
+) -> dict[str, Any]:
+    cfg = copy.deepcopy(config["dual_domain_style_distillation"])
+    output_name = str(cfg["output_directory"])
+    if smoke:
+        output_name += "_smoke"
+        cfg["training"].update(
+            {
+                "steps": 2,
+                "log_every": 1,
+                "validation_every": 0,
+                "checkpoint_every": 0,
+                "sample_every": 0,
+                "fixed_sample_every": 0,
+                "extended_evaluation_every": 0,
+                "resume": False,
+                "wandb": {"enabled": False},
+            }
+        )
+        for domain in ("human", "synthetic"):
+            cfg["training"]["dual_domain_teacher"][domain]["ramp_steps"] = 0
+    effective = copy.deepcopy(config)
+    effective["dual_query_style_tokenizer"] = cfg
+    device = str(cfg["training"].get("device", "cuda"))
+    anima = _resolve_anima_model(effective, destination, device).requires_grad_(
+        False
+    ).eval()
+    _optimize_frozen_anima(
+        anima,
+        low_precision_rmsnorm=bool(
+            cfg["training"].get("low_precision_rmsnorm", True)
+        ),
+        fuse_attention_projections=bool(
+            cfg["training"].get("fuse_attention_projections", True)
+        ),
+    )
+    return _train_variant(
+        effective,
+        destination,
+        anima,
+        include_artist_summary=True,
+        output_name=output_name,
+        cfg_override=cfg,
+    )
+
+
+def train_dual_domain_native_distillation(
+    config: dict[str, Any], destination: Path
+) -> dict[str, Any]:
+    return _run_dual_domain_native_distillation(config, destination, smoke=False)
+
+
+def smoke_test_dual_domain_native_distillation(
+    config: dict[str, Any], destination: Path
+) -> dict[str, Any]:
+    return _run_dual_domain_native_distillation(config, destination, smoke=True)
 
 
 def _smoke_test_compact_dual_query_style_tokenizer_section(

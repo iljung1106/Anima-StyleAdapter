@@ -46,19 +46,93 @@ def _load_probe_latents(
     return result
 
 
-def cache_native_centered_teacher(
-    config: dict[str, Any], destination: Path
-) -> dict[str, Any]:
-    cfg = dict(config["native_centered_teacher"])
-    output = destination / str(cfg["output_directory"])
-    output.mkdir(parents=True, exist_ok=True)
-    tensor_path = output / "teacher_bank.safetensors"
-    summary_path = output / "summary.json"
+def _load_manifest_probe_latents(
+    destination: Path,
+    cfg: dict[str, Any],
+    probe_rows: list[dict[str, Any]],
+) -> torch.Tensor:
+    root = destination / str(cfg["probe_latent_directory"])
+    shards: dict[str, dict[str, torch.Tensor]] = {}
+    values = []
+    for row in probe_rows:
+        shard_name = str(row["latent_shard"])
+        if shard_name not in shards:
+            shards[shard_name] = load_file(root / shard_name, device="cpu")
+        values.append(shards[shard_name]["latents"][int(row["latent_row"])])
+    result = torch.stack(values).to(dtype=torch.float16).contiguous()
+    if len({tuple(value.shape) for value in result}) != 1:
+        raise RuntimeError("Configured teacher probe latents must share one shape")
+    return result
+
+
+def _teacher_spec(
+    cfg: dict[str, Any], destination: Path
+) -> tuple[list[str], list[str], list[str], list[int], dict[str, Any]]:
+    requested_contents = int(cfg.get("content_count", 4))
+    if cfg.get("artist_manifest"):
+        source_path = destination / str(cfg["artist_manifest"])
+        all_source_rows = read_records(source_path)
+        source_rows = [
+            row
+            for row in all_source_rows
+            if str(row.get("kind", "artist")) == "artist"
+        ]
+        by_artist: dict[str, dict[str, Any]] = {}
+        for row in source_rows:
+            artist = str(row["artist"])
+            by_artist.setdefault(artist, row)
+        artists = sorted(
+            by_artist,
+            key=lambda value: int(by_artist[value].get("artist_index", 0)),
+        )
+        requested_artists = int(cfg.get("artist_count", len(artists)))
+        if len(artists) != requested_artists:
+            raise RuntimeError(
+                f"Teacher manifest has {len(artists)} artists, expected "
+                f"{requested_artists}"
+            )
+        style_ids = [str(by_artist[artist]["style_id"]) for artist in artists]
+        splits = [
+            "test"
+            if str(by_artist[artist].get("artist_split", "train")) == "meta_test"
+            else str(by_artist[artist].get("artist_split", "train"))
+            for artist in artists
+        ]
+        if cfg.get("probe_manifest"):
+            controls = {
+                int(row["content_index"]): int(row["id"])
+                for row in all_source_rows
+                if str(row.get("kind")) == "content_control"
+                and int(row.get("seed_index", 0)) == 0
+            }
+            probe_ids = [controls[index] for index in sorted(controls)][
+                :requested_contents
+            ]
+        else:
+            content_ids = {
+                int(row["content_index"]): int(row["content_source_id"])
+                for row in source_rows
+            }
+            probe_ids = [content_ids[index] for index in sorted(content_ids)][
+                :requested_contents
+            ]
+        if len(probe_ids) != requested_contents:
+            raise RuntimeError("Artist manifest does not contain enough probe contents")
+        source_signature = {
+            "artist_manifest": str(cfg["artist_manifest"]),
+            "artist_manifest_sha256": _sha256(source_path),
+        }
+        if cfg.get("probe_manifest"):
+            probe_manifest_path = destination / str(cfg["probe_manifest"])
+            source_signature["probe_manifest_sha256"] = _sha256(
+                probe_manifest_path
+            )
+        return artists, style_ids, splits, probe_ids, source_signature
+
     calibration_path = destination / str(cfg["calibration_file"])
     style_manifest = destination / str(cfg["style_manifest"])
     calibration = json.loads(calibration_path.read_text(encoding="utf-8"))
     retained = [str(value) for value in calibration["retained_artists"]]
-    requested_contents = int(cfg.get("content_count", 4))
     probe_ids = [int(value) for value in calibration["probe_ids"]][
         :requested_contents
     ]
@@ -75,14 +149,34 @@ def cache_native_centered_teacher(
     if set(split_by_artist) != set(retained):
         missing = sorted(set(retained) - set(split_by_artist))
         raise RuntimeError(f"Teacher artists missing from style cache: {missing}")
-    artists = retained
-    style_ids = [split_by_artist[artist][0] for artist in artists]
-    splits = [split_by_artist[artist][1] for artist in artists]
+    return (
+        retained,
+        [split_by_artist[artist][0] for artist in retained],
+        [split_by_artist[artist][1] for artist in retained],
+        probe_ids,
+        {
+            "calibration_sha256": _sha256(calibration_path),
+            "style_manifest": str(cfg["style_manifest"]),
+        },
+    )
+
+
+def _cache_native_centered_teacher(
+    config: dict[str, Any], destination: Path, *, config_key: str
+) -> dict[str, Any]:
+    cfg = dict(config[config_key])
+    output = destination / str(cfg["output_directory"])
+    output.mkdir(parents=True, exist_ok=True)
+    tensor_path = output / "teacher_bank.safetensors"
+    summary_path = output / "summary.json"
+    artists, style_ids, splits, probe_ids, source_signature = _teacher_spec(
+        cfg, destination
+    )
     timesteps = [float(value) for value in cfg["timesteps"]]
     signature = {
         "version": "native-artist-centered-flow-v1",
-        "calibration_sha256": _sha256(calibration_path),
-        "style_manifest": str(cfg["style_manifest"]),
+        "config_key": config_key,
+        **source_signature,
         "artists": artists,
         "style_ids": style_ids,
         "splits": splits,
@@ -95,14 +189,37 @@ def cache_native_centered_teacher(
         if summary.get("signature") == signature:
             return {**summary, "reused": True}
 
-    captions = {int(row["id"]): row for row in _caption_rows(destination)}
-    probe_rows = [captions[image_id] for image_id in probe_ids]
+    if cfg.get("probe_manifest"):
+        probe_manifest_path = destination / str(cfg["probe_manifest"])
+        probe_manifest = {
+            int(row["id"]): row for row in read_records(probe_manifest_path)
+        }
+        probe_rows = [
+            {
+                **probe_manifest[image_id],
+                "anima_caption": str(probe_manifest[image_id]["content_prompt"]),
+            }
+            for image_id in probe_ids
+        ]
+        latents = _load_manifest_probe_latents(destination, cfg, probe_rows)
+    else:
+        captions = {int(row["id"]): row for row in _caption_rows(destination)}
+        probe_rows = [captions[image_id] for image_id in probe_ids]
+        latents = _load_probe_latents(destination, config, probe_ids)
     prompts = [str(row["anima_caption"]) for row in probe_rows]
-    prompts.extend(
-        _artist_prompt(row, artist)
-        for artist in artists
-        for row in probe_rows
-    )
+    if cfg.get("probe_manifest"):
+        prompts.extend(
+            f"{row['anima_caption']}, "
+            f"@{' '.join(artist.replace('_', ' ').split())}"
+            for artist in artists
+            for row in probe_rows
+        )
+    else:
+        prompts.extend(
+            _artist_prompt(row, artist)
+            for artist in artists
+            for row in probe_rows
+        )
     device = str(cfg.get("device", "cuda"))
     conditions = _encode_prompts(
         config,
@@ -119,7 +236,6 @@ def cache_native_centered_teacher(
     base_lengths = (
         base_context.float().abs().sum(dim=-1) > 0
     ).sum(dim=-1).to(torch.int64)
-    latents = _load_probe_latents(destination, config, probe_ids)
     latent_shape = tuple(int(value) for value in latents.shape[1:])
     noisy_inputs = torch.empty(
         contents, len(timesteps), *latent_shape, dtype=torch.float16
@@ -232,6 +348,22 @@ def cache_native_centered_teacher(
     return {**summary, "reused": False}
 
 
+def cache_native_centered_teacher(
+    config: dict[str, Any], destination: Path
+) -> dict[str, Any]:
+    return _cache_native_centered_teacher(
+        config, destination, config_key="native_centered_teacher"
+    )
+
+
+def cache_dual_domain_centered_teacher(
+    config: dict[str, Any], destination: Path
+) -> dict[str, Any]:
+    return _cache_native_centered_teacher(
+        config, destination, config_key="dual_domain_native_teacher"
+    )
+
+
 @dataclass
 class NativeCenteredTeacherBank:
     tensors: dict[str, torch.Tensor]
@@ -240,9 +372,13 @@ class NativeCenteredTeacherBank:
 
     @classmethod
     def load(
-        cls, config: dict[str, Any], destination: Path
+        cls,
+        config: dict[str, Any],
+        destination: Path,
+        *,
+        config_key: str = "native_centered_teacher",
     ) -> "NativeCenteredTeacherBank":
-        cfg = dict(config["native_centered_teacher"])
+        cfg = dict(config[config_key])
         root = destination / str(cfg["output_directory"])
         summary = json.loads((root / "summary.json").read_text(encoding="utf-8"))
         tensors = load_file(root / "teacher_bank.safetensors", device="cpu")

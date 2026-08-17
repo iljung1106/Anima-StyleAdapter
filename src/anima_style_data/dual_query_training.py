@@ -88,7 +88,10 @@ def _intersect_cache_rows(
                 "id": image_id,
                 "style_id": feature_style,
                 "artist": feature.get("artist", feature_style),
-                "split": feature.get("split", latent.get("split", "train")),
+                "split": latent.get(
+                    "teacher_split",
+                    feature.get("split", latent.get("split", "train")),
+                ),
                 "feature_shard": feature["feature_shard"],
                 "semantic_height": int(feature["target_height"]) // 16,
                 "semantic_width": int(feature["target_width"]) // 16,

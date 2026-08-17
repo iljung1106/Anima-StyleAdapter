@@ -66,24 +66,55 @@ def build_synthetic_teacher_plan(
     if not 0 <= female_contents <= content_count:
         raise ValueError("female_contents must be between zero and contents_per_artist")
     rows = [row for row in _caption_rows(destination) if row.get("split", "train") == "train"]
-    counts = Counter(str(row.get("style_id", row["artist"])) for row in rows)
+    # `style_id` is an internal cache key such as ``human:foo_(bar)``.  Anima's
+    # native artist syntax expects the raw Danbooru artist name, so never feed
+    # that namespace prefix to the text encoder.
+    counts = Counter(str(row["artist"]) for row in rows)
+    style_by_artist: dict[str, str] = {}
+    for row in rows:
+        artist = str(row["artist"])
+        style_id = str(row.get("style_id", artist))
+        recorded = style_by_artist.setdefault(artist, style_id)
+        if recorded != style_id:
+            raise RuntimeError(f"Artist {artist!r} maps to multiple style IDs")
     eligible = sorted(name for name, count in counts.items() if count >= 2)
     if len(eligible) < artist_count:
         raise RuntimeError(f"Need {artist_count} train artists, found {len(eligible)}")
     rng = random.Random(seed)
     artists = rng.sample(eligible, artist_count)
+    split_cfg = dict(cfg.get("bootstrap", {}))
+    split_order = sorted(artists)
+    random.Random(int(split_cfg.get("split_seed", seed))).shuffle(split_order)
+    validation_count = int(split_cfg.get("validation_artists", 25))
+    meta_test_count = int(split_cfg.get("meta_test_artists", 25))
+    if validation_count + meta_test_count >= len(split_order):
+        raise ValueError("Synthetic teacher split leaves no training artists")
+    meta_test = set(split_order[:meta_test_count])
+    validation = set(
+        split_order[meta_test_count : meta_test_count + validation_count]
+    )
+    artist_splits = {
+        artist: (
+            "meta_test"
+            if artist in meta_test
+            else "validation"
+            if artist in validation
+            else "train"
+        )
+        for artist in artists
+    }
 
     # Reuse real, artist-free Anima captions as content controls. Selecting
     # different source styles prevents one artist's subject distribution from
     # becoming the shared synthetic content template.
-    content_pool = [row for row in rows if str(row.get("style_id", row["artist"])) not in artists]
+    content_pool = [row for row in rows if str(row["artist"]) not in artists]
     rng.shuffle(content_pool)
     content_rows: list[dict[str, Any]] = []
     used_styles: set[str] = set()
     for want_female, wanted in ((True, female_contents), (False, content_count - female_contents)):
         selected = 0
         for row in content_pool:
-            style = str(row.get("style_id", row["artist"]))
+            style = str(row["artist"])
             prompt = _content_prompt(row)
             tags = set(str(value) for value in (row.get("count_tags") or []))
             has_1girl = "1girl" in tags or "1girl" in set(str(value) for value in (row.get("general_tags") or []))
@@ -145,6 +176,8 @@ def build_synthetic_teacher_plan(
     for artist_index, artist in enumerate(artists):
         raw_tag = artist_tag(artist)
         escaped_tag = comfy_literal_artist_tag(artist)
+        style_id = style_by_artist[artist]
+        artist_split = artist_splits[artist]
         artist_slug = f"{artist_index:04d}-{hashlib.sha1(artist.encode()).hexdigest()[:10]}"
         for content in content_rows:
             condition_id = len(prompts)
@@ -152,6 +185,7 @@ def build_synthetic_teacher_plan(
             prompts.append({
                 "condition_id": condition_id, "kind": "artist",
                 "artist": artist, "content_index": content["content_index"],
+                "style_id": style_id, "artist_split": artist_split,
                 "artist_tag": raw_tag, "comfy_literal_artist_tag": escaped_tag,
                 "prompt": f"{content['prompt']}, {raw_tag}",
             })
@@ -161,7 +195,8 @@ def build_synthetic_teacher_plan(
                 image_id = 10_000_000_000 + item_index
                 plan.append({
                     "id": image_id, "synthetic_index": item_index, "kind": "artist",
-                    "artist_index": artist_index, "artist": artist, "style_id": artist,
+                    "artist_index": artist_index, "artist": artist, "style_id": style_id,
+                    "artist_split": artist_split,
                     "artist_slug": artist_slug, "split": "synthetic_teacher",
                     "content_index": int(content["content_index"]),
                     "content_source_id": int(content["source_id"]),
@@ -181,6 +216,7 @@ def build_synthetic_teacher_plan(
         "seeds_per_content": len(seed_values), "artist_images": len(artists) * len(content_rows) * len(seed_values),
         "content_controls": len(content_rows) * len(seed_values), "images": len(plan),
         "prompts": len(prompts), "seed_values": seed_values,
+        "artist_split_counts": dict(Counter(artist_splits.values())),
         "literal_parentheses_are_tokenized_directly": True,
         "comfy_prompts_escape_weighting_delimiters": True,
     })

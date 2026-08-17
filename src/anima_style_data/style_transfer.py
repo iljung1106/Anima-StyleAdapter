@@ -138,6 +138,9 @@ class ProductionStyleLoader:
         allowed_style_ids = {
             str(value) for value in cfg.get("allowed_style_ids", [])
         }
+        excluded_style_ids = {
+            str(value) for value in cfg.get("excluded_style_ids", [])
+        }
 
         style_root = destination / str(cfg["style_cache"])
         text_root = destination / str(cfg["text_cache"])
@@ -169,6 +172,8 @@ class ProductionStyleLoader:
                 continue
             style_id = str(style_row.get("style_id", style_row["artist"]))
             if allowed_style_ids and style_id not in allowed_style_ids:
+                continue
+            if style_id in excluded_style_ids:
                 continue
             by_style[style_id].append(image_id)
             shape = (int(latent_row["latent_height"]), int(latent_row["latent_width"]))
