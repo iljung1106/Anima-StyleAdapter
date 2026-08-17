@@ -125,6 +125,18 @@ def build_parser() -> argparse.ArgumentParser:
             "dual-domain-style-distill-smoke",
             "Smoke-test independent human and synthetic distillation",
         ),
+        (
+            "global-query-multimode-text-cache",
+            "Cache Full/Dropout/Short quality and plain post-LLM conditions",
+        ),
+        (
+            "global-query-multimode-train",
+            "Train the typed-memory global-query Style Tokenizer",
+        ),
+        (
+            "global-query-multimode-smoke",
+            "Smoke-test the global-query multi-prompt training recipe",
+        ),
         ("dual-query-style-ablate", "Compare artist-summary token delivery"),
         ("dual-query-style-train", "Train the multi-reference Dual-query Style Tokenizer"),
         ("dual-query-style-pilot", "Run the summary-ON 10k Dual-query Style Tokenizer pilot"),
@@ -356,6 +368,9 @@ def main() -> None:
         "synthetic-dual-query-style-cache",
         "dual-domain-style-distill",
         "dual-domain-style-distill-smoke",
+        "global-query-multimode-text-cache",
+        "global-query-multimode-train",
+        "global-query-multimode-smoke",
         "dual-query-style-ablate",
         "dual-query-style-train",
         "dual-query-style-pilot",
@@ -375,6 +390,9 @@ def main() -> None:
             cache_synthetic_dual_query_style_tokens,
         )
         from .dual_query_external_samples import cache_dual_query_external_references
+        from .global_query_style_tokenizer import (
+            cache_global_query_multimode_text,
+        )
         from .native_centered_teacher import (
             cache_dual_domain_centered_teacher,
             cache_native_centered_teacher,
@@ -395,6 +413,8 @@ def main() -> None:
             train_dual_query_style_tokenizer_pilot,
             train_dual_domain_native_distillation,
             smoke_test_dual_domain_native_distillation,
+            train_global_query_multimode_style_tokenizer,
+            smoke_test_global_query_multimode_style_tokenizer,
         )
 
         stage = {
@@ -410,6 +430,15 @@ def main() -> None:
             "dual-domain-style-distill": train_dual_domain_native_distillation,
             "dual-domain-style-distill-smoke": (
                 smoke_test_dual_domain_native_distillation
+            ),
+            "global-query-multimode-text-cache": (
+                cache_global_query_multimode_text
+            ),
+            "global-query-multimode-train": (
+                train_global_query_multimode_style_tokenizer
+            ),
+            "global-query-multimode-smoke": (
+                smoke_test_global_query_multimode_style_tokenizer
             ),
             "dual-query-style-ablate": compare_artist_summary_tokens,
             "dual-query-style-train": train_dual_query_style_tokenizer,

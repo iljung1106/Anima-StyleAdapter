@@ -20,6 +20,12 @@ from .hierarchical_dual_query_style_tokenizer import (
     HierarchicalDualQueryStyleTokenizer,
 )
 from .compact_dual_query_style_tokenizer import CompactDualQueryStyleTokenizer
+from .global_query_style_tokenizer import (
+    GlobalQueryMemoryStyleTokenizer,
+    MultiPromptDualQueryCachedStyleLoader,
+    attention_map_diversity_loss,
+    reference_conditioned_diversity_loss,
+)
 from .dual_query_external_samples import load_dual_query_external_sample
 from .external_style_tokenizer_sheet import generate_live_external_style_sample
 from .io import write_json
@@ -103,6 +109,7 @@ def _save_state(
     optimizer: torch.optim.Optimizer,
     cfg: dict[str, Any],
     cache_summary: dict[str, Any],
+    trainer_state: dict[str, Any] | None = None,
 ) -> None:
     temporary = path.with_suffix(path.suffix + ".tmp")
     torch.save(
@@ -114,6 +121,7 @@ def _save_state(
             "optimizer": optimizer.state_dict(),
             "config": cfg,
             "resampler_cache": cache_summary,
+            "trainer_state": dict(trainer_state or {}),
             "python_rng": random.getstate(),
             "torch_rng": torch.get_rng_state(),
             "cuda_rng": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
@@ -548,6 +556,7 @@ def _dual_domain_centered_teacher_step(
     training_by_domain: dict[str, dict[str, Any]],
     *,
     step: int,
+    probe_index_override: int | None = None,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """Run independent human/synthetic objectives in one larger Anima batch."""
     domains = ("human_teacher", "synthetic_teacher")
@@ -584,9 +593,18 @@ def _dual_domain_centered_teacher_step(
     }
     if len(starts) != 1:
         raise ValueError("Fused teacher domains require the same start step")
-    probe_index = max(0, step - next(iter(starts)))
-    content_index = probe_index % contents
-    timestep_index = (probe_index // contents) % timestep_count
+    probe_index = (
+        int(probe_index_override)
+        if probe_index_override is not None
+        else max(0, step - next(iter(starts)))
+    )
+    total_probes = contents * timestep_count
+    cycle, position = divmod(probe_index, total_probes)
+    probe_order = list(range(total_probes))
+    random.Random(0x7EA4_CE11 + cycle * 1_000_003).shuffle(probe_order)
+    selected_probe = probe_order[position]
+    content_index = selected_probe % contents
+    timestep_index = selected_probe // contents
     noisy = tensors["noisy_inputs"][content_index, timestep_index].to(
         device=device, dtype=torch.bfloat16, non_blocking=True
     )
@@ -665,15 +683,59 @@ def _dual_domain_centered_teacher_step(
         )
         weighted = float(weight) * alignment
         total = total + weighted
+        common_weight_target = float(
+            domain_training.get("common_output_weight", 0.0)
+        )
+        common_start = int(domain_training.get("common_output_start_step", 500))
+        common_ramp_end = int(
+            domain_training.get("common_output_ramp_end_step", 1500)
+        )
+        common_weight = _linear_ramp(
+            step,
+            start_step=common_start,
+            end_step=common_ramp_end,
+            start=0.0,
+            end=common_weight_target,
+        ) if step >= common_start else 0.0
+        threshold = _linear_ramp(
+            step,
+            start_step=common_start,
+            end_step=int(
+                domain_training.get("common_output_threshold_end_step", 8000)
+            ),
+            start=float(
+                domain_training.get("common_output_threshold_start", 0.85)
+            ),
+            end=float(
+                domain_training.get("common_output_threshold_end", 0.70)
+            ),
+        )
+        common_loss, common_metrics = _common_output_loss(
+            student[offset : offset + rows], threshold=threshold
+        )
+        common_weighted = common_weight * common_loss
+        total = total + common_weighted
         domain_metrics.update({
             "native_teacher_alignment_loss": alignment.detach(),
             "native_teacher_weight": alignment.new_tensor(weight),
             "native_teacher_weighted_loss": weighted.detach(),
             "native_teacher_content_index": alignment.new_tensor(content_index),
             "native_teacher_timestep": timestep.detach().float(),
+            "native_teacher_update_index": alignment.new_tensor(probe_index),
+            "native_teacher_probe_cycle": alignment.new_tensor(cycle),
+            "native_teacher_probe_position": alignment.new_tensor(position),
+            "common_output_loss": common_loss.detach(),
+            "common_output_weight": common_loss.new_tensor(common_weight),
+            "common_output_threshold": common_loss.new_tensor(threshold),
+            "common_output_weighted_loss": common_weighted.detach(),
+            **common_metrics,
         })
         metrics.update({
-            key.replace("native_teacher", domain, 1): value
+            (
+                f"{domain}_{key}"
+                if key.startswith(("common_output", "controlled_"))
+                else key.replace("native_teacher", domain, 1)
+            ): value
             for key, value in domain_metrics.items()
         })
         offset += rows
@@ -970,12 +1032,17 @@ def _forward_dual_query_flow(
             )
         else:
             references, reference_mask = _reference_inputs(batch, device, "heldout")
-            include_target = torch.zeros(
-                references.shape[0], dtype=torch.bool, device=device
+            include_target = torch.tensor(
+                [
+                    int(item.target_id) in set(item.reference_ids)
+                    for item in batch["episodes"]
+                ],
+                dtype=torch.bool,
+                device=device,
             )
         curriculum = {
             "target_only": bool(stage.get("exact_self", False)),
-            "target_probability": float(bool(stage.get("exact_self", False))),
+            "target_probability": float(include_target.float().mean()),
             "phase": str(stage["name"]),
         }
     else:
@@ -1131,10 +1198,47 @@ def _forward_dual_query_flow(
         )
         total = total + normalized_weight * normalized + floor_weight * floor
 
-    diversity_weight = float(training.get("slot_diversity_weight", 0.0))
+    diversity_target_weight = float(training.get("slot_diversity_weight", 0.0))
+    configured_diversity_ramp = int(training.get("diversity_ramp_steps", 0))
+    diversity_progress = (
+        min(1.0, float(step) / max(1, configured_diversity_ramp))
+        if configured_diversity_ramp > 0 else 1.0
+    )
+    diversity_weight = diversity_target_weight * diversity_progress
     diversity_source = getattr(output, "diversity_tokens", output.tokens)
     diversity = _slot_diversity_loss(diversity_source)
     total = total + diversity_weight * diversity
+
+    attention_target_weight = float(
+        training.get("attention_diversity_weight", 0.0)
+    )
+    reference_target_weight = float(
+        training.get("reference_conditioned_diversity_weight", 0.0)
+    )
+    attention_weight = attention_target_weight * diversity_progress
+    reference_diversity_weight = reference_target_weight * diversity_progress
+    attention_diversity = flow_loss.new_zeros(())
+    if attention_weight > 0:
+        attention_maps = getattr(output, "attention_maps", None)
+        if attention_maps is None:
+            raise RuntimeError(
+                "attention_diversity_weight requires tokenizer attention maps"
+            )
+        attention_diversity = attention_map_diversity_loss(attention_maps)
+        total = total + attention_weight * attention_diversity
+    reference_diversity = flow_loss.new_zeros(())
+    if reference_diversity_weight > 0:
+        reference_tokens = getattr(
+            output, "reference_conditioned_tokens", None
+        )
+        if reference_tokens is None:
+            raise RuntimeError(
+                "reference_conditioned_diversity_weight requires conditioned tokens"
+            )
+        reference_diversity = reference_conditioned_diversity_loss(
+            reference_tokens
+        )
+        total = total + reference_diversity_weight * reference_diversity
 
     contrastive = flow_loss.new_zeros(())
     positive = flow_loss.new_zeros(())
@@ -1384,6 +1488,22 @@ def _forward_dual_query_flow(
         ).detach(),
         **{key: value.detach() for key, value in direction_metrics.items()},
         "style_token_rms": output.tokens.detach().float().square().mean().sqrt(),
+        "style_token_sample_rms_std": output.tokens.detach().float().square()
+        .mean(dim=(1, 2)).sqrt().std(unbiased=False),
+        "style_token_slot_rms_std": output.tokens.detach().float().square()
+        .mean(dim=(0, 2)).sqrt().std(unbiased=False),
+        "attention_diversity_loss": attention_diversity.detach(),
+        "attention_diversity_weight": flow_loss.new_tensor(attention_weight),
+        "attention_diversity_weighted_loss": (
+            attention_weight * attention_diversity
+        ).detach(),
+        "reference_conditioned_diversity_loss": reference_diversity.detach(),
+        "reference_conditioned_diversity_weight": flow_loss.new_tensor(
+            reference_diversity_weight
+        ),
+        "reference_conditioned_diversity_weighted_loss": (
+            reference_diversity_weight * reference_diversity
+        ).detach(),
         "references": reference_mask.sum(dim=1).float().mean(),
         "reference_count_1_fraction": (
             reference_mask.sum(dim=1) == 1
@@ -1397,6 +1517,19 @@ def _forward_dual_query_flow(
         ),
         "timestep_mean": timesteps.detach().mean(),
     }
+    prompt_modes = [str(value) for value in batch.get("prompt_modes", [])]
+    if prompt_modes:
+        base_modes = [
+            value.removesuffix("_quality") for value in prompt_modes
+        ]
+        for mode in ("full", "tag_dropout", "short", "empty"):
+            metrics[f"prompt_mode_{mode}_fraction"] = flow_loss.new_tensor(
+                sum(value == mode for value in base_modes) / len(base_modes)
+            )
+        metrics["prompt_quality_fraction"] = flow_loss.new_tensor(
+            sum(value.endswith("_quality") for value in prompt_modes)
+            / len(prompt_modes)
+        )
     if base_prediction is not None:
         metrics.update(
             {
@@ -1468,16 +1601,29 @@ def _train_variant(
         ]
         cfg.setdefault("loader", {})["excluded_style_ids"] = heldout_teacher_styles
 
-    train_loader = DualQueryCachedStyleLoader(
+    use_multi_prompt = bool(cfg.get("loader", {}).get("prompt_modes"))
+    train_loader_class = (
+        MultiPromptDualQueryCachedStyleLoader
+        if use_multi_prompt else DualQueryCachedStyleLoader
+    )
+    train_loader = train_loader_class(
         destination,
         _loader_config(config, cfg, split=str(cfg.get("train_split", "train"))),
     )
-    validation_loader = DualQueryCachedStyleLoader(
-        destination,
-        _loader_config(
-            config, cfg, split=str(cfg.get("validation_split", "validation"))
-        ),
+    validation_loader_cfg = _loader_config(
+        config, cfg, split=str(cfg.get("validation_split", "validation"))
     )
+    if use_multi_prompt:
+        validation_loader_cfg["prompt_modes"] = dict(
+            cfg.get("loader", {}).get(
+                "validation_prompt_modes",
+                {"full": 1.0, "tag_dropout": 0.0, "short": 0.0, "empty": 0.0},
+            )
+        )
+        validation_loader_cfg["prompt_modes"]["quality_probability"] = float(
+            cfg.get("loader", {}).get("validation_quality_probability", 0.0)
+        )
+    validation_loader = train_loader_class(destination, validation_loader_cfg)
     pilot_enabled = bool(training.get("pilot_enabled", False))
     functional_probe_enabled = pilot_enabled and bool(
         training.get("functional_probe_enabled", True)
@@ -1498,7 +1644,11 @@ def _train_variant(
                     "pilot_reference_schedule": [],
                 }
             )
-            reference_eval_loaders[count] = DualQueryCachedStyleLoader(
+            if use_multi_prompt:
+                eval_loader_cfg["prompt_modes"] = dict(
+                    validation_loader_cfg["prompt_modes"]
+                )
+            reference_eval_loaders[count] = train_loader_class(
                 destination, eval_loader_cfg
             )
         controlled_cfg = _loader_config(
@@ -1514,7 +1664,11 @@ def _train_variant(
                 "artist_balanced": True,
             }
         )
-        controlled_loader = DualQueryCachedStyleLoader(destination, controlled_cfg)
+        if use_multi_prompt:
+            controlled_cfg["prompt_modes"] = dict(
+                validation_loader_cfg["prompt_modes"]
+            )
+        controlled_loader = train_loader_class(destination, controlled_cfg)
         if functional_probe_enabled:
             functional_cfg = _loader_config(
                 config, cfg, split=str(cfg.get("train_split", "train"))
@@ -1669,6 +1823,8 @@ def _train_variant(
         tokenizer = HierarchicalDualQueryStyleTokenizer(**model_cfg).to(device)
     elif architecture == "compact":
         tokenizer = CompactDualQueryStyleTokenizer(**model_cfg).to(device)
+    elif architecture == "global_query_memory":
+        tokenizer = GlobalQueryMemoryStyleTokenizer(**model_cfg).to(device)
     else:
         raise ValueError(f"Unknown Dual-query StyleTokenizer architecture {architecture!r}")
     output = destination / output_name
@@ -1823,12 +1979,25 @@ def _train_variant(
             depth=int(training.get("native_teacher_prefetch_batches", 2)),
         )
     dual_domain_prefetched: dict[str, Any] = {}
+    dual_domain_every = max(1, int(dual_domain_cfg.get("every", 1)))
+    saved_trainer_state = (
+        dict(resume_state.get("trainer_state", {}))
+        if resume_state is not None else {}
+    )
+    teacher_update_index = int(
+        saved_trainer_state.get(
+            "dual_domain_teacher_update_index",
+            start_step // dual_domain_every,
+        )
+    )
     if dual_domain_enabled:
-        remaining = max(0, steps - start_step)
+        remaining = max(
+            0, steps // dual_domain_every - start_step // dual_domain_every
+        )
         for domain, loader in dual_domain_train_loaders.items():
             domain_cfg = dict(dual_domain_cfg[domain.removesuffix("_teacher")])
             dual_domain_prefetched[domain] = loader.prefetch(
-                start_step,
+                teacher_update_index,
                 remaining,
                 workers=int(domain_cfg.get("prefetch_workers", 1)),
                 depth=int(domain_cfg.get("prefetch_batches", 4)),
@@ -1943,7 +2112,7 @@ def _train_variant(
                     row["total_auxiliary_weighted_loss"] = (
                         row["loss"] - row["flow_loss"]
                     )
-            if dual_domain_enabled:
+            if dual_domain_enabled and step % dual_domain_every == 0:
                 assert dual_domain_bank is not None
                 domain_batches = {
                     domain: next(dual_domain_prefetched[domain])
@@ -1958,6 +2127,7 @@ def _train_variant(
                         device,
                         dual_domain_training,
                         step=step,
+                        probe_index_override=teacher_update_index,
                     )
                     if domain_loss.requires_grad:
                         domain_loss.backward()
@@ -1978,6 +2148,7 @@ def _train_variant(
                             dual_domain_training[domain],
                             step=step,
                             metric_prefix=domain,
+                            probe_index_override=teacher_update_index,
                         )
                         if domain_loss.requires_grad:
                             domain_loss.backward()
@@ -1987,6 +2158,7 @@ def _train_variant(
                             row["total_auxiliary_weighted_loss"] = (
                                 row["loss"] - row["flow_loss"]
                             )
+                teacher_update_index += 1
             grad_norm = torch.nn.utils.clip_grad_norm_(
                 tokenizer.parameters(), max_grad_norm
             )
@@ -2206,6 +2378,10 @@ def _train_variant(
                     optimizer=optimizer,
                     cfg=cfg,
                     cache_summary=cache_summary,
+                    trainer_state={
+                        "dual_domain_teacher_update_index": teacher_update_index,
+                        "dual_domain_teacher_every": dual_domain_every,
+                    },
                 )
                 _save_state(
                     state_path,
@@ -2214,6 +2390,10 @@ def _train_variant(
                     optimizer=optimizer,
                     cfg=cfg,
                     cache_summary=cache_summary,
+                    trainer_state={
+                        "dual_domain_teacher_update_index": teacher_update_index,
+                        "dual_domain_teacher_every": dual_domain_every,
+                    },
                 )
             if sample_every and (step % sample_every == 0 or step == steps):
                 sheets = _sample_panels(
@@ -2583,6 +2763,73 @@ def train_dual_domain_native_distillation(
     config: dict[str, Any], destination: Path
 ) -> dict[str, Any]:
     return _run_dual_domain_native_distillation(config, destination, smoke=False)
+
+
+def _run_global_query_multimode_style_tokenizer(
+    config: dict[str, Any], destination: Path, *, smoke: bool
+) -> dict[str, Any]:
+    cfg = copy.deepcopy(config["global_query_multimode_style_tokenizer"])
+    output_name = str(cfg["output_directory"])
+    if smoke:
+        output_name += "_smoke"
+        cfg["training"].update(
+            {
+                "steps": 2,
+                "log_every": 1,
+                "validation_every": 0,
+                "checkpoint_every": 1,
+                "sample_every": 0,
+                "fixed_sample_every": 0,
+                "extended_evaluation_every": 0,
+                "resume": False,
+                "wandb": {"enabled": False},
+            }
+        )
+        cfg["training"]["dual_domain_teacher"]["every"] = 1
+        cfg["training"]["common_output_start_step"] = 1
+        cfg["training"]["common_output_ramp_end_step"] = 1
+        for domain in ("human", "synthetic"):
+            cfg["training"]["dual_domain_teacher"][domain]["ramp_steps"] = 0
+    effective = copy.deepcopy(config)
+    effective["dual_query_style_tokenizer"] = cfg
+    device = str(cfg["training"].get("device", "cuda"))
+    anima = _resolve_anima_model(effective, destination, device).requires_grad_(
+        False
+    ).eval()
+    _optimize_frozen_anima(
+        anima,
+        low_precision_rmsnorm=bool(
+            cfg["training"].get("low_precision_rmsnorm", True)
+        ),
+        fuse_attention_projections=bool(
+            cfg["training"].get("fuse_attention_projections", True)
+        ),
+    )
+    return _train_variant(
+        effective,
+        destination,
+        anima,
+        include_artist_summary=True,
+        output_name=output_name,
+        steps_override=int(cfg["training"].get("steps", 8_000)),
+        cfg_override=cfg,
+    )
+
+
+def train_global_query_multimode_style_tokenizer(
+    config: dict[str, Any], destination: Path
+) -> dict[str, Any]:
+    return _run_global_query_multimode_style_tokenizer(
+        config, destination, smoke=False
+    )
+
+
+def smoke_test_global_query_multimode_style_tokenizer(
+    config: dict[str, Any], destination: Path
+) -> dict[str, Any]:
+    return _run_global_query_multimode_style_tokenizer(
+        config, destination, smoke=True
+    )
 
 
 def smoke_test_dual_domain_native_distillation(

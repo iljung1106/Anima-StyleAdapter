@@ -3,7 +3,6 @@ from __future__ import annotations
 import hashlib
 import json
 import math
-import os
 import subprocess
 import sys
 import time
@@ -13,8 +12,7 @@ from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
 from queue import Empty, Queue
-from types import SimpleNamespace
-from typing import Any, Iterable
+from typing import Any
 
 import numpy as np
 from PIL import Image, ImageOps
@@ -45,10 +43,76 @@ def _stable_keep(seed: int, image_id: int, tag: str, keep_probability: float) ->
     return value < keep_probability
 
 
+def _stable_unit(seed: int, image_id: int, label: str) -> float:
+    digest = hashlib.blake2b(
+        f"{seed}:{image_id}:{label}".encode("utf-8"), digest_size=8
+    ).digest()
+    return int.from_bytes(digest, "big") / float(2**64)
+
+
+def _unique_caption(parts: list[str]) -> str:
+    seen = set()
+    result = []
+    for value in parts:
+        tag = str(value).strip().strip(",")
+        key = tag.casefold()
+        if tag and key not in seen:
+            seen.add(key)
+            result.append(tag)
+    return ", ".join(result)
+
+
 def build_anima_caption_variants(
     row: dict[str, Any], cfg: dict[str, Any]
 ) -> list[tuple[int, str, str]]:
     """Return deterministic caption variants without leaking artist identity."""
+    configured_modes = [str(value) for value in cfg.get("variant_modes", [])]
+    if configured_modes:
+        rating = str(row.get("rating_anima") or "").strip()
+        counts = [str(value) for value in row.get("count_tags") or []]
+        characters = [str(value) for value in row.get("character_tags") or []]
+        general = [str(value) for value in row.get("general_tags") or []]
+        seed = int(cfg.get("variant_seed", 20260811))
+        image_id = int(row["id"])
+        minimum_drop = float(cfg.get("general_tag_dropout_min", 0.20))
+        maximum_drop = float(cfg.get("general_tag_dropout_max", 0.60))
+        if not 0 <= minimum_drop <= maximum_drop < 1:
+            raise ValueError("Invalid variable general-tag dropout range")
+        drop_rate = minimum_drop + (maximum_drop - minimum_drop) * _stable_unit(
+            seed, image_id, "drop-rate"
+        )
+        kept = [
+            tag
+            for tag in general
+            if _stable_keep(seed, image_id, f"drop:{tag}", 1.0 - drop_rate)
+        ]
+        if general and not kept:
+            kept = [general[0]]
+        short_count = max(0, int(cfg.get("short_general_tags", 6)))
+        short_general = general[:short_count]
+        quality = [
+            str(value)
+            for value in cfg.get(
+                "quality_prefix", ["masterpiece", "best quality", "score_7"]
+            )
+        ]
+        protected = ([rating] if rating else []) + counts + characters
+        captions = {
+            "full": str(row["anima_caption"]),
+            "full_quality": _unique_caption(quality + protected + general),
+            "tag_dropout": _unique_caption(protected + kept),
+            "tag_dropout_quality": _unique_caption(quality + protected + kept),
+            "short": _unique_caption(protected + short_general),
+            "short_quality": _unique_caption(quality + protected + short_general),
+        }
+        unknown = sorted(set(configured_modes) - set(captions))
+        if unknown:
+            raise ValueError(f"Unknown Anima caption variant modes: {unknown}")
+        return [
+            (index, mode, captions[mode])
+            for index, mode in enumerate(configured_modes)
+        ]
+
     count = max(1, int(cfg.get("variants", 2)))
     result = [(0, "full", str(row["anima_caption"]))]
     if count == 1:
@@ -237,7 +301,6 @@ def _resolve_model_files(cfg: dict[str, Any], destination: Path) -> dict[str, st
 
 
 def _load_llm_adapter(anima_models, checkpoint: str, device: str, dtype):
-    import torch
     from safetensors import safe_open
 
     adapter = anima_models.LLMAdapter(
@@ -343,7 +406,20 @@ def cache_anima_text_conditions(config: dict[str, Any], destination: Path) -> di
         "qwen_max_length": int(text_cfg.get("qwen_max_length", 512)),
         "t5_max_length": int(text_cfg.get("t5_max_length", 512)),
         "variants": int(text_cfg.get("variants", 2)),
+        "variant_modes": list(text_cfg.get("variant_modes", [])),
         "general_tag_dropout": float(text_cfg.get("general_tag_dropout", 0.15)),
+        "general_tag_dropout_min": float(
+            text_cfg.get("general_tag_dropout_min", 0.20)
+        ),
+        "general_tag_dropout_max": float(
+            text_cfg.get("general_tag_dropout_max", 0.60)
+        ),
+        "short_general_tags": int(text_cfg.get("short_general_tags", 6)),
+        "quality_prefix": list(
+            text_cfg.get(
+                "quality_prefix", ["masterpiece", "best quality", "score_7"]
+            )
+        ),
         "variant_seed": int(text_cfg.get("variant_seed", 20260811)),
         "storage_dtype": "float16",
         "max_images": text_cfg.get("max_images"),

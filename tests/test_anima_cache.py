@@ -30,6 +30,35 @@ def test_caption_variants_are_deterministic_and_preserve_identity_tags():
     assert "character" in first[1][2]
 
 
+def test_multimode_caption_variants_cover_quality_dropout_and_short():
+    row = {
+        "id": 17,
+        "anima_caption": "safe, 1girl, alice, sky, smile, dress, cloud, flower, cup, blue eyes",
+        "rating_anima": "safe",
+        "count_tags": ["1girl"],
+        "character_tags": ["alice"],
+        "general_tags": ["sky", "smile", "dress", "cloud", "flower", "cup", "blue eyes"],
+    }
+    cfg = {
+        "variant_modes": [
+            "full", "full_quality", "tag_dropout", "tag_dropout_quality",
+            "short", "short_quality",
+        ],
+        "general_tag_dropout_min": 0.2,
+        "general_tag_dropout_max": 0.6,
+        "short_general_tags": 2,
+        "variant_seed": 9,
+    }
+    variants = build_anima_caption_variants(row, cfg)
+    by_name = {name: caption for _, name, caption in variants}
+    assert set(by_name) == set(cfg["variant_modes"])
+    assert by_name["full_quality"].startswith("masterpiece, best quality, score_7")
+    assert "safe" in by_name["tag_dropout"]
+    assert "1girl" in by_name["tag_dropout"]
+    assert "alice" in by_name["tag_dropout"]
+    assert by_name["short"] == "safe, 1girl, alice, sky, smile"
+
+
 def test_anima_geometry_limits_area_and_aligns_bucket_without_upscale():
     cfg = {
         "max_side": 1536,

@@ -23,13 +23,13 @@ from .dual_query_training import (
     _model_from_config,
 )
 from .io import read_records, write_json, write_records
+from .query_style_tokenizer import QueryStyleTokenizerOutput
+from .style_transfer import ProductionStyleLoader, StyleEpisode, _pad_text_conditions
 from .synthetic_teacher import synthetic_artist_split_map
 
 
 _RESIDENT_TOKEN_BANKS: dict[str, dict[str, torch.Tensor]] = {}
 _RESIDENT_TOKEN_BANKS_LOCK = threading.Lock()
-from .query_style_tokenizer import QueryStyleTokenizerOutput
-from .style_transfer import ProductionStyleLoader, StyleEpisode, _pad_text_conditions
 
 
 def _file_sha256(path: Path) -> str:
@@ -662,6 +662,22 @@ class DualQueryCachedStyleLoader(ProductionStyleLoader):
     def _pin(value: torch.Tensor) -> torch.Tensor:
         return value.pin_memory() if torch.cuda.is_available() else value
 
+    def _load_episode_condition(
+        self, item: StyleEpisode
+    ) -> tuple[torch.Tensor, int]:
+        row = self.text_by_key[(item.target_id, item.text_variant)]
+        shard = self.text_shards.get(str(row["cache_shard"]))
+        start = int(row["token_offset"])
+        length = int(row["token_length"])
+        return shard["conditioning"][start : start + length], length
+
+    def _episode_prompt_mode(self, item: StyleEpisode) -> str:
+        return str(
+            self.text_by_key[(item.target_id, item.text_variant)].get(
+                "variant_name", item.text_variant
+            )
+        )
+
     def episodes_for_step(self, step: int) -> list[StyleEpisode]:
         episodes = super().episodes_for_step(step)
         if self.pilot_reference_schedule:
@@ -776,11 +792,8 @@ class DualQueryCachedStyleLoader(ProductionStyleLoader):
         conditions = []
         lengths = []
         for item in episodes:
-            row = self.text_by_key[(item.target_id, item.text_variant)]
-            shard = self.text_shards.get(str(row["cache_shard"]))
-            start = int(row["token_offset"])
-            length = int(row["token_length"])
-            conditions.append(shard["conditioning"][start : start + length])
+            condition, length = self._load_episode_condition(item)
+            conditions.append(condition)
             lengths.append(length)
         conditioning = _pad_text_conditions(conditions, self.text_conditioning_length)
 
@@ -812,4 +825,5 @@ class DualQueryCachedStyleLoader(ProductionStyleLoader):
             "cached_target_tokens": self._pin(target_tokens),
             "reference_positions": positions,
             "reference_mask": self._pin(reference_mask),
+            "prompt_modes": [self._episode_prompt_mode(item) for item in episodes],
         }
