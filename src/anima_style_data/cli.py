@@ -105,6 +105,10 @@ def build_parser() -> argparse.ArgumentParser:
         ("dual-query-resampler-smoke", "Run two synthetic dual-query Resampler steps"),
         ("dual-query-style-cache", "Cache frozen Dual-query Resampler outputs"),
         ("dual-query-style-external-cache", "Cache the seven fixed external references"),
+        (
+            "native-centered-teacher-cache",
+            "Cache centered native @artist velocity targets",
+        ),
         ("dual-query-style-ablate", "Compare artist-summary token delivery"),
         ("dual-query-style-train", "Train the multi-reference Dual-query Style Tokenizer"),
         ("dual-query-style-pilot", "Run the summary-ON 10k Dual-query Style Tokenizer pilot"),
@@ -128,6 +132,14 @@ def build_parser() -> argparse.ArgumentParser:
         (
             "dual-query-style-compact-aligned-smoke",
             "Smoke-test the aligned compact tokenizer recipe",
+        ),
+        (
+            "dual-query-style-native-teacher-continue",
+            "Continue the compact tokenizer on centered native artist effects",
+        ),
+        (
+            "dual-query-style-native-teacher-smoke",
+            "Smoke-test centered native artist-effect continuation",
         ),
         ("dual-query-style-pilot-smoke", "Exercise all 10k pilot loss branches on real caches"),
         ("dual-query-style-smoke", "Smoke-test the Dual-query Style Tokenizer"),
@@ -323,6 +335,7 @@ def main() -> None:
     elif args.command in {
         "dual-query-style-cache",
         "dual-query-style-external-cache",
+        "native-centered-teacher-cache",
         "dual-query-style-ablate",
         "dual-query-style-train",
         "dual-query-style-pilot",
@@ -332,11 +345,14 @@ def main() -> None:
         "dual-query-style-compact-smoke",
         "dual-query-style-compact-aligned-train",
         "dual-query-style-compact-aligned-smoke",
+        "dual-query-style-native-teacher-continue",
+        "dual-query-style-native-teacher-smoke",
         "dual-query-style-pilot-smoke",
         "dual-query-style-smoke",
     }:
         from .dual_query_style_tokenizer import cache_dual_query_style_tokens
         from .dual_query_external_samples import cache_dual_query_external_references
+        from .native_centered_teacher import cache_native_centered_teacher
         from .dual_query_style_training import (
             compare_artist_summary_tokens,
             smoke_test_dual_query_style_tokenizer,
@@ -348,12 +364,15 @@ def main() -> None:
             smoke_test_compact_dual_query_style_tokenizer,
             train_aligned_compact_dual_query_style_tokenizer,
             smoke_test_aligned_compact_dual_query_style_tokenizer,
+            train_native_teacher_compact_continuation,
+            smoke_test_native_teacher_compact_continuation,
             train_dual_query_style_tokenizer_pilot,
         )
 
         stage = {
             "dual-query-style-cache": cache_dual_query_style_tokens,
             "dual-query-style-external-cache": cache_dual_query_external_references,
+            "native-centered-teacher-cache": cache_native_centered_teacher,
             "dual-query-style-ablate": compare_artist_summary_tokens,
             "dual-query-style-train": train_dual_query_style_tokenizer,
             "dual-query-style-pilot": train_dual_query_style_tokenizer_pilot,
@@ -372,6 +391,12 @@ def main() -> None:
             ),
             "dual-query-style-compact-aligned-smoke": (
                 smoke_test_aligned_compact_dual_query_style_tokenizer
+            ),
+            "dual-query-style-native-teacher-continue": (
+                train_native_teacher_compact_continuation
+            ),
+            "dual-query-style-native-teacher-smoke": (
+                smoke_test_native_teacher_compact_continuation
             ),
             "dual-query-style-pilot-smoke": smoke_test_dual_query_style_tokenizer_pilot,
             "dual-query-style-smoke": smoke_test_dual_query_style_tokenizer,

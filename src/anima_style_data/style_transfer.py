@@ -135,6 +135,9 @@ class ProductionStyleLoader:
         # zero embeddings are part of the learned softmax normalization and
         # must not be trimmed at runtime.
         self.text_conditioning_length = int(cfg.get("text_conditioning_length", 512))
+        allowed_style_ids = {
+            str(value) for value in cfg.get("allowed_style_ids", [])
+        }
 
         style_root = destination / str(cfg["style_cache"])
         text_root = destination / str(cfg["text_cache"])
@@ -165,6 +168,8 @@ class ProductionStyleLoader:
             if str(style_row.get("split", "train")) != self.split:
                 continue
             style_id = str(style_row.get("style_id", style_row["artist"]))
+            if allowed_style_ids and style_id not in allowed_style_ids:
+                continue
             by_style[style_id].append(image_id)
             shape = (int(latent_row["latent_height"]), int(latent_row["latent_width"]))
             buckets[shape].append(image_id)

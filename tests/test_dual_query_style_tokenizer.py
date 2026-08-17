@@ -13,6 +13,7 @@ from anima_style_data.dual_query_style_training import (  # noqa: E402
     _bounded_aligned_effect_loss,
     _centered_artist_effect_loss,
     _common_output_loss,
+    _native_teacher_alignment_loss,
     _pilot_alignment_state,
     _pilot_stage,
     _same_artist_functional_loss,
@@ -250,3 +251,45 @@ def test_artist_flow_ranking_prefers_the_correct_reference_without_moving_wrong(
     assert correct.grad is not None and correct.grad.abs().sum() > 0
     assert torch.isfinite(correct.grad).all()
     assert wrong.grad is None
+
+
+def test_native_teacher_alignment_requires_direction_and_absolute_magnitude():
+    teacher = torch.stack((torch.ones(2, 2), -torch.eye(2)))
+    matching = teacher.clone().requires_grad_(True)
+    weak = (0.1 * teacher).requires_grad_(True)
+    orthogonal = torch.flip(teacher, dims=(-1,)).requires_grad_(True)
+
+    matching_loss, matching_metrics = _native_teacher_alignment_loss(
+        matching,
+        teacher,
+        huber_beta=0.10,
+        scale_floor=1e-4,
+        direction_weight=0.10,
+        magnitude_weight=0.05,
+    )
+    weak_loss, weak_metrics = _native_teacher_alignment_loss(
+        weak,
+        teacher,
+        huber_beta=0.10,
+        scale_floor=1e-4,
+        direction_weight=0.10,
+        magnitude_weight=0.05,
+    )
+    orthogonal_loss, orthogonal_metrics = _native_teacher_alignment_loss(
+        orthogonal,
+        teacher,
+        huber_beta=0.10,
+        scale_floor=1e-4,
+        direction_weight=0.10,
+        magnitude_weight=0.05,
+    )
+
+    assert matching_loss.item() == pytest.approx(0.0, abs=1e-7)
+    assert matching_metrics["native_teacher_projection_coefficient"] == pytest.approx(1.0)
+    assert weak_loss > matching_loss
+    assert weak_metrics["native_teacher_student_to_target_rms"] == pytest.approx(0.1)
+    assert orthogonal_loss > matching_loss
+    assert orthogonal_metrics["native_teacher_cosine"] < 1.0
+
+    weak_loss.backward()
+    assert weak.grad is not None and torch.isfinite(weak.grad).all()

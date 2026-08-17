@@ -22,6 +22,7 @@ from .compact_dual_query_style_tokenizer import CompactDualQueryStyleTokenizer
 from .dual_query_external_samples import load_dual_query_external_sample
 from .external_style_tokenizer_sheet import generate_live_external_style_sample
 from .io import write_json
+from .native_centered_teacher import NativeCenteredTeacherBank
 from .pure_token_injection import (
     _aligned_velocity_losses,
     _coefficient_floor,
@@ -362,6 +363,168 @@ def _centered_artist_effect_loss(
         "functional_between_artist_cosine": between_cosine.detach(),
         "functional_between_artist_pairwise_rms": pairwise_rms.detach(),
     }
+
+
+def _native_teacher_alignment_loss(
+    student_delta: torch.Tensor,
+    teacher_delta: torch.Tensor,
+    *,
+    huber_beta: float,
+    scale_floor: float,
+    direction_weight: float,
+    magnitude_weight: float,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Regress a globally centered native @artist velocity effect."""
+
+    if student_delta.shape != teacher_delta.shape:
+        raise ValueError("Native teacher and student residual shapes differ")
+    dimensions = tuple(range(1, student_delta.ndim))
+    teacher = teacher_delta.detach().float()
+    student = student_delta.float()
+    teacher_rms = teacher.square().mean(dim=dimensions).sqrt().clamp_min(
+        float(scale_floor)
+    )
+    student_rms = student.square().mean(dim=dimensions).sqrt().clamp_min(1e-8)
+    scale = teacher_rms.reshape(-1, *([1] * (student.ndim - 1)))
+    direct = F.smooth_l1_loss(
+        (student - teacher) / scale,
+        torch.zeros_like(student),
+        beta=float(huber_beta),
+    )
+    cosine = F.cosine_similarity(student.flatten(1), teacher.flatten(1), dim=-1)
+    direction = (1.0 - cosine).mean()
+    magnitude = F.smooth_l1_loss(
+        student_rms.log(), teacher_rms.log(), beta=float(huber_beta)
+    )
+    teacher_power = teacher.square().mean(dim=dimensions).clamp_min(
+        float(scale_floor) ** 2
+    )
+    coefficient = (student * teacher).mean(dim=dimensions) / teacher_power
+    coefficient_view = coefficient.reshape(-1, *([1] * (student.ndim - 1)))
+    orthogonal = student - coefficient_view * teacher
+    orthogonal_ratio = (
+        orthogonal.square().mean(dim=dimensions).sqrt() / teacher_rms
+    )
+    total = direct + float(direction_weight) * direction + float(
+        magnitude_weight
+    ) * magnitude
+    return total, {
+        "native_teacher_direct_loss": direct.detach(),
+        "native_teacher_direction_loss": direction.detach(),
+        "native_teacher_magnitude_loss": magnitude.detach(),
+        "native_teacher_cosine": cosine.detach().mean(),
+        "native_teacher_projection_coefficient": coefficient.detach().mean(),
+        "native_teacher_orthogonal_ratio": orthogonal_ratio.detach().mean(),
+        "native_teacher_target_rms": teacher_rms.detach().mean(),
+        "native_teacher_student_rms": student_rms.detach().mean(),
+        "native_teacher_student_to_target_rms": (
+            student_rms.detach() / teacher_rms.detach()
+        ).mean(),
+    }
+
+
+def _native_centered_teacher_step(
+    anima: torch.nn.Module,
+    tokenizer: torch.nn.Module,
+    bank: NativeCenteredTeacherBank,
+    batch: dict[str, Any],
+    device: str,
+    training: dict[str, Any],
+    *,
+    step: int,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    references, reference_mask = _reference_inputs(batch, device, "heldout")
+    rows = min(
+        int(training.get("native_teacher_batch_rows", 4)), references.shape[0]
+    )
+    references = references[:rows]
+    reference_mask = reference_mask[:rows]
+    style_ids = [str(item.style_id) for item in batch["episodes"][:rows]]
+    try:
+        artist_indices = torch.tensor(
+            [bank.artist_to_index[value] for value in style_ids], dtype=torch.long
+        )
+    except KeyError as error:
+        raise RuntimeError(f"Artist is absent from native teacher bank: {error}") from error
+    tensors = bank.tensors
+    contents = int(tensors["noisy_inputs"].shape[0])
+    timestep_count = int(tensors["noisy_inputs"].shape[1])
+    probe_index = max(0, step - int(training.get("native_teacher_start_step", 0)))
+    content_index = probe_index % contents
+    timestep_index = (probe_index // contents) % timestep_count
+    noisy = tensors["noisy_inputs"][content_index, timestep_index].to(
+        device=device, dtype=torch.bfloat16, non_blocking=True
+    )
+    base_prediction = tensors["base_predictions"][content_index, timestep_index].to(
+        device=device, dtype=torch.float32, non_blocking=True
+    )
+    teacher = tensors["centered_teacher"][
+        artist_indices, content_index, timestep_index
+    ].to(device=device, dtype=torch.float32, non_blocking=True)
+    context = tensors["base_context"][content_index : content_index + 1].to(
+        device=device, dtype=torch.bfloat16, non_blocking=True
+    )
+    length = tensors["base_lengths"][content_index : content_index + 1].to(
+        device=device, non_blocking=True
+    )
+    timestep = tensors["timesteps"][timestep_index].to(
+        device=device, dtype=torch.bfloat16
+    )
+    with torch.autocast(
+        device_type=torch.device(device).type,
+        dtype=torch.bfloat16,
+        enabled=torch.device(device).type == "cuda",
+    ):
+        output = tokenizer(references, reference_mask)
+        styled = insert_style_tokens(
+            context.expand(rows, -1, -1).clone(),
+            length.expand(rows),
+            output.tokens,
+        )
+        padding = torch.zeros(
+            rows, 1, noisy.shape[-2], noisy.shape[-1],
+            device=device, dtype=noisy.dtype,
+        )
+        prediction = anima(
+            noisy.expand(rows, -1, -1, -1).unsqueeze(2),
+            timestep.expand(rows),
+            context=styled,
+            padding_mask=padding,
+            target_input_ids=None,
+        ).squeeze(2).float()
+    student = prediction - base_prediction
+    alignment, metrics = _native_teacher_alignment_loss(
+        student,
+        teacher,
+        huber_beta=float(training.get("native_teacher_huber_beta", 0.10)),
+        scale_floor=float(training.get("native_teacher_scale_floor", 1e-4)),
+        direction_weight=float(
+            training.get("native_teacher_direction_weight", 0.10)
+        ),
+        magnitude_weight=float(
+            training.get("native_teacher_magnitude_weight", 0.05)
+        ),
+    )
+    start = int(training.get("native_teacher_start_step", 1))
+    ramp_steps = max(0, int(training.get("native_teacher_ramp_steps", 250)))
+    weight = _linear_ramp(
+        step,
+        start_step=start,
+        end_step=start + ramp_steps,
+        start=0.0 if ramp_steps else float(training.get("native_teacher_weight", 0.10)),
+        end=float(training.get("native_teacher_weight", 0.10)),
+    )
+    weighted = float(weight) * alignment
+    metrics.update(
+        {
+            "native_teacher_alignment_loss": alignment.detach(),
+            "native_teacher_weight": alignment.new_tensor(weight),
+            "native_teacher_weighted_loss": weighted.detach(),
+            "native_teacher_content_index": alignment.new_tensor(content_index),
+            "native_teacher_timestep": timestep.detach().float(),
+        }
+    )
+    return weighted, metrics
 
 
 def _artist_flow_ranking_loss(
@@ -1148,6 +1311,45 @@ def _train_variant(
                 }
             )
             functional_loader = DualQueryCachedStyleLoader(destination, functional_cfg)
+    native_teacher_enabled = bool(training.get("native_teacher_enabled", False))
+    native_teacher_bank = None
+    native_teacher_loader = None
+    native_teacher_validation_loader = None
+    if native_teacher_enabled:
+        native_teacher_bank = NativeCenteredTeacherBank.load(config, destination)
+
+        def build_native_loader(split: str, style_ids: list[str]):
+            if not style_ids:
+                return None
+            loader_cfg = _loader_config(config, cfg, split=split)
+            references = int(training.get("native_teacher_references", 4))
+            loader_cfg.update(
+                {
+                    "batch_size": int(training.get("native_teacher_batch_rows", 4)),
+                    "min_references": references,
+                    "max_references": references,
+                    "artist_balanced": True,
+                    "gradient_accumulation_steps": 1,
+                    "reference_curriculum": {},
+                    "pilot_reference_schedule": [],
+                    "allowed_style_ids": style_ids,
+                }
+            )
+            return DualQueryCachedStyleLoader(destination, loader_cfg)
+
+        native_teacher_loader = build_native_loader(
+            str(cfg.get("train_split", "train")),
+            [str(value) for value in native_teacher_bank.summary["train_style_ids"]],
+        )
+        native_teacher_validation_loader = build_native_loader(
+            str(cfg.get("validation_split", "validation")),
+            [
+                str(value)
+                for value in native_teacher_bank.summary["validation_style_ids"]
+            ],
+        )
+        if native_teacher_loader is None:
+            raise RuntimeError("Native centered teacher has no training artists")
     cache_summary = _cache_summary(destination, cfg)
     model_cfg = dict(cfg["model"])
     architecture = str(model_cfg.pop("architecture", "flat_set"))
@@ -1167,13 +1369,16 @@ def _train_variant(
     history = json.loads(history_path.read_text("utf-8")) if history_path.exists() else []
     start_step = 0
     resume_state = None
+    resume_source = ""
     if bool(training.get("resume", True)) and state_path.exists():
         resume_state = torch.load(state_path, map_location="cpu", weights_only=False)
+        resume_source = "output"
     elif training.get("initial_checkpoint"):
         initial_path = Path(str(training["initial_checkpoint"]))
         if not initial_path.is_absolute():
             initial_path = destination / initial_path
         resume_state = torch.load(initial_path, map_location="cpu", weights_only=False)
+        resume_source = "initial"
         initial_history = training.get("initial_history")
         if initial_history and not history:
             initial_history_path = Path(str(initial_history))
@@ -1205,7 +1410,10 @@ def _train_variant(
         weight_decay=float(training.get("weight_decay", 0.01)),
         fused=bool(training.get("fused_adamw", True) and device.startswith("cuda")),
     )
-    if resume_state is not None:
+    if resume_state is not None and not (
+        resume_source == "initial"
+        and bool(training.get("reset_optimizer_on_initial_checkpoint", False))
+    ):
         optimizer.load_state_dict(resume_state["optimizer"])
         random.setstate(resume_state["python_rng"])
         torch.set_rng_state(resume_state["torch_rng"])
@@ -1291,6 +1499,19 @@ def _train_variant(
             workers=int(training.get("functional_prefetch_workers", 1)),
             depth=int(training.get("functional_prefetch_batches", 2)),
         )
+    native_teacher_every = max(1, int(training.get("native_teacher_every", 1)))
+    native_teacher_prefetched = None
+    if native_teacher_enabled:
+        assert native_teacher_loader is not None
+        native_batches = (
+            steps - start_step + native_teacher_every - 1
+        ) // native_teacher_every
+        native_teacher_prefetched = native_teacher_loader.prefetch(
+            start_step // native_teacher_every,
+            native_batches,
+            workers=int(training.get("native_teacher_prefetch_workers", 1)),
+            depth=int(training.get("native_teacher_prefetch_batches", 2)),
+        )
     completed = start_step
     run_started = time.perf_counter()
     running: dict[str, float] = defaultdict(float)
@@ -1299,8 +1520,12 @@ def _train_variant(
     try:
         for step in range(start_step + 1, steps + 1):
             step_started = time.perf_counter()
+            schedule_start = int(training.get("lr_schedule_start_step", 0))
             multiplier = _learning_rate_multiplier(
-                step, steps, warmup, minimum_ratio
+                step - schedule_start,
+                steps - schedule_start,
+                warmup,
+                minimum_ratio,
             )
             optimizer.param_groups[0]["lr"] = base_lr * multiplier
             optimizer.zero_grad(set_to_none=True)
@@ -1376,6 +1601,27 @@ def _train_variant(
                     row["total_auxiliary_weighted_loss"] = (
                         row["loss"] - row["flow_loss"]
                     )
+            if native_teacher_enabled and step % native_teacher_every == 0:
+                assert native_teacher_prefetched is not None
+                assert native_teacher_bank is not None
+                teacher_batch = next(native_teacher_prefetched)
+                teacher_loss, teacher_metrics = _native_centered_teacher_step(
+                    anima,
+                    tokenizer,
+                    native_teacher_bank,
+                    teacher_batch,
+                    device,
+                    training,
+                    step=step,
+                )
+                if teacher_loss.requires_grad:
+                    teacher_loss.backward()
+                for row in micro_rows:
+                    row.update(teacher_metrics)
+                    row["loss"] = row["loss"] + teacher_loss.detach()
+                    row["total_auxiliary_weighted_loss"] = (
+                        row["loss"] - row["flow_loss"]
+                    )
             grad_norm = torch.nn.utils.clip_grad_norm_(
                 tokenizer.parameters(), max_grad_norm
             )
@@ -1408,6 +1654,8 @@ def _train_variant(
                     f"common={averaged.get('common_output_ratio', 0.0):.3f} "
                     f"centered={averaged.get('functional_centered_effect_ratio', 0.0):.3f} "
                     f"func_w={averaged.get('functional_probe_per_step_loss', 0.0):.5f} "
+                    f"teacher_cos={averaged.get('native_teacher_cosine', 0.0):.3f} "
+                    f"teacher_proj={averaged.get('native_teacher_projection_coefficient', 0.0):.3f} "
                     f"refs={averaged['references']:.2f} "
                     f"target={averaged['target_inclusion']:.3f} "
                     f"step_s={averaged['step_s']:.3f}",
@@ -1448,6 +1696,30 @@ def _train_variant(
                         - validation_wrong["paired_flow_improvement"]
                     ),
                 }
+                if (
+                    native_teacher_enabled
+                    and native_teacher_validation_loader is not None
+                ):
+                    assert native_teacher_bank is not None
+                    teacher_validation_batch = (
+                        native_teacher_validation_loader.load_step(
+                            step // max(1, validation_every)
+                        )
+                    )
+                    with torch.no_grad():
+                        _, teacher_validation = _native_centered_teacher_step(
+                            anima,
+                            tokenizer,
+                            native_teacher_bank,
+                            teacher_validation_batch,
+                            device,
+                            training,
+                            step=step,
+                        )
+                    row["validation_native_teacher"] = {
+                        key: float(value)
+                        for key, value in teacher_validation.items()
+                    }
                 extended_every = int(
                     training.get("extended_evaluation_every", 1000)
                 )
@@ -1502,6 +1774,12 @@ def _train_variant(
                                 "correct_vs_wrong_paired_advantage"
                             ],
                             "validation/selection_score": row["selection_score"],
+                            **{
+                                f"validation_native_teacher/{key}": value
+                                for key, value in row.get(
+                                    "validation_native_teacher", {}
+                                ).items()
+                            },
                             **(
                                 {
                                     f"validation_references_{count}/{key}": value
@@ -1781,6 +2059,78 @@ def train_aligned_compact_dual_query_style_tokenizer(
     return _train_compact_dual_query_style_tokenizer_section(
         config, destination, "aligned_compact_dual_query_style_tokenizer"
     )
+
+
+def _native_teacher_continuation_config(
+    config: dict[str, Any], *, smoke: bool
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    cfg = copy.deepcopy(config["aligned_compact_dual_query_style_tokenizer"])
+    continuation = copy.deepcopy(cfg.pop("native_teacher_continuation"))
+    cfg["output_directory"] = str(continuation["output_directory"])
+    training = dict(cfg["training"])
+    training.update(dict(continuation["training"]))
+    if smoke:
+        cfg["output_directory"] += "_smoke"
+        start = int(continuation.get("start_step", 10_000))
+        training.update(
+            {
+                "steps": start + 2,
+                "resume": False,
+                "log_every": 1,
+                "validation_every": 0,
+                "checkpoint_every": 0,
+                "sample_every": 0,
+                "fixed_sample_every": 0,
+                "extended_evaluation_every": 0,
+                "native_teacher_ramp_steps": 0,
+                "wandb": {"enabled": False},
+            }
+        )
+    cfg["training"] = training
+    effective = copy.deepcopy(config)
+    effective["dual_query_style_tokenizer"] = cfg
+    return effective, cfg
+
+
+def _run_native_teacher_continuation(
+    config: dict[str, Any], destination: Path, *, smoke: bool
+) -> dict[str, Any]:
+    effective, cfg = _native_teacher_continuation_config(config, smoke=smoke)
+    training = dict(cfg["training"])
+    device = str(training.get("device", "cuda"))
+    anima = _resolve_anima_model(effective, destination, device).requires_grad_(
+        False
+    ).eval()
+    _optimize_frozen_anima(
+        anima,
+        low_precision_rmsnorm=bool(training.get("low_precision_rmsnorm", True)),
+        fuse_attention_projections=bool(
+            training.get("fuse_attention_projections", True)
+        ),
+    )
+    return _train_variant(
+        effective,
+        destination,
+        anima,
+        include_artist_summary=True,
+        output_name=str(cfg["output_directory"]),
+        steps_override=int(training["steps"]),
+        cfg_override=cfg,
+    )
+
+
+def train_native_teacher_compact_continuation(
+    config: dict[str, Any], destination: Path
+) -> dict[str, Any]:
+    """Continue the 10k compact model on centered native artist effects."""
+
+    return _run_native_teacher_continuation(config, destination, smoke=False)
+
+
+def smoke_test_native_teacher_compact_continuation(
+    config: dict[str, Any], destination: Path
+) -> dict[str, Any]:
+    return _run_native_teacher_continuation(config, destination, smoke=True)
 
 
 def _smoke_test_compact_dual_query_style_tokenizer_section(

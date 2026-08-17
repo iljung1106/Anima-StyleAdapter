@@ -1016,6 +1016,60 @@ aligned_compact_dual_query_style_tokenizer:
     batch_size: 4
     vae_batch_size: 4
 
+  # Continue the completed 10k model against a detached, globally centered
+  # native Anima @artist flow bank.  The bank holds the same content, latent,
+  # noise, and timestep for every artist, so its only varying target is the
+  # artist-tag effect.  A fresh optimizer is intentional because the objective
+  # changes from noisy target-image flow to direct native-effect regression.
+  native_teacher_continuation:
+    start_step: 10000
+    output_directory: compact_dual_query_style_tokenizer_native_teacher_12k_v1
+    training:
+      steps: 12000
+      initial_checkpoint: compact_dual_query_style_tokenizer_aligned_multiref_10k_v1/checkpoints/step-0010000.pt
+      initial_history: compact_dual_query_style_tokenizer_aligned_multiref_10k_v1/history.json
+      reset_optimizer_on_initial_checkpoint: true
+      resume: true
+      learning_rate: 0.00003
+      lr_schedule_start_step: 10000
+      warmup_steps: 100
+      minimum_lr_ratio: 0.20
+      functional_probe_enabled: false
+      native_teacher_enabled: true
+      native_teacher_start_step: 10001
+      native_teacher_ramp_steps: 250
+      native_teacher_every: 1
+      native_teacher_batch_rows: 4
+      native_teacher_references: 4
+      native_teacher_weight: 0.10
+      native_teacher_direction_weight: 0.10
+      native_teacher_magnitude_weight: 0.05
+      native_teacher_huber_beta: 0.10
+      native_teacher_scale_floor: 0.0001
+      native_teacher_prefetch_workers: 1
+      native_teacher_prefetch_batches: 4
+      validation_every: 250
+      checkpoint_every: 250
+      sample_every: 500
+      fixed_sample_every: 1000
+      extended_evaluation_every: 1000
+      wandb:
+        enabled: true
+        project: anima-style-adapter
+        name: compact-dual-query-native-centered-teacher-12k-v1
+        id: compact-dual-query-native-centered-teacher-12k-v1
+
+native_centered_teacher:
+  output_directory: native_artist_centered_flow_teacher_v1
+  calibration_file: style_effect_calibration.json
+  style_manifest: dual_query_reference_tokens_v8_step10000/manifest.parquet
+  device: cuda
+  content_count: 4
+  timesteps: [0.10, 0.25, 0.40, 0.55, 0.70, 0.82, 0.90, 0.97]
+  seed: 20260817
+  text_batch_size: 64
+  artist_batch_size: 8
+
 # External controlled benchmark. Each group contains one image from the shard
 # artist and three images of the same character(s) from different artists.
 stylenet_benchmark:
