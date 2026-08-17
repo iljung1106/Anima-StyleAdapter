@@ -1094,7 +1094,7 @@ dual_domain_native_teacher:
 # and synthetic regressions to the same detached native-effect bank.  There is
 # deliberately no human/synthetic token or residual consistency loss.
 dual_domain_style_distillation:
-  output_directory: compact_dual_domain_native_distill_500a_2k_v1
+  output_directory: compact_dual_domain_native_distill_500a_2k_v2
   seed: 20260820
   train_split: train
   validation_split: validation
@@ -1220,8 +1220,34 @@ dual_domain_style_distillation:
     wandb:
       enabled: true
       project: anima-style-adapter
-      name: compact-dual-domain-native-distill-500a-2k-v1
-      id: compact-dual-domain-native-distill-500a-2k-v1
+      name: compact-dual-domain-native-distill-500a-2k-v2
+      id: compact-dual-domain-native-distill-500a-2k-v2
+  # Keep both qualitative samplers explicit on this standalone experiment
+  # section.  `_run_dual_domain_native_distillation` installs this section as
+  # the active StyleTokenizer config, so it must not implicitly depend on a
+  # previous experiment's sampling contract.
+  fixed_reference_sampling:
+    cache_directory: dual_query_external_reference_cache_v1
+    device: cuda
+    generation:
+      output_directory: dual_query_external_reference_cache_v1
+      width: 832
+      height: 1024
+      cfg: 4.0
+      steps: 30
+      flow_shift: 3.0
+      batch_size: 4
+      vae_batch_size: 4
+  sampling:
+    width: 768
+    height: 768
+    steps: 30
+    flow_shift: 3.0
+    seed: 20260820
+    text_cfg: 4.0
+    guidance_mode: shared
+    batch_size: 4
+    vae_batch_size: 4
 
 # External controlled benchmark. Each group contains one image from the shard
 # artist and three images of the same character(s) from different artists.
