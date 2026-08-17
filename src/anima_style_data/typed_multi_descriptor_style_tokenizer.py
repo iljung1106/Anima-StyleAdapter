@@ -20,7 +20,7 @@ class TypedMultiDescriptorOutput(QueryStyleTokenizerOutput):
 
 
 class _CrossAttentionResidualBlock(nn.Module):
-    """Cross-attend without allowing query identities to mix."""
+    """Use learned queries for routing without emitting their common residual."""
 
     def __init__(self, dim: int, heads: int, ff_dim: int) -> None:
         super().__init__()
@@ -49,8 +49,12 @@ class _CrossAttentionResidualBlock(nn.Module):
             need_weights=True,
             average_attn_weights=False,
         )
-        queries = queries + attended
-        return queries + self.ff(self.ff_norm(queries)), attention
+        # Raw learned queries are identical for every sample. Carrying them
+        # into the value stream made the first experiment emit one dominant
+        # common style. The queries define routing only; emitted values must be
+        # conditioned on memory.
+        values = attended
+        return values + self.ff(self.ff_norm(values)), attention
 
 
 class TypedMultiDescriptorCompactStyleTokenizer(nn.Module):
@@ -76,9 +80,10 @@ class TypedMultiDescriptorCompactStyleTokenizer(nn.Module):
         output_tokens: int = 16,
         heads: int = 16,
         ff_dim: int = 2048,
-        slot_reinjection_scale: float = 0.25,
+        slot_modulation_scale: float = 0.25,
         output_gain_center: float = 0.15,
         output_gain_log_span: float = 0.50,
+        learnable_output_gain: bool = False,
     ) -> None:
         super().__init__()
         descriptor_counts = (
@@ -98,8 +103,8 @@ class TypedMultiDescriptorCompactStyleTokenizer(nn.Module):
             raise ValueError("Token and descriptor counts must be positive")
         if not include_artist_summary:
             raise ValueError("Typed multi-descriptor training requires artist summary")
-        if output_gain_center <= 0 or output_gain_log_span <= 0:
-            raise ValueError("Output gain parameters must be positive")
+        if output_gain_center <= 0 or output_gain_log_span < 0:
+            raise ValueError("Output gain parameters must be non-negative")
 
         self.dim = int(dim)
         self.source_dim = int(dim)
@@ -115,9 +120,10 @@ class TypedMultiDescriptorCompactStyleTokenizer(nn.Module):
         self.descriptor_counts = tuple(int(value) for value in descriptor_counts)
         self.descriptor_tokens = sum(self.descriptor_counts)
         self.output_tokens = int(output_tokens)
-        self.slot_reinjection_scale = float(slot_reinjection_scale)
+        self.slot_modulation_scale = float(slot_modulation_scale)
         self.output_gain_center = float(output_gain_center)
         self.output_gain_log_span = float(output_gain_log_span)
+        self.learnable_output_gain = bool(learnable_output_gain)
 
         self.input_norms = nn.ModuleList(nn.LayerNorm(dim) for _ in range(3))
         self.type_embeddings = nn.Parameter(torch.empty(3, dim))
@@ -138,9 +144,12 @@ class TypedMultiDescriptorCompactStyleTokenizer(nn.Module):
             torch.empty(1, output_tokens, dim)
         )
         self.output_reader = _CrossAttentionResidualBlock(dim, heads, ff_dim)
+        self.output_slot_modulation = nn.Parameter(
+            torch.zeros(1, output_tokens, dim)
+        )
         self.output_norm = nn.LayerNorm(dim)
-        self.gain_norm = nn.LayerNorm(dim)
-        self.gain_head = nn.Linear(dim, 1)
+        self.gain_norm = nn.LayerNorm(dim) if self.learnable_output_gain else None
+        self.gain_head = nn.Linear(dim, 1) if self.learnable_output_gain else None
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
@@ -157,8 +166,9 @@ class TypedMultiDescriptorCompactStyleTokenizer(nn.Module):
         nn.init.normal_(self.descriptor_queries, std=1.0)
         nn.init.normal_(self.output_slot_queries, std=1.0)
         nn.init.normal_(self.reference_score_queries, std=self.dim**-0.5)
-        nn.init.zeros_(self.gain_head.weight)
-        nn.init.zeros_(self.gain_head.bias)
+        if self.gain_head is not None:
+            nn.init.zeros_(self.gain_head.weight)
+            nn.init.zeros_(self.gain_head.bias)
 
     def _read_typed_descriptors(
         self, references: torch.Tensor
@@ -238,16 +248,27 @@ class TypedMultiDescriptorCompactStyleTokenizer(nn.Module):
         output_queries, output_attention = self.output_reader(
             output_queries, style_memory
         )
-        output_queries = output_queries + (
-            self.slot_reinjection_scale * self.output_slot_queries
+        output_queries = output_queries * (
+            1.0
+            + self.slot_modulation_scale
+            * torch.tanh(self.output_slot_modulation)
         )
         normalized = self.output_norm(output_queries)
-        gain_logits = self.gain_head(
-            self.gain_norm(style_memory.mean(dim=1))
-        ).float()
-        gain = self.output_gain_center * torch.exp(
-            self.output_gain_log_span * torch.tanh(gain_logits)
-        )
+        if self.gain_head is None:
+            gain = torch.full(
+                (batch, 1),
+                self.output_gain_center,
+                device=references.device,
+                dtype=torch.float32,
+            )
+        else:
+            assert self.gain_norm is not None
+            gain_logits = self.gain_head(
+                self.gain_norm(style_memory.mean(dim=1))
+            ).float()
+            gain = self.output_gain_center * torch.exp(
+                self.output_gain_log_span * torch.tanh(gain_logits)
+            )
         tokens = (normalized.float() * gain[:, None]).to(references.dtype)
 
         return TypedMultiDescriptorOutput(

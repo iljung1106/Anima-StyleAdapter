@@ -19,11 +19,14 @@ Anima를 사용하며, 과도한 content 보존과 global-query slot 붕괴를 �
    불변인 `8 x 1024` style memory를 만든다.
 4. RMS 약 1로 초기화한 명시적 learned query 16개가 style memory를 한 층
    cross-attention하여 Anima용 `16 x 1024` token을 만든다.
-5. 최종 query끼리 self-attention하지 않으며, 출력 직전에 slot embedding을
-   다시 더한다. 현재 모델의 공통 full-rank output projection은 사용하지 않는다.
-6. Final LayerNorm 뒤에는 descriptor로 예측한 bounded sample gain을 사용한다.
-   초기 중심은 0.15이며 대략 0.09--0.25 범위로 제한한다. 추론 시 별도의
-   style strength를 적용할 수 있다.
+5. 최종 query끼리 self-attention하지 않는다. Learned query는 attention의 Q로만
+   사용하고 출력 value residual에는 직접 더하지 않는다. 대신 reference-conditioned
+   value에 slot별 multiplicative modulation을 적용한다. 이로써 slot identity를
+   보존하면서 모든 샘플에 동일한 learned query가 출력되는 shortcut을 막는다.
+6. Final LayerNorm 뒤 gain은 첫 2,000-step gate까지 0.15로 고정한다. 첫 실험에서
+   learnable gain이 0.15에서 약 0.10으로 축소되어 flow 손상을 피하는 shortcut이
+   확인되었기 때문이다. 안정적인 artist-specific 효과가 생긴 뒤에만 bounded
+   sample gain을 다시 여는 것을 검토한다.
 
 목표 모델 크기는 약 16--22M이다. 초기 학습에서는 Resampler를 동결하고,
 필요성이 지표로 확인된 경우에만 후반에 상단부 일부를 낮은 LR로 연다.
@@ -92,3 +95,20 @@ descriptor에서 만든 보조 artist-summary에만 약하게 적용한다.
 
 첫 실험은 2,000 step으로 제한한다. 위 지표가 소형 baseline을 따라잡는 것이
 확인된 뒤에만 8,000 step 본학습과 선택적 Resampler 공동학습을 진행한다.
+
+## 500-step v1 진단과 v2 수정
+
+v1은 heldout paired-flow improvement가 `-0.00488`, human/synthetic teacher
+projection coefficient가 `0.033/0.040`이었고, common/teacher-aligned effect
+비율이 `56.5/65.8`까지 증가했다. 최종 token RMS도 `0.15 -> 0.10` 방향으로
+축소됐다. 정성 샘플에서는 레퍼런스 화풍보다 공통 chibi/고채도 변형이 강했다.
+
+v2에서는 다음을 적용한다.
+
+- descriptor/final learned query의 raw residual 및 additive reinjection 제거
+- learned query는 routing Q로만 사용하고 slot별 multiplicative modulation 사용
+- 첫 2,000 step 동안 output gain 0.15 고정
+- projected-effect loss weight `0.05 -> 0.50`
+- common-output 분모를 작은 student aligned RMS가 아니라 teacher centered RMS로
+  바꾸고 step 1부터 250까지 weight를 ramp
+- v1의 500-step checkpoint는 재사용하지 않고 처음부터 학습

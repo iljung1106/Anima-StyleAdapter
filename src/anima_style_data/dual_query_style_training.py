@@ -709,22 +709,40 @@ def _native_artist_teacher_objective(
             training.get("teacher_projection_orthogonal_weight", 0.25)
         ),
     )
-    if (
-        centered_enabled
-        and str(training.get("common_output_denominator", "student_centered_rms"))
-        == "teacher_aligned_projection"
-    ):
+    common_denominator_mode = str(
+        training.get("common_output_denominator", "student_centered_rms")
+    )
+    if centered_enabled and common_denominator_mode in {
+        "teacher_aligned_projection",
+        "teacher_centered_rms",
+    }:
         common_rms = student_delta.float().mean(dim=0).square().mean().sqrt()
         aligned_rms = projected_metrics[
             "native_teacher_aligned_effect_rms"
         ].clamp_min(1e-8)
-        common_ratio = common_rms / aligned_rms
+        dimensions = tuple(range(1, teacher.ndim))
+        teacher_rms = teacher.detach().float().square().mean(
+            dim=dimensions
+        ).sqrt().mean().clamp_min(1e-8)
+        common_to_aligned = common_rms / aligned_rms
+        denominator = (
+            aligned_rms
+            if common_denominator_mode == "teacher_aligned_projection"
+            else teacher_rms
+        )
+        common_ratio = common_rms / denominator
         centered_metrics["common_output_ratio"] = common_ratio.detach()
         centered_metrics["common_output_loss"] = F.relu(
             common_ratio - float(common_threshold)
         ).square()
         centered_metrics["controlled_common_rms"] = common_rms.detach()
-        centered_metrics["controlled_artist_effect_rms"] = aligned_rms.detach()
+        centered_metrics["controlled_artist_effect_rms"] = denominator.detach()
+        centered_metrics["native_teacher_common_to_aligned_ratio"] = (
+            common_to_aligned.detach()
+        )
+        centered_metrics["native_teacher_common_denominator_rms"] = (
+            denominator.detach()
+        )
     alignment, metrics = _native_teacher_alignment_loss(
         student,
         teacher,

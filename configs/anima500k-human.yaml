@@ -2678,7 +2678,7 @@ slot_preserving_global_query_style_tokenizer:
     vae_batch_size: 4
 
 typed_multi_descriptor_compact_style_tokenizer:
-  output_directory: typed_multi_descriptor_compact_8k_v1
+  output_directory: typed_multi_descriptor_compact_8k_v2
   seed: 20260818
   train_split: train
   validation_split: validation
@@ -2727,9 +2727,10 @@ typed_multi_descriptor_compact_style_tokenizer:
     output_tokens: 16
     heads: 16
     ff_dim: 2048
-    slot_reinjection_scale: 0.25
+    slot_modulation_scale: 0.25
     output_gain_center: 0.15
     output_gain_log_span: 0.50
+    learnable_output_gain: false
   training:
     device: cuda
     steps: 8000
@@ -2770,8 +2771,8 @@ typed_multi_descriptor_compact_style_tokenizer:
 
     # Artist identity is learned only from the compact artist descriptors.
     artist_contrastive_weight: 0.002
-    artist_contrastive_start_step: 500
-    artist_contrastive_ramp_steps: 500
+    artist_contrastive_start_step: 250
+    artist_contrastive_ramp_steps: 250
     artist_contrastive_temperature: 0.10
     artist_contrastive_every: 2
     token_contrastive_weight: 0.0
@@ -2816,7 +2817,7 @@ typed_multi_descriptor_compact_style_tokenizer:
     centered_energy_weight: 0.0
     teacher_projected_effect_start_step: 1
     teacher_projected_effect_ramp_steps: 250
-    teacher_projected_effect_weight: 0.05
+    teacher_projected_effect_weight: 0.50
     teacher_projection_floor_start_step: 1
     teacher_projection_floor_end_step: 1500
     teacher_projection_floor_start: 0.02
@@ -2824,10 +2825,10 @@ typed_multi_descriptor_compact_style_tokenizer:
     teacher_projection_coefficient_maximum: 1.25
     teacher_projection_orthogonal_maximum: 0.50
     teacher_projection_orthogonal_weight: 0.25
-    common_output_denominator: teacher_aligned_projection
-    common_output_weight: 0.01
-    common_output_start_step: 2000
-    common_output_ramp_end_step: 3500
+    common_output_denominator: teacher_centered_rms
+    common_output_weight: 0.02
+    common_output_start_step: 1
+    common_output_ramp_end_step: 250
     common_output_threshold_start: 0.85
     common_output_threshold_end: 0.60
     common_output_threshold_end_step: 8000
@@ -2909,8 +2910,8 @@ typed_multi_descriptor_compact_style_tokenizer:
     wandb:
       enabled: true
       project: anima-style-adapter
-      name: typed-multi-descriptor-compact-8k-v1
-      id: typed-multi-descriptor-compact-8k-v1
+      name: typed-multi-descriptor-compact-8k-v2
+      id: typed-multi-descriptor-compact-8k-v2
   fixed_reference_sampling:
     cache_directory: dual_query_external_reference_cache_v1
     device: cuda

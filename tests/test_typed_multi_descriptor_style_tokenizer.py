@@ -3,6 +3,7 @@ from __future__ import annotations
 import torch
 
 from anima_style_data.dual_query_style_training import (
+    _native_artist_teacher_objective,
     _teacher_projected_effect_loss,
 )
 from anima_style_data.global_query_style_tokenizer import (
@@ -64,12 +65,13 @@ def test_typed_tokenizer_preserves_descriptor_and_output_slot_shapes():
         torch.full_like(output.output_gain, 0.15),
         atol=1e-6,
     )
+    token_rms = output.tokens.float().square().mean(dim=(1, 2)).sqrt()
+    assert torch.allclose(token_rms, torch.full_like(token_rms, 0.15), atol=2e-5)
     # Explicit output slots must not initialize as one shared vector.
     assert not torch.allclose(output.tokens[:, 0], output.tokens[:, 1])
+    assert not torch.allclose(output.tokens[0], output.tokens[1])
 
-    output.tokens.square().mean().backward()
-    assert model.gain_head.weight.grad is not None
-    assert torch.isfinite(model.gain_head.weight.grad).all()
+    output.tokens[:, 0, 0].mean().backward()
     assert model.descriptor_queries.grad is not None
     assert torch.isfinite(model.descriptor_queries.grad).all()
 
@@ -110,6 +112,36 @@ def test_teacher_projected_loss_rejects_orthogonal_energy_shortcut():
     assert orthogonal_metrics["native_teacher_projection_coefficient"].abs() < 1e-7
 
 
+def test_common_output_can_be_bounded_against_teacher_rms_not_tiny_projection():
+    teacher = torch.tensor([[[1.0, 0.0]], [[-1.0, 0.0]]])
+    common = torch.tensor([[[0.0, 0.20]], [[0.0, 0.20]]])
+    student = 0.20 * teacher + common
+    _, metrics = _native_artist_teacher_objective(
+        student,
+        teacher,
+        {
+            "center_student_teacher": True,
+            "native_teacher_weight": 0.0,
+            "native_teacher_ramp_steps": 0,
+            "teacher_projected_effect_weight": 0.0,
+            "common_output_denominator": "teacher_centered_rms",
+            "common_output_start_step": 1,
+            "common_output_ramp_end_step": 1,
+            "common_output_weight": 1.0,
+            "common_output_threshold_start": 0.10,
+            "common_output_threshold_end": 0.10,
+            "centered_energy_weight": 0.0,
+            "artist_teacher_contrastive_weight": 0.0,
+            "artist_teacher_ranking_weight": 0.0,
+        },
+        step=1,
+    )
+    assert torch.allclose(metrics["common_output_ratio"], torch.tensor(0.20))
+    assert torch.allclose(
+        metrics["native_teacher_common_to_aligned_ratio"], torch.tensor(1.0)
+    )
+
+
 def test_prompt_warmup_uses_optimizer_steps_and_preserves_distribution():
     base = {"full": 0.30, "tag_dropout": 0.40, "short": 0.20, "empty": 0.10}
     warm = scheduled_prompt_mode_weights(
@@ -129,4 +161,3 @@ def test_prompt_warmup_uses_optimizer_steps_and_preserves_distribution():
     assert abs(sum(warm.values()) - 1.0) < 1e-8
     assert warm["empty"] == 0.20
     assert after == base
-
