@@ -843,6 +843,41 @@ compact_dual_query_style_tokenizer:
     batch_size: 4
     vae_batch_size: 4
 
+# Exact 8k-vs-8k A/B test of the successful compact StyleTokenizer.  The
+# target/reference image IDs, text conditioning, noisy latents, timesteps, and
+# Anima model are paired; only the frozen per-reference representation differs.
+resampler_representation_comparison:
+  output_directory: resampler_representation_ab_8k_v1
+  device: cuda
+  seed: 20260818
+  train_split: train
+  validation_split: validation
+  validation_batches: 64
+  reference_counts: [1, 2, 4, 8]
+  small_checkpoint: style_tokenizer_native_context_16_multiref_contrastive_8k_v1/checkpoints/step-0008000.pt
+  dual_query_checkpoint: compact_dual_query_style_tokenizer_small_baseline_8k_v1/checkpoints/step-0008000.pt
+  small_token_cache: production_resampler_tokens_l18_l24_siglip_l24
+  dual_query_token_cache: dual_query_reference_tokens_v8_step10000
+  panel_samples_per_split: 4
+  panel_min_references: 1
+  panel_max_references: 8
+  panel_batch_size: 4
+  sampling:
+    width: 768
+    height: 768
+    steps: 30
+    flow_shift: 3.0
+    seed: 20260818
+    text_cfg: 4.0
+    guidance_mode: shared
+  loader:
+    batch_size: 4
+    artist_balanced: true
+    text_conditioning_length: 512
+    text_lru_shards: 4
+    latent_lru_shards: 4
+    token_lru_shards: 8
+
 # Controlled successor to the completed compact baseline. It keeps the same
 # 9.48M tokenizer and frozen Dual-query Resampler, but corrects the two measured
 # failures: only 12.5% of the old batches had one reference, and its final Anima
