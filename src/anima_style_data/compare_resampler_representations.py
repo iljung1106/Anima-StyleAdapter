@@ -8,9 +8,10 @@ from typing import Any
 
 import torch
 from PIL import Image, ImageDraw
+from torch import nn
 
 from .compact_dual_query_style_tokenizer import CompactDualQueryStyleTokenizer
-from .compare_style_tokenizers import _TokenView, _load_checkpoint_tokenizer
+from .compare_style_tokenizers import _TokenView
 from .config import load_config, output_dir
 from .io import write_json
 from .style_tokenizer import (
@@ -25,6 +26,30 @@ from .style_transfer import (
     _optimize_frozen_anima,
     _resolve_anima_model,
 )
+
+
+def _load_ab_tokenizer(
+    checkpoint_path: Path,
+    architecture: type[nn.Module],
+    device: str,
+) -> tuple[_TokenView, dict[str, Any]]:
+    state = torch.load(
+        checkpoint_path, map_location="cpu", weights_only=False, mmap=True
+    )
+    model_cfg = dict(state["config"]["model"])
+    model_cfg.pop("architecture", None)
+    tokenizer = architecture(**model_cfg)
+    tokenizer.load_state_dict(state["tokenizer"], strict=True)
+    tokenizer.to(device).eval()
+    metadata = {
+        "path": str(checkpoint_path),
+        "step": int(state["step"]),
+        "trainable_parameters": sum(
+            parameter.numel() for parameter in tokenizer.parameters()
+        ),
+        "output_tokens": int(model_cfg["output_tokens"]),
+    }
+    return _TokenView(tokenizer), metadata
 
 
 def _episode_signature(batch: dict[str, Any]) -> list[tuple[int, tuple[int, ...], str, int]]:
@@ -244,12 +269,12 @@ def generate_panel_comparison(
     device = str(cfg.get("device", "cuda"))
     output = destination / str(cfg["output_directory"]) / "panels"
     output.mkdir(parents=True, exist_ok=True)
-    small, small_metadata = _load_checkpoint_tokenizer(
+    small, small_metadata = _load_ab_tokenizer(
         destination / str(cfg["small_checkpoint"]),
         AnimaStyleTokenizer,
         device,
     )
-    dual, dual_metadata = _load_checkpoint_tokenizer(
+    dual, dual_metadata = _load_ab_tokenizer(
         destination / str(cfg["dual_query_checkpoint"]),
         CompactDualQueryStyleTokenizer,
         device,
@@ -371,12 +396,12 @@ def compare_resampler_representations(
     output = destination / str(cfg["output_directory"])
     output.mkdir(parents=True, exist_ok=True)
 
-    small, small_metadata = _load_checkpoint_tokenizer(
+    small, small_metadata = _load_ab_tokenizer(
         destination / str(cfg["small_checkpoint"]),
         AnimaStyleTokenizer,
         device,
     )
-    dual, dual_metadata = _load_checkpoint_tokenizer(
+    dual, dual_metadata = _load_ab_tokenizer(
         destination / str(cfg["dual_query_checkpoint"]),
         CompactDualQueryStyleTokenizer,
         device,
