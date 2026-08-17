@@ -2678,7 +2678,7 @@ slot_preserving_global_query_style_tokenizer:
     vae_batch_size: 4
 
 typed_multi_descriptor_compact_style_tokenizer:
-  output_directory: typed_multi_descriptor_compact_8k_v2
+  output_directory: typed_multi_descriptor_grouped_8k_v3
   seed: 20260818
   train_split: train
   validation_split: validation
@@ -2728,6 +2728,9 @@ typed_multi_descriptor_compact_style_tokenizer:
     heads: 16
     ff_dim: 2048
     slot_modulation_scale: 0.25
+    output_mode: grouped_mlp
+    descriptor_group_size: 2
+    group_bottleneck_dim: 512
     output_gain_center: 0.15
     output_gain_log_span: 0.50
     learnable_output_gain: false
@@ -2797,8 +2800,8 @@ typed_multi_descriptor_compact_style_tokenizer:
     slot_diversity_weight: 0.0
     attention_diversity_weight: 0.0
     reference_conditioned_diversity_weight: 0.0
-    functional_value_diversity_weight: 0.001
-    functional_value_diversity_start_step: 1500
+    functional_value_diversity_weight: 0.0005
+    functional_value_diversity_start_step: 3000
     functional_value_diversity_ramp_steps: 500
     functional_value_blocks: [4, 12, 20, 27]
     functional_value_slot_energy_floor: 0.08
@@ -2826,14 +2829,14 @@ typed_multi_descriptor_compact_style_tokenizer:
     teacher_projection_orthogonal_maximum: 0.50
     teacher_projection_orthogonal_weight: 0.25
     common_output_denominator: teacher_centered_rms
-    common_output_weight: 0.02
+    common_output_weight: 0.10
     common_output_start_step: 1
     common_output_ramp_end_step: 250
     common_output_threshold_start: 0.85
     common_output_threshold_end: 0.60
     common_output_threshold_end_step: 8000
     artist_teacher_contrastive_weight: 0.005
-    artist_teacher_contrastive_start_step: 2500
+    artist_teacher_contrastive_start_step: 2000
     artist_teacher_contrastive_ramp_end_step: 4000
     artist_teacher_temperature: 0.07
     artist_teacher_ranking_weight: 0.005
@@ -2856,6 +2859,7 @@ typed_multi_descriptor_compact_style_tokenizer:
       - {end_step: 1000, every: 1}
       - {end_step: 3000, every: 2}
       - {end_step: 8000, every: 4}
+    dual_domain_teacher_scale_by_cadence: true
     dual_domain_teacher:
       enabled: true
       every: 1
@@ -2910,8 +2914,8 @@ typed_multi_descriptor_compact_style_tokenizer:
     wandb:
       enabled: true
       project: anima-style-adapter
-      name: typed-multi-descriptor-compact-8k-v2
-      id: typed-multi-descriptor-compact-8k-v2
+      name: typed-multi-descriptor-grouped-8k-v3
+      id: typed-multi-descriptor-grouped-8k-v3
   fixed_reference_sampling:
     cache_directory: dual_query_external_reference_cache_v1
     device: cuda

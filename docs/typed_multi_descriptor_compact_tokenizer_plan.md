@@ -112,3 +112,29 @@ v2에서는 다음을 적용한다.
 - common-output 분모를 작은 student aligned RMS가 아니라 teacher centered RMS로
   바꾸고 step 1부터 250까지 weight를 ramp
 - v1의 500-step checkpoint는 재사용하지 않고 처음부터 학습
+
+## 2,000-step v2 게이트와 v3 전환
+
+v2는 붕괴하지 않았고 wrong-reference 구분도 학습했지만 2,000 step에서
+heldout paired-flow improvement가 `0.00183 ± 0.00287`에 그쳤다. 같은 시점의
+소형 Dual-query baseline `0.00369`보다 낮다. Human/Synthetic teacher projection
+coefficient도 `0.057/0.084`인 반면 common-output ratio는 `0.831/0.820`이었다.
+1/2-reference는 일부 개선됐지만 4/8-reference는 `0.00038/0.00083`에 그쳤고,
+고정 레퍼런스 시트에서는 주로 머리색과 채도만 달라졌다. 따라서 v2는
+step-2,000 checkpoint를 보존하고 중단한다.
+
+v3는 `84 -> 8 typed descriptor`와 descriptor별 reference pooling은 유지하되,
+마지막 `8 -> 16` cross-attention을 네 개의 typed dense group head로 교체한다.
+
+- spatial descriptor 4개: 2개씩 두 group
+- global descriptor 2개: 한 group
+- artist-summary descriptor 2개: 한 group
+- 각 group은 `2x1024 -> 512 -> 4x1024` MLP로 네 개의 명시적 slot을 출력
+- 네 group을 이어 `16x1024`로 만들고 마지막 LayerNorm과 고정 RMS `0.15` 적용
+
+이 구조는 learned query의 공통 value를 출력하지 않으면서도 각 slot에 독립적인
+조건부 출력 행렬을 준다. 전체 크기는 약 `21.1M`이다. Teacher update를 2/4-step
+간격으로 줄일 때는 loss를 cadence만큼 보정해 평균 teacher gradient 세기를
+유지한다. Common-output weight는 `0.02 -> 0.10`으로 올리고, 이미 구조적으로
+분리된 slot에 대한 functional diversity는 3,000 step 이후로 늦춘다. v3 역시
+2,000 step에서 소형 baseline과 정량·정성 비교한 뒤에만 8,000 step까지 연장한다.

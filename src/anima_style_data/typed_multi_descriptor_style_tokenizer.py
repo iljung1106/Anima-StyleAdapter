@@ -57,13 +57,48 @@ class _CrossAttentionResidualBlock(nn.Module):
         return values + self.ff(self.ff_norm(values)), attention
 
 
+class _DescriptorGroupHead(nn.Module):
+    """Expand a small typed descriptor group into explicit conditional slots."""
+
+    def __init__(
+        self,
+        *,
+        dim: int,
+        descriptor_tokens: int,
+        output_tokens: int,
+        bottleneck_dim: int,
+    ) -> None:
+        super().__init__()
+        self.dim = int(dim)
+        self.descriptor_tokens = int(descriptor_tokens)
+        self.output_tokens = int(output_tokens)
+        self.input_norm = nn.LayerNorm(dim)
+        self.mlp = nn.Sequential(
+            nn.Linear(descriptor_tokens * dim, bottleneck_dim),
+            nn.SiLU(),
+            nn.Linear(bottleneck_dim, output_tokens * dim),
+        )
+        self.slot_embedding = nn.Parameter(
+            torch.empty(1, output_tokens, dim)
+        )
+
+    def forward(self, descriptors: torch.Tensor) -> torch.Tensor:
+        batch = descriptors.shape[0]
+        values = self.mlp(self.input_norm(descriptors).flatten(1)).reshape(
+            batch, self.output_tokens, self.dim
+        )
+        return values + self.slot_embedding
+
+
 class TypedMultiDescriptorCompactStyleTokenizer(nn.Module):
     """Moderately compress typed Dual-query memory before native token output.
 
     Every reference becomes eight aligned descriptors instead of either one
     pooled vector or all 84 cached tokens. References are pooled independently
-    for each descriptor role. Sixteen explicit final slots then read this
-    compact style memory in one cross-attention layer.
+    for each descriptor role. The final sixteen slots are produced either by
+    a routing-only cross-attention layer or by typed dense group heads. The
+    grouped path gives every slot a reference-conditioned output matrix while
+    preserving the semantic source type until the final token expansion.
     """
 
     def __init__(
@@ -81,6 +116,9 @@ class TypedMultiDescriptorCompactStyleTokenizer(nn.Module):
         heads: int = 16,
         ff_dim: int = 2048,
         slot_modulation_scale: float = 0.25,
+        output_mode: str = "attention",
+        descriptor_group_size: int = 2,
+        group_bottleneck_dim: int = 512,
         output_gain_center: float = 0.15,
         output_gain_log_span: float = 0.50,
         learnable_output_gain: bool = False,
@@ -105,6 +143,10 @@ class TypedMultiDescriptorCompactStyleTokenizer(nn.Module):
             raise ValueError("Typed multi-descriptor training requires artist summary")
         if output_gain_center <= 0 or output_gain_log_span < 0:
             raise ValueError("Output gain parameters must be non-negative")
+        if output_mode not in {"attention", "grouped_mlp"}:
+            raise ValueError(f"Unknown typed output mode: {output_mode}")
+        if descriptor_group_size <= 0 or group_bottleneck_dim <= 0:
+            raise ValueError("Grouped output dimensions must be positive")
 
         self.dim = int(dim)
         self.source_dim = int(dim)
@@ -120,6 +162,9 @@ class TypedMultiDescriptorCompactStyleTokenizer(nn.Module):
         self.descriptor_counts = tuple(int(value) for value in descriptor_counts)
         self.descriptor_tokens = sum(self.descriptor_counts)
         self.output_tokens = int(output_tokens)
+        self.output_mode = str(output_mode)
+        self.descriptor_group_size = int(descriptor_group_size)
+        self.group_bottleneck_dim = int(group_bottleneck_dim)
         self.slot_modulation_scale = float(slot_modulation_scale)
         self.output_gain_center = float(output_gain_center)
         self.output_gain_log_span = float(output_gain_log_span)
@@ -140,13 +185,45 @@ class TypedMultiDescriptorCompactStyleTokenizer(nn.Module):
             torch.empty(self.descriptor_tokens, dim)
         )
 
-        self.output_slot_queries = nn.Parameter(
-            torch.empty(1, output_tokens, dim)
-        )
-        self.output_reader = _CrossAttentionResidualBlock(dim, heads, ff_dim)
-        self.output_slot_modulation = nn.Parameter(
-            torch.zeros(1, output_tokens, dim)
-        )
+        self.output_slot_queries: nn.Parameter | None = None
+        self.output_reader: _CrossAttentionResidualBlock | None = None
+        self.output_slot_modulation: nn.Parameter | None = None
+        self.output_group_slices: tuple[tuple[int, int], ...] = ()
+        self.output_group_heads = nn.ModuleList()
+        if self.output_mode == "attention":
+            self.output_slot_queries = nn.Parameter(
+                torch.empty(1, output_tokens, dim)
+            )
+            self.output_reader = _CrossAttentionResidualBlock(
+                dim, heads, ff_dim
+            )
+            self.output_slot_modulation = nn.Parameter(
+                torch.zeros(1, output_tokens, dim)
+            )
+        else:
+            if output_tokens % self.descriptor_tokens:
+                raise ValueError(
+                    "Grouped output tokens must be a multiple of descriptors"
+                )
+            expansion = output_tokens // self.descriptor_tokens
+            group_slices = []
+            start = 0
+            for type_count in self.descriptor_counts:
+                type_end = start + type_count
+                while start < type_end:
+                    end = min(start + self.descriptor_group_size, type_end)
+                    descriptor_count = end - start
+                    group_slices.append((start, end))
+                    self.output_group_heads.append(
+                        _DescriptorGroupHead(
+                            dim=dim,
+                            descriptor_tokens=descriptor_count,
+                            output_tokens=descriptor_count * expansion,
+                            bottleneck_dim=self.group_bottleneck_dim,
+                        )
+                    )
+                    start = end
+            self.output_group_slices = tuple(group_slices)
         self.output_norm = nn.LayerNorm(dim)
         self.gain_norm = nn.LayerNorm(dim) if self.learnable_output_gain else None
         self.gain_head = nn.Linear(dim, 1) if self.learnable_output_gain else None
@@ -164,8 +241,11 @@ class TypedMultiDescriptorCompactStyleTokenizer(nn.Module):
         # markers. RMS-one initialization prevents common attended memory from
         # immediately erasing descriptor and output-slot identities.
         nn.init.normal_(self.descriptor_queries, std=1.0)
-        nn.init.normal_(self.output_slot_queries, std=1.0)
+        if self.output_slot_queries is not None:
+            nn.init.normal_(self.output_slot_queries, std=1.0)
         nn.init.normal_(self.reference_score_queries, std=self.dim**-0.5)
+        for head in self.output_group_heads:
+            nn.init.normal_(head.slot_embedding, std=self.dim**-0.5)
         if self.gain_head is not None:
             nn.init.zeros_(self.gain_head.weight)
             nn.init.zeros_(self.gain_head.bias)
@@ -244,15 +324,32 @@ class TypedMultiDescriptorCompactStyleTokenizer(nn.Module):
         )
         style_memory = self._pool_references(per_reference, reference_mask)
 
-        output_queries = self.output_slot_queries.expand(batch, -1, -1)
-        output_queries, output_attention = self.output_reader(
-            output_queries, style_memory
-        )
-        output_queries = output_queries * (
-            1.0
-            + self.slot_modulation_scale
-            * torch.tanh(self.output_slot_modulation)
-        )
+        if self.output_mode == "attention":
+            assert self.output_slot_queries is not None
+            assert self.output_reader is not None
+            assert self.output_slot_modulation is not None
+            output_queries = self.output_slot_queries.expand(batch, -1, -1)
+            output_queries, output_attention = self.output_reader(
+                output_queries, style_memory
+            )
+            output_queries = output_queries * (
+                1.0
+                + self.slot_modulation_scale
+                * torch.tanh(self.output_slot_modulation)
+            )
+        else:
+            output_queries = torch.cat(
+                [
+                    head(style_memory[:, start:end])
+                    for head, (start, end) in zip(
+                        self.output_group_heads,
+                        self.output_group_slices,
+                        strict=True,
+                    )
+                ],
+                dim=1,
+            )
+            output_attention = None
         normalized = self.output_norm(output_queries)
         if self.gain_head is None:
             gain = torch.full(
@@ -278,7 +375,11 @@ class TypedMultiDescriptorCompactStyleTokenizer(nn.Module):
             reconstruction_target=None,
             artist_tokens=style_memory[:, -self.descriptor_counts[-1] :],
             diversity_tokens=tokens,
-            attention_maps=output_attention[:, None],
+            attention_maps=(
+                output_attention[:, None]
+                if output_attention is not None
+                else None
+            ),
             reference_conditioned_tokens=tokens,
             descriptor_tokens=style_memory,
             output_gain=gain,

@@ -4,6 +4,7 @@ import torch
 
 from anima_style_data.dual_query_style_training import (
     _native_artist_teacher_objective,
+    _scheduled_teacher_gradient_scale,
     _teacher_projected_effect_loss,
 )
 from anima_style_data.global_query_style_tokenizer import (
@@ -14,7 +15,9 @@ from anima_style_data.typed_multi_descriptor_style_tokenizer import (
 )
 
 
-def _model() -> TypedMultiDescriptorCompactStyleTokenizer:
+def _model(
+    output_mode: str = "attention",
+) -> TypedMultiDescriptorCompactStyleTokenizer:
     torch.manual_seed(7)
     return TypedMultiDescriptorCompactStyleTokenizer(
         dim=32,
@@ -27,6 +30,8 @@ def _model() -> TypedMultiDescriptorCompactStyleTokenizer:
         output_tokens=4,
         heads=4,
         ff_dim=64,
+        output_mode=output_mode,
+        group_bottleneck_dim=32,
         output_gain_center=0.15,
     )
 
@@ -74,6 +79,30 @@ def test_typed_tokenizer_preserves_descriptor_and_output_slot_shapes():
     output.tokens[:, 0, 0].mean().backward()
     assert model.descriptor_queries.grad is not None
     assert torch.isfinite(model.descriptor_queries.grad).all()
+
+
+def test_grouped_mlp_preserves_typed_groups_and_conditional_output_slots():
+    model = _model("grouped_mlp")
+    references = torch.randn(3, 2, 14, 32)
+    mask = torch.ones(3, 2, dtype=torch.bool)
+    output = model(references, mask)
+
+    assert model.output_reader is None
+    assert model.output_group_slices == ((0, 2), (2, 3), (3, 4))
+    assert [head.output_tokens for head in model.output_group_heads] == [2, 1, 1]
+    assert output.attention_maps is None
+    assert output.tokens.shape == (3, 4, 32)
+    token_rms = output.tokens.float().square().mean(dim=(1, 2)).sqrt()
+    assert torch.allclose(token_rms, torch.full_like(token_rms, 0.15), atol=2e-5)
+    assert not torch.allclose(output.tokens[:, 0], output.tokens[:, 1])
+    assert not torch.allclose(output.tokens[0], output.tokens[1])
+
+    output.tokens.square().mean().backward()
+    assert model.descriptor_queries.grad is not None
+    assert all(
+        head.mlp[-1].weight.grad is not None
+        for head in model.output_group_heads
+    )
 
 
 def test_teacher_projected_loss_rejects_orthogonal_energy_shortcut():
@@ -161,3 +190,10 @@ def test_prompt_warmup_uses_optimizer_steps_and_preserves_distribution():
     assert abs(sum(warm.values()) - 1.0) < 1e-8
     assert warm["empty"] == 0.20
     assert after == base
+
+
+def test_sparse_teacher_updates_can_preserve_expected_gradient_pressure():
+    assert _scheduled_teacher_gradient_scale(4, {}) == 1.0
+    assert _scheduled_teacher_gradient_scale(
+        4, {"dual_domain_teacher_scale_by_cadence": True}
+    ) == 4.0

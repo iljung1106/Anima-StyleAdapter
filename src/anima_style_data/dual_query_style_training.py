@@ -181,6 +181,18 @@ def _scheduled_teacher_every(step: int, training: dict[str, Any]) -> int:
     return max(1, int(schedule[-1]["every"]))
 
 
+def _scheduled_teacher_gradient_scale(
+    cadence: int, training: dict[str, Any]
+) -> float:
+    """Keep expected teacher pressure constant when updates are subsampled."""
+
+    return (
+        float(cadence)
+        if bool(training.get("dual_domain_teacher_scale_by_cadence", False))
+        else 1.0
+    )
+
+
 def _pilot_stage(step: int, training: dict[str, Any]) -> dict[str, Any]:
     schedule = list(training.get("reference_schedule", []))
     if not schedule:
@@ -2595,6 +2607,9 @@ def _train_variant(
             current_teacher_every = _scheduled_teacher_every(step, training)
             if dual_domain_enabled and step % current_teacher_every == 0:
                 assert dual_domain_bank is not None
+                teacher_gradient_scale = _scheduled_teacher_gradient_scale(
+                    current_teacher_every, training
+                )
                 domain_batches = {
                     domain: next(dual_domain_prefetched[domain])
                     for domain in ("human_teacher", "synthetic_teacher")
@@ -2610,11 +2625,12 @@ def _train_variant(
                         step=step,
                         probe_index_override=teacher_update_index,
                     )
-                    if domain_loss.requires_grad:
-                        domain_loss.backward()
+                    scaled_domain_loss = domain_loss * teacher_gradient_scale
+                    if scaled_domain_loss.requires_grad:
+                        scaled_domain_loss.backward()
                     for row in micro_rows:
                         row.update(domain_metrics)
-                        row["loss"] = row["loss"] + domain_loss.detach()
+                        row["loss"] = row["loss"] + scaled_domain_loss.detach()
                         row["total_auxiliary_weighted_loss"] = (
                             row["loss"] - row["flow_loss"]
                         )
@@ -2631,11 +2647,16 @@ def _train_variant(
                             metric_prefix=domain,
                             probe_index_override=teacher_update_index,
                         )
-                        if domain_loss.requires_grad:
-                            domain_loss.backward()
+                        scaled_domain_loss = (
+                            domain_loss * teacher_gradient_scale
+                        )
+                        if scaled_domain_loss.requires_grad:
+                            scaled_domain_loss.backward()
                         for row in micro_rows:
                             row.update(domain_metrics)
-                            row["loss"] = row["loss"] + domain_loss.detach()
+                            row["loss"] = (
+                                row["loss"] + scaled_domain_loss.detach()
+                            )
                             row["total_auxiliary_weighted_loss"] = (
                                 row["loss"] - row["flow_loss"]
                             )
@@ -2644,6 +2665,9 @@ def _train_variant(
                     row["dual_domain_teacher_every"] = row["flow_loss"].new_tensor(
                         current_teacher_every
                     )
+                    row["dual_domain_teacher_gradient_scale"] = row[
+                        "flow_loss"
+                    ].new_tensor(teacher_gradient_scale)
             grad_norm = torch.nn.utils.clip_grad_norm_(
                 tokenizer.parameters(), max_grad_norm
             )
