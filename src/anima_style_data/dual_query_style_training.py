@@ -713,7 +713,9 @@ def _native_artist_teacher_objective(
         + weighted_contrastive
         + weighted_ranking
     )
-    metrics.update(centered_metrics)
+    metrics.update(
+        {key: value.detach() for key, value in centered_metrics.items()}
+    )
     metrics.update(artist_metrics)
     metrics.update(
         {
