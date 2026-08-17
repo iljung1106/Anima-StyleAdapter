@@ -2389,7 +2389,10 @@ synthetic_teacher:
   image_writer_workers: 8
   webp_quality: 95
   sage_attention: true
-  torch_compile: true
+  # The H100 eager batch-24 path matches compiled batch-8 throughput, while a
+  # new fixed-shape graph takes several minutes to compile and is used only
+  # for this one 8k-image cache build.
+  torch_compile: false
   compile_mode: reduce-overhead
   speed:
     enabled: true
