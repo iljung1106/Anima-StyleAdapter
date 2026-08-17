@@ -100,6 +100,42 @@ class _PreNormQueryBlock(nn.Module):
         return queries, attention
 
 
+class _SlotPreservingQueryBlock(nn.Module):
+    """Read memory without mixing the identities of the output slots."""
+
+    def __init__(self, dim: int, heads: int, ff_dim: int) -> None:
+        super().__init__()
+        self.cross_query_norm = nn.LayerNorm(dim)
+        self.cross_memory_norm = nn.LayerNorm(dim)
+        self.cross_attention = nn.MultiheadAttention(
+            dim, heads, batch_first=True
+        )
+        self.ff_norm = nn.LayerNorm(dim)
+        self.ff = nn.Sequential(
+            nn.Linear(dim, ff_dim),
+            nn.GELU(approximate="tanh"),
+            nn.Linear(ff_dim, dim),
+        )
+
+    def forward(
+        self,
+        queries: torch.Tensor,
+        memory: torch.Tensor,
+        memory_padding_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        normalized_memory = self.cross_memory_norm(memory)
+        attended, attention = self.cross_attention(
+            self.cross_query_norm(queries),
+            normalized_memory,
+            normalized_memory,
+            key_padding_mask=memory_padding_mask,
+            need_weights=True,
+            average_attn_weights=False,
+        )
+        queries = queries + attended
+        return queries + self.ff(self.ff_norm(queries)), attention
+
+
 class GlobalQueryMemoryStyleTokenizer(nn.Module):
     """Read typed, per-reference Dual-query memories without early pooling."""
 
@@ -192,7 +228,9 @@ class GlobalQueryMemoryStyleTokenizer(nn.Module):
         reconstruct: bool = False,
     ) -> GlobalQueryStyleTokenizerOutput:
         if reconstruct:
-            raise ValueError("Reconstruction belongs to the frozen Dual-query Resampler")
+            raise ValueError(
+                "Reconstruction belongs to the frozen Dual-query Resampler"
+            )
         if references.ndim != 4:
             raise ValueError("references must be [batch, references, tokens, dim]")
         if references.shape[2:] != (self.cached_tokens, self.dim):
@@ -236,6 +274,183 @@ class GlobalQueryMemoryStyleTokenizer(nn.Module):
             artist_tokens=tokens,
             diversity_tokens=tokens,
             attention_maps=attention_maps,
+            reference_conditioned_tokens=tokens,
+        )
+
+
+class SlotPreservingGlobalQueryStyleTokenizer(nn.Module):
+    """Global memory reader with non-exchangeable final Anima token slots.
+
+    Fixed orthogonal slot bases keep the sixteen output roles distinct.  Each
+    slot receives the same shared output map plus a small slot-specific low-rank
+    delta.  Query self-attention is intentionally absent: references interact
+    through the memory set, while output-slot identities cannot average into a
+    single common query.
+    """
+
+    def __init__(
+        self,
+        *,
+        dim: int = 1024,
+        spatial_tokens: int = 64,
+        global_tokens: int = 16,
+        artist_summary_tokens: int = 4,
+        include_artist_summary: bool = True,
+        output_tokens: int = 16,
+        heads: int = 16,
+        local_layers: int = 1,
+        cross_layers: int = 2,
+        ff_dim: int = 2048,
+        slot_rank: int = 32,
+        slot_query_delta_scale: float = 0.10,
+        output_rms_init: float = 0.15,
+    ) -> None:
+        super().__init__()
+        if dim % heads:
+            raise ValueError("Style width must be divisible by attention heads")
+        if min(
+            spatial_tokens,
+            global_tokens,
+            output_tokens,
+            local_layers,
+            cross_layers,
+            slot_rank,
+        ) <= 0:
+            raise ValueError("Token counts, depths, and slot rank must be positive")
+        if artist_summary_tokens <= 0 or not include_artist_summary:
+            raise ValueError("Artist-summary tokens must be present")
+        self.dim = int(dim)
+        self.source_dim = int(dim)
+        self.spatial_tokens = int(spatial_tokens)
+        self.global_tokens = int(global_tokens)
+        self.artist_summary_tokens = int(artist_summary_tokens)
+        self.include_artist_summary = True
+        self.cached_tokens = (
+            self.spatial_tokens + self.global_tokens + self.artist_summary_tokens
+        )
+        self.output_tokens = int(output_tokens)
+        self.slot_rank = int(slot_rank)
+        self.slot_query_delta_scale = float(slot_query_delta_scale)
+        self.output_rms_init = float(output_rms_init)
+
+        self.input_norm = nn.LayerNorm(dim)
+        self.type_embedding = nn.Parameter(torch.empty(3, dim))
+        self.spatial_position = nn.Parameter(torch.empty(spatial_tokens, dim))
+        self.reference_register = nn.Parameter(torch.empty(1, 1, dim))
+        self.local_blocks = nn.ModuleList(
+            _PreNormMemoryBlock(dim, heads, ff_dim) for _ in range(local_layers)
+        )
+        self.register_buffer(
+            "slot_query_basis", torch.empty(1, output_tokens, dim), persistent=True
+        )
+        self.slot_query_delta = nn.Parameter(torch.zeros(1, output_tokens, dim))
+        self.query_blocks = nn.ModuleList(
+            _SlotPreservingQueryBlock(dim, heads, ff_dim)
+            for _ in range(cross_layers)
+        )
+        self.final_norm = nn.LayerNorm(dim)
+        self.shared_output = nn.Linear(dim, dim)
+        self.slot_down = nn.Parameter(torch.empty(output_tokens, dim, slot_rank))
+        self.slot_up = nn.Parameter(torch.zeros(output_tokens, slot_rank, dim))
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        for module in self.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.xavier_uniform_(module.weight)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+        std = self.dim**-0.5
+        nn.init.normal_(self.type_embedding, std=std)
+        nn.init.normal_(self.spatial_position, std=std)
+        nn.init.normal_(self.reference_register, std=std)
+        basis = torch.randn(
+            self.dim,
+            self.output_tokens,
+            device=self.slot_query_basis.device,
+            dtype=self.slot_query_basis.dtype,
+        )
+        basis = torch.linalg.qr(basis, mode="reduced").Q.transpose(0, 1)
+        self.slot_query_basis.copy_(basis.unsqueeze(0))
+        nn.init.zeros_(self.slot_query_delta)
+        nn.init.normal_(
+            self.shared_output.weight,
+            std=self.output_rms_init / (self.dim**0.5),
+        )
+        nn.init.zeros_(self.shared_output.bias)
+        nn.init.normal_(self.slot_down, std=self.dim**-0.5)
+        nn.init.zeros_(self.slot_up)
+
+    def _typed_memory(self, references: torch.Tensor) -> torch.Tensor:
+        spatial_end = self.spatial_tokens
+        global_end = spatial_end + self.global_tokens
+        spatial = (
+            references[:, :, :spatial_end]
+            + self.type_embedding[0]
+            + self.spatial_position
+        )
+        global_values = references[:, :, spatial_end:global_end]
+        global_values = global_values + self.type_embedding[1]
+        artist = references[:, :, global_end:] + self.type_embedding[2]
+        return torch.cat((spatial, global_values, artist), dim=2)
+
+    def forward(
+        self,
+        references: torch.Tensor,
+        reference_mask: torch.Tensor,
+        *,
+        reconstruct: bool = False,
+    ) -> GlobalQueryStyleTokenizerOutput:
+        if reconstruct:
+            raise ValueError(
+                "Reconstruction belongs to the frozen Dual-query Resampler"
+            )
+        if references.ndim != 4:
+            raise ValueError("references must be [batch, references, tokens, dim]")
+        if references.shape[2:] != (self.cached_tokens, self.dim):
+            raise ValueError(
+                f"Expected reference tail {(self.cached_tokens, self.dim)}, "
+                f"got {tuple(references.shape[2:])}"
+            )
+        if reference_mask.shape != references.shape[:2]:
+            raise ValueError("reference_mask does not match references")
+        if not bool(reference_mask.any(dim=1).all()):
+            raise ValueError("Every sample must contain a reference")
+
+        batch, reference_count = references.shape[:2]
+        memory = self.input_norm(self._typed_memory(references))
+        memory = memory.reshape(batch * reference_count, self.cached_tokens, self.dim)
+        register = self.reference_register.expand(batch * reference_count, -1, -1)
+        memory = torch.cat((register, memory), dim=1)
+        for block in self.local_blocks:
+            memory = block(memory)
+        memory_per_reference = memory.reshape(
+            batch, reference_count, self.cached_tokens + 1, self.dim
+        )
+        memory = memory_per_reference.flatten(1, 2)
+        memory_padding_mask = (~reference_mask).unsqueeze(-1).expand(
+            -1, -1, self.cached_tokens + 1
+        ).reshape(batch, -1)
+
+        queries = self.slot_query_basis.expand(batch, -1, -1)
+        queries = queries + self.slot_query_delta_scale * self.slot_query_delta
+        attentions = []
+        for block in self.query_blocks:
+            queries, attention = block(queries, memory, memory_padding_mask)
+            attentions.append(attention)
+        normalized = self.final_norm(queries)
+        shared = self.shared_output(normalized)
+        low_rank = torch.einsum("bsd,sdr->bsr", normalized, self.slot_down)
+        low_rank = torch.einsum("bsr,srd->bsd", low_rank, self.slot_up)
+        tokens = (shared + low_rank).to(dtype=references.dtype)
+        return GlobalQueryStyleTokenizerOutput(
+            tokens=tokens,
+            per_reference_tokens=memory_per_reference,
+            reconstruction=None,
+            reconstruction_target=None,
+            artist_tokens=tokens,
+            diversity_tokens=tokens,
+            attention_maps=torch.stack(attentions, dim=1),
             reference_conditioned_tokens=tokens,
         )
 

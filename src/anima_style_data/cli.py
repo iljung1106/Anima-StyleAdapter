@@ -137,6 +137,14 @@ def build_parser() -> argparse.ArgumentParser:
             "global-query-multimode-smoke",
             "Smoke-test the global-query multi-prompt training recipe",
         ),
+        (
+            "slot-preserving-global-query-train",
+            "Train the slot-preserving artist-specific Style Tokenizer",
+        ),
+        (
+            "slot-preserving-global-query-smoke",
+            "Smoke-test slot identity and dense artist supervision",
+        ),
         ("dual-query-style-ablate", "Compare artist-summary token delivery"),
         ("dual-query-style-train", "Train the multi-reference Dual-query Style Tokenizer"),
         ("dual-query-style-pilot", "Run the summary-ON 10k Dual-query Style Tokenizer pilot"),
@@ -371,6 +379,8 @@ def main() -> None:
         "global-query-multimode-text-cache",
         "global-query-multimode-train",
         "global-query-multimode-smoke",
+        "slot-preserving-global-query-train",
+        "slot-preserving-global-query-smoke",
         "dual-query-style-ablate",
         "dual-query-style-train",
         "dual-query-style-pilot",
@@ -415,6 +425,8 @@ def main() -> None:
             smoke_test_dual_domain_native_distillation,
             train_global_query_multimode_style_tokenizer,
             smoke_test_global_query_multimode_style_tokenizer,
+            train_slot_preserving_global_query_style_tokenizer,
+            smoke_test_slot_preserving_global_query_style_tokenizer,
         )
 
         stage = {
@@ -439,6 +451,12 @@ def main() -> None:
             ),
             "global-query-multimode-smoke": (
                 smoke_test_global_query_multimode_style_tokenizer
+            ),
+            "slot-preserving-global-query-train": (
+                train_slot_preserving_global_query_style_tokenizer
+            ),
+            "slot-preserving-global-query-smoke": (
+                smoke_test_slot_preserving_global_query_style_tokenizer
             ),
             "dual-query-style-ablate": compare_artist_summary_tokens,
             "dual-query-style-train": train_dual_query_style_tokenizer,

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import json
+import math
 import random
 import time
 from collections import defaultdict
@@ -23,6 +24,7 @@ from .compact_dual_query_style_tokenizer import CompactDualQueryStyleTokenizer
 from .global_query_style_tokenizer import (
     GlobalQueryMemoryStyleTokenizer,
     MultiPromptDualQueryCachedStyleLoader,
+    SlotPreservingGlobalQueryStyleTokenizer,
     attention_map_diversity_loss,
     reference_conditioned_diversity_loss,
 )
@@ -165,6 +167,17 @@ def _linear_ramp(
     return float(start) + progress * (float(end) - float(start))
 
 
+def _scheduled_teacher_every(step: int, training: dict[str, Any]) -> int:
+    schedule = training.get("dual_domain_teacher_schedule")
+    if not schedule:
+        teacher = dict(training.get("dual_domain_teacher", {}))
+        return max(1, int(teacher.get("every", 1)))
+    for phase in schedule:
+        if step <= int(phase["end_step"]):
+            return max(1, int(phase["every"]))
+    return max(1, int(schedule[-1]["every"]))
+
+
 def _pilot_stage(step: int, training: dict[str, Any]) -> dict[str, Any]:
     schedule = list(training.get("reference_schedule", []))
     if not schedule:
@@ -290,6 +303,142 @@ def _common_output_loss(
         "common_output_ratio": ratio.detach(),
         "controlled_artist_effect_rms": per_artist_rms.detach().mean(),
         "controlled_common_rms": common_rms.detach(),
+    }
+
+
+def _centered_teacher_effects(
+    student_delta: torch.Tensor,
+    teacher_delta: torch.Tensor,
+    *,
+    common_threshold: float,
+    centered_ratio_minimum: float,
+    centered_ratio_maximum: float,
+) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
+    """Center an artist batch while preserving its absolute teacher energy."""
+
+    if student_delta.shape != teacher_delta.shape or student_delta.shape[0] < 2:
+        raise ValueError(
+            "Centered teacher effects require matching multi-artist batches"
+        )
+    dimensions = tuple(range(1, student_delta.ndim))
+    student = student_delta.float()
+    teacher = teacher_delta.detach().float()
+    common = student.mean(dim=0, keepdim=True)
+    student_centered = student - common
+    teacher_centered = teacher - teacher.mean(dim=0, keepdim=True)
+    student_rms = student_centered.square().mean(dim=dimensions).sqrt().mean()
+    teacher_rms = (
+        teacher_centered.square().mean(dim=dimensions).sqrt().mean().clamp_min(1e-8)
+    )
+    centered_ratio = student_rms / teacher_rms.detach()
+    centered_energy_loss = (
+        F.relu(float(centered_ratio_minimum) - centered_ratio).square()
+        + F.relu(centered_ratio - float(centered_ratio_maximum)).square()
+    )
+    common_rms = common.square().mean().sqrt()
+    common_ratio = common_rms / student_rms.detach().clamp_min(1e-8)
+    common_loss = F.relu(common_ratio - float(common_threshold)).square()
+    return student_centered, teacher_centered, {
+        "native_teacher_centered_student_rms": student_rms.detach(),
+        "native_teacher_centered_target_rms": teacher_rms.detach(),
+        "native_teacher_centered_student_to_target_rms": centered_ratio.detach(),
+        "native_teacher_centered_energy_loss": centered_energy_loss,
+        "common_output_ratio": common_ratio.detach(),
+        "common_output_loss": common_loss,
+        "controlled_common_rms": common_rms.detach(),
+        "controlled_artist_effect_rms": student_rms.detach(),
+    }
+
+
+def _artist_teacher_contrastive_loss(
+    student_centered: torch.Tensor,
+    teacher_centered: torch.Tensor,
+    *,
+    temperature: float,
+    margin: float,
+) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
+    """Use every artist as a positive once; other same-probe artists are negatives."""
+
+    if student_centered.shape != teacher_centered.shape:
+        raise ValueError("Artist contrastive tensors must have the same shape")
+    if student_centered.shape[0] < 2:
+        raise ValueError("Artist contrastive loss needs at least two artists")
+    student = F.normalize(student_centered.flatten(1), dim=-1)
+    teacher = F.normalize(teacher_centered.detach().flatten(1), dim=-1)
+    similarities = student @ teacher.transpose(0, 1)
+    logits = similarities / float(temperature)
+    labels = torch.arange(logits.shape[0], device=logits.device)
+    contrastive = 0.5 * (
+        F.cross_entropy(logits, labels)
+        + F.cross_entropy(logits.transpose(0, 1), labels)
+    )
+    diagonal = similarities.diagonal()
+    negative = similarities.masked_fill(
+        torch.eye(similarities.shape[0], device=similarities.device, dtype=torch.bool),
+        -torch.inf,
+    ).amax(dim=1)
+    ranking = F.relu(float(margin) - diagonal + negative).mean()
+    return contrastive, ranking, {
+        "native_teacher_artist_contrastive_loss": contrastive.detach(),
+        "native_teacher_artist_ranking_loss": ranking.detach(),
+        "native_teacher_artist_positive_cosine": diagonal.detach().mean(),
+        "native_teacher_artist_hard_negative_cosine": negative.detach().mean(),
+        "native_teacher_artist_retrieval_top1": (
+            similarities.argmax(dim=1) == labels
+        ).float().mean().detach(),
+    }
+
+
+def _native_kv_functional_diversity_loss(
+    anima: torch.nn.Module,
+    tokens: torch.Tensor,
+    *,
+    block_indices: list[int],
+    slot_energy_floor: float,
+    reference_energy_floor: float,
+    decorrelation_fraction: float,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Measure diversity after Frozen Anima's actual context K/V projections."""
+
+    if tokens.ndim != 3 or tokens.shape[0] < 2 or tokens.shape[1] < 2:
+        raise ValueError("Functional K/V diversity needs [batch, slots, dim]")
+    projected = []
+    blocks = getattr(anima, "blocks", None)
+    if blocks is None:
+        raise TypeError("Anima model does not expose transformer blocks")
+    for index in block_indices:
+        cross_attention = blocks[int(index)].cross_attn
+        if hasattr(cross_attention, "kv_proj"):
+            value = cross_attention.kv_proj(tokens)
+        elif hasattr(cross_attention, "k_proj") and hasattr(cross_attention, "v_proj"):
+            value = torch.cat(
+                (cross_attention.k_proj(tokens), cross_attention.v_proj(tokens)), dim=-1
+            )
+        else:
+            raise TypeError("Anima cross-attention exposes no native K/V projection")
+        projected.append(value.float())
+    signature = torch.cat(projected, dim=-1)
+    total_rms = signature.square().mean().sqrt().detach().clamp_min(1e-8)
+    slot_centered = signature - signature.mean(dim=1, keepdim=True)
+    reference_centered = signature - signature.mean(dim=0, keepdim=True)
+    slot_ratio = slot_centered.square().mean().sqrt() / total_rms
+    reference_ratio = reference_centered.square().mean().sqrt() / total_rms
+    slot_floor_loss = F.relu(float(slot_energy_floor) - slot_ratio).square()
+    reference_floor_loss = F.relu(
+        float(reference_energy_floor) - reference_ratio
+    ).square()
+    normalized = F.normalize(slot_centered, dim=-1)
+    similarities = normalized @ normalized.transpose(1, 2)
+    identity = torch.eye(tokens.shape[1], device=tokens.device, dtype=torch.bool)
+    decorrelation = similarities[:, ~identity].square().mean()
+    total = slot_floor_loss + reference_floor_loss + float(
+        decorrelation_fraction
+    ) * decorrelation
+    return total, {
+        "functional_value_diversity_loss": total.detach(),
+        "functional_value_slot_energy_ratio": slot_ratio.detach(),
+        "functional_value_reference_energy_ratio": reference_ratio.detach(),
+        "functional_value_decorrelation_loss": decorrelation.detach(),
     }
 
 
@@ -432,6 +581,170 @@ def _native_teacher_alignment_loss(
     }
 
 
+def _native_artist_teacher_objective(
+    student_delta: torch.Tensor,
+    teacher_delta: torch.Tensor,
+    training: dict[str, Any],
+    *,
+    step: int,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Build magnitude-preserving centered teacher and artist discrimination losses."""
+
+    common_start = int(training.get("common_output_start_step", 1_000))
+    common_ramp_end = int(training.get("common_output_ramp_end_step", 2_000))
+    common_threshold = _linear_ramp(
+        step,
+        start_step=common_start,
+        end_step=int(training.get("common_output_threshold_end_step", 8_000)),
+        start=float(training.get("common_output_threshold_start", 0.85)),
+        end=float(training.get("common_output_threshold_end", 0.55)),
+    )
+    centered_minimum = _linear_ramp(
+        step,
+        start_step=int(training.get("centered_energy_start_step", 1)),
+        end_step=int(training.get("centered_energy_ramp_end_step", 1_500)),
+        start=float(training.get("centered_energy_ratio_start", 0.30)),
+        end=float(training.get("centered_energy_ratio_end", 0.80)),
+    )
+    centered_maximum = float(training.get("centered_energy_ratio_maximum", 1.40))
+    centered_enabled = bool(training.get("center_student_teacher", False))
+    if centered_enabled:
+        student, teacher, centered_metrics = _centered_teacher_effects(
+            student_delta,
+            teacher_delta,
+            common_threshold=common_threshold,
+            centered_ratio_minimum=centered_minimum,
+            centered_ratio_maximum=centered_maximum,
+        )
+    else:
+        student = student_delta
+        teacher = teacher_delta
+        common_loss, common_metrics = _common_output_loss(
+            student_delta, threshold=common_threshold
+        )
+        centered_metrics = {
+            "native_teacher_centered_student_rms": student_delta.new_zeros(()),
+            "native_teacher_centered_target_rms": student_delta.new_zeros(()),
+            "native_teacher_centered_student_to_target_rms": (
+                student_delta.new_zeros(())
+            ),
+            "native_teacher_centered_energy_loss": student_delta.new_zeros(()),
+            "common_output_loss": common_loss,
+            **common_metrics,
+        }
+    alignment, metrics = _native_teacher_alignment_loss(
+        student,
+        teacher,
+        huber_beta=float(training.get("native_teacher_huber_beta", 0.10)),
+        scale_floor=float(training.get("native_teacher_scale_floor", 1e-4)),
+        direction_weight=float(training.get("native_teacher_direction_weight", 0.10)),
+        magnitude_weight=float(training.get("native_teacher_magnitude_weight", 0.05)),
+    )
+    start = int(training.get("native_teacher_start_step", 1))
+    ramp_steps = max(0, int(training.get("native_teacher_ramp_steps", 250)))
+    teacher_weight = _linear_ramp(
+        step,
+        start_step=start,
+        end_step=start + ramp_steps,
+        start=0.0 if ramp_steps else float(training.get("native_teacher_weight", 0.05)),
+        end=float(training.get("native_teacher_weight", 0.05)),
+    )
+    common_weight = (
+        _linear_ramp(
+            step,
+            start_step=common_start,
+            end_step=common_ramp_end,
+            start=0.0,
+            end=float(training.get("common_output_weight", 0.0)),
+        )
+        if step >= common_start
+        else 0.0
+    )
+    energy_weight = _linear_ramp(
+        step,
+        start_step=int(training.get("centered_energy_start_step", 1)),
+        end_step=int(training.get("centered_energy_weight_ramp_end_step", 500)),
+        start=0.0,
+        end=float(training.get("centered_energy_weight", 0.0)),
+    )
+    contrast_start = int(training.get("artist_teacher_contrastive_start_step", 750))
+    contrast_weight = (
+        _linear_ramp(
+            step,
+            start_step=contrast_start,
+            end_step=int(
+                training.get("artist_teacher_contrastive_ramp_end_step", 1_500)
+            ),
+            start=0.0,
+            end=float(training.get("artist_teacher_contrastive_weight", 0.0)),
+        )
+        if step >= contrast_start
+        else 0.0
+    )
+    ranking_start = int(training.get("artist_teacher_ranking_start_step", 1_000))
+    ranking_weight = (
+        _linear_ramp(
+            step,
+            start_step=ranking_start,
+            end_step=int(training.get("artist_teacher_ranking_ramp_end_step", 2_000)),
+            start=0.0,
+            end=float(training.get("artist_teacher_ranking_weight", 0.0)),
+        )
+        if step >= ranking_start
+        else 0.0
+    )
+    contrastive, ranking, artist_metrics = _artist_teacher_contrastive_loss(
+        student,
+        teacher,
+        temperature=float(training.get("artist_teacher_temperature", 0.07)),
+        margin=float(training.get("artist_teacher_ranking_margin", 0.10)),
+    )
+    common_loss = centered_metrics["common_output_loss"]
+    energy_loss = centered_metrics["native_teacher_centered_energy_loss"]
+    weighted_alignment = teacher_weight * alignment
+    weighted_common = common_weight * common_loss
+    weighted_energy = energy_weight * energy_loss
+    weighted_contrastive = contrast_weight * contrastive
+    weighted_ranking = ranking_weight * ranking
+    total = (
+        weighted_alignment
+        + weighted_common
+        + weighted_energy
+        + weighted_contrastive
+        + weighted_ranking
+    )
+    metrics.update(centered_metrics)
+    metrics.update(artist_metrics)
+    metrics.update(
+        {
+            "native_teacher_alignment_loss": alignment.detach(),
+            "native_teacher_weight": alignment.new_tensor(teacher_weight),
+            "native_teacher_weighted_loss": weighted_alignment.detach(),
+            "native_teacher_centered_energy_ratio_minimum": alignment.new_tensor(
+                centered_minimum
+            ),
+            "native_teacher_centered_energy_weight": alignment.new_tensor(
+                energy_weight
+            ),
+            "native_teacher_centered_energy_weighted_loss": weighted_energy.detach(),
+            "native_teacher_artist_contrastive_weight": alignment.new_tensor(
+                contrast_weight
+            ),
+            "native_teacher_artist_contrastive_weighted_loss": (
+                weighted_contrastive.detach()
+            ),
+            "native_teacher_artist_ranking_weight": alignment.new_tensor(
+                ranking_weight
+            ),
+            "native_teacher_artist_ranking_weighted_loss": weighted_ranking.detach(),
+            "common_output_weight": alignment.new_tensor(common_weight),
+            "common_output_threshold": alignment.new_tensor(common_threshold),
+            "common_output_weighted_loss": weighted_common.detach(),
+        }
+    )
+    return total, metrics
+
+
 def _native_centered_teacher_step(
     anima: torch.nn.Module,
     tokenizer: torch.nn.Module,
@@ -508,34 +821,12 @@ def _native_centered_teacher_step(
             target_input_ids=None,
         ).squeeze(2).float()
     student = prediction - base_prediction
-    alignment, metrics = _native_teacher_alignment_loss(
-        student,
-        teacher,
-        huber_beta=float(training.get("native_teacher_huber_beta", 0.10)),
-        scale_floor=float(training.get("native_teacher_scale_floor", 1e-4)),
-        direction_weight=float(
-            training.get("native_teacher_direction_weight", 0.10)
-        ),
-        magnitude_weight=float(
-            training.get("native_teacher_magnitude_weight", 0.05)
-        ),
+    weighted, metrics = _native_artist_teacher_objective(
+        student, teacher, training, step=step
     )
-    start = int(training.get("native_teacher_start_step", 1))
-    ramp_steps = max(0, int(training.get("native_teacher_ramp_steps", 250)))
-    weight = _linear_ramp(
-        step,
-        start_step=start,
-        end_step=start + ramp_steps,
-        start=0.0 if ramp_steps else float(training.get("native_teacher_weight", 0.10)),
-        end=float(training.get("native_teacher_weight", 0.10)),
-    )
-    weighted = float(weight) * alignment
     metrics.update(
         {
-            "native_teacher_alignment_loss": alignment.detach(),
-            "native_teacher_weight": alignment.new_tensor(weight),
-            "native_teacher_weighted_loss": weighted.detach(),
-            "native_teacher_content_index": alignment.new_tensor(content_index),
+            "native_teacher_content_index": student.new_tensor(content_index),
             "native_teacher_timestep": timestep.detach().float(),
         }
     )
@@ -652,83 +943,19 @@ def _dual_domain_centered_teacher_step(
     metrics: dict[str, torch.Tensor] = {}
     offset = 0
     for domain, domain_training, _, _, _, rows in prepared:
-        alignment, domain_metrics = _native_teacher_alignment_loss(
+        domain_loss, domain_metrics = _native_artist_teacher_objective(
             student[offset : offset + rows],
             teacher[offset : offset + rows],
-            huber_beta=float(
-                domain_training.get("native_teacher_huber_beta", 0.10)
-            ),
-            scale_floor=float(
-                domain_training.get("native_teacher_scale_floor", 1e-4)
-            ),
-            direction_weight=float(
-                domain_training.get("native_teacher_direction_weight", 0.10)
-            ),
-            magnitude_weight=float(
-                domain_training.get("native_teacher_magnitude_weight", 0.05)
-            ),
+            domain_training,
+            step=step,
         )
-        start = int(domain_training.get("native_teacher_start_step", 1))
-        ramp_steps = max(
-            0, int(domain_training.get("native_teacher_ramp_steps", 250))
-        )
-        weight = _linear_ramp(
-            step,
-            start_step=start,
-            end_step=start + ramp_steps,
-            start=0.0 if ramp_steps else float(
-                domain_training.get("native_teacher_weight", 0.10)
-            ),
-            end=float(domain_training.get("native_teacher_weight", 0.10)),
-        )
-        weighted = float(weight) * alignment
-        total = total + weighted
-        common_weight_target = float(
-            domain_training.get("common_output_weight", 0.0)
-        )
-        common_start = int(domain_training.get("common_output_start_step", 500))
-        common_ramp_end = int(
-            domain_training.get("common_output_ramp_end_step", 1500)
-        )
-        common_weight = _linear_ramp(
-            step,
-            start_step=common_start,
-            end_step=common_ramp_end,
-            start=0.0,
-            end=common_weight_target,
-        ) if step >= common_start else 0.0
-        threshold = _linear_ramp(
-            step,
-            start_step=common_start,
-            end_step=int(
-                domain_training.get("common_output_threshold_end_step", 8000)
-            ),
-            start=float(
-                domain_training.get("common_output_threshold_start", 0.85)
-            ),
-            end=float(
-                domain_training.get("common_output_threshold_end", 0.70)
-            ),
-        )
-        common_loss, common_metrics = _common_output_loss(
-            student[offset : offset + rows], threshold=threshold
-        )
-        common_weighted = common_weight * common_loss
-        total = total + common_weighted
+        total = total + domain_loss
         domain_metrics.update({
-            "native_teacher_alignment_loss": alignment.detach(),
-            "native_teacher_weight": alignment.new_tensor(weight),
-            "native_teacher_weighted_loss": weighted.detach(),
-            "native_teacher_content_index": alignment.new_tensor(content_index),
+            "native_teacher_content_index": domain_loss.new_tensor(content_index),
             "native_teacher_timestep": timestep.detach().float(),
-            "native_teacher_update_index": alignment.new_tensor(probe_index),
-            "native_teacher_probe_cycle": alignment.new_tensor(cycle),
-            "native_teacher_probe_position": alignment.new_tensor(position),
-            "common_output_loss": common_loss.detach(),
-            "common_output_weight": common_loss.new_tensor(common_weight),
-            "common_output_threshold": common_loss.new_tensor(threshold),
-            "common_output_weighted_loss": common_weighted.detach(),
-            **common_metrics,
+            "native_teacher_update_index": domain_loss.new_tensor(probe_index),
+            "native_teacher_probe_cycle": domain_loss.new_tensor(cycle),
+            "native_teacher_probe_position": domain_loss.new_tensor(position),
         })
         metrics.update({
             (
@@ -1240,6 +1467,51 @@ def _forward_dual_query_flow(
         )
         total = total + reference_diversity_weight * reference_diversity
 
+    functional_value_weight = float(
+        training.get("functional_value_diversity_weight", 0.0)
+    ) * diversity_progress
+    functional_value_diversity = flow_loss.new_zeros(())
+    functional_value_metrics = {
+        "functional_value_slot_energy_ratio": flow_loss.new_zeros(()),
+        "functional_value_reference_energy_ratio": flow_loss.new_zeros(()),
+        "functional_value_decorrelation_loss": flow_loss.new_zeros(()),
+    }
+    if functional_value_weight > 0:
+        block_indices = [
+            int(value)
+            for value in training.get(
+                "functional_value_blocks", [0, 4, 8, 12, 16, 20, 24, 27]
+            )
+        ]
+        functional_value_diversity, functional_value_metrics = (
+            _native_kv_functional_diversity_loss(
+                anima,
+                output.tokens,
+                block_indices=block_indices,
+                slot_energy_floor=float(
+                    training.get("functional_value_slot_energy_floor", 0.20)
+                ),
+                reference_energy_floor=float(
+                    training.get("functional_value_reference_energy_floor", 0.03)
+                ),
+                decorrelation_fraction=float(
+                    training.get("functional_value_decorrelation_fraction", 0.10)
+                ),
+            )
+        )
+        total = total + functional_value_weight * functional_value_diversity
+
+    context_rms_weight = float(training.get("context_rms_weight", 0.0))
+    token_sample_rms = output.tokens.float().square().mean(dim=(1, 2)).sqrt()
+    context_rms_minimum = float(training.get("context_rms_minimum", 0.08))
+    context_rms_maximum = float(training.get("context_rms_maximum", 0.25))
+    log_rms = token_sample_rms.clamp_min(1e-8).log()
+    context_rms_loss = (
+        F.relu(math.log(context_rms_minimum) - log_rms).square()
+        + F.relu(log_rms - math.log(context_rms_maximum)).square()
+    ).mean()
+    total = total + context_rms_weight * context_rms_loss
+
     contrastive = flow_loss.new_zeros(())
     positive = flow_loss.new_zeros(())
     negative = flow_loss.new_zeros(())
@@ -1503,6 +1775,22 @@ def _forward_dual_query_flow(
         ),
         "reference_conditioned_diversity_weighted_loss": (
             reference_diversity_weight * reference_diversity
+        ).detach(),
+        "functional_value_diversity_loss": functional_value_diversity.detach(),
+        "functional_value_diversity_weight": flow_loss.new_tensor(
+            functional_value_weight
+        ),
+        "functional_value_diversity_weighted_loss": (
+            functional_value_weight * functional_value_diversity
+        ).detach(),
+        **{
+            key: value.detach()
+            for key, value in functional_value_metrics.items()
+        },
+        "context_rms_loss": context_rms_loss.detach(),
+        "context_rms_weight": flow_loss.new_tensor(context_rms_weight),
+        "context_rms_weighted_loss": (
+            context_rms_weight * context_rms_loss
         ).detach(),
         "references": reference_mask.sum(dim=1).float().mean(),
         "reference_count_1_fraction": (
@@ -1825,8 +2113,12 @@ def _train_variant(
         tokenizer = CompactDualQueryStyleTokenizer(**model_cfg).to(device)
     elif architecture == "global_query_memory":
         tokenizer = GlobalQueryMemoryStyleTokenizer(**model_cfg).to(device)
+    elif architecture == "slot_preserving_global_query":
+        tokenizer = SlotPreservingGlobalQueryStyleTokenizer(**model_cfg).to(device)
     else:
-        raise ValueError(f"Unknown Dual-query StyleTokenizer architecture {architecture!r}")
+        raise ValueError(
+            f"Unknown Dual-query StyleTokenizer architecture {architecture!r}"
+        )
     output = destination / output_name
     checkpoints = output / "checkpoints"
     checkpoints.mkdir(parents=True, exist_ok=True)
@@ -1979,7 +2271,6 @@ def _train_variant(
             depth=int(training.get("native_teacher_prefetch_batches", 2)),
         )
     dual_domain_prefetched: dict[str, Any] = {}
-    dual_domain_every = max(1, int(dual_domain_cfg.get("every", 1)))
     saved_trainer_state = (
         dict(resume_state.get("trainer_state", {}))
         if resume_state is not None else {}
@@ -1987,12 +2278,20 @@ def _train_variant(
     teacher_update_index = int(
         saved_trainer_state.get(
             "dual_domain_teacher_update_index",
-            start_step // dual_domain_every,
+            sum(
+                1
+                for previous_step in range(1, start_step + 1)
+                if previous_step
+                % _scheduled_teacher_every(previous_step, training)
+                == 0
+            ),
         )
     )
     if dual_domain_enabled:
-        remaining = max(
-            0, steps // dual_domain_every - start_step // dual_domain_every
+        remaining = sum(
+            1
+            for future_step in range(start_step + 1, steps + 1)
+            if future_step % _scheduled_teacher_every(future_step, training) == 0
         )
         for domain, loader in dual_domain_train_loaders.items():
             domain_cfg = dict(dual_domain_cfg[domain.removesuffix("_teacher")])
@@ -2112,7 +2411,8 @@ def _train_variant(
                     row["total_auxiliary_weighted_loss"] = (
                         row["loss"] - row["flow_loss"]
                     )
-            if dual_domain_enabled and step % dual_domain_every == 0:
+            current_teacher_every = _scheduled_teacher_every(step, training)
+            if dual_domain_enabled and step % current_teacher_every == 0:
                 assert dual_domain_bank is not None
                 domain_batches = {
                     domain: next(dual_domain_prefetched[domain])
@@ -2159,6 +2459,10 @@ def _train_variant(
                                 row["loss"] - row["flow_loss"]
                             )
                 teacher_update_index += 1
+                for row in micro_rows:
+                    row["dual_domain_teacher_every"] = row["flow_loss"].new_tensor(
+                        current_teacher_every
+                    )
             grad_norm = torch.nn.utils.clip_grad_norm_(
                 tokenizer.parameters(), max_grad_norm
             )
@@ -2380,7 +2684,12 @@ def _train_variant(
                     cache_summary=cache_summary,
                     trainer_state={
                         "dual_domain_teacher_update_index": teacher_update_index,
-                        "dual_domain_teacher_every": dual_domain_every,
+                        "dual_domain_teacher_every": _scheduled_teacher_every(
+                            step, training
+                        ),
+                        "dual_domain_teacher_schedule": training.get(
+                            "dual_domain_teacher_schedule", []
+                        ),
                     },
                 )
                 _save_state(
@@ -2392,7 +2701,12 @@ def _train_variant(
                     cache_summary=cache_summary,
                     trainer_state={
                         "dual_domain_teacher_update_index": teacher_update_index,
-                        "dual_domain_teacher_every": dual_domain_every,
+                        "dual_domain_teacher_every": _scheduled_teacher_every(
+                            step, training
+                        ),
+                        "dual_domain_teacher_schedule": training.get(
+                            "dual_domain_teacher_schedule", []
+                        ),
                     },
                 )
             if sample_every and (step % sample_every == 0 or step == steps):
@@ -2828,6 +3142,83 @@ def smoke_test_global_query_multimode_style_tokenizer(
     config: dict[str, Any], destination: Path
 ) -> dict[str, Any]:
     return _run_global_query_multimode_style_tokenizer(
+        config, destination, smoke=True
+    )
+
+
+def _run_slot_preserving_global_query_style_tokenizer(
+    config: dict[str, Any], destination: Path, *, smoke: bool
+) -> dict[str, Any]:
+    cfg = copy.deepcopy(config["slot_preserving_global_query_style_tokenizer"])
+    output_name = str(cfg["output_directory"])
+    if smoke:
+        output_name += "_smoke"
+        training = cfg["training"]
+        training.update(
+            {
+                "steps": 2,
+                "log_every": 1,
+                "validation_every": 0,
+                "checkpoint_every": 1,
+                "sample_every": 0,
+                "fixed_sample_every": 0,
+                "extended_evaluation_every": 0,
+                "resume": False,
+                "wandb": {"enabled": False},
+                "dual_domain_teacher_schedule": [
+                    {"end_step": 2, "every": 1}
+                ],
+                "centered_energy_ramp_end_step": 1,
+                "centered_energy_weight_ramp_end_step": 1,
+                "common_output_start_step": 1,
+                "common_output_ramp_end_step": 1,
+                "artist_teacher_contrastive_start_step": 1,
+                "artist_teacher_contrastive_ramp_end_step": 1,
+                "artist_teacher_ranking_start_step": 1,
+                "artist_teacher_ranking_ramp_end_step": 1,
+            }
+        )
+        training["dual_domain_teacher"]["every"] = 1
+        for domain in ("human", "synthetic"):
+            training["dual_domain_teacher"][domain]["ramp_steps"] = 0
+    effective = copy.deepcopy(config)
+    effective["dual_query_style_tokenizer"] = cfg
+    device = str(cfg["training"].get("device", "cuda"))
+    anima = _resolve_anima_model(effective, destination, device).requires_grad_(
+        False
+    ).eval()
+    _optimize_frozen_anima(
+        anima,
+        low_precision_rmsnorm=bool(
+            cfg["training"].get("low_precision_rmsnorm", True)
+        ),
+        fuse_attention_projections=bool(
+            cfg["training"].get("fuse_attention_projections", True)
+        ),
+    )
+    return _train_variant(
+        effective,
+        destination,
+        anima,
+        include_artist_summary=True,
+        output_name=output_name,
+        steps_override=int(cfg["training"].get("steps", 8_000)),
+        cfg_override=cfg,
+    )
+
+
+def train_slot_preserving_global_query_style_tokenizer(
+    config: dict[str, Any], destination: Path
+) -> dict[str, Any]:
+    return _run_slot_preserving_global_query_style_tokenizer(
+        config, destination, smoke=False
+    )
+
+
+def smoke_test_slot_preserving_global_query_style_tokenizer(
+    config: dict[str, Any], destination: Path
+) -> dict[str, Any]:
+    return _run_slot_preserving_global_query_style_tokenizer(
         config, destination, smoke=True
     )
 

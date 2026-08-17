@@ -2457,6 +2457,226 @@ global_query_multimode_style_tokenizer:
     batch_size: 4
     vae_batch_size: 4
 
+slot_preserving_global_query_style_tokenizer:
+  output_directory: slot_preserving_global_query_multimode_8k_v1
+  seed: 20260818
+  train_split: train
+  validation_split: validation
+  resampler_checkpoint: dual_query_resampler_bprime_v8/checkpoints/step-010000.pt
+  cache:
+    output_directory: dual_query_reference_tokens_v8_step10000
+  text_cache:
+    output_directory: anima_text_cache_post_llm_multimode_v1
+  loader:
+    batch_size: 4
+    min_references: 1
+    max_references: 8
+    artist_balanced: true
+    self_reference_target_images_per_style: 0
+    text_cache: anima_text_cache_post_llm_multimode_v1
+    text_conditioning_length: 512
+    text_lru_shards: 6
+    latent_lru_shards: 4
+    token_lru_shards: 8
+    ram_resident_tokens: true
+    ram_preload_workers: 8
+    prompt_modes:
+      full: 0.30
+      tag_dropout: 0.40
+      short: 0.20
+      empty: 0.10
+      quality_probability: 0.50
+    validation_prompt_modes:
+      full: 1.0
+      tag_dropout: 0.0
+      short: 0.0
+      empty: 0.0
+    validation_quality_probability: 0.0
+  model:
+    architecture: slot_preserving_global_query
+    dim: 1024
+    spatial_tokens: 64
+    global_tokens: 16
+    artist_summary_tokens: 4
+    include_artist_summary: true
+    output_tokens: 16
+    heads: 16
+    local_layers: 1
+    cross_layers: 2
+    ff_dim: 2048
+    slot_rank: 32
+    slot_query_delta_scale: 0.10
+    output_rms_init: 0.15
+  training:
+    device: cuda
+    steps: 8000
+    learning_rate: 0.0001
+    betas: [0.9, 0.999]
+    adam_eps: 0.00000001
+    weight_decay: 0.01
+    warmup_steps: 400
+    minimum_lr_ratio: 0.10
+    max_grad_norm: 1.0
+    gradient_accumulation_steps: 4
+    fused_adamw: true
+    allow_tf32: true
+    low_precision_rmsnorm: true
+    fuse_attention_projections: true
+    timestep_sampling: shift
+    sigmoid_scale: 1.0
+    sigmoid_bias: 0.0
+    discrete_flow_shift: 3.0
+    prefetch_workers: 2
+    prefetch_batches: 6
+    resume: true
+    pilot_enabled: true
+    reference_schedule:
+      - name: target_excluded_1_8
+        end_step: 8000
+        exact_self: false
+        min_references: 1
+        max_references: 8
+        reference_count_weights: [0.45, 0.25, 0.12, 0.07, 0.04, 0.03, 0.02, 0.02]
+    exact_self_end_step: 0
+    heldout_normalized_residual_weight: 0.0
+    heldout_aligned_floor_weight: 0.0
+    heldout_bounded_weight: 0.0
+    exact_projection_target_weight: 0.0
+    reconstruction_weight: 0.0
+    reconstruction_final_weight: 0.0
+    artist_contrastive_weight: 0.0
+    token_contrastive_weight: 0.0
+    subset_consistency_weight: 0.0
+    wrong_ranking_weight: 0.0
+    functional_probe_enabled: false
+
+    # Slot identity is structural. These old proxy losses are retained only as
+    # zero-weight diagnostics; actual frozen-Anima K/V values are regularized.
+    slot_diversity_weight: 0.0
+    attention_diversity_weight: 0.0
+    reference_conditioned_diversity_weight: 0.0
+    diversity_ramp_steps: 500
+    functional_value_diversity_weight: 0.01
+    functional_value_blocks: [0, 4, 8, 12, 16, 20, 24, 27]
+    functional_value_slot_energy_floor: 0.20
+    functional_value_reference_energy_floor: 0.03
+    functional_value_decorrelation_fraction: 0.10
+    context_rms_weight: 0.0
+    context_rms_minimum: 0.08
+    context_rms_maximum: 0.25
+
+    # Artist-specific supervision is centered at fixed content/timestep and
+    # must retain a substantial fraction of the teacher's absolute energy.
+    center_student_teacher: true
+    centered_energy_start_step: 1
+    centered_energy_ramp_end_step: 1500
+    centered_energy_ratio_start: 0.30
+    centered_energy_ratio_end: 0.80
+    centered_energy_ratio_maximum: 1.40
+    centered_energy_weight: 0.05
+    centered_energy_weight_ramp_end_step: 500
+    common_output_weight: 0.02
+    common_output_start_step: 1000
+    common_output_ramp_end_step: 2000
+    common_output_threshold_start: 0.85
+    common_output_threshold_end: 0.55
+    common_output_threshold_end_step: 8000
+    artist_teacher_contrastive_weight: 0.02
+    artist_teacher_contrastive_start_step: 750
+    artist_teacher_contrastive_ramp_end_step: 1500
+    artist_teacher_temperature: 0.07
+    artist_teacher_ranking_weight: 0.02
+    artist_teacher_ranking_start_step: 1000
+    artist_teacher_ranking_ramp_end_step: 2000
+    artist_teacher_ranking_margin: 0.10
+
+    # Dense early teacher use establishes artist directions before the normal
+    # flow objective can settle into a weak common-output shortcut.
+    dual_domain_teacher_schedule:
+      - {end_step: 1000, every: 1}
+      - {end_step: 3000, every: 2}
+      - {end_step: 8000, every: 4}
+    dual_domain_teacher:
+      enabled: true
+      every: 1
+      fuse_domain_forward: true
+      bank_config_key: dual_domain_native_teacher
+      synthetic_reference_cache: synthetic_teacher_500x16/dual_query_reference_tokens_v8_step10000
+      validation_batches: 16
+      human:
+        source_split: train
+        start_step: 1
+        ramp_steps: 250
+        weight: 0.05
+        direction_weight: 0.10
+        magnitude_weight: 0.05
+        huber_beta: 0.10
+        scale_floor: 0.0001
+        batch_rows: 4
+        references: 4
+        prefetch_workers: 1
+        prefetch_batches: 4
+        ram_resident_tokens: true
+        ram_preload_workers: 8
+      synthetic:
+        start_step: 1
+        ramp_steps: 250
+        weight: 0.05
+        direction_weight: 0.10
+        magnitude_weight: 0.05
+        huber_beta: 0.10
+        scale_floor: 0.0001
+        batch_rows: 4
+        references: 4
+        token_lru_shards: 8
+        prefetch_workers: 1
+        prefetch_batches: 4
+        ram_resident_tokens: true
+        ram_preload_workers: 4
+    sample_modes: [heldout]
+    log_every: 10
+    validation_every: 250
+    validation_batches: 8
+    checkpoint_every: 250
+    sample_every: 500
+    fixed_sample_every: 1000
+    extended_evaluation_every: 1000
+    reference_evaluation_batches: 8
+    controlled_evaluation_artists: 4
+    controlled_evaluation:
+      references_per_view: 4
+      timesteps: [0.2, 0.4, 0.65, 0.85]
+      inference_batch_size: 4
+    wandb:
+      enabled: true
+      project: anima-style-adapter
+      name: slot-preserving-global-query-multimode-8k-v1
+      id: slot-preserving-global-query-multimode-8k-v1
+  fixed_reference_sampling:
+    cache_directory: dual_query_external_reference_cache_v1
+    device: cuda
+    prompt: "masterpiece, best quality, score_7, safe, Tateyama Ayano, upper body shot, close up, blue sky, smile,"
+    negative_prompt: "worst quality, low quality, score_1, score_2, score_3, artist name, blurry, jpeg artifacts,"
+    generation:
+      output_directory: dual_query_external_reference_cache_v1
+      width: 832
+      height: 1024
+      cfg: 4.0
+      steps: 30
+      flow_shift: 3.0
+      batch_size: 4
+      vae_batch_size: 4
+  sampling:
+    width: 768
+    height: 768
+    steps: 30
+    flow_shift: 3.0
+    seed: 20260818
+    text_cfg: 4.0
+    guidance_mode: shared
+    batch_size: 4
+    vae_batch_size: 4
+
 style_tokenizer_selection:
   source_config_section: style_tokenizer_generalization
   device: cuda
