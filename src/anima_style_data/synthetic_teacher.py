@@ -583,10 +583,28 @@ def generate_synthetic_teacher_images(
             len(condition_ids), *negative.shape[1:],
             device=device, dtype=torch.bfloat16,
         )
-        for condition_id in condition_ids:
-            condition_bank[condition_id].copy_(
-                condition_cpu(condition_id), non_blocking=False
+        rows_by_shard: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        for row in condition_rows:
+            rows_by_shard[str(row["cache_shard"])].append(row)
+        for shard_name, shard_rows in sorted(rows_by_shard.items()):
+            source = load_file(
+                text_root / shard_name, device="cpu"
+            )["conditioning"]
+            source_rows = torch.tensor(
+                [int(row["row_index"]) for row in shard_rows], dtype=torch.long
             )
+            destination_rows = torch.tensor(
+                [int(row["condition_id"]) for row in shard_rows],
+                device=device, dtype=torch.long,
+            )
+            condition_bank.index_copy_(
+                0,
+                destination_rows,
+                source.index_select(0, source_rows).pin_memory().to(
+                    device=device, dtype=torch.bfloat16, non_blocking=True
+                ),
+            )
+        torch.cuda.synchronize()
         negative = negative.to(device=device, dtype=torch.bfloat16)
         condition_shards.clear()
         print(
