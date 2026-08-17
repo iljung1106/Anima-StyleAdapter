@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import gc
 import hashlib
+import json
 import math
 import random
 import re
@@ -367,44 +368,68 @@ def _save_webp(path: Path, pixels, quality: int) -> None:
     temporary.replace(path)
 
 
-def _dct_downscale(value, scale: float):
-    import numpy as np
-    import torch
-    from scipy.fft import dctn, idctn
+_DCT_MATRIX_CACHE: dict[tuple[int, str, int | None], Any] = {}
 
-    source = value.detach().float().cpu().numpy()
-    height, width = source.shape[-2:]
+
+def _orthonormal_dct_matrix(size: int, device):
+    """Return a cached float32 orthonormal DCT-II matrix on ``device``."""
+    import torch
+
+    key = (int(size), device.type, device.index)
+    cached = _DCT_MATRIX_CACHE.get(key)
+    if cached is not None:
+        return cached
+    positions = torch.arange(size, device=device, dtype=torch.float32) + 0.5
+    frequencies = torch.arange(size, device=device, dtype=torch.float32)[:, None]
+    matrix = torch.cos(math.pi * frequencies * positions[None] / size)
+    matrix.mul_(math.sqrt(2.0 / size))
+    matrix[0].fill_(1.0 / math.sqrt(size))
+    _DCT_MATRIX_CACHE[key] = matrix
+    return matrix
+
+
+def _dct2(value):
+    matrix_h = _orthonormal_dct_matrix(value.shape[-2], value.device)
+    matrix_w = _orthonormal_dct_matrix(value.shape[-1], value.device)
+    source = value.float().flatten(0, -3)
+    transformed = matrix_h @ source @ matrix_w.T
+    return transformed.unflatten(0, value.shape[:-2])
+
+
+def _idct2(value):
+    matrix_h = _orthonormal_dct_matrix(value.shape[-2], value.device)
+    matrix_w = _orthonormal_dct_matrix(value.shape[-1], value.device)
+    source = value.float().flatten(0, -3)
+    transformed = matrix_h.T @ source @ matrix_w
+    return transformed.unflatten(0, value.shape[:-2])
+
+
+def _dct_downscale(value, scale: float):
+    height, width = value.shape[-2:]
     target = (round(height * scale), round(width * scale))
-    output = np.empty((*source.shape[:-2], *target), dtype=np.float32)
-    for index in np.ndindex(*source.shape[:-2]):
-        coefficients = dctn(source[index], type=2, norm="ortho")
-        output[index] = idctn(
-            coefficients[: target[0], : target[1]], type=2, norm="ortho"
-        ).astype(np.float32)
-    return torch.from_numpy(output).to(device=value.device, dtype=value.dtype)
+    coefficients = _dct2(value)
+    return _idct2(coefficients[..., : target[0], : target[1]]).to(value.dtype)
 
 
 def _dct_expand(value, target: tuple[int, int], timestep: float, seeds: list[int]):
-    import numpy as np
     import torch
-    from scipy.fft import dctn, idctn
 
-    source = value.detach().float().cpu().numpy()
-    output = np.empty((*source.shape[:-2], *target), dtype=np.float32)
-    for batch_index in range(source.shape[0]):
-        rng = np.random.default_rng(int(seeds[batch_index]) + 10_000)
-        for leading in np.ndindex(*source.shape[1:-2]):
-            index = (batch_index, *leading)
-            coefficients = dctn(source[index], type=2, norm="ortho")
-            expanded = (float(timestep) * rng.standard_normal(target)).astype(np.float32)
-            expanded[: source.shape[-2], : source.shape[-1]] = coefficients
-            output[index] = idctn(expanded, type=2, norm="ortho").astype(np.float32)
-    ratio = target[0] / source.shape[-2]
+    coefficients = _dct2(value)
+    expanded_rows = []
+    for batch_index, seed in enumerate(seeds):
+        generator = torch.Generator(device=value.device).manual_seed(int(seed) + 10_000)
+        expanded = float(timestep) * torch.randn(
+            (*value.shape[1:-2], *target),
+            device=value.device,
+            dtype=torch.float32,
+            generator=generator,
+        )
+        expanded[..., : value.shape[-2], : value.shape[-1]] = coefficients[batch_index]
+        expanded_rows.append(expanded)
+    output = _idct2(torch.stack(expanded_rows))
+    ratio = target[0] / value.shape[-2]
     kappa = ratio / (1.0 + (ratio - 1.0) * float(timestep))
-    return (
-        torch.from_numpy(output * kappa).to(device=value.device, dtype=value.dtype),
-        float(timestep) * kappa,
-    )
+    return (output.mul_(kappa).to(value.dtype), float(timestep) * kappa)
 
 
 def _sample_anima_batch(
@@ -490,7 +515,6 @@ def _validate_batched_vae(vae, latents) -> dict[str, float]:
 def generate_synthetic_teacher_images(
     config: dict[str, Any], destination: Path, plan: list[dict[str, Any]], *, benchmark_only: bool = False
 ) -> dict[str, Any]:
-    import numpy as np
     import torch
     from safetensors.torch import load_file, save_file
 
@@ -513,11 +537,6 @@ def generate_synthetic_teacher_images(
     device = str(cfg.get("device", "cuda"))
     attn_mode = "sageattn" if bool(cfg.get("sage_attention", True)) else "torch"
     anima = _resolve_anima_model(config, destination, device, attn_mode=attn_mode).requires_grad_(False).eval()
-    if bool(cfg.get("torch_compile", True)):
-        anima = torch.compile(
-            anima, mode=str(cfg.get("compile_mode", "reduce-overhead")),
-            fullgraph=False, dynamic=False,
-        )
     vae = _load_sampling_vae(config, destination).to(device=device, dtype=torch.bfloat16)
     vae.requires_grad_(False).eval()
     text_root = root / "text"
@@ -525,7 +544,6 @@ def generate_synthetic_teacher_images(
     condition_index = {int(row["condition_id"]): row for row in condition_rows}
     condition_shards: dict[str, torch.Tensor] = {}
     negative = load_file(text_root / "negative.safetensors", device="cpu")["conditioning"]
-    batch_size = int(cfg.get("batch_size", 8))
     width = int(cfg.get("width", 512))
     height = int(cfg.get("height", 512))
     latent_h, latent_w = height // 8, width // 8
@@ -534,6 +552,7 @@ def generate_synthetic_teacher_images(
     shift = float(cfg.get("flow_shift", 3.0))
     sigmas = torch.linspace(1.0, 0.0, steps + 1, device=device, dtype=torch.float32)
     sigmas = (sigmas * shift) / (1 + (shift - 1) * sigmas)
+    speed_cfg = dict(cfg.get("speed", {}))
     shard_rows = int(cfg.get("latent_shard_rows", 256))
     image_workers = int(cfg.get("image_writer_workers", 8))
     webp_quality = int(cfg.get("webp_quality", 95))
@@ -543,15 +562,198 @@ def generate_synthetic_teacher_images(
     shard_index = len(list(manifest_dir.glob("part-*.parquet")))
     output_rows = list(completed_rows)
     started = time.monotonic()
-    benchmark_path = root / "benchmark.json"
+    benchmark_path = root / "benchmark-gpu-dct-v1.json"
     benchmark_done = benchmark_path.exists()
 
-    def condition(condition_id: int) -> torch.Tensor:
+    def condition_cpu(condition_id: int) -> torch.Tensor:
         row = condition_index[condition_id]
         name = str(row["cache_shard"])
         if name not in condition_shards:
             condition_shards[name] = load_file(text_root / name, device="cpu")["conditioning"]
         return condition_shards[name][int(row["row_index"])]
+
+    # The complete 500-artist text bank is about 4 GiB.  Keeping it on an
+    # 80-GiB H100 avoids a pageable CPU->GPU copy at every denoising batch.
+    condition_bank = None
+    if bool(cfg.get("gpu_resident_text", True)) and device.startswith("cuda"):
+        condition_ids = sorted(condition_index)
+        if condition_ids != list(range(len(condition_ids))):
+            raise RuntimeError("Synthetic condition IDs must be dense for GPU residency")
+        condition_bank = torch.empty(
+            len(condition_ids), *negative.shape[1:],
+            device=device, dtype=torch.bfloat16,
+        )
+        for condition_id in condition_ids:
+            condition_bank[condition_id].copy_(
+                condition_cpu(condition_id), non_blocking=False
+            )
+        negative = negative.to(device=device, dtype=torch.bfloat16)
+        condition_shards.clear()
+        print(
+            f"resident synthetic text bank {len(condition_ids)} conditions "
+            f"({condition_bank.numel() * condition_bank.element_size() / 2**30:.2f} GiB)",
+            flush=True,
+        )
+
+    def conditions_for(rows: list[dict[str, Any]]) -> torch.Tensor:
+        ids = [int(row["artist_condition_id"]) for row in rows]
+        if condition_bank is not None:
+            return condition_bank.index_select(
+                0, torch.tensor(ids, device=device, dtype=torch.long)
+            )
+        return torch.stack([condition_cpu(value) for value in ids]).to(
+            device=device, dtype=torch.bfloat16
+        )
+
+    def noise_for(rows: list[dict[str, Any]]) -> torch.Tensor:
+        return torch.stack([
+            torch.randn(
+                16, 1, latent_h, latent_w,
+                generator=torch.Generator(device=device).manual_seed(
+                    int(row["generation_seed"])
+                ),
+                device=device,
+                dtype=torch.bfloat16,
+            )
+            for row in rows
+        ])
+
+    work.sort(
+        key=lambda row: (
+            int(row["content_index"]), int(row["artist_index"]), int(row["seed_index"])
+        )
+    )
+
+    batch_size = int(cfg.get("batch_size", 8))
+    autotune_cfg = dict(cfg.get("batch_autotune", {}))
+    autotune_path = root / "batch_autotune.json"
+    if bool(autotune_cfg.get("enabled", False)) and device.startswith("cuda"):
+        candidates = sorted({
+            int(value) for value in autotune_cfg.get("candidates", [batch_size])
+            if 0 < int(value) <= len(work)
+        })
+        signature = {
+            "version": "synthetic-batch-autotune-gpu-dct-v1",
+            "candidates": candidates,
+            "width": width,
+            "height": height,
+            "steps": steps,
+            "speed": speed_cfg,
+            "attention_backend": attn_mode,
+        }
+        cached_tune = None
+        if autotune_path.exists():
+            candidate_cache = json.loads(autotune_path.read_text(encoding="utf-8"))
+            if candidate_cache.get("signature") == signature:
+                cached_tune = candidate_cache
+        if cached_tune is None:
+            results = []
+            maximum_fraction = float(
+                autotune_cfg.get("maximum_vram_fraction", 0.90)
+            )
+            total_memory = torch.cuda.get_device_properties(device).total_memory
+            warmups = max(0, int(autotune_cfg.get("warmup_runs", 1)))
+            timed_runs = max(1, int(autotune_cfg.get("timed_runs", 1)))
+            for candidate in candidates:
+                probe_rows = work[:candidate]
+                positive_probe = negative_probe = noise_probe = None
+                sampled = decoded_probe = warm = None
+                try:
+                    positive_probe = conditions_for(probe_rows)
+                    negative_probe = negative.expand(candidate, -1, -1).to(
+                        device=device, dtype=torch.bfloat16
+                    )
+                    noise_probe = noise_for(probe_rows)
+                    torch.cuda.empty_cache()
+                    torch.cuda.reset_peak_memory_stats(device)
+                    with torch.inference_mode(), torch.autocast(
+                        "cuda", dtype=torch.bfloat16
+                    ):
+                        for _ in range(warmups):
+                            warm = _sample_anima_batch(
+                                anima, noise_probe, positive_probe, negative_probe,
+                                sigmas, text_cfg=text_cfg, speed=speed_cfg,
+                                generation_seeds=[
+                                    int(row["generation_seed"]) for row in probe_rows
+                                ],
+                            )
+                            vae.decode_to_pixels(warm)
+                    warm = None
+                    torch.cuda.synchronize()
+                    started_tune = time.perf_counter()
+                    finite = True
+                    with torch.inference_mode(), torch.autocast(
+                        "cuda", dtype=torch.bfloat16
+                    ):
+                        for _ in range(timed_runs):
+                            sampled = _sample_anima_batch(
+                                anima, noise_probe, positive_probe, negative_probe,
+                                sigmas, text_cfg=text_cfg, speed=speed_cfg,
+                                generation_seeds=[
+                                    int(row["generation_seed"]) for row in probe_rows
+                                ],
+                            )
+                            decoded_probe = vae.decode_to_pixels(sampled)
+                            finite = finite and bool(torch.isfinite(decoded_probe).all())
+                    torch.cuda.synchronize()
+                    elapsed_tune = time.perf_counter() - started_tune
+                    peak = int(torch.cuda.max_memory_allocated(device))
+                    result = {
+                        "batch_size": candidate,
+                        "images_s": candidate * timed_runs / max(elapsed_tune, 1e-9),
+                        "elapsed_s": elapsed_tune,
+                        "peak_vram_bytes": peak,
+                        "peak_vram_fraction": peak / total_memory,
+                        "finite": finite,
+                        "eligible": finite and peak / total_memory <= maximum_fraction,
+                    }
+                    results.append(result)
+                    print(f"synthetic batch autotune {result}", flush=True)
+                except torch.cuda.OutOfMemoryError:
+                    results.append({
+                        "batch_size": candidate, "eligible": False, "oom": True
+                    })
+                    print(f"synthetic batch autotune batch={candidate} OOM", flush=True)
+                finally:
+                    positive_probe = negative_probe = noise_probe = None
+                    sampled = decoded_probe = warm = None
+                    gc.collect()
+                    torch.cuda.empty_cache()
+            eligible = [row for row in results if row.get("eligible")]
+            if not eligible:
+                raise RuntimeError("Every synthetic batch-size candidate failed")
+            selected = max(eligible, key=lambda row: float(row["images_s"]))
+            cached_tune = {
+                "signature": signature,
+                "selected_batch_size": int(selected["batch_size"]),
+                "results": results,
+            }
+            write_json(autotune_path, cached_tune)
+        batch_size = int(cached_tune["selected_batch_size"])
+        print(f"selected synthetic batch size {batch_size}", flush=True)
+
+    if bool(cfg.get("torch_compile", True)):
+        anima = torch.compile(
+            anima, mode=str(cfg.get("compile_mode", "reduce-overhead")),
+            fullgraph=False, dynamic=False,
+        )
+
+    transfer_stream = torch.cuda.Stream(device=device) if device.startswith("cuda") else None
+    pixel_buffers = [
+        torch.empty(
+            batch_size, height, width, 3,
+            dtype=torch.uint8, device="cpu", pin_memory=device.startswith("cuda"),
+        )
+        for _ in range(2)
+    ]
+    latent_buffers = [
+        torch.empty(
+            batch_size, 16, latent_h, latent_w,
+            dtype=torch.float16, device="cpu", pin_memory=device.startswith("cuda"),
+        )
+        for _ in range(2)
+    ]
+    transfers: list[dict[str, Any]] = []
 
     def flush() -> None:
         nonlocal shard_buffer, shard_index
@@ -570,32 +772,53 @@ def generate_synthetic_teacher_images(
         shard_buffer = []
         shard_index += 1
 
-    # Grouping by artist condition keeps text shards hot while seed/content are
-    # still fully crossed in the deterministic plan.
-    work.sort(key=lambda row: (int(row["content_index"]), int(row["artist_index"]), int(row["seed_index"])))
-    for offset in range(0, len(work), batch_size):
-        batch = work[offset : offset + batch_size]
-        positive = torch.stack([condition(int(row["artist_condition_id"])) for row in batch]).to(
-            device=device, dtype=torch.bfloat16
-        )
-        negative_batch = negative.expand(len(batch), -1, -1).to(device=device, dtype=torch.bfloat16)
-        noise = torch.stack([
-            torch.randn(
-                16, 1, latent_h, latent_w,
-                generator=torch.Generator(device="cpu").manual_seed(int(row["generation_seed"])),
-                dtype=torch.float32,
+    def consume_transfer(item: dict[str, Any]) -> None:
+        item["event"].synchronize()
+        count = len(item["rows"])
+        pixels_cpu = pixel_buffers[item["buffer"]][:count].numpy()
+        latents_cpu = latent_buffers[item["buffer"]][:count]
+        for row, latent, image_pixels in zip(
+            item["rows"], latents_cpu, pixels_cpu, strict=True
+        ):
+            relative = (
+                Path("images") / str(row["artist_slug"])
+                / f"{int(row['content_index'])}-{int(row['seed_index'])}.webp"
             )
-            for row in batch
-        ]).to(device=device, dtype=torch.bfloat16)
+            # The writer outlives this reusable pinned buffer, so give it a
+            # compact owned array while the much larger D2H copy stays async.
+            pending.append(
+                writer.submit(
+                    _save_webp, root / relative, image_pixels.copy(), webp_quality
+                )
+            )
+            record = {
+                **row, "local_path": str((root / relative).resolve()),
+                "width": width, "height": height,
+                "latent_height": latent_h, "latent_width": latent_w,
+                "steps": steps, "text_cfg": text_cfg, "flow_shift": shift,
+                "attention_backend": attn_mode,
+            }
+            shard_buffer.append((record, latent.clone().contiguous()))
+            if len(shard_buffer) >= shard_rows:
+                flush()
+        if len(pending) >= image_workers * 4:
+            pending.pop(0).result()
+
+    for batch_number, offset in enumerate(range(0, len(work), batch_size)):
+        if len(transfers) >= 2:
+            consume_transfer(transfers.pop(0))
+        batch = work[offset : offset + batch_size]
+        positive = conditions_for(batch)
+        negative_batch = negative.expand(len(batch), -1, -1).to(device=device, dtype=torch.bfloat16)
+        noise = noise_for(batch)
         x = noise
-        speed_cfg = dict(cfg.get("speed", {}))
         with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
             x = _sample_anima_batch(
                 anima, x, positive, negative_batch, sigmas, text_cfg=text_cfg,
                 speed=speed_cfg,
                 generation_seeds=[int(row["generation_seed"]) for row in batch],
             )
-            decoded = vae.decode_to_pixels(x).float()
+            decoded = vae.decode_to_pixels(x)
         if not benchmark_done:
             # Benchmark on the first real production batch. The baseline uses
             # identical prompts/noise and is saved beside SPEED for visual QA.
@@ -619,17 +842,21 @@ def generate_synthetic_teacher_images(
                 )
             torch.cuda.synchronize()
             speed_s = time.monotonic() - speed_started
-            vae_validation = _validate_batched_vae(vae, speed_x)
+            comparison_rows = min(8, len(batch))
+            vae_validation = _validate_batched_vae(vae, speed_x[:comparison_rows])
             with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
-                comparison = vae.decode_to_pixels(torch.cat((baseline_x, speed_x))).float()
+                comparison = vae.decode_to_pixels(torch.cat((
+                    baseline_x[:comparison_rows], speed_x[:comparison_rows]
+                ))).float()
             if comparison.ndim == 5:
                 comparison = comparison[:, :, 0]
             compare_pixels = ((comparison.clamp(-1, 1) + 1) * 127.5).byte().permute(0, 2, 3, 1).cpu().numpy()
-            columns = len(batch)
+            columns = comparison_rows
             sheet = Image.new("RGB", (width * columns, height * 2), "white")
             for index, value in enumerate(compare_pixels):
                 sheet.paste(Image.fromarray(value), ((index % columns) * width, (index // columns) * height))
-            sheet.save(root / "benchmark-baseline-top-speed-bottom.webp", format="WEBP", quality=95)
+            comparison_path = root / "benchmark-gpu-dct-baseline-top-speed-bottom.webp"
+            sheet.save(comparison_path, format="WEBP", quality=95)
             benchmark = {
                 "batch_size": len(batch), "baseline_s": baseline_s, "speed_s": speed_s,
                 "speedup": baseline_s / max(speed_s, 1e-9),
@@ -637,7 +864,7 @@ def generate_synthetic_teacher_images(
                 "baseline_finite": bool(torch.isfinite(baseline_x).all()),
                 "speed_finite": bool(torch.isfinite(speed_x).all()),
                 "vae": vae_validation,
-                "comparison": str((root / "benchmark-baseline-top-speed-bottom.webp").resolve()),
+                "comparison": str(comparison_path.resolve()),
             }
             write_json(benchmark_path, benchmark)
             print(f"synthetic benchmark {benchmark}", flush=True)
@@ -650,23 +877,29 @@ def generate_synthetic_teacher_images(
                 return {"benchmark_only": True, **benchmark}
         if decoded.ndim == 5:
             decoded = decoded[:, :, 0]
-        pixels = ((decoded.clamp(-1, 1) + 1) * 127.5).byte().permute(0, 2, 3, 1).cpu().numpy()
-        latents = x[:, :, 0].to(device="cpu", dtype=torch.float16)
-        for row, latent, image_pixels in zip(batch, latents, pixels, strict=True):
-            relative = Path("images") / str(row["artist_slug"]) / f"{int(row['content_index'])}-{int(row['seed_index'])}.webp"
-            pending.append(writer.submit(_save_webp, root / relative, image_pixels, webp_quality))
-            record = {
-                **row, "local_path": str((root / relative).resolve()),
-                "width": width, "height": height,
-                "latent_height": latent_h, "latent_width": latent_w,
-                "steps": steps, "text_cfg": text_cfg, "flow_shift": shift,
-                "attention_backend": attn_mode,
-            }
-            shard_buffer.append((record, latent.contiguous()))
-            if len(shard_buffer) >= shard_rows:
-                flush()
-        if len(pending) >= image_workers * 4:
-            pending.pop(0).result()
+        pixels_gpu = (
+            (decoded.clamp(-1, 1) + 1).mul_(127.5).to(torch.uint8)
+            .permute(0, 2, 3, 1).contiguous()
+        )
+        latents_gpu = x[:, :, 0].to(dtype=torch.float16).contiguous()
+        buffer_index = batch_number % 2
+        assert transfer_stream is not None
+        transfer_stream.wait_stream(torch.cuda.current_stream(device))
+        with torch.cuda.stream(transfer_stream):
+            pixel_buffers[buffer_index][: len(batch)].copy_(
+                pixels_gpu, non_blocking=True
+            )
+            latent_buffers[buffer_index][: len(batch)].copy_(
+                latents_gpu, non_blocking=True
+            )
+            event = torch.cuda.Event()
+            event.record(transfer_stream)
+        transfers.append({
+            "event": event,
+            "buffer": buffer_index,
+            "rows": batch,
+            "gpu_sources": (pixels_gpu, latents_gpu, decoded, x),
+        })
         done = offset + len(batch)
         if done % max(batch_size * 10, 100) == 0 or done == len(work):
             elapsed = time.monotonic() - started
@@ -675,6 +908,8 @@ def generate_synthetic_teacher_images(
                 f"({done / max(elapsed, 1e-6):.3f} images/s, batch={len(batch)})",
                 flush=True,
             )
+    for transfer in transfers:
+        consume_transfer(transfer)
     flush()
     for future in pending:
         future.result()

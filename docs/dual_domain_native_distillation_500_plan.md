@@ -60,6 +60,14 @@ Dual-query Resampler는 업데이트하지 않으며 약 9.48M compact Style Tok
 ## 최적화와 관찰
 
 - fused AdamW, LR 1e-4, 100-step warmup, cosine decay, grad clip 1.0
+- Synthetic 생성은 GPU DCT 기반 SPEED, GPU-resident text condition,
+  batch 8/16/24/32 실측 자동 선택, pinned D2H double buffer를 사용
+- Native teacher는 기존 synthetic text cache를 재사용하고 artist batch를
+  8/16/24/32 중 실측 선택하며, centered effect를 GPU에서 계산
+- 2 TiB host RAM에 Human/Synthetic reference-token shard를 한 번만 상주시켜
+  NFS random-read 반복을 제거
+- Human/Anima teacher loss는 독립적으로 계산하되 같은 shape의 forward만
+  batch 8로 결합하여 H100 kernel occupancy를 높임
 - 250 step마다 일반 validation과 human/synthetic teacher validation
 - teacher validation은 고정 16개 content/timestep probe를 평균
 - 250 step마다 checkpoint, 500 step마다 panel, 1,000 step마다 fixed-reference

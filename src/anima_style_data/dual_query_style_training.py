@@ -539,6 +539,148 @@ def _native_centered_teacher_step(
     return weighted, metrics
 
 
+def _dual_domain_centered_teacher_step(
+    anima: torch.nn.Module,
+    tokenizer: torch.nn.Module,
+    bank: NativeCenteredTeacherBank,
+    batches: dict[str, dict[str, Any]],
+    device: str,
+    training_by_domain: dict[str, dict[str, Any]],
+    *,
+    step: int,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Run independent human/synthetic objectives in one larger Anima batch."""
+    domains = ("human_teacher", "synthetic_teacher")
+    prepared = []
+    for domain in domains:
+        batch = batches[domain]
+        domain_training = training_by_domain[domain]
+        references, reference_mask = _reference_inputs(batch, device, "heldout")
+        rows = min(
+            int(domain_training.get("native_teacher_batch_rows", 4)),
+            references.shape[0],
+        )
+        style_ids = [str(item.style_id) for item in batch["episodes"][:rows]]
+        artist_indices = torch.tensor(
+            [bank.artist_to_index[value] for value in style_ids], dtype=torch.long
+        )
+        prepared.append((
+            domain,
+            domain_training,
+            references[:rows],
+            reference_mask[:rows],
+            artist_indices,
+            rows,
+        ))
+    reference_counts = {item[2].shape[1] for item in prepared}
+    if len(reference_counts) != 1:
+        raise ValueError("Fused teacher domains require the same reference count")
+
+    tensors = bank.tensors
+    contents = int(tensors["noisy_inputs"].shape[0])
+    timestep_count = int(tensors["noisy_inputs"].shape[1])
+    starts = {
+        int(item[1].get("native_teacher_start_step", 1)) for item in prepared
+    }
+    if len(starts) != 1:
+        raise ValueError("Fused teacher domains require the same start step")
+    probe_index = max(0, step - next(iter(starts)))
+    content_index = probe_index % contents
+    timestep_index = (probe_index // contents) % timestep_count
+    noisy = tensors["noisy_inputs"][content_index, timestep_index].to(
+        device=device, dtype=torch.bfloat16, non_blocking=True
+    )
+    base_prediction = tensors["base_predictions"][content_index, timestep_index].to(
+        device=device, dtype=torch.float32, non_blocking=True
+    )
+    all_indices = torch.cat([item[4] for item in prepared])
+    teacher = tensors["centered_teacher"][
+        all_indices, content_index, timestep_index
+    ].to(device=device, dtype=torch.float32, non_blocking=True)
+    context = tensors["base_context"][content_index : content_index + 1].to(
+        device=device, dtype=torch.bfloat16, non_blocking=True
+    )
+    length = tensors["base_lengths"][content_index : content_index + 1].to(
+        device=device, non_blocking=True
+    )
+    timestep = tensors["timesteps"][timestep_index].to(
+        device=device, dtype=torch.bfloat16
+    )
+    references = torch.cat([item[2] for item in prepared])
+    reference_mask = torch.cat([item[3] for item in prepared])
+    total_rows = references.shape[0]
+    with torch.autocast(
+        device_type=torch.device(device).type,
+        dtype=torch.bfloat16,
+        enabled=torch.device(device).type == "cuda",
+    ):
+        output = tokenizer(references, reference_mask)
+        styled = insert_style_tokens(
+            context.expand(total_rows, -1, -1).clone(),
+            length.expand(total_rows),
+            output.tokens,
+        )
+        padding = torch.zeros(
+            total_rows, 1, noisy.shape[-2], noisy.shape[-1],
+            device=device, dtype=noisy.dtype,
+        )
+        prediction = anima(
+            noisy.expand(total_rows, -1, -1, -1).unsqueeze(2),
+            timestep.expand(total_rows), context=styled,
+            padding_mask=padding, target_input_ids=None,
+        ).squeeze(2).float()
+    student = prediction - base_prediction
+    total = student.new_zeros(())
+    metrics: dict[str, torch.Tensor] = {}
+    offset = 0
+    for domain, domain_training, _, _, _, rows in prepared:
+        alignment, domain_metrics = _native_teacher_alignment_loss(
+            student[offset : offset + rows],
+            teacher[offset : offset + rows],
+            huber_beta=float(
+                domain_training.get("native_teacher_huber_beta", 0.10)
+            ),
+            scale_floor=float(
+                domain_training.get("native_teacher_scale_floor", 1e-4)
+            ),
+            direction_weight=float(
+                domain_training.get("native_teacher_direction_weight", 0.10)
+            ),
+            magnitude_weight=float(
+                domain_training.get("native_teacher_magnitude_weight", 0.05)
+            ),
+        )
+        start = int(domain_training.get("native_teacher_start_step", 1))
+        ramp_steps = max(
+            0, int(domain_training.get("native_teacher_ramp_steps", 250))
+        )
+        weight = _linear_ramp(
+            step,
+            start_step=start,
+            end_step=start + ramp_steps,
+            start=0.0 if ramp_steps else float(
+                domain_training.get("native_teacher_weight", 0.10)
+            ),
+            end=float(domain_training.get("native_teacher_weight", 0.10)),
+        )
+        weighted = float(weight) * alignment
+        total = total + weighted
+        domain_metrics.update({
+            "native_teacher_alignment_loss": alignment.detach(),
+            "native_teacher_weight": alignment.new_tensor(weight),
+            "native_teacher_weighted_loss": weighted.detach(),
+            "native_teacher_content_index": alignment.new_tensor(content_index),
+            "native_teacher_timestep": timestep.detach().float(),
+        })
+        metrics.update({
+            key.replace("native_teacher", domain, 1): value
+            for key, value in domain_metrics.items()
+        })
+        offset += rows
+    metrics["dual_domain_fused_batch_rows"] = total.new_tensor(total_rows)
+    return total, metrics
+
+
 def _domain_teacher_training(
     training: dict[str, Any], domain: dict[str, Any]
 ) -> dict[str, Any]:
@@ -1489,6 +1631,12 @@ def _train_variant(
                 references=int(synthetic_cfg.get("references", 4)),
                 seed=seed ^ 0x51A7_0001,
                 token_lru_shards=int(synthetic_cfg.get("token_lru_shards", 8)),
+                ram_resident_tokens=bool(
+                    synthetic_cfg.get("ram_resident_tokens", False)
+                ),
+                ram_preload_workers=int(
+                    synthetic_cfg.get("ram_preload_workers", 8)
+                ),
             )
         )
         dual_domain_validation_loaders["synthetic_teacher"] = (
@@ -1500,6 +1648,12 @@ def _train_variant(
                 references=int(synthetic_cfg.get("references", 4)),
                 seed=seed ^ 0x51A7_0002,
                 token_lru_shards=int(synthetic_cfg.get("token_lru_shards", 8)),
+                ram_resident_tokens=bool(
+                    synthetic_cfg.get("ram_resident_tokens", False)
+                ),
+                ram_preload_workers=int(
+                    synthetic_cfg.get("ram_preload_workers", 8)
+                ),
             )
         )
         dual_domain_training = {
@@ -1791,16 +1945,19 @@ def _train_variant(
                     )
             if dual_domain_enabled:
                 assert dual_domain_bank is not None
-                for domain in ("human_teacher", "synthetic_teacher"):
-                    domain_loss, domain_metrics = _native_centered_teacher_step(
+                domain_batches = {
+                    domain: next(dual_domain_prefetched[domain])
+                    for domain in ("human_teacher", "synthetic_teacher")
+                }
+                if bool(dual_domain_cfg.get("fuse_domain_forward", False)):
+                    domain_loss, domain_metrics = _dual_domain_centered_teacher_step(
                         anima,
                         tokenizer,
                         dual_domain_bank,
-                        next(dual_domain_prefetched[domain]),
+                        domain_batches,
                         device,
-                        dual_domain_training[domain],
+                        dual_domain_training,
                         step=step,
-                        metric_prefix=domain,
                     )
                     if domain_loss.requires_grad:
                         domain_loss.backward()
@@ -1810,6 +1967,26 @@ def _train_variant(
                         row["total_auxiliary_weighted_loss"] = (
                             row["loss"] - row["flow_loss"]
                         )
+                else:
+                    for domain in ("human_teacher", "synthetic_teacher"):
+                        domain_loss, domain_metrics = _native_centered_teacher_step(
+                            anima,
+                            tokenizer,
+                            dual_domain_bank,
+                            domain_batches[domain],
+                            device,
+                            dual_domain_training[domain],
+                            step=step,
+                            metric_prefix=domain,
+                        )
+                        if domain_loss.requires_grad:
+                            domain_loss.backward()
+                        for row in micro_rows:
+                            row.update(domain_metrics)
+                            row["loss"] = row["loss"] + domain_loss.detach()
+                            row["total_auxiliary_weighted_loss"] = (
+                                row["loss"] - row["flow_loss"]
+                            )
             grad_norm = torch.nn.utils.clip_grad_norm_(
                 tokenizer.parameters(), max_grad_norm
             )

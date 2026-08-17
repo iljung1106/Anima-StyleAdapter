@@ -1,4 +1,9 @@
+import torch
+
 from anima_style_data.synthetic_teacher import (
+    _dct2,
+    _dct_downscale,
+    _idct2,
     artist_tag,
     build_synthetic_teacher_plan,
     comfy_literal_artist_tag,
@@ -11,6 +16,18 @@ def test_artist_tag_preserves_literal_parenthesized_name():
     assert normalize_artist_name("foo_(bar)") == "foo (bar)"
     assert artist_tag("foo_(bar)") == "@foo (bar)"
     assert comfy_literal_artist_tag("foo_(bar)") == r"@foo \(bar\)"
+
+
+def test_gpu_compatible_dct_roundtrip_and_low_frequency_crop():
+    value = torch.randn(2, 3, 8, 8)
+    coefficients = _dct2(value)
+
+    assert torch.allclose(_idct2(coefficients), value, atol=1e-5, rtol=1e-5)
+    assert _dct_downscale(value, 0.5).shape == (2, 3, 4, 4)
+    constant = _dct2(torch.ones(1, 1, 8, 8))
+    assert torch.allclose(constant[..., 0, 0], torch.tensor([[8.0]]), atol=1e-5)
+    assert constant[..., 1:, :].abs().max() < 1e-5
+    assert constant[..., :, 1:].abs().max() < 1e-5
 
 
 def test_synthetic_plan_uses_raw_artist_names_and_keeps_style_ids(tmp_path):

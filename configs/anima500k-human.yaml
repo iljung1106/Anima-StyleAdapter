@@ -1085,7 +1085,9 @@ dual_domain_native_teacher:
   timesteps: [0.10, 0.25, 0.40, 0.55, 0.70, 0.82, 0.90, 0.97]
   seed: 20260820
   text_batch_size: 64
-  artist_batch_size: 8
+  artist_batch_size: 16
+  artist_batch_candidates: [8, 16, 24, 32]
+  gpu_resident_text: true
 
 # Clean 2k experiment: random compact tokenizer initialization, regular
 # target-excluded flow MSE on the full human corpus, plus independent human
@@ -1109,6 +1111,8 @@ dual_domain_style_distillation:
     text_lru_shards: 4
     latent_lru_shards: 4
     token_lru_shards: 8
+    ram_resident_tokens: true
+    ram_preload_workers: 8
   model:
     architecture: compact
     source_dim: 1024
@@ -1165,6 +1169,7 @@ dual_domain_style_distillation:
     functional_probe_enabled: false
     dual_domain_teacher:
       enabled: true
+      fuse_domain_forward: true
       bank_config_key: dual_domain_native_teacher
       synthetic_reference_cache: synthetic_teacher_500x16/dual_query_reference_tokens_v8_step10000
       validation_batches: 16
@@ -1181,6 +1186,8 @@ dual_domain_style_distillation:
         references: 4
         prefetch_workers: 1
         prefetch_batches: 4
+        ram_resident_tokens: true
+        ram_preload_workers: 8
       synthetic:
         start_step: 1
         ramp_steps: 250
@@ -1194,6 +1201,8 @@ dual_domain_style_distillation:
         token_lru_shards: 8
         prefetch_workers: 1
         prefetch_batches: 4
+        ram_resident_tokens: true
+        ram_preload_workers: 4
     sample_modes: [heldout]
     log_every: 10
     validation_every: 250
@@ -2367,6 +2376,13 @@ synthetic_teacher:
   text_cfg: 4.0
   flow_shift: 3.0
   batch_size: 8
+  batch_autotune:
+    enabled: true
+    candidates: [8, 16, 24, 32]
+    warmup_runs: 1
+    timed_runs: 1
+    maximum_vram_fraction: 0.90
+  gpu_resident_text: true
   text_batch_size: 64
   text_shard_rows: 128
   latent_shard_rows: 256

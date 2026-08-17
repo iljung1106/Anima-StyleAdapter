@@ -23,6 +23,10 @@ from .dual_query_training import (
     _model_from_config,
 )
 from .io import read_records, write_json, write_records
+
+
+_RESIDENT_TOKEN_BANKS: dict[str, dict[str, torch.Tensor]] = {}
+_RESIDENT_TOKEN_BANKS_LOCK = threading.Lock()
 from .query_style_tokenizer import QueryStyleTokenizerOutput
 from .style_transfer import ProductionStyleLoader, StyleEpisode, _pad_text_conditions
 
@@ -482,6 +486,43 @@ class _FullTokenShardLRU:
                 self.values.popitem(last=False)
             return cached
 
+    def preload(self, workers: int = 8) -> None:
+        """Materialize every token shard in host RAM before random sampling."""
+        cache_key = str(self.root.resolve())
+        with _RESIDENT_TOKEN_BANKS_LOCK:
+            resident = _RESIDENT_TOKEN_BANKS.get(cache_key)
+        if resident is not None:
+            with self.lock:
+                self.capacity = len(resident)
+                self.values = OrderedDict(resident)
+            print(
+                f"reused resident token cache {self.root.name}: "
+                f"{len(resident)} shards",
+                flush=True,
+            )
+            return
+        names = sorted(path.name for path in self.root.glob("part-*.safetensors"))
+        if not names:
+            raise RuntimeError(f"No token shards found in {self.root}")
+
+        def load(name: str) -> tuple[str, torch.Tensor]:
+            return name, load_file(self.root / name, device="cpu")["tokens"]
+
+        started = time.perf_counter()
+        with ThreadPoolExecutor(max_workers=max(1, int(workers))) as executor:
+            loaded = list(executor.map(load, names))
+        with self.lock:
+            self.capacity = len(loaded)
+            self.values = OrderedDict(loaded)
+        with _RESIDENT_TOKEN_BANKS_LOCK:
+            _RESIDENT_TOKEN_BANKS[cache_key] = dict(loaded)
+        total = sum(value.numel() * value.element_size() for _, value in loaded)
+        print(
+            f"resident token cache {self.root.name}: {len(loaded)} shards, "
+            f"{total / 2**30:.2f} GiB in {time.perf_counter() - started:.1f}s",
+            flush=True,
+        )
+
 
 class CachedTeacherReferenceLoader:
     """Artist-balanced reference-only loader for a cached image domain."""
@@ -496,6 +537,8 @@ class CachedTeacherReferenceLoader:
         references: int,
         seed: int,
         token_lru_shards: int = 8,
+        ram_resident_tokens: bool = False,
+        ram_preload_workers: int = 8,
     ) -> None:
         self.token_root = token_root
         self.batch_size = int(batch_size)
@@ -522,6 +565,8 @@ class CachedTeacherReferenceLoader:
             )
         self.styles = sorted(self.by_style)
         self.shards = _FullTokenShardLRU(token_root, token_lru_shards)
+        if ram_resident_tokens:
+            self.shards.preload(ram_preload_workers)
 
     @staticmethod
     def _pin(value: torch.Tensor) -> torch.Tensor:
@@ -599,6 +644,8 @@ class DualQueryCachedStyleLoader(ProductionStyleLoader):
         self.full_token_shards = _FullTokenShardLRU(
             self.token_root, int(cfg.get("token_lru_shards", 8))
         )
+        if bool(cfg.get("ram_resident_tokens", False)):
+            self.full_token_shards.preload(int(cfg.get("ram_preload_workers", 8)))
         self.reference_count_weights_by_phase = dict(
             cfg.get("reference_count_weights_by_phase", {})
         )

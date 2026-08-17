@@ -3,6 +3,7 @@ from __future__ import annotations
 import gc
 import hashlib
 import json
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -22,6 +23,35 @@ def _sha256(path: Path) -> str:
         for chunk in iter(lambda: handle.read(8 * 1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _load_cached_prompt_conditions(
+    text_root: Path, prompts: list[str]
+) -> torch.Tensor | None:
+    """Load an exact synthetic prompt cache instead of running Qwen again."""
+    manifest_path = text_root / "manifest.parquet"
+    if not manifest_path.exists():
+        return None
+    rows = sorted(
+        read_records(manifest_path), key=lambda row: int(row["condition_id"])
+    )
+    if len(rows) != len(prompts) or any(
+        str(row["prompt"]) != prompt
+        for row, prompt in zip(rows, prompts, strict=True)
+    ):
+        return None
+    shards: dict[str, torch.Tensor] = {}
+    values = []
+    for row in rows:
+        name = str(row["cache_shard"])
+        if name not in shards:
+            shards[name] = load_file(text_root / name, device="cpu")["conditioning"]
+        values.append(shards[name][int(row["row_index"])])
+    print(
+        f"reused {len(values)} exact synthetic text conditions for native teacher",
+        flush=True,
+    )
+    return torch.stack(values).contiguous()
 
 
 def _load_probe_latents(
@@ -221,13 +251,20 @@ def _cache_native_centered_teacher(
             for row in probe_rows
         )
     device = str(cfg.get("device", "cuda"))
-    conditions = _encode_prompts(
-        config,
-        destination,
-        prompts,
-        device,
-        int(cfg.get("text_batch_size", 64)),
-    )
+    conditions = None
+    if cfg.get("probe_manifest"):
+        conditions = _load_cached_prompt_conditions(
+            (destination / str(cfg["probe_manifest"])).parent / "text",
+            prompts,
+        )
+    if conditions is None:
+        conditions = _encode_prompts(
+            config,
+            destination,
+            prompts,
+            device,
+            int(cfg.get("text_batch_size", 64)),
+        )
     contents = len(probe_rows)
     base_context = conditions[:contents].to(dtype=torch.float16).contiguous()
     tagged_context = conditions[contents:].reshape(
@@ -250,8 +287,89 @@ def _cache_native_centered_teacher(
     _optimize_frozen_anima(
         anima, low_precision_rmsnorm=True, fuse_attention_projections=True
     )
+    base_context_device = base_context
+    if bool(cfg.get("gpu_resident_text", False)) and device.startswith("cuda"):
+        base_context_device = base_context.to(device=device, dtype=torch.bfloat16)
+        tagged_context = tagged_context.to(device=device, dtype=torch.bfloat16)
+        print(
+            "resident native-teacher text context "
+            f"{(base_context_device.numel() + tagged_context.numel()) * 2 / 2**30:.2f} GiB",
+            flush=True,
+        )
+
     artist_batch = max(1, int(cfg.get("artist_batch_size", 8)))
     seed = int(cfg.get("seed", 20260817))
+    candidates = sorted({
+        int(value) for value in cfg.get("artist_batch_candidates", [artist_batch])
+        if 0 < int(value) <= len(artists)
+    })
+    if device.startswith("cuda") and len(candidates) > 1:
+        benchmark_rows = []
+        probe_latent = latents[:1].to(device=device, dtype=torch.bfloat16)
+        probe_context = base_context_device[:1].to(
+            device=device, dtype=torch.bfloat16
+        )
+        probe_padding = torch.zeros(
+            1, 1, probe_latent.shape[-2], probe_latent.shape[-1],
+            device=device, dtype=probe_latent.dtype,
+        )
+        probe_timestep = torch.full(
+            (1,), timesteps[0], device=device, dtype=probe_latent.dtype
+        )
+        probe_generator = torch.Generator(device=device).manual_seed(seed)
+        probe_noise = torch.randn(
+            probe_latent.shape, device=device, dtype=probe_latent.dtype,
+            generator=probe_generator,
+        )
+        probe_noisy = (1 - timesteps[0]) * probe_latent + timesteps[0] * probe_noise
+        with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
+            for candidate in candidates:
+                try:
+                    tagged = tagged_context[:candidate, 0].to(
+                        device=device, dtype=torch.bfloat16
+                    )
+                    torch.cuda.empty_cache()
+                    torch.cuda.reset_peak_memory_stats(device)
+                    # One warmup removes lazy kernel and allocator setup from timing.
+                    anima(
+                        probe_noisy.expand(candidate, -1, -1, -1).unsqueeze(2),
+                        probe_timestep.expand(candidate), context=tagged,
+                        padding_mask=probe_padding.expand(candidate, -1, -1, -1),
+                        target_input_ids=None,
+                    )
+                    torch.cuda.synchronize()
+                    probe_started = time.perf_counter()
+                    prediction = anima(
+                        probe_noisy.expand(candidate, -1, -1, -1).unsqueeze(2),
+                        probe_timestep.expand(candidate), context=tagged,
+                        padding_mask=probe_padding.expand(candidate, -1, -1, -1),
+                        target_input_ids=None,
+                    )
+                    torch.cuda.synchronize()
+                    elapsed = time.perf_counter() - probe_started
+                    benchmark_rows.append({
+                        "batch_size": candidate,
+                        "artists_s": candidate / max(elapsed, 1e-9),
+                        "elapsed_s": elapsed,
+                        "peak_vram_bytes": int(torch.cuda.max_memory_allocated(device)),
+                    })
+                    del prediction, tagged
+                except torch.cuda.OutOfMemoryError:
+                    benchmark_rows.append({"batch_size": candidate, "oom": True})
+                    torch.cuda.empty_cache()
+        valid_rows = [row for row in benchmark_rows if not row.get("oom")]
+        if not valid_rows:
+            raise RuntimeError("Every native-teacher artist batch candidate OOMed")
+        artist_batch = int(max(valid_rows, key=lambda row: row["artists_s"])["batch_size"])
+        write_json(output / "artist_batch_autotune.json", {
+            "selected_batch_size": artist_batch, "results": benchmark_rows
+        })
+        print(
+            f"selected native-teacher artist batch {artist_batch}: {benchmark_rows}",
+            flush=True,
+        )
+        del probe_latent, probe_context, probe_padding, probe_noise, probe_noisy
+        torch.cuda.empty_cache()
     with torch.inference_mode(), torch.autocast(
         "cuda", dtype=torch.bfloat16, enabled=device.startswith("cuda")
     ):
@@ -259,7 +377,7 @@ def _cache_native_centered_teacher(
             latent = latents[content_index : content_index + 1].to(
                 device=device, dtype=torch.bfloat16
             )
-            context = base_context[content_index : content_index + 1].to(
+            context = base_context_device[content_index : content_index + 1].to(
                 device=device, dtype=torch.bfloat16
             )
             padding = torch.zeros(
@@ -282,7 +400,10 @@ def _cache_native_centered_teacher(
                     noisy.unsqueeze(2), timestep, context=context,
                     padding_mask=padding, target_input_ids=None,
                 ).squeeze(2).float()
-                deltas = []
+                effects = torch.empty(
+                    len(artists), *base.shape[1:],
+                    device=device, dtype=torch.float32,
+                )
                 for offset in range(0, len(artists), artist_batch):
                     count = min(artist_batch, len(artists) - offset)
                     tagged = tagged_context[
@@ -295,19 +416,20 @@ def _cache_native_centered_teacher(
                         padding_mask=padding.expand(count, -1, -1, -1),
                         target_input_ids=None,
                     ).squeeze(2).float()
-                    deltas.append((prediction - base).cpu())
-                effects = torch.cat(deltas)
+                    effects[offset : offset + count].copy_(prediction - base)
                 centered = effects - effects.mean(dim=0, keepdim=True)
                 noisy_inputs[content_index, timestep_index] = noisy[0].cpu()
                 base_predictions[content_index, timestep_index] = base[0].cpu()
-                centered_teacher[:, content_index, timestep_index] = centered
+                centered_teacher[:, content_index, timestep_index] = centered.to(
+                    device="cpu", dtype=torch.float16
+                )
                 print(
                     "native centered teacher "
                     f"content={content_index + 1}/{contents} "
                     f"timestep={timestep_index + 1}/{len(timesteps)}",
                     flush=True,
                 )
-    del anima, conditions, tagged_context
+    del anima, conditions, tagged_context, base_context_device, effects, centered
     gc.collect()
     if device.startswith("cuda"):
         torch.cuda.empty_cache()
