@@ -15,6 +15,7 @@ from .anima_cache import _caption_rows
 from .io import read_records, write_json
 from .style_calibration import _artist_prompt, _encode_prompts
 from .style_transfer import _optimize_frozen_anima, _resolve_anima_model
+from .synthetic_teacher import synthetic_artist_split_map
 
 
 def _sha256(path: Path) -> str:
@@ -96,7 +97,7 @@ def _load_manifest_probe_latents(
 
 
 def _teacher_spec(
-    cfg: dict[str, Any], destination: Path
+    cfg: dict[str, Any], destination: Path, config: dict[str, Any]
 ) -> tuple[list[str], list[str], list[str], list[int], dict[str, Any]]:
     requested_contents = int(cfg.get("content_count", 4))
     if cfg.get("artist_manifest"):
@@ -122,10 +123,22 @@ def _teacher_spec(
                 f"{requested_artists}"
             )
         style_ids = [str(by_artist[artist]["style_id"]) for artist in artists]
+        fallback_splits = (
+            synthetic_artist_split_map(config, source_rows)
+            if any(not row.get("artist_split") for row in source_rows)
+            else {}
+        )
         splits = [
             "test"
-            if str(by_artist[artist].get("artist_split", "train")) == "meta_test"
-            else str(by_artist[artist].get("artist_split", "train"))
+            if str(
+                by_artist[artist].get("artist_split")
+                or fallback_splits.get(artist, "train")
+            )
+            == "meta_test"
+            else str(
+                by_artist[artist].get("artist_split")
+                or fallback_splits.get(artist, "train")
+            )
             for artist in artists
         ]
         if cfg.get("probe_manifest"):
@@ -200,7 +213,7 @@ def _cache_native_centered_teacher(
     tensor_path = output / "teacher_bank.safetensors"
     summary_path = output / "summary.json"
     artists, style_ids, splits, probe_ids, source_signature = _teacher_spec(
-        cfg, destination
+        cfg, destination, config
     )
     timesteps = [float(value) for value in cfg["timesteps"]]
     signature = {

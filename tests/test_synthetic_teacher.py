@@ -8,6 +8,7 @@ from anima_style_data.synthetic_teacher import (
     build_synthetic_teacher_plan,
     comfy_literal_artist_tag,
     normalize_artist_name,
+    synthetic_artist_split_map,
 )
 from anima_style_data.io import write_records
 
@@ -79,3 +80,27 @@ def test_synthetic_plan_uses_raw_artist_names_and_keeps_style_ids(tmp_path):
         "meta_test",
     }
     assert all("@human:" not in str(row.get("prompt", "")) for row in prompts)
+
+
+def test_synthetic_split_is_recovered_from_legacy_rows_without_field(tmp_path):
+    config = {
+        "synthetic_teacher": {
+            "seed": 7,
+            "bootstrap": {
+                "split_seed": 11,
+                "validation_artists": 1,
+                "meta_test_artists": 1,
+            },
+        }
+    }
+    rows = [
+        {"kind": "artist", "artist": f"artist_{index}"}
+        for index in range(4)
+    ]
+
+    recovered = synthetic_artist_split_map(config, rows)
+
+    assert set(recovered) == {row["artist"] for row in rows}
+    assert list(recovered.values()).count("train") == 2
+    assert list(recovered.values()).count("validation") == 1
+    assert list(recovered.values()).count("meta_test") == 1

@@ -42,6 +42,52 @@ def comfy_literal_artist_tag(artist: str) -> str:
     return re.sub(r"([()\[\]{}])", r"\\\1", value)
 
 
+def synthetic_artist_split_map(
+    config: dict[str, Any], rows: list[dict[str, Any]]
+) -> dict[str, str]:
+    """Return the deterministic artist split, including for legacy manifests.
+
+    Older heterogeneous Parquet manifests lost fields absent from their first
+    control row.  The split is reproducible from the selected artist set and
+    configured split seed, so existing expensive image/feature caches do not
+    need to be regenerated.
+    """
+
+    cfg = dict(config["synthetic_teacher"])
+    artists = sorted(
+        {
+            str(row["artist"])
+            for row in rows
+            if str(row.get("kind", "artist")) == "artist"
+        }
+    )
+    if not artists:
+        raise RuntimeError("Synthetic teacher manifest contains no artist rows")
+    split_cfg = dict(cfg.get("bootstrap", {}))
+    split_order = list(artists)
+    random.Random(int(split_cfg.get("split_seed", cfg.get("seed", 20260812)))).shuffle(
+        split_order
+    )
+    validation_count = int(split_cfg.get("validation_artists", 25))
+    meta_test_count = int(split_cfg.get("meta_test_artists", 25))
+    if validation_count + meta_test_count >= len(split_order):
+        raise ValueError("Synthetic teacher split leaves no training artists")
+    meta_test = set(split_order[:meta_test_count])
+    validation = set(
+        split_order[meta_test_count : meta_test_count + validation_count]
+    )
+    return {
+        artist: (
+            "meta_test"
+            if artist in meta_test
+            else "validation"
+            if artist in validation
+            else "train"
+        )
+        for artist in artists
+    }
+
+
 def _content_prompt(row: dict[str, Any]) -> str:
     parts: list[str] = []
     rating = str(row.get("rating_anima") or "safe").strip()
@@ -83,27 +129,10 @@ def build_synthetic_teacher_plan(
         raise RuntimeError(f"Need {artist_count} train artists, found {len(eligible)}")
     rng = random.Random(seed)
     artists = rng.sample(eligible, artist_count)
-    split_cfg = dict(cfg.get("bootstrap", {}))
-    split_order = sorted(artists)
-    random.Random(int(split_cfg.get("split_seed", seed))).shuffle(split_order)
-    validation_count = int(split_cfg.get("validation_artists", 25))
-    meta_test_count = int(split_cfg.get("meta_test_artists", 25))
-    if validation_count + meta_test_count >= len(split_order):
-        raise ValueError("Synthetic teacher split leaves no training artists")
-    meta_test = set(split_order[:meta_test_count])
-    validation = set(
-        split_order[meta_test_count : meta_test_count + validation_count]
+    artist_splits = synthetic_artist_split_map(
+        config,
+        [{"artist": artist, "kind": "artist"} for artist in artists],
     )
-    artist_splits = {
-        artist: (
-            "meta_test"
-            if artist in meta_test
-            else "validation"
-            if artist in validation
-            else "train"
-        )
-        for artist in artists
-    }
 
     # Reuse real, artist-free Anima captions as content controls. Selecting
     # different source styles prevents one artist's subject distribution from

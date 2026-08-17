@@ -18,6 +18,13 @@ def write_records(path: str | Path, records: Iterable[dict[str, Any]]) -> int:
     rows = list(records)
     if not rows:
         raise ValueError(f"Refusing to write an empty Parquet file: {path}")
+    # ``Table.from_pylist`` infers its schema from the first mapping only.  A
+    # number of our manifests intentionally mix control and artist rows, and
+    # artist-only fields would otherwise be silently discarded when a control
+    # row comes first.  Preserve first-seen field order while materializing the
+    # union schema for every row.
+    fields = list(dict.fromkeys(key for row in rows for key in row))
+    rows = [{field: row.get(field) for field in fields} for row in rows]
     temp = path.with_suffix(path.suffix + ".tmp")
     pq.write_table(pa.Table.from_pylist(rows), temp, compression="zstd")
     temp.replace(path)

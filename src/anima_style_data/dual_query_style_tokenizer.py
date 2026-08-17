@@ -23,6 +23,7 @@ from .dual_query_training import (
     _model_from_config,
 )
 from .io import read_records, write_json, write_records
+from .synthetic_teacher import synthetic_artist_split_map
 
 
 _RESIDENT_TOKEN_BANKS: dict[str, dict[str, torch.Tensor]] = {}
@@ -426,6 +427,7 @@ def cache_synthetic_dual_query_style_tokens(
         for row in read_records(manifest_path)
         if str(row.get("kind")) == "artist"
     ]
+    artist_splits = synthetic_artist_split_map(config, source_rows)
     compatibility_rows = [
         {
             "id": int(row["id"]),
@@ -434,8 +436,11 @@ def cache_synthetic_dual_query_style_tokens(
             "split": "synthetic_teacher",
             "teacher_split": (
                 "test"
-                if str(row["artist_split"]) == "meta_test"
-                else str(row["artist_split"])
+                if str(row.get("artist_split") or artist_splits[str(row["artist"])])
+                == "meta_test"
+                else str(
+                    row.get("artist_split") or artist_splits[str(row["artist"])]
+                )
             ),
             "cache_shard": str(row["latent_shard"]),
             "row_index": int(row["latent_row"]),
