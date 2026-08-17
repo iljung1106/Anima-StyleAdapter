@@ -23,8 +23,11 @@ from .style_tokenizer import (
 from .query_style_tokenizer import _select_sample_episodes
 from .style_transfer import (
     ProductionStyleLoader,
+    _encode_reference_tokens,
+    _encode_target_tokens,
     _optimize_frozen_anima,
     _resolve_anima_model,
+    load_per_reference_resampler,
 )
 
 
@@ -173,7 +176,7 @@ def _loader_config(
     config: dict[str, Any],
     cfg: dict[str, Any],
     *,
-    token_cache: str,
+    token_cache: str | None,
     references: int | None = None,
     split: str | None = None,
 ) -> dict[str, Any]:
@@ -197,10 +200,71 @@ def _loader_config(
             "reference_curriculum": {},
             "pilot_reference_schedule": [],
             "self_reference_target_images_per_style": 0,
-            "resampler_token_cache": token_cache,
         }
     )
+    if token_cache is None:
+        result.pop("resampler_token_cache", None)
+    else:
+        result["resampler_token_cache"] = token_cache
     return result
+
+
+class _OnDemandLegacyTokenLoader:
+    """Materialize only panel-requested legacy Resampler tokens in GPU memory."""
+
+    def __init__(
+        self,
+        loader: ProductionStyleLoader,
+        resampler: nn.Module,
+        device: str,
+    ) -> None:
+        self.loader = loader
+        self.resampler = resampler
+        self.device = device
+        self.materialized: dict[int, dict[str, Any]] = {}
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.loader, name)
+
+    def episodes_for_step(self, step: int):
+        return self.loader.episodes_for_step(step)
+
+    def load_step(self, step: int) -> dict[str, Any]:
+        cached = self.materialized.get(step)
+        if cached is not None:
+            return cached
+        batch = self.loader.load_step(step)
+        with torch.inference_mode(), torch.autocast(
+            device_type=torch.device(self.device).type,
+            dtype=torch.bfloat16,
+            enabled=torch.device(self.device).type == "cuda",
+        ):
+            packed_references = _encode_reference_tokens(
+                self.resampler, batch, self.device
+            )
+            target_tokens = _encode_target_tokens(
+                self.resampler, batch, self.device
+            )
+        reference_mask = batch["reference_mask"].to(
+            self.device, non_blocking=True
+        )
+        result = {
+            "episodes": batch["episodes"],
+            "latents": batch["latents"],
+            "conditioning": batch["conditioning"],
+            "conditioning_lengths": batch["conditioning_lengths"],
+            "cached_reference_tokens": packed_references[reference_mask],
+            "cached_target_tokens": target_tokens,
+            "reference_positions": batch["reference_positions"],
+            "reference_mask": batch["reference_mask"],
+        }
+        self.materialized[step] = result
+        print(
+            f"materialized legacy panel tokens episode={step} "
+            f"images={len(batch['reference_positions']) + len(batch['episodes'])}",
+            flush=True,
+        )
+        return result
 
 
 def _combine_panel_pair(small: Path, dual: Path, output: Path) -> None:
@@ -290,19 +354,43 @@ def generate_panel_comparison(
     )
 
     count = int(cfg.get("panel_samples_per_split", 4))
-    loaders: dict[str, tuple[ProductionStyleLoader, ProductionStyleLoader]] = {}
     requests_small: list[tuple[str, ProductionStyleLoader, int, str]] = []
     requests_dual: list[tuple[str, ProductionStyleLoader, int, str]] = []
     episodes: list[dict[str, Any]] = []
-    for split in (str(cfg.get("train_split", "train")), str(cfg.get("validation_split", "validation"))):
-        small_loader = ProductionStyleLoader(
+    small_cache = destination / str(cfg["small_token_cache"]) / "manifest.parquet"
+    legacy_resampler = None
+    if not small_cache.exists():
+        legacy_resampler = load_per_reference_resampler(
+            destination,
+            dict(config["style_transfer"]["resampler"]),
+            device,
+            trainable=False,
+        )
+        print(
+            "legacy full token cache is absent; materializing panel episodes on demand",
+            flush=True,
+        )
+    for split in (
+        str(cfg.get("train_split", "train")),
+        str(cfg.get("validation_split", "validation")),
+    ):
+        small_base_loader = ProductionStyleLoader(
             destination,
             _loader_config(
                 config,
                 cfg,
-                token_cache=str(cfg["small_token_cache"]),
+                token_cache=str(cfg["small_token_cache"])
+                if small_cache.exists()
+                else None,
                 split=split,
             ),
+        )
+        small_loader = (
+            small_base_loader
+            if legacy_resampler is None
+            else _OnDemandLegacyTokenLoader(
+                small_base_loader, legacy_resampler, device
+            )
         )
         dual_loader = ProductionStyleLoader(
             destination,
@@ -313,7 +401,6 @@ def generate_panel_comparison(
                 split=split,
             ),
         )
-        loaders[split] = (small_loader, dual_loader)
         indices = _select_sample_episodes(small_loader, count)
         for sample_index, episode_index in enumerate(indices):
             small_signature = _episode_signature(small_loader.load_step(episode_index))
