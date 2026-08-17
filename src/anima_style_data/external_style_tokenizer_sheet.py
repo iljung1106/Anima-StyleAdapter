@@ -575,11 +575,16 @@ def generate_live_external_style_sample(
     training_output: Path,
     device: str,
     step: int,
+    *,
+    style_multiplier: float = 1.0,
 ) -> dict[str, Any]:
-    """Render the fixed 1x external-reference sheet from an in-memory tokenizer."""
+    """Render a fixed external-reference sheet from an in-memory tokenizer."""
 
+    style_multiplier = float(style_multiplier)
+    if style_multiplier <= 0:
+        raise ValueError("style_multiplier must be positive")
     cfg = dict(prepared["cfg"])
-    cfg["style_multipliers"] = [1.0]
+    cfg["style_multipliers"] = [style_multiplier]
     was_training = tokenizer.training
     tokenizer.eval()
     references = prepared["reference_tokens"][:, None].to(
@@ -615,20 +620,21 @@ def generate_live_external_style_sample(
         int(cfg.get("vae_batch_size", 4)),
     )
     base = decoded["base"][0]
-    current = decoded["large_1x"]
+    multiplier_label = f"{style_multiplier:g}x"
+    current = decoded[f"large_{multiplier_label}"]
     output_dir = training_output / "external_reference_samples" / f"step-{step:07d}"
     raw_dir = output_dir / "generated"
     raw_dir.mkdir(parents=True, exist_ok=True)
     base.save(raw_dir / "no-style.png")
     for index, image in enumerate(current, start=1):
-        image.save(raw_dir / f"large_1x-TestSample{index}.png")
+        image.save(raw_dir / f"large_{multiplier_label}-TestSample{index}.png")
 
     size = (int(cfg["width"]), int(cfg["height"]))
     sheet = _make_sheet(prepared["paths"], base, None, current, size)
     expected = (size[0] * 8, size[1] * 2)
     if sheet.size != expected:
         raise RuntimeError(f"Unexpected live sheet size: {sheet.size} != {expected}")
-    sheet_path = output_dir / "style-tokenizer-external-1x.png"
+    sheet_path = output_dir / f"style-tokenizer-external-{multiplier_label}.png"
     sheet.save(sheet_path, compress_level=4)
     rms = _pixel_rms_from_baseline(base, current)
     summary = {
@@ -641,13 +647,14 @@ def generate_live_external_style_sample(
         "prompt": str(cfg["prompt"]),
         "negative_prompt": str(cfg["negative_prompt"]),
         "cfg": float(cfg["cfg"]),
-        "style_multiplier": 1.0,
+        "style_multiplier": style_multiplier,
         "steps": int(cfg["steps"]),
         "seed": int(cfg["seed"]),
         "pixel_rms_from_baseline": rms,
         "mean_pixel_rms_from_baseline": float(np.mean(rms)),
     }
-    (output_dir / "summary.json").write_text(
+    summary_name = "summary.json" if style_multiplier == 1.0 else f"summary-{multiplier_label}.json"
+    (output_dir / summary_name).write_text(
         json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8"
     )
     del references, current_tokens, latent_groups, decoded
