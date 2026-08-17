@@ -586,16 +586,16 @@ def generate_synthetic_teacher_images(
         rows_by_shard: dict[str, list[dict[str, Any]]] = defaultdict(list)
         for row in condition_rows:
             rows_by_shard[str(row["cache_shard"])].append(row)
-        for shard_name, shard_rows in sorted(rows_by_shard.items()):
+        for shard_name, text_shard_rows in sorted(rows_by_shard.items()):
             source = load_file(
                 text_root / shard_name, device=device
             )["conditioning"]
             source_rows = torch.tensor(
-                [int(row["row_index"]) for row in shard_rows],
+                [int(row["row_index"]) for row in text_shard_rows],
                 device=device, dtype=torch.long,
             )
             destination_rows = torch.tensor(
-                [int(row["condition_id"]) for row in shard_rows],
+                [int(row["condition_id"]) for row in text_shard_rows],
                 device=device, dtype=torch.long,
             )
             condition_bank.index_copy_(
