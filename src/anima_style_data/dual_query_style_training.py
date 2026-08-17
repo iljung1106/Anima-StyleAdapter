@@ -28,6 +28,9 @@ from .global_query_style_tokenizer import (
     attention_map_diversity_loss,
     reference_conditioned_diversity_loss,
 )
+from .typed_multi_descriptor_style_tokenizer import (
+    TypedMultiDescriptorCompactStyleTokenizer,
+)
 from .dual_query_external_samples import load_dual_query_external_sample
 from .external_style_tokenizer_sheet import generate_live_external_style_sample
 from .io import write_json
@@ -350,6 +353,59 @@ def _centered_teacher_effects(
     }
 
 
+def _teacher_projected_effect_loss(
+    student_centered: torch.Tensor,
+    teacher_centered: torch.Tensor,
+    *,
+    coefficient_minimum: float,
+    coefficient_maximum: float,
+    orthogonal_maximum: float,
+    orthogonal_weight: float,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Preserve artist effect magnitude specifically along the teacher direction.
+
+    A total-RMS floor can be satisfied by a large component orthogonal to the
+    teacher.  This objective instead bounds the signed projection coefficient
+    and separately suppresses excessive orthogonal energy.
+    """
+
+    if student_centered.shape != teacher_centered.shape:
+        raise ValueError("Projected teacher tensors must have matching shapes")
+    dimensions = tuple(range(1, student_centered.ndim))
+    student = student_centered.float()
+    teacher = teacher_centered.detach().float()
+    teacher_power = teacher.square().mean(dim=dimensions).clamp_min(1e-8)
+    teacher_rms = teacher_power.sqrt()
+    coefficient = (student * teacher).mean(dim=dimensions) / teacher_power
+    coefficient_view = coefficient.reshape(
+        -1, *([1] * (student_centered.ndim - 1))
+    )
+    orthogonal = student - coefficient_view * teacher
+    orthogonal_ratio = (
+        orthogonal.square().mean(dim=dimensions).sqrt() / teacher_rms
+    )
+    lower = F.relu(float(coefficient_minimum) - coefficient).square().mean()
+    upper = F.relu(coefficient - float(coefficient_maximum)).square().mean()
+    orthogonal_loss = F.relu(
+        orthogonal_ratio - float(orthogonal_maximum)
+    ).square().mean()
+    total = lower + upper + float(orthogonal_weight) * orthogonal_loss
+    aligned_rms = coefficient.clamp_min(0.0) * teacher_rms
+    return total, {
+        "native_teacher_projected_effect_loss": total.detach(),
+        "native_teacher_projection_floor_loss": lower.detach(),
+        "native_teacher_projection_ceiling_loss": upper.detach(),
+        "native_teacher_projection_coefficient": coefficient.detach().mean(),
+        "native_teacher_projection_positive_fraction": (
+            coefficient.detach() > 0
+        ).float().mean(),
+        "native_teacher_aligned_effect_rms": aligned_rms.detach().mean(),
+        "native_teacher_projection_orthogonal_ratio": (
+            orthogonal_ratio.detach().mean()
+        ),
+    }
+
+
 def _artist_teacher_contrastive_loss(
     student_centered: torch.Tensor,
     teacher_centered: torch.Tensor,
@@ -632,6 +688,43 @@ def _native_artist_teacher_objective(
             "common_output_loss": common_loss,
             **common_metrics,
         }
+    projection_floor = _linear_ramp(
+        step,
+        start_step=int(training.get("teacher_projection_floor_start_step", 1)),
+        end_step=int(training.get("teacher_projection_floor_end_step", 1_500)),
+        start=float(training.get("teacher_projection_floor_start", 0.02)),
+        end=float(training.get("teacher_projection_floor_end", 0.15)),
+    )
+    projected_effect, projected_metrics = _teacher_projected_effect_loss(
+        student,
+        teacher,
+        coefficient_minimum=projection_floor,
+        coefficient_maximum=float(
+            training.get("teacher_projection_coefficient_maximum", 1.25)
+        ),
+        orthogonal_maximum=float(
+            training.get("teacher_projection_orthogonal_maximum", 0.50)
+        ),
+        orthogonal_weight=float(
+            training.get("teacher_projection_orthogonal_weight", 0.25)
+        ),
+    )
+    if (
+        centered_enabled
+        and str(training.get("common_output_denominator", "student_centered_rms"))
+        == "teacher_aligned_projection"
+    ):
+        common_rms = student_delta.float().mean(dim=0).square().mean().sqrt()
+        aligned_rms = projected_metrics[
+            "native_teacher_aligned_effect_rms"
+        ].clamp_min(1e-8)
+        common_ratio = common_rms / aligned_rms
+        centered_metrics["common_output_ratio"] = common_ratio.detach()
+        centered_metrics["common_output_loss"] = F.relu(
+            common_ratio - float(common_threshold)
+        ).square()
+        centered_metrics["controlled_common_rms"] = common_rms.detach()
+        centered_metrics["controlled_artist_effect_rms"] = aligned_rms.detach()
     alignment, metrics = _native_teacher_alignment_loss(
         student,
         teacher,
@@ -666,6 +759,24 @@ def _native_artist_teacher_objective(
         end_step=int(training.get("centered_energy_weight_ramp_end_step", 500)),
         start=0.0,
         end=float(training.get("centered_energy_weight", 0.0)),
+    )
+    projected_start = int(training.get("teacher_projected_effect_start_step", 1))
+    projected_ramp_steps = max(
+        0, int(training.get("teacher_projected_effect_ramp_steps", 250))
+    )
+    projected_target_weight = float(
+        training.get("teacher_projected_effect_weight", 0.0)
+    )
+    projected_weight = (
+        _linear_ramp(
+            step,
+            start_step=projected_start,
+            end_step=projected_start + projected_ramp_steps,
+            start=0.0 if projected_ramp_steps else projected_target_weight,
+            end=projected_target_weight,
+        )
+        if step >= projected_start
+        else 0.0
     )
     contrast_start = int(training.get("artist_teacher_contrastive_start_step", 750))
     contrast_weight = (
@@ -704,18 +815,21 @@ def _native_artist_teacher_objective(
     weighted_alignment = teacher_weight * alignment
     weighted_common = common_weight * common_loss
     weighted_energy = energy_weight * energy_loss
+    weighted_projected = projected_weight * projected_effect
     weighted_contrastive = contrast_weight * contrastive
     weighted_ranking = ranking_weight * ranking
     total = (
         weighted_alignment
         + weighted_common
         + weighted_energy
+        + weighted_projected
         + weighted_contrastive
         + weighted_ranking
     )
     metrics.update(
         {key: value.detach() for key, value in centered_metrics.items()}
     )
+    metrics.update(projected_metrics)
     metrics.update(artist_metrics)
     metrics.update(
         {
@@ -729,6 +843,15 @@ def _native_artist_teacher_objective(
                 energy_weight
             ),
             "native_teacher_centered_energy_weighted_loss": weighted_energy.detach(),
+            "native_teacher_projection_floor": alignment.new_tensor(
+                projection_floor
+            ),
+            "native_teacher_projected_effect_weight": alignment.new_tensor(
+                projected_weight
+            ),
+            "native_teacher_projected_effect_weighted_loss": (
+                weighted_projected.detach()
+            ),
             "native_teacher_artist_contrastive_weight": alignment.new_tensor(
                 contrast_weight
             ),
@@ -1002,6 +1125,7 @@ def _evaluate_native_teacher_domain(
     *,
     metric_prefix: str,
     batches: int,
+    step: int,
 ) -> dict[str, float]:
     totals: dict[str, float] = defaultdict(float)
     counts: dict[str, int] = defaultdict(int)
@@ -1014,7 +1138,7 @@ def _evaluate_native_teacher_domain(
                 loader.load_step(index),
                 device,
                 training,
-                step=int(training.get("native_teacher_start_step", 1)),
+                step=step,
                 metric_prefix=metric_prefix,
                 probe_index_override=index,
             )
@@ -1116,7 +1240,12 @@ def _pilot_functional_probe_step(
 
     same_weight = weight("same_artist_functional_weight", 0.02)
     centered_weight = weight("centered_artist_effect_weight", 0.03)
-    common_weight = weight("common_output_weight", 0.03)
+    common_weight_key = (
+        "functional_common_output_weight"
+        if "functional_common_output_weight" in training
+        else "common_output_weight"
+    )
+    common_weight = weight(common_weight_key, 0.03)
     threshold = _linear_ramp(
         step,
         start_step=start,
@@ -1469,9 +1598,24 @@ def _forward_dual_query_flow(
         )
         total = total + reference_diversity_weight * reference_diversity
 
+    functional_value_start = int(
+        training.get("functional_value_diversity_start_step", 1)
+    )
+    functional_value_progress = (
+        _linear_ramp(
+            step,
+            start_step=functional_value_start,
+            end_step=functional_value_start
+            + int(training.get("functional_value_diversity_ramp_steps", 500)),
+            start=0.0,
+            end=1.0,
+        )
+        if step >= functional_value_start
+        else 0.0
+    )
     functional_value_weight = float(
         training.get("functional_value_diversity_weight", 0.0)
-    ) * diversity_progress
+    ) * functional_value_progress
     functional_value_diversity = flow_loss.new_zeros(())
     functional_value_metrics = {
         "functional_value_slot_energy_ratio": flow_loss.new_zeros(()),
@@ -1519,8 +1663,10 @@ def _forward_dual_query_flow(
     negative = flow_loss.new_zeros(())
     contrastive_weight = 0.0
     contrastive_every = max(1, int(training.get("artist_contrastive_every", 2)))
+    contrastive_start = int(training.get("artist_contrastive_start_step", 1))
     if (
         float(training.get("artist_contrastive_weight", 0.0)) > 0
+        and step >= contrastive_start
         and step % contrastive_every == 0
         and output.tokens.shape[0] > 1
     ):
@@ -1549,7 +1695,14 @@ def _forward_dual_query_flow(
         )
         positive = contrastive_metrics["artist_positive_similarity"]
         negative = contrastive_metrics["artist_negative_similarity"]
-        contrastive_weight = float(training["artist_contrastive_weight"])
+        contrastive_weight = _linear_ramp(
+            step,
+            start_step=contrastive_start,
+            end_step=contrastive_start
+            + int(training.get("artist_contrastive_ramp_steps", 500)),
+            start=0.0,
+            end=float(training["artist_contrastive_weight"]),
+        )
         total = total + contrastive_weight * contrastive
 
     token_contrastive = flow_loss.new_zeros(())
@@ -1807,6 +1960,12 @@ def _forward_dual_query_flow(
         ),
         "timestep_mean": timesteps.detach().mean(),
     }
+    output_gain = getattr(output, "output_gain", None)
+    if output_gain is not None:
+        metrics["style_output_gain_mean"] = output_gain.detach().float().mean()
+        metrics["style_output_gain_std"] = output_gain.detach().float().std(
+            unbiased=False
+        )
     prompt_modes = [str(value) for value in batch.get("prompt_modes", [])]
     if prompt_modes:
         base_modes = [
@@ -2117,6 +2276,8 @@ def _train_variant(
         tokenizer = GlobalQueryMemoryStyleTokenizer(**model_cfg).to(device)
     elif architecture == "slot_preserving_global_query":
         tokenizer = SlotPreservingGlobalQueryStyleTokenizer(**model_cfg).to(device)
+    elif architecture == "typed_multi_descriptor_compact":
+        tokenizer = TypedMultiDescriptorCompactStyleTokenizer(**model_cfg).to(device)
     else:
         raise ValueError(
             f"Unknown Dual-query StyleTokenizer architecture {architecture!r}"
@@ -2583,6 +2744,7 @@ def _train_variant(
                                 dual_domain_training[domain],
                                 metric_prefix=domain,
                                 batches=teacher_validation_batches,
+                                step=step,
                             )
                         )
                 extended_every = int(
@@ -3221,6 +3383,84 @@ def smoke_test_slot_preserving_global_query_style_tokenizer(
     config: dict[str, Any], destination: Path
 ) -> dict[str, Any]:
     return _run_slot_preserving_global_query_style_tokenizer(
+        config, destination, smoke=True
+    )
+
+
+def _run_typed_multi_descriptor_style_tokenizer(
+    config: dict[str, Any], destination: Path, *, smoke: bool
+) -> dict[str, Any]:
+    cfg = copy.deepcopy(config["typed_multi_descriptor_compact_style_tokenizer"])
+    output_name = str(cfg["output_directory"])
+    if smoke:
+        output_name += "_smoke"
+        training = cfg["training"]
+        training.update(
+            {
+                "steps": 2,
+                "log_every": 1,
+                "validation_every": 0,
+                "checkpoint_every": 1,
+                "sample_every": 0,
+                "fixed_sample_every": 0,
+                "extended_evaluation_every": 0,
+                "resume": False,
+                "wandb": {"enabled": False},
+                "dual_domain_teacher_schedule": [
+                    {"end_step": 2, "every": 1}
+                ],
+                "teacher_projected_effect_ramp_steps": 0,
+                "teacher_projection_floor_end_step": 1,
+                "functional_probe_start_step": 1,
+                "functional_probe_ramp_steps": 0,
+                "functional_probe_every": 1,
+                "functional_value_diversity_start_step": 1,
+                "functional_value_diversity_ramp_steps": 0,
+                "artist_contrastive_start_step": 1,
+                "artist_contrastive_ramp_steps": 0,
+            }
+        )
+        training["dual_domain_teacher"]["every"] = 1
+        for domain in ("human", "synthetic"):
+            training["dual_domain_teacher"][domain]["ramp_steps"] = 0
+    effective = copy.deepcopy(config)
+    effective["dual_query_style_tokenizer"] = cfg
+    device = str(cfg["training"].get("device", "cuda"))
+    anima = _resolve_anima_model(effective, destination, device).requires_grad_(
+        False
+    ).eval()
+    _optimize_frozen_anima(
+        anima,
+        low_precision_rmsnorm=bool(
+            cfg["training"].get("low_precision_rmsnorm", True)
+        ),
+        fuse_attention_projections=bool(
+            cfg["training"].get("fuse_attention_projections", True)
+        ),
+    )
+    return _train_variant(
+        effective,
+        destination,
+        anima,
+        include_artist_summary=True,
+        output_name=output_name,
+        steps_override=int(cfg["training"].get("steps", 8_000)),
+        cfg_override=cfg,
+    )
+
+
+def train_typed_multi_descriptor_style_tokenizer(
+    config: dict[str, Any], destination: Path
+) -> dict[str, Any]:
+    return _run_typed_multi_descriptor_style_tokenizer(
+        config, destination, smoke=False
+    )
+
+
+def smoke_test_typed_multi_descriptor_style_tokenizer(
+    config: dict[str, Any], destination: Path
+) -> dict[str, Any]:
+    return _run_typed_multi_descriptor_style_tokenizer(
         config, destination, smoke=True
     )
 

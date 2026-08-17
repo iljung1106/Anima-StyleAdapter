@@ -479,6 +479,33 @@ def reference_conditioned_diversity_loss(tokens: torch.Tensor) -> torch.Tensor:
     return similarities[:, ~identity].square().mean()
 
 
+def scheduled_prompt_mode_weights(
+    base_weights: dict[str, float],
+    *,
+    data_step: int,
+    gradient_accumulation_steps: int,
+    empty_warmup_steps: int,
+    empty_warmup_weight: float,
+) -> dict[str, float]:
+    """Raise Empty exact-self exposure during an optimizer-step warmup."""
+
+    weights = dict(base_weights)
+    optimizer_step = int(data_step) // max(1, int(gradient_accumulation_steps)) + 1
+    if empty_warmup_steps <= 0 or optimizer_step > int(empty_warmup_steps):
+        return weights
+    empty = float(empty_warmup_weight)
+    if not 0.0 <= empty <= 1.0:
+        raise ValueError("empty_warmup_weight must be in [0,1]")
+    nonempty = sum(value for key, value in weights.items() if key != "empty")
+    if nonempty <= 0 and empty < 1.0:
+        raise ValueError("Prompt warmup needs a non-empty prompt mode")
+    scale = (1.0 - empty) / max(nonempty, 1e-12)
+    return {
+        key: empty if key == "empty" else value * scale
+        for key, value in weights.items()
+    }
+
+
 class MultiPromptDualQueryCachedStyleLoader(DualQueryCachedStyleLoader):
     """Select cached prompt modes while keeping Empty strictly exact-self."""
 
@@ -502,6 +529,12 @@ class MultiPromptDualQueryCachedStyleLoader(DualQueryCachedStyleLoader):
         self.quality_probability = float(prompt_cfg.get("quality_probability", 0.50))
         if not 0 <= self.quality_probability <= 1:
             raise ValueError("quality_probability must be in [0,1]")
+        self.empty_warmup_steps = int(prompt_cfg.get("empty_warmup_steps", 0))
+        self.empty_warmup_weight = float(
+            prompt_cfg.get(
+                "empty_warmup_weight", self.prompt_mode_weights["empty"]
+            )
+        )
         self.variant_by_image_and_name = {
             (int(row["id"]), str(row.get("variant_name", row["variant"]))): int(
                 row["variant"]
@@ -527,8 +560,15 @@ class MultiPromptDualQueryCachedStyleLoader(DualQueryCachedStyleLoader):
     def episodes_for_step(self, step: int) -> list[StyleEpisode]:
         episodes = super().episodes_for_step(step)
         rng = random.Random(self.seed ^ 0x6D75_1A0D ^ (int(step) * 1_000_003))
-        modes = tuple(self.prompt_mode_weights)
-        weights = tuple(self.prompt_mode_weights[value] for value in modes)
+        scheduled_weights = scheduled_prompt_mode_weights(
+            self.prompt_mode_weights,
+            data_step=step,
+            gradient_accumulation_steps=self.gradient_accumulation_steps,
+            empty_warmup_steps=self.empty_warmup_steps,
+            empty_warmup_weight=self.empty_warmup_weight,
+        )
+        modes = tuple(scheduled_weights)
+        weights = tuple(scheduled_weights[value] for value in modes)
         result = []
         for episode in episodes:
             mode = rng.choices(modes, weights=weights, k=1)[0]
