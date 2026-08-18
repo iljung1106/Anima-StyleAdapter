@@ -89,6 +89,17 @@ def _loader_config(
     return result
 
 
+def _with_excluded_style_ids(
+    loader_cfg: dict[str, Any], style_ids: list[str]
+) -> dict[str, Any]:
+    """Return a loader-local exclusion list without mutating shared config."""
+    result = dict(loader_cfg)
+    result["excluded_style_ids"] = sorted(
+        set(result.get("excluded_style_ids", [])) | set(style_ids)
+    )
+    return result
+
+
 def _cache_summary(destination: Path, cfg: dict[str, Any]) -> dict[str, Any]:
     path = destination / str(cfg["cache"]["output_directory"]) / "summary.json"
     summary = json.loads(path.read_text(encoding="utf-8"))
@@ -2154,6 +2165,7 @@ def _train_variant(
     dual_domain_cfg = dict(training.get("dual_domain_teacher", {}))
     dual_domain_enabled = bool(dual_domain_cfg.get("enabled", False))
     dual_domain_bank = None
+    heldout_teacher_styles: list[str] = []
     if dual_domain_enabled:
         dual_domain_bank = NativeCenteredTeacherBank.load(
             config,
@@ -2169,17 +2181,20 @@ def _train_variant(
             for key in ("validation_style_ids", "test_style_ids")
             for value in dual_domain_bank.summary.get(key, [])
         ]
-        cfg.setdefault("loader", {})["excluded_style_ids"] = heldout_teacher_styles
 
     use_multi_prompt = bool(cfg.get("loader", {}).get("prompt_modes"))
     train_loader_class = (
         MultiPromptDualQueryCachedStyleLoader
         if use_multi_prompt else DualQueryCachedStyleLoader
     )
-    train_loader = train_loader_class(
-        destination,
-        _loader_config(config, cfg, split=str(cfg.get("train_split", "train"))),
+    train_loader_cfg = _loader_config(
+        config, cfg, split=str(cfg.get("train_split", "train"))
     )
+    if heldout_teacher_styles:
+        train_loader_cfg = _with_excluded_style_ids(
+            train_loader_cfg, heldout_teacher_styles
+        )
+    train_loader = train_loader_class(destination, train_loader_cfg)
     validation_loader_cfg = _loader_config(
         config, cfg, split=str(cfg.get("validation_split", "validation"))
     )

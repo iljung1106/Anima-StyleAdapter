@@ -9,6 +9,7 @@ from anima_style_data.dual_query_style_training import (
     _scheduled_teacher_gradient_scale,
     _scheduled_teacher_reference_count,
     _teacher_projected_effect_loss,
+    _with_excluded_style_ids,
 )
 from anima_style_data.global_query_style_tokenizer import (
     scheduled_prompt_mode_weights,
@@ -227,6 +228,21 @@ def test_fused_teacher_cycles_one_two_four_references_for_both_domains():
         _scheduled_teacher_reference_count(domain_training, available, update)
         for update in range(6)
     ] == [1, 2, 4, 1, 2, 4]
+
+
+def test_teacher_heldout_exclusions_are_local_to_training_loader():
+    shared = {"split": "validation", "excluded_style_ids": ["existing"]}
+    training = _with_excluded_style_ids(shared, ["validation-a", "test-a"])
+
+    assert training["excluded_style_ids"] == [
+        "existing",
+        "test-a",
+        "validation-a",
+    ]
+    assert shared == {
+        "split": "validation",
+        "excluded_style_ids": ["existing"],
+    }
 
 
 def test_domain_teacher_config_preserves_reference_count_curriculum():
