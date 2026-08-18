@@ -66,6 +66,11 @@ from .style_transfer import (
     _resolve_anima_model,
     _sample_flow_timesteps,
 )
+from .wandb_metric_schema import (
+    compact_training_metrics,
+    compact_validation_metrics,
+    define_wandb_metric_summaries,
+)
 
 
 def _loader_config(
@@ -2671,6 +2676,7 @@ def _train_variant(
                 "cache": cache_summary,
             },
         )
+        define_wandb_metric_summaries(wandb_run)
 
     accumulation = max(1, int(training.get("gradient_accumulation_steps", 1)))
     base_lr = float(training.get("learning_rate", 1e-4))
@@ -2965,31 +2971,42 @@ def _train_variant(
                     for key, value in running.items()
                 }
                 averaged["learning_rate"] = float(optimizer.param_groups[0]["lr"])
+                console_details: list[str] = []
+                if "human_teacher_cosine" in averaged:
+                    console_details.append(
+                        "human="
+                        f"{averaged['human_teacher_cosine']:.3f}/"
+                        f"{averaged.get('human_teacher_projection_coefficient', 0.0):.3f}"
+                    )
+                if "synthetic_teacher_cosine" in averaged:
+                    console_details.append(
+                        "synthetic="
+                        f"{averaged['synthetic_teacher_cosine']:.3f}/"
+                        f"{averaged.get('synthetic_teacher_projection_coefficient', 0.0):.3f}"
+                    )
+                if averaged.get("artist_direction_weight", 0.0) > 0.0:
+                    console_details.append(
+                        "ranking_adv="
+                        f"{averaged.get('artist_flow_improvement_advantage', 0.0):.4f}"
+                    )
+                detail_text = " ".join(console_details)
                 print(
                     f"dual-query-style step={step}/{steps} "
                     f"summary={include_artist_summary} "
                     f"loss={averaged['loss']:.5f} "
                     f"flow={averaged['flow_loss']:.5f} "
                     f"paired={averaged.get('paired_flow_improvement', 0.0):.5f} "
-                    f"same={averaged.get('functional_same_artist_cosine', 0.0):.3f} "
-                    f"between={averaged.get('functional_between_artist_cosine', 0.0):.3f} "
-                    f"common={averaged.get('common_output_ratio', 0.0):.3f} "
-                    f"centered={averaged.get('functional_centered_effect_ratio', 0.0):.3f} "
-                    f"func_w={averaged.get('functional_probe_per_step_loss', 0.0):.5f} "
-                    f"teacher_cos={averaged.get('native_teacher_cosine', 0.0):.3f} "
-                    f"teacher_proj={averaged.get('native_teacher_projection_coefficient', 0.0):.3f} "
-                    f"human_cos={averaged.get('human_teacher_cosine', 0.0):.3f} "
-                    f"human_proj={averaged.get('human_teacher_projection_coefficient', 0.0):.3f} "
-                    f"synth_cos={averaged.get('synthetic_teacher_cosine', 0.0):.3f} "
-                    f"synth_proj={averaged.get('synthetic_teacher_projection_coefficient', 0.0):.3f} "
+                    f"direction={averaged.get('style_flow_direction_cosine', 0.0):.3f} "
+                    f"token_rms={averaged.get('style_token_rms', 0.0):.3f} "
                     f"refs={averaged['references']:.2f} "
-                    f"target={averaged['target_inclusion']:.3f} "
-                    f"step_s={averaged['step_s']:.3f}",
+                    f"lr={averaged['learning_rate']:.2e} "
+                    f"step_s={averaged['step_s']:.3f}"
+                    + (f" {detail_text}" if detail_text else ""),
                     flush=True,
                 )
                 if wandb_run is not None:
                     wandb_run.log(
-                        {f"train/{key}": value for key, value in averaged.items()},
+                        compact_training_metrics(averaged),
                         step=step,
                     )
                 running.clear()
@@ -3103,60 +3120,7 @@ def _train_variant(
                 write_json(history_path, history)
                 print(f"dual-query-style validation step={step} {row}", flush=True)
                 if wandb_run is not None:
-                    wandb_run.log(
-                        {
-                            **{
-                                f"validation_self/{key}": value
-                                for key, value in validation_self.items()
-                            },
-                            **{
-                                f"validation_heldout/{key}": value
-                                for key, value in validation_heldout.items()
-                            },
-                            **{
-                                f"validation_wrong_artist/{key}": value
-                                for key, value in validation_wrong.items()
-                            },
-                            "validation/correct_vs_wrong_paired_advantage": row[
-                                "correct_vs_wrong_paired_advantage"
-                            ],
-                            "validation/selection_score": row["selection_score"],
-                            **{
-                                f"validation_native_teacher/{key}": value
-                                for key, value in row.get(
-                                    "validation_native_teacher", {}
-                                ).items()
-                            },
-                            **{
-                                f"validation_human_teacher/{key}": value
-                                for key, value in row.get(
-                                    "validation_human_teacher", {}
-                                ).items()
-                            },
-                            **{
-                                f"validation_synthetic_teacher/{key}": value
-                                for key, value in row.get(
-                                    "validation_synthetic_teacher", {}
-                                ).items()
-                            },
-                            **(
-                                {
-                                    f"validation_references_{count}/{key}": value
-                                    for count, values in row.get(
-                                        "reference_count_evaluation", {}
-                                    ).items()
-                                    for key, value in values.items()
-                                }
-                            ),
-                            **{
-                                f"validation_controlled/{key}": value
-                                for key, value in row.get(
-                                    "controlled_artist_consistency", {}
-                                ).items()
-                            },
-                        },
-                        step=step,
-                    )
+                    wandb_run.log(compact_validation_metrics(row), step=step)
 
             if checkpoint_every and (step % checkpoint_every == 0 or step == steps):
                 _save_state(

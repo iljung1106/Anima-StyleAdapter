@@ -3118,8 +3118,9 @@ single_stage_typed_attention_style_tokenizer:
     wandb:
       enabled: true
       project: anima-style-adapter
-      name: compact-single-stage-typed-attention-2k-dual-domain-8k-v1
-      id: compact-single-stage-typed-attention-2k-dual-domain-8k-v1
+      name: compact-single-stage-typed-attention-2k-dual-domain-8k-wandb-v2
+      id: compact-single-stage-typed-attention-2k-dual-domain-8k-wandb-v2
+      metric_schema: compact_v2
   fixed_reference_sampling:
     cache_directory: dual_query_external_reference_cache_v1
     device: cuda

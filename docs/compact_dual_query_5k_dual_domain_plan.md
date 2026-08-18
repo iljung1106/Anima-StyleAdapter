@@ -153,9 +153,16 @@ baseline의 `0.00075`를 시작점으로 사용한다.
 - Frozen Anima, Frozen Resampler와 cached text/VAE/reference token을 사용한다.
 - 250 step마다 validation/checkpoint, 500 step마다 panel, 1,000 step마다 외부
   fixed-reference sample을 생성한다. Optimizer와 scheduler 상태를 함께 저장한다.
-- W&B에는 heldout paired-flow improvement, correct-vs-wrong advantage,
-  1/2/4/8-reference 성능, human/synthetic teacher cosine·projection·RMS,
-  common-output ratio와 최종 token RMS 분포를 기록한다.
+- W&B는 원시 diagnostic을 전부 펼치지 않고 `compact_v2` schema를 사용한다.
+  `train_objective`, `train_flow`, `train_teacher_human`,
+  `train_teacher_synthetic`, `train_ranking`, `train_style`, `train_batch`,
+  `train_schedule`, `system`, `val_flow_*`, `val_teacher_*`,
+  `val_reference_sweep`, `val_controlled`, `val_summary`, `samples`로 구분한다.
+  각 section에는 heldout paired-flow improvement, correct-vs-wrong advantage,
+  1/2/4/8-reference 성능, human/synthetic teacher cosine·projection·RMS와 retrieval,
+  controlled common-output ratio, 최종 token RMS 등 판단에 직접 쓰는 값만 기록한다.
+  비활성 loss의 0 값, 내부 probe index, elapsed/count 같은 운영 세부값은 W&B에서
+  제외하되 전체 raw validation row는 로컬 JSON에 계속 보존한다.
 
 ### 캐시 및 실행 순서
 
