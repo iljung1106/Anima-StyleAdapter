@@ -75,10 +75,18 @@ def _audit_student_prompts(loader: MultiPromptDualQueryCachedStyleLoader) -> Non
     violations = []
     for row in loader.text_by_key.values():
         caption = str(row.get("caption", ""))
-        if "@" in caption:
-            violations.append((row.get("id"), "@", caption[:160]))
         artist = " ".join(str(row.get("artist", "")).replace("_", " ").split())
-        if artist and artist.casefold() in caption.casefold():
+        tags = {value.strip().casefold() for value in caption.split(",")}
+        artist_tag = f"@{artist}".casefold()
+        explicit_artist_tags = {
+            value for value in tags
+            if value.startswith("@") and value not in {"@", "@ @"}
+        }
+        if explicit_artist_tags:
+            violations.append(
+                (row.get("id"), sorted(explicit_artist_tags), caption[:160])
+            )
+        if artist and ({artist.casefold(), artist_tag} & tags):
             violations.append((row.get("id"), artist, caption[:160]))
         if len(violations) >= 8:
             break

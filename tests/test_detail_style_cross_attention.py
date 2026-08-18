@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import pytest
+from types import SimpleNamespace
 
 torch = pytest.importorskip("torch")
 import torch.nn.functional as F  # noqa: E402
@@ -10,6 +11,7 @@ from anima_style_data.detail_style_cross_attention import (  # noqa: E402
     DetailPreservingTypedSlotReader,
     FreshKVStyleCrossAttention,
 )
+from anima_style_data.detail_style_training import _audit_student_prompts  # noqa: E402
 
 
 class _CountingLinear(nn.Linear):
@@ -197,3 +199,24 @@ def test_same_q_internal_teacher_produces_live_gradient_and_calibrates_alpha():
     assert metrics["internal_teacher_cosine"].isfinite()
     assert len(calibration["alpha"]) == 2
     assert all(0 <= value <= 2.0 for value in calibration["alpha"])
+
+
+def test_student_prompt_audit_uses_tag_boundaries_not_substrings():
+    clean = SimpleNamespace(text_by_key={
+        (1, 0): {
+            "id": 1,
+            "artist": "tri",
+            "caption": "safe, triangular headpiece, @ @, 1girl",
+        }
+    })
+    _audit_student_prompts(clean)
+
+    leaked = SimpleNamespace(text_by_key={
+        (2, 0): {
+            "id": 2,
+            "artist": "some_artist",
+            "caption": "safe, 1girl, @some artist",
+        }
+    })
+    with pytest.raises(RuntimeError, match="Artist leakage"):
+        _audit_student_prompts(leaked)
