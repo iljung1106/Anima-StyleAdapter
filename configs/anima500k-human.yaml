@@ -3814,7 +3814,7 @@ real_artist_teacher:
 # Detail-preserving typed-slot, separate-softmax Style Cross-Attention v1.
 # Contract: docs/detail_preserving_style_cross_attention_plan.md
 detail_preserving_style_cross_attention:
-  output_directory: detail_preserving_style_cross_attention_v1_10k
+  output_directory: detail_preserving_style_cross_attention_v1_10k_retry1
   seed: 20260819
   train_split: train
   validation_split: validation
@@ -3987,6 +3987,7 @@ detail_preserving_style_cross_attention:
     log_every: 10
     validation_every: 250
     validation_batches: 8
+    state_every: 250
     checkpoint_every: 500
     sample_every: 500
     fixed_sample_every: 1000
@@ -3994,8 +3995,8 @@ detail_preserving_style_cross_attention:
     wandb:
       enabled: true
       project: anima-style-adapter
-      name: detail-preserving-style-cross-attention-v1-10k
-      id: detail-preserving-style-cross-attention-v1-10k
+      name: detail-preserving-style-cross-attention-v1-10k-retry1
+      id: detail-preserving-style-cross-attention-v1-10k-retry1
   sampling:
     width: 768
     height: 768

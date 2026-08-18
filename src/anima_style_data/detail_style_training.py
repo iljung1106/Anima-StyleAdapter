@@ -242,7 +242,12 @@ def _flow_step(
             ).squeeze(2).float()
     if need_wrong:
         wrong_references, wrong_mask = _reference_inputs(batch, device, "wrong_artist")
-        with torch.autocast(
+        # The wrong-reference branch is a comparator, not a target that should be
+        # made deliberately worse.  Keeping its complete frozen-Anima graph alive
+        # beside the correct graph nearly doubles peak activation memory.  Detach
+        # the comparator while retaining gradients through ``prediction`` so the
+        # ranking objective can only improve the correct-reference result.
+        with torch.no_grad(), torch.autocast(
             device_type=torch.device(device).type,
             dtype=torch.bfloat16,
             enabled=torch.device(device).type == "cuda",
@@ -634,6 +639,7 @@ def train_detail_style_cross_attention(
     log_every = int(training.get("log_every", 10))
     validation_every = int(training.get("validation_every", 250))
     checkpoint_every = int(training.get("checkpoint_every", 500))
+    state_every = int(training.get("state_every", checkpoint_every))
     sample_every = int(training.get("sample_every", 500))
     teacher_every_after = int(training.get("teacher_every_after_bootstrap", 2))
     teacher_bootstrap_end = int(training.get("teacher_every_step_until", 500))
@@ -773,14 +779,15 @@ def train_detail_style_cross_attention(
                         for mode, values in validation.items()
                         for key, value in values.items()
                     }, step=step)
+            if state_every > 0 and (step % state_every == 0 or step == steps):
+                _save_state(
+                    state_path, step=step, reader=reader, adapter=adapter,
+                    optimizer=optimizer, cfg=cfg,
+                )
             if step % checkpoint_every == 0 or step == steps:
                 _save_state(
                     checkpoint_dir / f"step-{step:07d}.pt", step=step,
                     reader=reader, adapter=adapter, optimizer=optimizer, cfg=cfg,
-                )
-                _save_state(
-                    state_path, step=step, reader=reader, adapter=adapter,
-                    optimizer=optimizer, cfg=cfg,
                 )
             if sample_every > 0 and (step % sample_every == 0 or step == steps):
                 sample_records, vae = _sample_query_style_tokenizer(
@@ -833,6 +840,8 @@ def smoke_test_detail_style_cross_attention(
         "resume": False,
         "alpha_calibration_batches": 1,
         "teacher_batch_rows": 2,
+        "functional_start_step": 1,
+        "functional_every": 1,
     })
     cfg["training"].setdefault("wandb", {})["enabled"] = False
     return train_detail_style_cross_attention(smoke, destination, steps_override=2)
