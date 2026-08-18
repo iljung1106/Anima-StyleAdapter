@@ -18,7 +18,7 @@ from .anima_cache import (
     _verify_sd_scripts_revision,
 )
 from .io import read_records, write_json
-from .style_transfer import _pad_text_conditions, _resolve_anima_model
+from .style_transfer import _resolve_anima_model
 
 
 def _artist_prompt(row: dict[str, Any], artist: str) -> str:
@@ -49,7 +49,7 @@ def _encode_prompts(
     )
     t5_tokenizer = anima_utils.load_t5_tokenizer()
     adapter = _load_llm_adapter(anima_models, models["dit"], device, dtype)
-    encoded = []
+    encoded: torch.Tensor | None = None
     max_qwen = int(text_cfg.get("qwen_max_length", 512))
     max_t5 = int(text_cfg.get("t5_max_length", 512))
     with torch.inference_mode():
@@ -75,17 +75,32 @@ def _encode_prompts(
                     source_attention_mask=source_mask,
                 )
                 condition[~target_mask.bool()] = 0
-            lengths = target_mask.sum(1).cpu().tolist()
-            encoded.extend(
-                tensor[: int(length)].to(device="cpu", dtype=torch.float16).clone()
-                for tensor, length in zip(condition, lengths, strict=True)
-            )
+            # Materialize the final fixed-length CPU tensor one batch at a
+            # time.  The previous ragged-list path issued one CPU copy per
+            # prompt and then copied all conditions a second time in
+            # ``_pad_text_conditions``.  At 20k prompts this turned a simple
+            # 20 GiB materialization into several minutes of tiny threaded
+            # copy kernels.  Padding has already been zeroed by target_mask,
+            # so copying the dense batch is numerically identical.
+            cpu_condition = condition.to(device="cpu", dtype=torch.float16)
+            if encoded is None:
+                encoded = torch.zeros(
+                    len(prompts),
+                    max_t5,
+                    cpu_condition.shape[-1],
+                    dtype=torch.float16,
+                )
+            encoded[
+                offset : offset + len(values), : cpu_condition.shape[1]
+            ].copy_(cpu_condition)
             print(f"encoded calibration prompts {min(offset + batch_size, len(prompts))}/{len(prompts)}", flush=True)
     del adapter, qwen
     gc.collect()
     if device.startswith("cuda"):
         torch.cuda.empty_cache()
-    return _pad_text_conditions(encoded, int(text_cfg.get("t5_max_length", 512)))
+    if encoded is None:
+        raise ValueError("Cannot encode an empty prompt list")
+    return encoded
 
 
 def filter_artist_effects(
