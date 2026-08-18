@@ -18,6 +18,7 @@ from .compare_resampler_representations import (
     _load_ab_tokenizer,
     _loader_config,
 )
+from .compare_style_tokenizers import _TokenView
 from .config import load_config, output_dir
 from .external_style_tokenizer_sheet import _decode_latents, _denoise_batch
 from .query_style_tokenizer import _select_sample_episodes
@@ -52,6 +53,33 @@ class SampleCase:
     small_tokens: torch.Tensor
     typed_tokens: torch.Tensor
     noise_seed: int
+
+
+def _load_typed_tokenizer(
+    checkpoint: Path, device: str
+) -> tuple[_TokenView, dict[str, Any]]:
+    state = torch.load(
+        checkpoint, map_location="cpu", weights_only=False, mmap=True
+    )
+    model_cfg = dict(state["config"]["model"])
+    model_cfg.pop("architecture", None)
+    # The shared trainer injected this old ON/OFF-ablation field into saved
+    # configs. Typed attention always consumes its four summary tokens, so the
+    # constructor intentionally has no such argument.
+    model_cfg.pop("include_artist_summary", None)
+    tokenizer = SingleStageTypedAttentionStyleTokenizer(**model_cfg)
+    tokenizer.load_state_dict(state["tokenizer"], strict=True)
+    tokenizer.to(device).eval()
+    metadata = {
+        "path": str(checkpoint),
+        "step": int(state["step"]),
+        "trainable_parameters": sum(
+            parameter.numel() for parameter in tokenizer.parameters()
+        ),
+        "output_tokens": int(tokenizer.output_tokens),
+    }
+    del state
+    return _TokenView(tokenizer), metadata
 
 
 def _slug(value: str) -> str:
@@ -188,9 +216,8 @@ def _tokenize_cases(
         AnimaStyleTokenizer,
         device,
     )
-    typed, typed_metadata = _load_ab_tokenizer(
+    typed, typed_metadata = _load_typed_tokenizer(
         destination / str(cfg["typed_checkpoint"]),
-        SingleStageTypedAttentionStyleTokenizer,
         device,
     )
     legacy_resampler = load_per_reference_resampler(
