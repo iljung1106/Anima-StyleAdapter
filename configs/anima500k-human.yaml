@@ -3996,8 +3996,8 @@ detail_preserving_style_cross_attention:
     wandb:
       enabled: true
       project: anima-style-adapter
-      name: detail-preserving-style-cross-attention-v1-10k-retry1
-      id: detail-preserving-style-cross-attention-v1-10k-retry1
+      name: detail-preserving-style-cross-attention-v1-10k-teacher-rms
+      id: detail-preserving-style-cross-attention-v1-10k-teacher-rms
   sampling:
     width: 768
     height: 768
