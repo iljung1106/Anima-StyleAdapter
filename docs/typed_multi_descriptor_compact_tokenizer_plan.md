@@ -268,8 +268,9 @@ v5는 구조 변경과 teacher coverage 변경을 섞지 않고 다음과 같이
 - 타입별 작은 pooling head가 reference consensus와 reference-specific residual을
   함께 읽고, 명시적 slot identity를 가진 최종 `16 x 1024` token을 만든다.
 - Anima 연결부는 별도 깊은 style branch 없이 기존 LLM-adapter token sequence에
-  이 16개 token을 주입하는 단순한 구조를 사용한다. 최종 token RMS는 강제로
-  고정하지 않는다.
+  이 16개 token을 주입하는 단순한 구조를 사용한다. 첫 2,000-step gate에서는
+  약한 출력 shortcut을 막기 위해 최종 token RMS를 `0.15`로 고정하고,
+  artist-specific 효과가 검증된 이후에만 bounded sample gain을 여는 것을 검토한다.
 - 우선 frozen Resampler로 tokenizer만 검증한다. Resampler 공동학습은 tokenizer의
   heldout 성능과 정성 샘플이 검증된 이후의 별도 단계로 둔다.
 
