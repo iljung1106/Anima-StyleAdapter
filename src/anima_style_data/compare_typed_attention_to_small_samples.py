@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import gc
 import json
 import re
@@ -33,6 +34,7 @@ from .style_tokenizer import (
 from .style_transfer import (
     ProductionStyleLoader,
     _optimize_frozen_anima,
+    _pad_text_conditions,
     _resolve_anima_model,
     load_per_reference_resampler,
 )
@@ -254,7 +256,10 @@ def _tokenize_cases(
                         typed_loader.text_root / "null_conditioning.safetensors",
                         device="cpu",
                     )["empty_prompt"]
-                    null_conditioning = raw[0] if raw.ndim == 3 else raw
+                    null_raw = raw[0] if raw.ndim == 3 else raw
+                    null_conditioning = _pad_text_conditions(
+                        [null_raw], typed_loader.text_conditioning_length
+                    )[0]
                 for artist_index, episode_index in enumerate(selected_indices[split]):
                     small_batch = small_loader.load_step(episode_index)
                     typed_batch = typed_loader.load_step(episode_index)
@@ -560,8 +565,17 @@ def generate_comparison_sweep(
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", required=True)
+    parser.add_argument("--smoke", action="store_true")
     args = parser.parse_args()
     config = load_config(args.config)
+    if args.smoke:
+        config = copy.deepcopy(config)
+        cfg = config["typed_attention_small_visual_sweep"]
+        cfg["output_directory"] = "diagnostics/typed-vs-small-sweep-smoke"
+        cfg["splits"] = ["validation"]
+        cfg["artists_per_split"] = 1
+        cfg["reference_counts"] = [1]
+        cfg["style_multipliers"] = [1.0]
     generate_comparison_sweep(config, output_dir(config))
 
 
