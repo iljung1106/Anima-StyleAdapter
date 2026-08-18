@@ -1118,7 +1118,7 @@ dual_domain_native_teacher:
   content_count: 4
   timesteps: [0.10, 0.25, 0.40, 0.55, 0.70, 0.82, 0.90, 0.97]
   seed: 20260820
-  text_batch_size: 512
+  text_batch_size: 64
   artist_batch_size: 32
   artist_batch_candidates: [16, 32, 48, 64]
   gpu_resident_text: true
