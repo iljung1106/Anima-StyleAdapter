@@ -2336,6 +2336,7 @@ def _train_variant(
             str(value)
             for value in dual_domain_bank.summary["validation_style_ids"]
         ]
+        all_teacher_style_ids = list(dual_domain_bank.artist_to_index)
         human_cfg = dict(dual_domain_cfg["human"])
         synthetic_cfg = dict(dual_domain_cfg["synthetic"])
         human_train_split, human_validation_split = _dual_domain_human_splits(
@@ -2409,7 +2410,13 @@ def _train_variant(
             CachedTeacherReferenceLoader(
                 synthetic_root,
                 split="validation",
-                style_ids=validation_style_ids,
+                # Synthetic references have their own 450/25/25 split inside
+                # the 500-artist subset (which was originally sampled from
+                # the human training artists).  Let that cache choose its
+                # held-out validation artists, then look their effects up in
+                # the full 5k bank.  Reusing the human validation IDs here
+                # makes the valid intersection empty by construction.
+                style_ids=all_teacher_style_ids,
                 batch_size=int(synthetic_cfg.get("batch_rows", 4)),
                 references=max(
                     int(value)
