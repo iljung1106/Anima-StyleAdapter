@@ -2677,7 +2677,7 @@ slot_preserving_global_query_style_tokenizer:
     vae_batch_size: 4
 
 typed_multi_descriptor_compact_style_tokenizer:
-  output_directory: typed_multi_descriptor_grouped_8k_v5_full_teacher
+  output_directory: typed_multi_descriptor_grouped_8k_v5b_artist_guard
   seed: 20260818
   train_split: train
   validation_split: validation
@@ -2759,6 +2759,9 @@ typed_multi_descriptor_compact_style_tokenizer:
     prefetch_workers: 2
     prefetch_batches: 6
     resume: true
+    initial_checkpoint: typed_multi_descriptor_grouped_8k_v5_full_teacher/checkpoints/step-0000750.pt
+    initial_history: typed_multi_descriptor_grouped_8k_v5_full_teacher/history.json
+    reset_optimizer_on_initial_checkpoint: false
     pilot_enabled: true
     reference_schedule:
       - name: target_excluded_1_8
@@ -2784,20 +2787,21 @@ typed_multi_descriptor_compact_style_tokenizer:
     token_contrastive_weight: 0.0
     subset_consistency_weight: 0.0
 
-    # Same-artist views are matched in Frozen-Anima effect space. Common and
-    # centered magnitude are supervised by the cleaner teacher objective.
+    # Do not directly match two jointly moving same-artist views: their easiest
+    # solution is a shared functional output.  Use the probe only to preserve
+    # artist-centered energy and suppress the batch-common Anima residual.
     functional_probe_enabled: true
     functional_probe_start_step: 500
     functional_probe_ramp_steps: 500
     functional_probe_every: 2
     functional_probe_batch_rows: 4
     functional_probe_references: 4
-    same_artist_functional_weight: 0.01
+    same_artist_functional_weight: 0.0
     same_artist_functional_direction_fraction: 0.75
     same_artist_functional_huber_beta: 0.10
     same_artist_functional_center_across_artists: true
-    centered_artist_effect_weight: 0.0
-    functional_common_output_weight: 0.0
+    centered_artist_effect_weight: 0.05
+    functional_common_output_weight: 0.05
 
     # Structural slot identity is preferred over attention-map proxies. A
     # weak late diagnostic acts after actual Frozen-Anima K/V projection.
@@ -2833,19 +2837,19 @@ typed_multi_descriptor_compact_style_tokenizer:
     teacher_projection_orthogonal_maximum: 0.50
     teacher_projection_orthogonal_weight: 0.25
     common_output_denominator: teacher_centered_rms
-    common_output_weight: 0.10
+    common_output_weight: 0.50
     common_output_start_step: 1
     common_output_ramp_end_step: 250
-    common_output_threshold_start: 0.85
-    common_output_threshold_end: 0.60
-    common_output_threshold_end_step: 8000
-    artist_teacher_contrastive_weight: 0.005
-    artist_teacher_contrastive_start_step: 1500
-    artist_teacher_contrastive_ramp_end_step: 3000
+    common_output_threshold_start: 0.65
+    common_output_threshold_end: 0.55
+    common_output_threshold_end_step: 2000
+    artist_teacher_contrastive_weight: 0.01
+    artist_teacher_contrastive_start_step: 750
+    artist_teacher_contrastive_ramp_end_step: 1500
     artist_teacher_temperature: 0.07
     artist_teacher_ranking_weight: 0.005
-    artist_teacher_ranking_start_step: 3000
-    artist_teacher_ranking_ramp_end_step: 4500
+    artist_teacher_ranking_start_step: 1000
+    artist_teacher_ranking_ramp_end_step: 2000
     artist_teacher_ranking_margin: 0.10
 
     # Wrong-reference ranking remains off during the 2k gate. It is opened
@@ -2920,8 +2924,8 @@ typed_multi_descriptor_compact_style_tokenizer:
     wandb:
       enabled: true
       project: anima-style-adapter
-      name: typed-multi-descriptor-grouped-v5-full-teacher
-      id: typed-multi-descriptor-grouped-v5-full-teacher
+      name: typed-multi-descriptor-grouped-v5b-artist-guard
+      id: typed-multi-descriptor-grouped-v5b-artist-guard
   fixed_reference_sampling:
     cache_directory: dual_query_external_reference_cache_v1
     device: cuda

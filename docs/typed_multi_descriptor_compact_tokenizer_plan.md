@@ -253,6 +253,29 @@ v5는 구조 변경과 teacher coverage 변경을 섞지 않고 다음과 같이
 - Coverage를 늘려도 외부 single-reference가 개선되지 않을 때에만 다음 실험에서
   reference mean/std consensus residual을 zero-init으로 추가한다.
 
+### v5 1,000-step gate와 v5b 교정
+
+5,000명 teacher coverage를 사용한 v5는 750 step에서 heldout improvement
+`0.00134`, correct-vs-wrong advantage `0.00308`, selection score `0.00363`까지
+개선됐다. 그러나 same-artist functional consistency가 완전히 열린 1,000
+step에서는 heldout이 `-0.00278`로 떨어지고 1/2/4/8-reference가 모두 음수가
+됐으며 controlled common-output ratio가 `0.954`까지 증가했다. 외부 고정 시트도
+서로 다른 일곱 reference가 거의 같은 얼굴·피부색·선화로 수렴했다.
+
+이는 두 jointly moving reference view를 직접 맞추는 objective가 artist-specific
+방향을 보존하지 못한 채 공통 출력을 만드는 shortcut을 택한 것으로 판단한다.
+따라서 v5b는 붕괴 전 step-750 checkpoint와 optimizer 상태에서 분기한다.
+
+- raw same-artist functional matching weight는 0으로 끈다.
+- Frozen-Anima residual의 artist-centered energy floor와 batch-common penalty를
+  각각 `0.05`로 켠다.
+- Teacher-RMS 분모의 common threshold를 `0.65 -> 0.55`로 좁히고 teacher common
+  weight를 `0.10 -> 0.50`으로 높인다.
+- 실제 teacher-aligned student effect에 대한 artist contrastive를 step 750부터,
+  ranking을 step 1,000부터 천천히 연다.
+- 1,000/1,250/1,500 step에서 common-output 감소와 heldout 회복이 동시에
+  확인되어야만 v5b를 4,000-step gate까지 진행한다.
+
 ## 통합 실행 계획 요약
 
 목표는 Dual-query Resampler가 보존한 공간·전역·작가 정보를 다시 하나의 공통
