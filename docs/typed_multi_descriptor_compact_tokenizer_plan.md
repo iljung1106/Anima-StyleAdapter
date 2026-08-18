@@ -138,3 +138,26 @@ v3는 `84 -> 8 typed descriptor`와 descriptor별 reference pooling은 유지하
 유지한다. Common-output weight는 `0.02 -> 0.10`으로 올리고, 이미 구조적으로
 분리된 slot에 대한 functional diversity는 3,000 step 이후로 늦춘다. v3 역시
 2,000 step에서 소형 baseline과 정량·정성 비교한 뒤에만 8,000 step까지 연장한다.
+
+### 1,000-step v3 중간 교정
+
+v3는 500-step 패널에서 v2보다 다양한 색면·선화·명암 변화를 보였고 slot
+diversity loss도 약 `0.99 -> 0.003--0.010`으로 개선됐다. 그러나 1,000 step에서
+self improvement는 `0.00371`, wrong-reference는 `-0.00476`, artist retrieval은
+`1.0`인 반면 heldout improvement는 `0.00023`에 불과했다. 4/8-reference도
+`-0.00058/0.00047`이었고, controlled reference-view difference ratio는 `0.584`였다.
+외부 고정 시트도 레퍼런스별 차이가 거의 없었다. 이는 정보를 읽는 능력은
+확보했지만 개별 그림 정보를 같은 작가의 공통 효과로 정제하지 못한 상태다.
+
+따라서 step-1,000 checkpoint에서 optimizer와 scheduler를 이어 다음과 같이
+교정한다.
+
+- functional probe cadence `4 -> 2`
+- same-artist functional weight `0.005 -> 0.05`
+- teacher projected-effect weight `0.50 -> 1.00`
+- functional artist-teacher contrastive 시작 `2,000 -> 1,500`
+
+이 변경은 token 자체를 억지로 같게 하지 않고, 동일 prompt/noise/timestep의
+Frozen-Anima velocity residual이 두 disjoint same-artist reference view에서
+일치하도록 한다. 1,250/1,500/2,000-step에서 heldout·multi-reference 성능과
+reference-view difference가 함께 개선되는지 확인한다.

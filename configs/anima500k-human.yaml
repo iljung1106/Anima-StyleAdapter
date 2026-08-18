@@ -2786,10 +2786,10 @@ typed_multi_descriptor_compact_style_tokenizer:
     functional_probe_enabled: true
     functional_probe_start_step: 500
     functional_probe_ramp_steps: 500
-    functional_probe_every: 4
+    functional_probe_every: 2
     functional_probe_batch_rows: 4
     functional_probe_references: 4
-    same_artist_functional_weight: 0.005
+    same_artist_functional_weight: 0.05
     same_artist_functional_direction_fraction: 0.75
     same_artist_functional_huber_beta: 0.10
     centered_artist_effect_weight: 0.0
@@ -2820,7 +2820,7 @@ typed_multi_descriptor_compact_style_tokenizer:
     centered_energy_weight: 0.0
     teacher_projected_effect_start_step: 1
     teacher_projected_effect_ramp_steps: 250
-    teacher_projected_effect_weight: 0.50
+    teacher_projected_effect_weight: 1.00
     teacher_projection_floor_start_step: 1
     teacher_projection_floor_end_step: 1500
     teacher_projection_floor_start: 0.02
@@ -2836,8 +2836,8 @@ typed_multi_descriptor_compact_style_tokenizer:
     common_output_threshold_end: 0.60
     common_output_threshold_end_step: 8000
     artist_teacher_contrastive_weight: 0.005
-    artist_teacher_contrastive_start_step: 2000
-    artist_teacher_contrastive_ramp_end_step: 4000
+    artist_teacher_contrastive_start_step: 1500
+    artist_teacher_contrastive_ramp_end_step: 3000
     artist_teacher_temperature: 0.07
     artist_teacher_ranking_weight: 0.005
     artist_teacher_ranking_start_step: 3000
@@ -2914,8 +2914,8 @@ typed_multi_descriptor_compact_style_tokenizer:
     wandb:
       enabled: true
       project: anima-style-adapter
-      name: typed-multi-descriptor-grouped-8k-v3
-      id: typed-multi-descriptor-grouped-8k-v3
+      name: typed-multi-descriptor-grouped-8k-v3b-consistency
+      id: typed-multi-descriptor-grouped-8k-v3b-consistency
   fixed_reference_sampling:
     cache_directory: dual_query_external_reference_cache_v1
     device: cuda
