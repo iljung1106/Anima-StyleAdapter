@@ -2756,6 +2756,8 @@ typed_multi_descriptor_compact_style_tokenizer:
     prefetch_workers: 2
     prefetch_batches: 6
     resume: true
+    initial_checkpoint: typed_multi_descriptor_grouped_8k_v3/checkpoints/step-0001000.pt
+    initial_history: typed_multi_descriptor_grouped_8k_v3/history.json
     pilot_enabled: true
     reference_schedule:
       - name: target_excluded_1_8

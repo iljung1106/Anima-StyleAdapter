@@ -170,3 +170,5 @@ reference-view difference가 함께 개선되는지 확인한다.
 동일 prompt/noise/timestep을 공유하는 artist batch 평균 residual을 먼저 뺀 뒤,
 남은 artist-specific residual끼리만 consistency를 계산한다. Weight는 과도했던
 `0.05`에서 `0.01`로 낮추고 cadence 2와 projected teacher weight 1.0은 유지한다.
+새 출력 디렉터리의 자동 resume에 의존하지 않고 v3 step-1,000 checkpoint와
+그 시점까지의 history를 `initial_checkpoint`/`initial_history`로 명시한다.
