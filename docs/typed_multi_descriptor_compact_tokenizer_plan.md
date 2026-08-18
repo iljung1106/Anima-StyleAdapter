@@ -172,3 +172,22 @@ reference-view difference가 함께 개선되는지 확인한다.
 `0.05`에서 `0.01`로 낮추고 cadence 2와 projected teacher weight 1.0은 유지한다.
 새 출력 디렉터리의 자동 resume에 의존하지 않고 v3 step-1,000 checkpoint와
 그 시점까지의 history를 `initial_checkpoint`/`initial_history`로 명시한다.
+
+### v3c 2,000-step gate
+
+Centered functional consistency를 적용한 v3c는 1,750 step에서 heldout
+improvement `0.00213`, correct-vs-wrong advantage `0.00525`, selection score
+`0.00563`을 기록했다. 2,000 step에서는 human/synthetic teacher cosine이
+`0.115/0.138`, projection coefficient가 `0.061/0.077`까지 개선됐고
+wrong-reference improvement는 `-0.00513`이었다. 구조 붕괴 없이 artist teacher
+방향을 학습한다는 점은 검증됐다.
+
+그러나 2,000 step heldout improvement는 `0.00079`로 다시 낮아졌으며,
+1/2-reference는 `0.00136/0.00398`인 반면 4/8-reference는
+`-0.00113/-0.00060`이었다. Controlled common-output ratio도 `0.814`, 두
+reference view의 difference ratio도 `0.579`였다. Fixed-reference 시트에서는
+reference별 머리색·피부색·채도 차이는 나타났지만 얼굴 비율·선화·명암은 공통
+Anima 출력에 남아 있었다. 따라서 2,000 step은 안정성 gate만 통과했고 최종
+스타일 재현 gate는 통과하지 못했다. Artist contrastive ramp가 끝나는 3,000
+step까지만 한정 연장해 common-output, 4/8-reference, fixed-reference 표현이
+개선되는지를 확인한 뒤 최대 8,000-step 연장 여부를 다시 결정한다.
