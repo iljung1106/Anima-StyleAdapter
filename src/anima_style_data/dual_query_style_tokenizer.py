@@ -173,8 +173,52 @@ def _load_resampler(
     device: str,
 ):
     resampler_cfg = config["dual_query_resampler"]
-    state = torch.load(checkpoint, map_location="cpu", weights_only=False, mmap=True)
-    model = _model_from_config(resampler_cfg, semantic_dim, vae_channels)
+    try:
+        state = torch.load(
+            checkpoint,
+            map_location="cpu",
+            weights_only=False,
+            mmap=True,
+        )
+    except TypeError as error:
+        if "mmap" not in str(error):
+            raise
+        state = torch.load(checkpoint, map_location="cpu", weights_only=False)
+    effective_cfg = copy.deepcopy(resampler_cfg)
+    checkpoint_model_cfg = state.get("model_config")
+    if isinstance(checkpoint_model_cfg, dict):
+        effective_cfg["model"] = copy.deepcopy(checkpoint_model_cfg)
+    model_state = state["model"]
+    semantic_layers = tuple(
+        int(value)
+        for value in effective_cfg["model"].get("semantic_layers", [18, 24])
+    )
+    checkpoint_semantic_dims = {
+        int(model_state[f"semantic_norms.{layer}.weight"].numel())
+        for layer in semantic_layers
+    }
+    if len(checkpoint_semantic_dims) != 1:
+        raise RuntimeError(
+            "Resampler checkpoint has inconsistent semantic layer widths: "
+            f"{sorted(checkpoint_semantic_dims)}"
+        )
+    checkpoint_semantic_dim = checkpoint_semantic_dims.pop()
+    checkpoint_vae_channels = int(model_state["vae_stem.0.weight"].shape[1])
+    if (
+        checkpoint_semantic_dim != int(semantic_dim)
+        or checkpoint_vae_channels != int(vae_channels)
+    ):
+        print(
+            "resampler checkpoint input dimensions override cache hints "
+            f"semantic={semantic_dim}->{checkpoint_semantic_dim} "
+            f"vae={vae_channels}->{checkpoint_vae_channels}",
+            flush=True,
+        )
+    model = _model_from_config(
+        effective_cfg,
+        checkpoint_semantic_dim,
+        checkpoint_vae_channels,
+    )
     model.load_state_dict(state["model"], strict=True)
     model.requires_grad_(False).eval().to(device)
     return model, int(state["step"])

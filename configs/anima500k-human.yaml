@@ -3608,7 +3608,7 @@ synthetic_teacher_additional:
     writer_workers: 2
     pending_writes: 2
     latent_lru_shards: 2
-    semantic_dim: 1536
+    semantic_dim: 1152
     vae_channels: 16
     amp_dtype: bfloat16
     model_cache_directory: /workspace/Anima-StyleAdapter/data/anima500k-human/cradio_model_cache

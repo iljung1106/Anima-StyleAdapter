@@ -8,7 +8,9 @@ torch = pytest.importorskip("torch")
 from anima_style_data.dual_query_style_tokenizer import (  # noqa: E402
     CachedTeacherReferenceLoader,
     DualQuerySetStyleTokenizer,
+    _load_resampler,
 )
+from anima_style_data.dual_query_training import _model_from_config  # noqa: E402
 from anima_style_data.io import write_records  # noqa: E402
 from anima_style_data.dual_query_style_training import (  # noqa: E402
     _artist_flow_ranking_loss,
@@ -35,6 +37,49 @@ def _model(*, include_summary: bool) -> DualQuerySetStyleTokenizer:
         cross_slot_layers=1,
         ff_dim=64,
     ).eval()
+
+
+def test_resampler_loader_uses_checkpoint_input_dimensions(tmp_path):
+    resampler_cfg = {
+        "model": {
+            "semantic_layers": [18, 24],
+            "dim": 32,
+            "spatial_query_grid": 2,
+            "global_queries": 2,
+            "layers": 1,
+            "heads": 4,
+            "ff_dim": 64,
+            "artist_descriptor_dim": 16,
+            "artist_pooling_queries": 2,
+            "artist_summary_tokens": 2,
+            "semantic_dropout": 0.0,
+            "vae_dropout": 0.0,
+        },
+        "training": {"artist_proxy_fraction": 0.0},
+    }
+    expected = _model_from_config(resampler_cfg, semantic_dim=12, vae_channels=4)
+    checkpoint = tmp_path / "resampler.pt"
+    torch.save(
+        {
+            "step": 17,
+            "model": expected.state_dict(),
+            "model_config": dict(resampler_cfg["model"]),
+        },
+        checkpoint,
+    )
+
+    loaded, step = _load_resampler(
+        {"dual_query_resampler": resampler_cfg},
+        tmp_path,
+        checkpoint,
+        semantic_dim=99,
+        vae_channels=99,
+        device="cpu",
+    )
+
+    assert step == 17
+    assert loaded.semantic_norms["18"].normalized_shape == (12,)
+    assert loaded.vae_stem[0].in_channels == 4
 
 
 def test_teacher_reference_loader_can_use_available_style_intersection(tmp_path):
