@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import pytest
+from safetensors.torch import save_file
 
 torch = pytest.importorskip("torch")
 
 from anima_style_data.dual_query_style_tokenizer import (  # noqa: E402
+    CachedTeacherReferenceLoader,
     DualQuerySetStyleTokenizer,
 )
+from anima_style_data.io import write_records  # noqa: E402
 from anima_style_data.dual_query_style_training import (  # noqa: E402
     _artist_flow_ranking_loss,
     _aligned_projection_target_loss,
@@ -32,6 +35,47 @@ def _model(*, include_summary: bool) -> DualQuerySetStyleTokenizer:
         cross_slot_layers=1,
         ff_dim=64,
     ).eval()
+
+
+def test_teacher_reference_loader_can_use_available_style_intersection(tmp_path):
+    rows = [
+        {
+            "id": index,
+            "style_id": "human:available",
+            "split": "train",
+            "token_shard": "part-00000.safetensors",
+            "token_row": index,
+        }
+        for index in range(4)
+    ]
+    write_records(tmp_path / "manifest.parquet", rows)
+    save_file(
+        {"tokens": torch.randn(4, 3, 8)},
+        tmp_path / "part-00000.safetensors",
+    )
+
+    loader = CachedTeacherReferenceLoader(
+        tmp_path,
+        split="train",
+        style_ids=["human:available", "human:missing"],
+        batch_size=1,
+        references=2,
+        seed=7,
+        strict_style_ids=False,
+    )
+    batch = loader.load_step(0)
+    assert batch["episodes"][0].style_id == "human:available"
+    assert batch["cached_reference_tokens"].shape == (2, 3, 8)
+
+    with pytest.raises(RuntimeError, match="missing 1 teacher artists"):
+        CachedTeacherReferenceLoader(
+            tmp_path,
+            split="train",
+            style_ids=["human:available", "human:missing"],
+            batch_size=1,
+            references=2,
+            seed=7,
+        )
 
 
 def test_reference_set_is_order_invariant():

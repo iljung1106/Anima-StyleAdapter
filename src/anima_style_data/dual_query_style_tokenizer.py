@@ -544,6 +544,7 @@ class CachedTeacherReferenceLoader:
         token_lru_shards: int = 8,
         ram_resident_tokens: bool = False,
         ram_preload_workers: int = 8,
+        strict_style_ids: bool = True,
     ) -> None:
         self.token_root = token_root
         self.batch_size = int(batch_size)
@@ -563,12 +564,23 @@ class CachedTeacherReferenceLoader:
             if len(rows) >= self.references
         }
         missing = sorted(allowed - set(self.by_style))
-        if missing:
+        if missing and strict_style_ids:
             raise RuntimeError(
                 f"Reference cache {token_root} is missing {len(missing)} "
                 f"teacher artists for split {split!r}"
             )
         self.styles = sorted(self.by_style)
+        if not self.styles:
+            raise RuntimeError(
+                f"Reference cache {token_root} has no teacher artists for "
+                f"split {split!r}"
+            )
+        if missing:
+            print(
+                f"teacher reference intersection {token_root.name} split={split}: "
+                f"{len(self.styles)}/{len(allowed)} styles",
+                flush=True,
+            )
         self.shards = _FullTokenShardLRU(token_root, token_lru_shards)
         if ram_resident_tokens:
             self.shards.preload(ram_preload_workers)

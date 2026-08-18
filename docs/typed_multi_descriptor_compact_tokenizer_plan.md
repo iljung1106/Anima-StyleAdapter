@@ -222,3 +222,33 @@ heldout `0.00135`, common-output `0.759/0.728`, 4/8-reference
 - 4/8-reference와 고정 시트가 함께 개선될 때만 8,000 step까지 연장한다.
   개선되지 않으면 단순 loss 증량 대신 reference pooling에 zero-init consensus
   residual을 추가하는 구조 변경으로 전환한다.
+
+### 4,000-step v4 gate와 v5 전환
+
+Reference-count teacher curriculum은 1/2/4-reference의 teacher projection을
+비슷하게 맞추는 데는 성공했지만 최종 성능을 개선하지 못했다. Step 4,000의
+heldout improvement는 `0.00050 ± 0.00393`이었고 1/2/4/8-reference는 각각
+`0.00082/0.00321/0.00032/-0.00033`이었다. Controlled common-output ratio도
+`0.806`으로 높았으며 외부 고정 시트는 일곱 reference 모두 거의 같은 얼굴,
+선화와 광원을 출력했다. 따라서 v4는 보존하되 8,000 step으로 연장하지 않는다.
+
+추가 진단에서 전체 reference cache는 5,000명(Train 4,000 / Validation 500 /
+Test 500)을 포함하지만 centered teacher bank는 500명(Train 450 / Validation
+25)뿐임을 확인했다. 21.1M tokenizer가 이 작은 직접 지도 집합을 분류·암기하고
+unseen 시각 스타일로 일반화하지 못하는 것이 single-reference 실패의 더 직접적인
+원인이다. 기존 500-bank의 artist median effect RMS도 `0.019--0.070` 범위여서
+약한 artist tag를 제거하는 것으로 해결될 문제는 아니다.
+
+v5는 구조 변경과 teacher coverage 변경을 섞지 않고 다음과 같이 검증한다.
+
+- 전체 5,000명에 대해 4 content x 8 timestep centered native-effect bank를
+  한 번 캐시한다. 예상 크기는 약 20 GiB이다.
+- Human teacher loader는 Train 4,000명을 모두 사용한다. Synthetic reference
+  cache는 존재하는 기존 500명과 bank의 교집합만 사용하며 두 도메인을 같은
+  스타일로 취급하지 않는다.
+- Tokenizer는 v4 구조를 처음부터 학습하되 불필요한 additive slot bias는 끈다.
+  1/2/4-reference curriculum, multimode prompt와 고정 output RMS는 유지한다.
+- 우선 4,000-step gate를 수행한다. Heldout 자체, 4/8-reference 성능과 외부
+  고정 시트가 함께 개선될 때만 같은 optimizer 상태로 8,000 step까지 연장한다.
+- Coverage를 늘려도 외부 single-reference가 개선되지 않을 때에만 다음 실험에서
+  reference mean/std consensus residual을 zero-init으로 추가한다.

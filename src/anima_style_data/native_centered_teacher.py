@@ -125,26 +125,39 @@ def _teacher_spec(
         style_ids = [str(by_artist[artist]["style_id"]) for artist in artists]
         fallback_splits = (
             synthetic_artist_split_map(config, source_rows)
-            if any(not row.get("artist_split") for row in source_rows)
+            if any(
+                not (row.get("artist_split") or row.get("split"))
+                for row in source_rows
+            )
             else {}
         )
         splits = [
             "test"
             if str(
                 by_artist[artist].get("artist_split")
+                or by_artist[artist].get("split")
                 or fallback_splits.get(artist, "train")
             )
             == "meta_test"
             else str(
                 by_artist[artist].get("artist_split")
+                or by_artist[artist].get("split")
                 or fallback_splits.get(artist, "train")
             )
             for artist in artists
         ]
         if cfg.get("probe_manifest"):
+            control_rows = all_source_rows
+            if not any(
+                str(row.get("kind")) == "content_control"
+                for row in control_rows
+            ):
+                control_rows = read_records(
+                    destination / str(cfg["probe_manifest"])
+                )
             controls = {
                 int(row["content_index"]): int(row["id"])
-                for row in all_source_rows
+                for row in control_rows
                 if str(row.get("kind")) == "content_control"
                 and int(row.get("seed_index", 0)) == 0
             }

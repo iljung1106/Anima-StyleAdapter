@@ -2373,6 +2373,7 @@ def _train_variant(
                 ram_preload_workers=int(
                     synthetic_cfg.get("ram_preload_workers", 8)
                 ),
+                strict_style_ids=False,
             )
         )
         dual_domain_validation_loaders["synthetic_teacher"] = (
@@ -2396,6 +2397,7 @@ def _train_variant(
                 ram_preload_workers=int(
                     synthetic_cfg.get("ram_preload_workers", 8)
                 ),
+                strict_style_ids=False,
             )
         )
         dual_domain_training = {

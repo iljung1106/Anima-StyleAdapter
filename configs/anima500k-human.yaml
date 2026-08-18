@@ -1105,23 +1105,22 @@ native_centered_teacher:
   text_batch_size: 64
   artist_batch_size: 8
 
-# Expanded native-effect bank shared by two independent reference domains.
-# Artist names come from the synthetic plan, while `style_id` remains the
-# matching human-cache key.  The probe images are square Anima content-control
-# latents so all 8 contents can share one dense cached tensor contract.
+# Full-corpus native-effect bank shared by two independent reference domains.
+# Human references cover all 5k artists; the synthetic loader uses its existing
+# 500-artist intersection. Probe images remain square Anima content controls.
 dual_domain_native_teacher:
-  output_directory: native_artist_centered_flow_teacher_500_v1
-  artist_manifest: synthetic_teacher_500x16/plan.parquet
+  output_directory: native_artist_centered_flow_teacher_5000_v2
+  artist_manifest: dual_query_reference_tokens_v8_step10000/manifest.parquet
   probe_manifest: synthetic_teacher_500x16/manifest.parquet
   probe_latent_directory: synthetic_teacher_500x16/latents
-  artist_count: 500
+  artist_count: 5000
   device: cuda
-  content_count: 8
+  content_count: 4
   timesteps: [0.10, 0.25, 0.40, 0.55, 0.70, 0.82, 0.90, 0.97]
   seed: 20260820
   text_batch_size: 64
-  artist_batch_size: 16
-  artist_batch_candidates: [8, 16, 24, 32]
+  artist_batch_size: 32
+  artist_batch_candidates: [16, 32, 48, 64]
   gpu_resident_text: true
 
 # Clean 2k experiment: random compact tokenizer initialization, regular
@@ -2678,7 +2677,7 @@ slot_preserving_global_query_style_tokenizer:
     vae_batch_size: 4
 
 typed_multi_descriptor_compact_style_tokenizer:
-  output_directory: typed_multi_descriptor_grouped_8k_v4_reference_curriculum
+  output_directory: typed_multi_descriptor_grouped_8k_v5_full_teacher
   seed: 20260818
   train_split: train
   validation_split: validation
@@ -2731,6 +2730,7 @@ typed_multi_descriptor_compact_style_tokenizer:
     output_mode: grouped_mlp
     descriptor_group_size: 2
     group_bottleneck_dim: 512
+    group_slot_embedding_scale: 0.0
     output_gain_center: 0.15
     output_gain_log_span: 0.50
     learnable_output_gain: false
@@ -2759,8 +2759,6 @@ typed_multi_descriptor_compact_style_tokenizer:
     prefetch_workers: 2
     prefetch_batches: 6
     resume: true
-    initial_checkpoint: typed_multi_descriptor_grouped_8k_v3c_centered/checkpoints/step-0003000.pt
-    initial_history: typed_multi_descriptor_grouped_8k_v3c_centered/history.json
     pilot_enabled: true
     reference_schedule:
       - name: target_excluded_1_8
@@ -2922,8 +2920,8 @@ typed_multi_descriptor_compact_style_tokenizer:
     wandb:
       enabled: true
       project: anima-style-adapter
-      name: typed-multi-descriptor-grouped-v4-reference-curriculum
-      id: typed-multi-descriptor-grouped-v4-reference-curriculum
+      name: typed-multi-descriptor-grouped-v5-full-teacher
+      id: typed-multi-descriptor-grouped-v5-full-teacher
   fixed_reference_sampling:
     cache_directory: dual_query_external_reference_cache_v1
     device: cuda
