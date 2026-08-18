@@ -252,3 +252,62 @@ v5는 구조 변경과 teacher coverage 변경을 섞지 않고 다음과 같이
   고정 시트가 함께 개선될 때만 같은 optimizer 상태로 8,000 step까지 연장한다.
 - Coverage를 늘려도 외부 single-reference가 개선되지 않을 때에만 다음 실험에서
   reference mean/std consensus residual을 zero-init으로 추가한다.
+
+## 통합 실행 계획 요약
+
+목표는 Dual-query Resampler가 보존한 공간·전역·작가 정보를 다시 하나의 공통
+벡터로 압축하지 않고, Anima가 실제로 사용할 수 있는 소수의 스타일 토큰으로
+변환하는 것이다.
+
+### 모델
+
+- Dual-query Resampler는 동결하고 이미지마다 `spatial/global/artist-summary`
+  typed descriptor를 출력한다.
+- Reference별 descriptor는 타입과 reference identity를 유지한 memory set으로
+  구성한다. Reference를 먼저 평균내거나 하나의 artist vector로 축소하지 않는다.
+- 타입별 작은 pooling head가 reference consensus와 reference-specific residual을
+  함께 읽고, 명시적 slot identity를 가진 최종 `16 x 1024` token을 만든다.
+- Anima 연결부는 별도 깊은 style branch 없이 기존 LLM-adapter token sequence에
+  이 16개 token을 주입하는 단순한 구조를 사용한다. 최종 token RMS는 강제로
+  고정하지 않는다.
+- 우선 frozen Resampler로 tokenizer만 검증한다. Resampler 공동학습은 tokenizer의
+  heldout 성능과 정성 샘플이 검증된 이후의 별도 단계로 둔다.
+
+### 데이터와 프롬프트
+
+- 전체 Train artist를 사용하고 artist 단위 validation/test 분리를 유지한다.
+- Reference 수는 1장이 가장 많고 2장이 그다음이 되도록
+  `1/2/3/4/5/6/7/8 = 45/25/12/7/4/3/2/2%`로 샘플링한다.
+- Prompt mode는 Full 30%, tag dropout 40%, short 20%, empty 10%로 구성한다.
+- Empty는 quality prefix 없이 반드시 단일 `reference = target`으로 학습한다.
+- Empty가 아닌 배치에는 quality prefix 포함/미포함을 섞는다. 모든 prompt와
+  cache에서 작가명 및 `@artist` 누출을 금지한다.
+
+### 지도 신호와 커리큘럼
+
+- 기본 목표는 rectified-flow MSE다. 초기에는 exact-self와 Human/Synthetic
+  centered artist teacher를 조밀하게 사용해 style effect의 방향과 절대 투영
+  크기를 먼저 학습한다.
+- 같은 작가의 서로 다른 reference view에는 token 자체가 아니라 Frozen Anima가
+  만든 artist-centered flow residual의 일관성을 적용한다.
+- Artist contrastive와 correct-vs-wrong cyclic ranking은 teacher alignment와
+  heldout paired-flow가 안정된 뒤 ramp한다. Wrong reference를 망가뜨리는 것이
+  아니라 correct reference의 residual이 더 정확하도록 margin을 둔다.
+- Common-output penalty는 작은 출력 자체를 보상하지 않는다. Teacher-aligned
+  절대 효과 크기를 보존하면서 artist 간 공통 성분만 억제한다.
+- Reconstruction, 강한 token prototype, attention-map diversity처럼 생성 기능과
+  직접 연결되지 않은 보조 loss는 사용하지 않는다.
+
+### 실행과 선택 기준
+
+- 먼저 전체 5,000명 centered teacher bank를 캐시하고 Human Train 4,000명을
+  직접 지도한다. Synthetic은 이용 가능한 500명 교집합을 별도 도메인으로 쓴다.
+- 새 모델은 처음부터 학습하며 4,000 step을 1차 gate로 삼는다.
+- 250/500 step 간격의 정량 validation과 500/1,000 step 간격의 panel 및 외부
+  fixed-reference 샘플을 함께 확인한다.
+- heldout paired-flow, teacher projection, 1/4/8-reference 성능이 개선되고,
+  fixed-reference에서 색상뿐 아니라 선화·명암·형태가 reference별로 달라질 때만
+  optimizer 상태를 이어 8,000 step까지 학습한다.
+- 4,000-step gate를 통과하지 못하면 단순히 loss나 모델 크기를 늘리지 않는다.
+  Reference consensus와 reference-specific residual이 어디서 소실되는지 측정한
+  뒤 zero-init consensus residual 같은 한 가지 구조 변경만 분리해 검증한다.
