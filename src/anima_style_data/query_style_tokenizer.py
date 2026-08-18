@@ -698,8 +698,10 @@ def _sample_query_style_tokenizer_chunk(
     device: str,
     step: int,
     vae: nn.Module | None,
+    *,
+    config_section: str = "query_style_tokenizer_v2",
 ) -> tuple[list[tuple[str, Path]], nn.Module | None]:
-    sample_cfg = dict(config["query_style_tokenizer_v2"].get("sampling", {}))
+    sample_cfg = dict(config[config_section].get("sampling", {}))
     batches = [
         loader.load_step(episode_index)
         for _, loader, episode_index, _ in requests
@@ -862,11 +864,13 @@ def _sample_query_style_tokenizer(
     device: str,
     step: int,
     vae: nn.Module | None,
+    *,
+    config_section: str = "query_style_tokenizer_v2",
 ) -> tuple[list[tuple[str, Path]], nn.Module]:
     tokenizer.eval()
     adapter.eval()
     anima.eval()
-    sample_cfg = dict(config["query_style_tokenizer_v2"].get("sampling", {}))
+    sample_cfg = dict(config[config_section].get("sampling", {}))
     chunk_size = max(1, int(sample_cfg.get("batch_size", 4)))
     records: list[tuple[str, Path]] = []
     for offset in range(0, len(requests), chunk_size):
@@ -874,6 +878,7 @@ def _sample_query_style_tokenizer(
             anima, adapter, tokenizer,
             requests[offset : offset + chunk_size],
             config, destination, output, device, step, vae,
+            config_section=config_section,
         )
         records.extend(chunk_records)
     write_json(

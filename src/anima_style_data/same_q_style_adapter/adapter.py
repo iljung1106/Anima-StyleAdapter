@@ -835,6 +835,13 @@ def _same_q_block_forward(
     result = rearrange(
         result, "b (t h w) d -> b t h w d", t=frames, h=height, w=width
     )
+    record_teacher = getattr(adapter, "record_gated_internal_teacher", None)
+    if record_teacher is not None:
+        record_teacher(
+            block.__dict__["_same_q_style_block_index"],
+            gate_cross,
+            (frames, height, width),
+        )
     # Native timestep-conditioned gate_cross controls the complete merged path.
     x = x + gate_cross * result
     normalized = block.layer_norm_mlp(x) * (1 + scale_mlp) + shift_mlp

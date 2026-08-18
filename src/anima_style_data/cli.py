@@ -99,6 +99,18 @@ def build_parser() -> argparse.ArgumentParser:
         ("style-tokenizer-smoke", "Run two real Anima StyleTokenizer training steps"),
         ("query-style-tokenizer-train", "Jointly train the 32-slot query StyleTokenizer and Anima style K/V"),
         ("query-style-tokenizer-smoke", "Run two real Anima query StyleTokenizer training steps"),
+        (
+            "detail-style-teacher-context-cache",
+            "Cache native content+artist post-LLM contexts for same-Q supervision",
+        ),
+        (
+            "detail-style-train",
+            "Train detail-preserving typed-slot Style Cross-Attention",
+        ),
+        (
+            "detail-style-smoke",
+            "Run two real detail-preserving Style Cross-Attention steps",
+        ),
         ("pure-token-style-tokenizer-train", "Train the 32-slot tokenizer by native text-context injection"),
         ("pure-token-style-tokenizer-smoke", "Smoke-test native-context pure token injection"),
         ("dual-query-resampler-train", "Pretrain the C-RADIO/Qwen-VAE dual-query Resampler"),
@@ -349,6 +361,27 @@ def main() -> None:
             "style-tokenizer-compare-artists": compare_style_tokenizer_artists,
             "style-tokenizer-smoke": smoke_test_style_tokenizer,
             "style-tokenizer-generalize-smoke": smoke_test_style_tokenizer_generalization,
+        }[args.command]
+        _run(stage, config, destination)
+    elif args.command in {
+        "detail-style-teacher-context-cache",
+        "detail-style-train",
+        "detail-style-smoke",
+    }:
+        from .detail_style_teacher_context import (
+            cache_detail_style_teacher_contexts,
+        )
+        from .detail_style_training import (
+            smoke_test_detail_style_cross_attention,
+            train_detail_style_cross_attention,
+        )
+
+        stage = {
+            "detail-style-teacher-context-cache": (
+                cache_detail_style_teacher_contexts
+            ),
+            "detail-style-train": train_detail_style_cross_attention,
+            "detail-style-smoke": smoke_test_detail_style_cross_attention,
         }[args.command]
         _run(stage, config, destination)
     elif args.command in {

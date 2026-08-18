@@ -3810,3 +3810,199 @@ real_artist_teacher:
       project: anima-style-adapter
       name: real-artist-5000-reference-head-batch64-gpu-cache-v6
       id: real-artist-5000-reference-head-batch64-gpu-cache-v6
+
+# Detail-preserving typed-slot, separate-softmax Style Cross-Attention v1.
+# Contract: docs/detail_preserving_style_cross_attention_plan.md
+detail_preserving_style_cross_attention:
+  output_directory: detail_preserving_style_cross_attention_v1_10k
+  seed: 20260819
+  train_split: train
+  validation_split: validation
+  resampler_checkpoint: dual_query_resampler_bprime_v8/checkpoints/step-010000.pt
+  cache:
+    output_directory: dual_query_reference_tokens_v8_step10000
+  loader:
+    batch_size: 4
+    min_references: 1
+    max_references: 8
+    artist_balanced: true
+    self_reference_target_images_per_style: 1
+    text_cache: anima_text_cache_post_llm_multimode_v1
+    text_conditioning_length: 512
+    text_lru_shards: 6
+    latent_lru_shards: 4
+    token_lru_shards: 8
+    ram_resident_tokens: true
+    ram_preload_workers: 8
+    prompt_modes:
+      full: 0.30
+      tag_dropout: 0.40
+      short: 0.20
+      empty: 0.10
+    quality_probability: 0.50
+    validation_prompt_modes:
+      full: 1.0
+      tag_dropout: 0.0
+      short: 0.0
+      empty: 0.0
+    validation_quality_probability: 0.0
+  model:
+    dim: 1024
+    spatial_tokens: 64
+    global_tokens: 16
+    summary_tokens: 4
+    output_tokens: 28
+    heads: 16
+    reader_layers: 2
+    reader_ff_dim: 3072
+    mixer_ff_dim: 3072
+    position_gain: 0.1
+    type_preference_bias: 1.0
+    slot_type_counts: [16, 8, 4]
+    strict_v1: true
+  adapter:
+    context_dim: 1024
+    blocks: 28
+    initial_alpha: 1.0
+  teacher:
+    bank_config_key: dual_domain_native_teacher
+    context_cache: native_artist_post_llm_context_5000_v1
+    context_cache_device: cuda
+    context_batch_size: 64
+    context_shard_artists: 64
+    context_lru_shards: 8
+    reference_lru_shards: 8
+    reference_caches:
+      - synthetic_teacher_500x16/dual_query_reference_tokens_v8_step10000
+      - synthetic_teacher_additional_1500x6/dual_query_reference_tokens_v8_step10000
+  training:
+    device: cuda
+    steps: 10000
+    learning_rate: 0.0001
+    kv_learning_rate: 0.00005
+    betas: [0.9, 0.95]
+    adam_eps: 0.00000001
+    weight_decay: 0.01
+    warmup_steps: 500
+    minimum_lr_ratio: 0.10
+    max_grad_norm: 1.0
+    gradient_accumulation_steps: 4
+    fused_adamw: true
+    allow_tf32: true
+    low_precision_rmsnorm: true
+    fuse_attention_projections: true
+    timestep_sampling: shift
+    sigmoid_scale: 1.0
+    sigmoid_bias: 0.0
+    discrete_flow_shift: 3.0
+    native_effect_timestep_weighting:
+      enabled: true
+      exponent: 1.0
+      minimum: 0.75
+      maximum: 1.33
+      statistics_chunk_artists: 16
+    reference_schedule:
+      - name: exact_single
+        end_step: 500
+        min_references: 1
+        max_references: 1
+        reference_count_weights: [1.0]
+      - name: mixed_1_2_4
+        end_step: 2000
+        min_references: 1
+        max_references: 4
+        reference_count_weights: [0.50, 0.35, 0.0, 0.15]
+      - name: heldout_1_2_4_8
+        end_step: 10000
+        min_references: 1
+        max_references: 8
+        reference_count_weights: [0.45, 0.30, 0.0, 0.17, 0.0, 0.0, 0.0, 0.08]
+    curriculum:
+      gate_only_steps: 0
+      self_reference_steps: 500
+      target_mix_end_step: 2000
+      target_mix_end_probability: 0.5
+      target_anneal_end: 6000
+      target_mix_min_references: 1
+      target_mix_max_references: 4
+      target_anneal_min_references: 1
+      target_anneal_max_references: 8
+    style_dropout: 0.05
+    reconstruction_weight: 0.05
+    reconstruction_final_weight: 0.01
+    reconstruction_hold_steps: 2000
+    functional_start_step: 500
+    functional_every: 4
+    functional_margin: 0.01
+    functional_weight: 0.10
+    same_artist_weight: 0.05
+    internal_teacher_weight: 0.25
+    teacher_batch_rows: 4
+    teacher_references: 4
+    teacher_every_step_until: 500
+    teacher_every_after_bootstrap: 2
+    alpha_calibration_batches: 4
+    teacher_objective:
+      native_teacher_start_step: 1
+      native_teacher_ramp_steps: 250
+      native_teacher_weight: 0.10
+      native_teacher_direction_weight: 0.10
+      native_teacher_magnitude_weight: 0.05
+      native_teacher_huber_beta: 0.10
+      native_teacher_scale_floor: 0.0001
+      center_student_teacher: true
+      teacher_projected_effect_start_step: 250
+      teacher_projected_effect_ramp_steps: 750
+      teacher_projected_effect_weight: 0.05
+      teacher_projection_floor_start_step: 250
+      teacher_projection_floor_end_step: 1000
+      teacher_projection_floor_start: 0.0
+      teacher_projection_floor_end: 0.5
+      teacher_projection_coefficient_maximum: 1.5
+      teacher_projection_orthogonal_maximum: 0.5
+      teacher_projection_orthogonal_weight: 0.4
+      artist_teacher_contrastive_start_step: 500
+      artist_teacher_contrastive_ramp_end_step: 1500
+      artist_teacher_contrastive_weight: 0.05
+      artist_teacher_ranking_start_step: 500
+      artist_teacher_ranking_ramp_end_step: 1500
+      artist_teacher_ranking_weight: 0.10
+      artist_teacher_temperature: 0.07
+      artist_teacher_ranking_margin: 0.10
+      common_output_start_step: 500
+      common_output_ramp_end_step: 1500
+      common_output_weight: 0.05
+      common_output_threshold_start: 0.85
+      common_output_threshold_end: 0.60
+      common_output_threshold_end_step: 10000
+      centered_energy_start_step: 500
+      centered_energy_ramp_end_step: 1500
+      centered_energy_ratio_start: 0.30
+      centered_energy_ratio_end: 0.80
+      centered_energy_ratio_maximum: 1.40
+      centered_energy_weight: 0.05
+      centered_energy_weight_ramp_end_step: 1500
+    prefetch_workers: 2
+    prefetch_batches: 6
+    log_every: 10
+    validation_every: 250
+    validation_batches: 8
+    checkpoint_every: 500
+    sample_every: 500
+    fixed_sample_every: 1000
+    resume: true
+    wandb:
+      enabled: true
+      project: anima-style-adapter
+      name: detail-preserving-style-cross-attention-v1-10k
+      id: detail-preserving-style-cross-attention-v1-10k
+  sampling:
+    width: 768
+    height: 768
+    steps: 30
+    flow_shift: 3.0
+    seed: 20260819
+    text_cfg: 4.0
+    style_cfg: 1.0
+    batch_size: 4
+    vae_batch_size: 4
