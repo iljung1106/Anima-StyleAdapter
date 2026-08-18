@@ -67,11 +67,13 @@ class _DescriptorGroupHead(nn.Module):
         descriptor_tokens: int,
         output_tokens: int,
         bottleneck_dim: int,
+        slot_embedding_scale: float,
     ) -> None:
         super().__init__()
         self.dim = int(dim)
         self.descriptor_tokens = int(descriptor_tokens)
         self.output_tokens = int(output_tokens)
+        self.slot_embedding_scale = float(slot_embedding_scale)
         self.input_norm = nn.LayerNorm(dim)
         self.mlp = nn.Sequential(
             nn.Linear(descriptor_tokens * dim, bottleneck_dim),
@@ -87,7 +89,7 @@ class _DescriptorGroupHead(nn.Module):
         values = self.mlp(self.input_norm(descriptors).flatten(1)).reshape(
             batch, self.output_tokens, self.dim
         )
-        return values + self.slot_embedding
+        return values + self.slot_embedding_scale * self.slot_embedding
 
 
 class TypedMultiDescriptorCompactStyleTokenizer(nn.Module):
@@ -119,6 +121,7 @@ class TypedMultiDescriptorCompactStyleTokenizer(nn.Module):
         output_mode: str = "attention",
         descriptor_group_size: int = 2,
         group_bottleneck_dim: int = 512,
+        group_slot_embedding_scale: float = 1.0,
         output_gain_center: float = 0.15,
         output_gain_log_span: float = 0.50,
         learnable_output_gain: bool = False,
@@ -145,7 +148,11 @@ class TypedMultiDescriptorCompactStyleTokenizer(nn.Module):
             raise ValueError("Output gain parameters must be non-negative")
         if output_mode not in {"attention", "grouped_mlp"}:
             raise ValueError(f"Unknown typed output mode: {output_mode}")
-        if descriptor_group_size <= 0 or group_bottleneck_dim <= 0:
+        if (
+            descriptor_group_size <= 0
+            or group_bottleneck_dim <= 0
+            or group_slot_embedding_scale < 0
+        ):
             raise ValueError("Grouped output dimensions must be positive")
 
         self.dim = int(dim)
@@ -165,6 +172,7 @@ class TypedMultiDescriptorCompactStyleTokenizer(nn.Module):
         self.output_mode = str(output_mode)
         self.descriptor_group_size = int(descriptor_group_size)
         self.group_bottleneck_dim = int(group_bottleneck_dim)
+        self.group_slot_embedding_scale = float(group_slot_embedding_scale)
         self.slot_modulation_scale = float(slot_modulation_scale)
         self.output_gain_center = float(output_gain_center)
         self.output_gain_log_span = float(output_gain_log_span)
@@ -220,6 +228,7 @@ class TypedMultiDescriptorCompactStyleTokenizer(nn.Module):
                             descriptor_tokens=descriptor_count,
                             output_tokens=descriptor_count * expansion,
                             bottleneck_dim=self.group_bottleneck_dim,
+                            slot_embedding_scale=self.group_slot_embedding_scale,
                         )
                     )
                     start = end

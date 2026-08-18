@@ -18,6 +18,8 @@ from anima_style_data.typed_multi_descriptor_style_tokenizer import (
 
 def _model(
     output_mode: str = "attention",
+    *,
+    group_slot_embedding_scale: float = 1.0,
 ) -> TypedMultiDescriptorCompactStyleTokenizer:
     torch.manual_seed(7)
     return TypedMultiDescriptorCompactStyleTokenizer(
@@ -33,6 +35,7 @@ def _model(
         ff_dim=64,
         output_mode=output_mode,
         group_bottleneck_dim=32,
+        group_slot_embedding_scale=group_slot_embedding_scale,
         output_gain_center=0.15,
     )
 
@@ -104,6 +107,18 @@ def test_grouped_mlp_preserves_typed_groups_and_conditional_output_slots():
         head.mlp[-1].weight.grad is not None
         for head in model.output_group_heads
     )
+
+
+def test_grouped_mlp_can_disable_sample_independent_slot_bias():
+    model = _model("grouped_mlp", group_slot_embedding_scale=0.0).eval()
+    references = torch.randn(2, 3, 14, 32)
+    mask = torch.ones(2, 3, dtype=torch.bool)
+    before = model(references, mask).tokens
+    with torch.no_grad():
+        for head in model.output_group_heads:
+            head.slot_embedding.fill_(1000.0)
+    after = model(references, mask).tokens
+    assert torch.allclose(before, after, atol=2e-6, rtol=2e-6)
 
 
 def test_teacher_projected_loss_rejects_orthogonal_energy_shortcut():
