@@ -7,7 +7,9 @@ from anima_style_data.global_query_style_tokenizer import (
     reference_conditioned_diversity_loss,
 )
 from anima_style_data.dual_query_style_training import (
+    _mean_one_clipped_weights,
     _native_artist_teacher_objective,
+    _native_effect_weights_for_timesteps,
     _native_kv_functional_diversity_loss,
     _save_state,
     _scheduled_teacher_every,
@@ -215,6 +217,23 @@ def test_dense_teacher_schedule_thins_only_after_artist_alignment_phase():
     assert _scheduled_teacher_every(1000, training) == 1
     assert _scheduled_teacher_every(1001, training) == 2
     assert _scheduled_teacher_every(3001, training) == 4
+
+
+def test_native_effect_timestep_weights_are_bounded_and_interpolated():
+    weights = _mean_one_clipped_weights(
+        torch.tensor([0.1, 0.8, 1.0, 4.0]), minimum=0.75, maximum=1.33
+    )
+    assert torch.isclose(weights.mean(), torch.tensor(1.0), atol=1e-6)
+    assert float(weights.min()) >= 0.75
+    assert float(weights.max()) <= 1.330001
+    interpolated = _native_effect_weights_for_timesteps(
+        torch.tensor([0.1, 0.3, 0.5]),
+        {
+            "timesteps": torch.tensor([0.1, 0.5]),
+            "weights": torch.tensor([0.75, 1.25]),
+        },
+    )
+    assert torch.allclose(interpolated, torch.tensor([0.75, 1.0, 1.25]))
 
 
 def test_checkpoint_preserves_optimizer_and_sparse_teacher_state(tmp_path):

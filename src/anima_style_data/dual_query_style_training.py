@@ -31,6 +31,9 @@ from .global_query_style_tokenizer import (
 from .typed_multi_descriptor_style_tokenizer import (
     TypedMultiDescriptorCompactStyleTokenizer,
 )
+from .single_stage_typed_attention_style_tokenizer import (
+    SingleStageTypedAttentionStyleTokenizer,
+)
 from .dual_query_external_samples import load_dual_query_external_sample
 from .external_style_tokenizer_sheet import generate_live_external_style_sample
 from .io import write_json
@@ -211,6 +214,78 @@ def _scheduled_teacher_gradient_scale(
         if bool(training.get("dual_domain_teacher_scale_by_cadence", False))
         else 1.0
     )
+
+
+def _mean_one_clipped_weights(
+    raw: torch.Tensor, *, minimum: float, maximum: float
+) -> torch.Tensor:
+    """Scale positive weights to mean one without violating hard bounds."""
+
+    lower, upper = 0.0, 4.0 / max(float(raw.mean()), 1e-8)
+    for _ in range(48):
+        scale = (lower + upper) * 0.5
+        mean = float((raw * scale).clamp(minimum, maximum).mean())
+        if mean < 1.0:
+            lower = scale
+        else:
+            upper = scale
+    return (raw * ((lower + upper) * 0.5)).clamp(minimum, maximum)
+
+
+def _build_native_effect_timestep_weighting(
+    bank: NativeCenteredTeacherBank,
+    training: dict[str, Any],
+) -> dict[str, torch.Tensor] | None:
+    cfg = dict(training.get("native_effect_timestep_weighting", {}))
+    if not bool(cfg.get("enabled", False)):
+        return None
+    teacher = bank.tensors["centered_teacher"]
+    timestep_count = int(teacher.shape[2])
+    rms_rows = []
+    chunk_rows = max(1, int(cfg.get("statistics_chunk_artists", 16)))
+    reduction = tuple(range(3, teacher.ndim))
+    for start in range(0, int(teacher.shape[0]), chunk_rows):
+        chunk = teacher[start : start + chunk_rows].float()
+        rms_rows.append(chunk.square().mean(dim=reduction).sqrt().reshape(-1, timestep_count))
+    rms = torch.cat(rms_rows, dim=0)
+    median = rms.quantile(0.50, dim=0)
+    p25 = rms.quantile(0.25, dim=0)
+    p75 = rms.quantile(0.75, dim=0)
+    overall = median.median().clamp_min(1e-8)
+    exponent = float(cfg.get("exponent", 0.25))
+    minimum = float(cfg.get("minimum", 0.75))
+    maximum = float(cfg.get("maximum", 1.33))
+    raw = (median / overall).clamp_min(1e-8).pow(exponent)
+    weights = _mean_one_clipped_weights(
+        raw, minimum=minimum, maximum=maximum
+    )
+    return {
+        "timesteps": bank.tensors["timesteps"].float().clone(),
+        "weights": weights.float(),
+        "median_rms": median.float(),
+        "p25_rms": p25.float(),
+        "p75_rms": p75.float(),
+    }
+
+
+def _native_effect_weights_for_timesteps(
+    timesteps: torch.Tensor,
+    weighting: dict[str, torch.Tensor] | None,
+) -> torch.Tensor:
+    if weighting is None:
+        return torch.ones_like(timesteps, dtype=torch.float32)
+    grid = weighting["timesteps"].to(timesteps.device)
+    values = weighting["weights"].to(timesteps.device)
+    order = grid.argsort()
+    grid = grid[order]
+    values = values[order]
+    query = timesteps.float().clamp(grid[0], grid[-1])
+    upper = torch.searchsorted(grid, query).clamp(1, len(grid) - 1)
+    lower = upper - 1
+    left = grid[lower]
+    right = grid[upper]
+    fraction = (query - left) / (right - left).clamp_min(1e-8)
+    return values[lower] + fraction * (values[upper] - values[lower])
 
 
 def _scheduled_teacher_reference_count(
@@ -969,6 +1044,7 @@ def _native_centered_teacher_step(
     metric_prefix: str = "native_teacher",
     probe_index_override: int | None = None,
     reference_count_override: int | None = None,
+    timestep_weighting: dict[str, torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     references, reference_mask = _reference_inputs(batch, device, "heldout")
     rows = min(
@@ -1051,14 +1127,21 @@ def _native_centered_teacher_step(
             target_input_ids=None,
         ).squeeze(2).float()
     student = prediction - base_prediction
-    weighted, metrics = _native_artist_teacher_objective(
+    weighted_unscaled, metrics = _native_artist_teacher_objective(
         student, teacher, training, step=step
     )
+    timestep_weight = _native_effect_weights_for_timesteps(
+        timestep.float().reshape(1), timestep_weighting
+    )[0]
+    weighted = weighted_unscaled * timestep_weight
     metrics.update(
         {
             "native_teacher_content_index": student.new_tensor(content_index),
             "native_teacher_timestep": timestep.detach().float(),
             "native_teacher_reference_count": student.new_tensor(reference_count),
+            "native_teacher_timestep_weight": timestep_weight.detach(),
+            "native_teacher_timestep_unweighted_loss": weighted_unscaled.detach(),
+            "native_teacher_timestep_weighted_loss": weighted.detach(),
         }
     )
     if metric_prefix != "native_teacher":
@@ -1079,6 +1162,7 @@ def _dual_domain_centered_teacher_step(
     *,
     step: int,
     probe_index_override: int | None = None,
+    timestep_weighting: dict[str, torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """Run independent human/synthetic objectives in one larger Anima batch."""
     domains = ("human_teacher", "synthetic_teacher")
@@ -1180,6 +1264,9 @@ def _dual_domain_centered_teacher_step(
         ).squeeze(2).float()
     student = prediction - base_prediction
     total = student.new_zeros(())
+    timestep_weight = _native_effect_weights_for_timesteps(
+        timestep.float().reshape(1), timestep_weighting
+    )[0]
     metrics: dict[str, torch.Tensor] = {}
     offset = 0
     for domain, domain_training, _, _, _, rows in prepared:
@@ -1189,7 +1276,8 @@ def _dual_domain_centered_teacher_step(
             domain_training,
             step=step,
         )
-        total = total + domain_loss
+        weighted_domain_loss = domain_loss * timestep_weight
+        total = total + weighted_domain_loss
         domain_metrics.update({
             "native_teacher_content_index": domain_loss.new_tensor(content_index),
             "native_teacher_timestep": timestep.detach().float(),
@@ -1199,6 +1287,9 @@ def _dual_domain_centered_teacher_step(
             "native_teacher_reference_count": domain_loss.new_tensor(
                 reference_count
             ),
+            "native_teacher_timestep_weight": timestep_weight.detach(),
+            "native_teacher_timestep_unweighted_loss": domain_loss.detach(),
+            "native_teacher_timestep_weighted_loss": weighted_domain_loss.detach(),
         })
         metrics.update({
             (
@@ -1245,6 +1336,7 @@ def _evaluate_native_teacher_domain(
     metric_prefix: str,
     batches: int,
     step: int,
+    timestep_weighting: dict[str, torch.Tensor] | None = None,
 ) -> dict[str, float]:
     reference_counts = [
         int(value)
@@ -1270,6 +1362,7 @@ def _evaluate_native_teacher_domain(
                     metric_prefix=metric_prefix,
                     probe_index_override=index,
                     reference_count_override=reference_count,
+                    timestep_weighting=timestep_weighting,
                 )
                 for key, value in metrics.items():
                     totals[key] += float(value)
@@ -1511,6 +1604,7 @@ def _forward_dual_query_flow(
     generator: torch.Generator,
     step: int,
     measure_base: bool,
+    timestep_weighting: dict[str, torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     latents = batch["latents"].to(
         device, dtype=torch.bfloat16, non_blocking=True
@@ -1647,7 +1741,12 @@ def _forward_dual_query_flow(
             noisy.unsqueeze(2), timesteps.to(latents.dtype),
             context=styled, padding_mask=padding_mask, target_input_ids=None,
         ).squeeze(2).float()
-    flow_loss = F.mse_loss(prediction, target)
+    flow_per_sample = (prediction - target).square().flatten(1).mean(dim=1)
+    flow_timestep_weights = _native_effect_weights_for_timesteps(
+        timesteps, timestep_weighting
+    )
+    flow_loss_unweighted = flow_per_sample.mean()
+    flow_loss = (flow_per_sample * flow_timestep_weights).mean()
     total = flow_loss
 
     reconstruction = flow_loss.new_zeros(())
@@ -1999,6 +2098,10 @@ def _forward_dual_query_flow(
     metrics = {
         "loss": total.detach(),
         "flow_loss": flow_loss.detach(),
+        "flow_loss_unweighted": flow_loss_unweighted.detach(),
+        "flow_timestep_weight_mean": flow_timestep_weights.detach().mean(),
+        "flow_timestep_weight_min": flow_timestep_weights.detach().min(),
+        "flow_timestep_weight_max": flow_timestep_weights.detach().max(),
         "reconstruction_loss": reconstruction.detach(),
         "reconstruction_huber_loss": reconstruction_huber.detach(),
         "reconstruction_cosine_loss": reconstruction_cosine.detach(),
@@ -2440,6 +2543,22 @@ def _train_variant(
             "human_teacher": _domain_teacher_training(training, human_cfg),
             "synthetic_teacher": _domain_teacher_training(training, synthetic_cfg),
         }
+    timestep_weighting_bank = dual_domain_bank or native_teacher_bank
+    timestep_weighting = (
+        _build_native_effect_timestep_weighting(
+            timestep_weighting_bank, training
+        )
+        if timestep_weighting_bank is not None
+        else None
+    )
+    if timestep_weighting is not None:
+        print(
+            "native effect timestep weighting "
+            f"timesteps={timestep_weighting['timesteps'].tolist()} "
+            f"weights={timestep_weighting['weights'].tolist()} "
+            f"median_rms={timestep_weighting['median_rms'].tolist()}",
+            flush=True,
+        )
     cache_summary = _cache_summary(destination, cfg)
     model_cfg = dict(cfg["model"])
     architecture = str(model_cfg.pop("architecture", "flat_set"))
@@ -2455,6 +2574,8 @@ def _train_variant(
         tokenizer = SlotPreservingGlobalQueryStyleTokenizer(**model_cfg).to(device)
     elif architecture == "typed_multi_descriptor_compact":
         tokenizer = TypedMultiDescriptorCompactStyleTokenizer(**model_cfg).to(device)
+    elif architecture == "single_stage_typed_attention":
+        tokenizer = SingleStageTypedAttentionStyleTokenizer(**model_cfg).to(device)
     else:
         raise ValueError(
             f"Unknown Dual-query StyleTokenizer architecture {architecture!r}"
@@ -2674,6 +2795,7 @@ def _train_variant(
                     generator=generator,
                     step=step,
                     measure_base=(step == 1 or step % log_every == 0),
+                    timestep_weighting=timestep_weighting,
                 )
                 consistency_weight = (
                     float(training.get("subset_consistency_weight", 0.0))
@@ -2743,6 +2865,7 @@ def _train_variant(
                     device,
                     training,
                     step=step,
+                    timestep_weighting=timestep_weighting,
                 )
                 if teacher_loss.requires_grad:
                     teacher_loss.backward()
@@ -2772,6 +2895,7 @@ def _train_variant(
                         dual_domain_training,
                         step=step,
                         probe_index_override=teacher_update_index,
+                        timestep_weighting=timestep_weighting,
                     )
                     scaled_domain_loss = domain_loss * teacher_gradient_scale
                     if scaled_domain_loss.requires_grad:
@@ -2794,6 +2918,7 @@ def _train_variant(
                             step=step,
                             metric_prefix=domain,
                             probe_index_override=teacher_update_index,
+                            timestep_weighting=timestep_weighting,
                         )
                         scaled_domain_loss = (
                             domain_loss * teacher_gradient_scale
@@ -2913,6 +3038,7 @@ def _train_variant(
                             device,
                             training,
                             step=step,
+                            timestep_weighting=timestep_weighting,
                         )
                     row["validation_native_teacher"] = {
                         key: float(value)
@@ -2935,6 +3061,7 @@ def _train_variant(
                                 metric_prefix=domain,
                                 batches=teacher_validation_batches,
                                 step=step,
+                                timestep_weighting=timestep_weighting,
                             )
                         )
                 extended_every = int(
@@ -3651,6 +3778,77 @@ def smoke_test_typed_multi_descriptor_style_tokenizer(
     config: dict[str, Any], destination: Path
 ) -> dict[str, Any]:
     return _run_typed_multi_descriptor_style_tokenizer(
+        config, destination, smoke=True
+    )
+
+
+def _run_single_stage_typed_attention_style_tokenizer(
+    config: dict[str, Any], destination: Path, *, smoke: bool
+) -> dict[str, Any]:
+    cfg = copy.deepcopy(config["single_stage_typed_attention_style_tokenizer"])
+    output_name = str(cfg["output_directory"])
+    if smoke:
+        output_name += "_smoke"
+        training = cfg["training"]
+        training.update(
+            {
+                "steps": 2,
+                "log_every": 1,
+                "validation_every": 0,
+                "checkpoint_every": 1,
+                "sample_every": 0,
+                "fixed_sample_every": 0,
+                "extended_evaluation_every": 0,
+                "resume": False,
+                "wandb": {"enabled": False},
+                "dual_domain_teacher_schedule": [
+                    {"end_step": 2, "every": 1}
+                ],
+                "wrong_ranking_start_step": 1,
+                "wrong_ranking_ramp_steps": 0,
+                "wrong_ranking_every": 1,
+            }
+        )
+        for domain in ("human", "synthetic"):
+            training["dual_domain_teacher"][domain]["ramp_steps"] = 0
+    effective = copy.deepcopy(config)
+    effective["dual_query_style_tokenizer"] = cfg
+    device = str(cfg["training"].get("device", "cuda"))
+    anima = _resolve_anima_model(effective, destination, device).requires_grad_(
+        False
+    ).eval()
+    _optimize_frozen_anima(
+        anima,
+        low_precision_rmsnorm=bool(
+            cfg["training"].get("low_precision_rmsnorm", True)
+        ),
+        fuse_attention_projections=bool(
+            cfg["training"].get("fuse_attention_projections", True)
+        ),
+    )
+    return _train_variant(
+        effective,
+        destination,
+        anima,
+        include_artist_summary=True,
+        output_name=output_name,
+        steps_override=int(cfg["training"].get("steps", 2_000)),
+        cfg_override=cfg,
+    )
+
+
+def train_single_stage_typed_attention_style_tokenizer(
+    config: dict[str, Any], destination: Path
+) -> dict[str, Any]:
+    return _run_single_stage_typed_attention_style_tokenizer(
+        config, destination, smoke=False
+    )
+
+
+def smoke_test_single_stage_typed_attention_style_tokenizer(
+    config: dict[str, Any], destination: Path
+) -> dict[str, Any]:
+    return _run_single_stage_typed_attention_style_tokenizer(
         config, destination, smoke=True
     )
 

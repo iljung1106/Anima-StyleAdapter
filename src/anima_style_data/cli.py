@@ -153,6 +153,14 @@ def build_parser() -> argparse.ArgumentParser:
             "typed-multi-descriptor-smoke",
             "Smoke-test typed descriptor pooling and projected supervision",
         ),
+        (
+            "single-stage-typed-attention-train",
+            "Train the compact single-stage typed-attention Style Tokenizer",
+        ),
+        (
+            "single-stage-typed-attention-smoke",
+            "Smoke-test single-stage typed multi-reference attention",
+        ),
         ("dual-query-style-ablate", "Compare artist-summary token delivery"),
         ("dual-query-style-train", "Train the multi-reference Dual-query Style Tokenizer"),
         ("dual-query-style-pilot", "Run the summary-ON 10k Dual-query Style Tokenizer pilot"),
@@ -189,6 +197,10 @@ def build_parser() -> argparse.ArgumentParser:
         ("dual-query-style-smoke", "Smoke-test the Dual-query Style Tokenizer"),
         ("style-calibrate", "Measure empirical Anima artist-tag velocity effect ranges"),
         ("synthetic-teacher", "Generate and fully cache artist-tag teacher images"),
+        (
+            "synthetic-reference-additional",
+            "Generate the non-overlapping additional synthetic reference corpus",
+        ),
         ("synthetic-teacher-benchmark", "Validate SPEED and batched VAE before production"),
         ("synthetic-teacher-kv", "Cache factorized native Anima K/V/O teacher targets"),
         ("real-artist-teacher-kv", "Cache 5k real-artist text and native K/V/O teacher targets"),
@@ -391,6 +403,8 @@ def main() -> None:
         "slot-preserving-global-query-smoke",
         "typed-multi-descriptor-train",
         "typed-multi-descriptor-smoke",
+        "single-stage-typed-attention-train",
+        "single-stage-typed-attention-smoke",
         "dual-query-style-ablate",
         "dual-query-style-train",
         "dual-query-style-pilot",
@@ -439,6 +453,8 @@ def main() -> None:
             smoke_test_slot_preserving_global_query_style_tokenizer,
             train_typed_multi_descriptor_style_tokenizer,
             smoke_test_typed_multi_descriptor_style_tokenizer,
+            train_single_stage_typed_attention_style_tokenizer,
+            smoke_test_single_stage_typed_attention_style_tokenizer,
         )
 
         stage = {
@@ -476,6 +492,12 @@ def main() -> None:
             "typed-multi-descriptor-smoke": (
                 smoke_test_typed_multi_descriptor_style_tokenizer
             ),
+            "single-stage-typed-attention-train": (
+                train_single_stage_typed_attention_style_tokenizer
+            ),
+            "single-stage-typed-attention-smoke": (
+                smoke_test_single_stage_typed_attention_style_tokenizer
+            ),
             "dual-query-style-ablate": compare_artist_summary_tokens,
             "dual-query-style-train": train_dual_query_style_tokenizer,
             "dual-query-style-pilot": train_dual_query_style_tokenizer_pilot,
@@ -509,6 +531,10 @@ def main() -> None:
         from .synthetic_teacher import build_synthetic_teacher_cache
 
         _run(build_synthetic_teacher_cache, config, destination)
+    elif args.command == "synthetic-reference-additional":
+        from .synthetic_teacher import build_additional_synthetic_reference_images
+
+        _run(build_additional_synthetic_reference_images, config, destination)
     elif args.command == "synthetic-teacher-benchmark":
         from .synthetic_teacher import benchmark_synthetic_teacher_cache
 

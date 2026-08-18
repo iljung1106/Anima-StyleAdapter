@@ -112,7 +112,15 @@ def build_synthetic_teacher_plan(
     seeds_per_content = int(cfg.get("seeds_per_content", 2))
     if not 0 <= female_contents <= content_count:
         raise ValueError("female_contents must be between zero and contents_per_artist")
-    rows = [row for row in _caption_rows(destination) if row.get("split", "train") == "train"]
+    source_splits = {
+        str(value)
+        for value in cfg.get("source_splits", ["train"])
+    }
+    rows = [
+        row
+        for row in _caption_rows(destination)
+        if str(row.get("split", "train")) in source_splits
+    ]
     # `style_id` is an internal cache key such as ``human:foo_(bar)``.  Anima's
     # native artist syntax expects the raw Danbooru artist name, so never feed
     # that namespace prefix to the text encoder.
@@ -124,20 +132,58 @@ def build_synthetic_teacher_plan(
         recorded = style_by_artist.setdefault(artist, style_id)
         if recorded != style_id:
             raise RuntimeError(f"Artist {artist!r} maps to multiple style IDs")
+    source_split_by_artist: dict[str, str] = {}
+    for row in rows:
+        artist = str(row["artist"])
+        split = str(row.get("split", "train"))
+        recorded = source_split_by_artist.setdefault(artist, split)
+        if recorded != split:
+            raise RuntimeError(f"Artist {artist!r} appears in multiple splits")
     eligible = sorted(name for name, count in counts.items() if count >= 2)
+    if cfg.get("artist_manifest"):
+        manifest_rows = read_records(destination / str(cfg["artist_manifest"]))
+        manifest_artists = {
+            str(row["artist"])
+            for row in manifest_rows
+            if str(row.get("kind", "artist")) == "artist"
+        }
+        eligible = [name for name in eligible if name in manifest_artists]
+    excluded_artists: set[str] = set()
+    for manifest in cfg.get("exclude_artist_plan_manifests", []):
+        for row in read_records(destination / str(manifest)):
+            if str(row.get("kind", "artist")) == "artist" and row.get("artist"):
+                excluded_artists.add(str(row["artist"]))
+    eligible = [name for name in eligible if name not in excluded_artists]
     if len(eligible) < artist_count:
-        raise RuntimeError(f"Need {artist_count} train artists, found {len(eligible)}")
+        raise RuntimeError(
+            f"Need {artist_count} eligible artists after excluding "
+            f"{len(excluded_artists)}, found {len(eligible)}"
+        )
     rng = random.Random(seed)
     artists = rng.sample(eligible, artist_count)
-    artist_splits = synthetic_artist_split_map(
-        config,
-        [{"artist": artist, "kind": "artist"} for artist in artists],
-    )
+    if bool(cfg.get("preserve_source_splits", False)):
+        artist_splits = {
+            artist: (
+                "meta_test"
+                if source_split_by_artist[artist] in {"test", "meta_test"}
+                else source_split_by_artist[artist]
+            )
+            for artist in artists
+        }
+    else:
+        artist_splits = synthetic_artist_split_map(
+            config,
+            [{"artist": artist, "kind": "artist"} for artist in artists],
+        )
 
     # Reuse real, artist-free Anima captions as content controls. Selecting
     # different source styles prevents one artist's subject distribution from
     # becoming the shared synthetic content template.
-    content_pool = [row for row in rows if str(row["artist"]) not in artists]
+    content_pool = (
+        [row for row in rows if str(row["artist"]) not in artists]
+        if bool(cfg.get("exclude_teacher_artists_from_content", True))
+        else list(rows)
+    )
     rng.shuffle(content_pool)
     content_rows: list[dict[str, Any]] = []
     used_styles: set[str] = set()
@@ -247,6 +293,7 @@ def build_synthetic_teacher_plan(
         "content_controls": len(content_rows) * len(seed_values), "images": len(plan),
         "prompts": len(prompts), "seed_values": seed_values,
         "artist_split_counts": dict(Counter(artist_splits.values())),
+        "excluded_artists": len(excluded_artists),
         "literal_parentheses_are_tokenized_directly": True,
         "comfy_prompts_escape_weighting_delimiters": True,
     })
@@ -592,7 +639,9 @@ def generate_synthetic_teacher_images(
     output_rows = list(completed_rows)
     started = time.monotonic()
     benchmark_path = root / "benchmark-gpu-dct-v1.json"
-    benchmark_done = benchmark_path.exists()
+    benchmark_done = benchmark_path.exists() or not bool(
+        cfg.get("run_first_batch_benchmark", True)
+    )
 
     def condition_cpu(condition_id: int) -> torch.Tensor:
         row = condition_index[condition_id]
@@ -979,7 +1028,11 @@ def generate_synthetic_teacher_images(
 def build_synthetic_teacher_cache(config: dict[str, Any], destination: Path) -> dict[str, Any]:
     plan, prompts = build_synthetic_teacher_plan(config, destination)
     text = cache_synthetic_teacher_text(config, destination, prompts)
-    kv_teacher = cache_synthetic_teacher_kv_basis(config, destination, prompts)
+    kv_teacher = (
+        cache_synthetic_teacher_kv_basis(config, destination, prompts)
+        if bool(config["synthetic_teacher"].get("cache_kv_teacher", True))
+        else {"skipped": True}
+    )
     generation = generate_synthetic_teacher_images(config, destination, plan)
     cfg = config["synthetic_teacher"]
     root = destination / str(cfg.get("output_directory", "synthetic_teacher"))
@@ -993,6 +1046,30 @@ def build_synthetic_teacher_cache(config: dict[str, Any], destination: Path) -> 
     result = {"plan": len(plan), "text": text, "kv_teacher": kv_teacher, "generation": generation, "features": features}
     write_json(root / "summary.json", result)
     return result
+
+
+def build_additional_synthetic_reference_images(
+    config: dict[str, Any], destination: Path
+) -> dict[str, Any]:
+    effective = copy.deepcopy(config)
+    effective["synthetic_teacher"] = copy.deepcopy(
+        config["synthetic_teacher_additional"]
+    )
+    plan, prompts = build_synthetic_teacher_plan(effective, destination)
+    text = cache_synthetic_teacher_text(effective, destination, prompts)
+    generation = generate_synthetic_teacher_images(effective, destination, plan)
+    cfg = effective["synthetic_teacher"]
+    root = destination / str(cfg["output_directory"])
+    summary = {
+        "artist_images": sum(row.get("kind") == "artist" for row in plan),
+        "content_controls": sum(row.get("kind") == "content_control" for row in plan),
+        "text": text,
+        "generation": generation,
+        "features_deferred": True,
+        "resampler_tokens_deferred": True,
+    }
+    write_json(root / "image_generation_summary.json", summary)
+    return summary
 
 
 def benchmark_synthetic_teacher_cache(config: dict[str, Any], destination: Path) -> dict[str, Any]:

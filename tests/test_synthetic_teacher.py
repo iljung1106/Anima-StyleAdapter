@@ -52,6 +52,15 @@ def test_synthetic_plan_uses_raw_artist_names_and_keeps_style_ids(tmp_path):
     captions = tmp_path / "captions"
     captions.mkdir()
     write_records(captions / "part-00000.parquet", rows)
+    previous = tmp_path / "synthetic_previous"
+    previous.mkdir()
+    write_records(
+        previous / "plan.parquet",
+        [
+            {"kind": "artist", "artist": "artist_0"},
+            {"kind": "artist", "artist": "artist_1"},
+        ],
+    )
     config = {
         "synthetic_teacher": {
             "output_directory": "synthetic",
@@ -60,6 +69,9 @@ def test_synthetic_plan_uses_raw_artist_names_and_keeps_style_ids(tmp_path):
             "contents_per_artist": 2,
             "female_contents": 1,
             "seeds_per_content": 1,
+            "exclude_artist_plan_manifests": [
+                "synthetic_previous/plan.parquet"
+            ],
             "bootstrap": {
                 "split_seed": 11,
                 "validation_artists": 1,
@@ -72,6 +84,9 @@ def test_synthetic_plan_uses_raw_artist_names_and_keeps_style_ids(tmp_path):
     artist_rows = [row for row in plan if row["kind"] == "artist"]
 
     assert len({row["artist"] for row in artist_rows}) == 4
+    assert not {"artist_0", "artist_1"} & {
+        row["artist"] for row in artist_rows
+    }
     assert all(row["style_id"] == f"human:{row['artist']}" for row in artist_rows)
     assert all("@human:" not in row["artist_tag"] for row in artist_rows)
     assert {row["artist_split"] for row in artist_rows} == {
