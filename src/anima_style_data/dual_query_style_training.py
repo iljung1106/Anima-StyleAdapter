@@ -193,6 +193,30 @@ def _scheduled_teacher_gradient_scale(
     )
 
 
+def _scheduled_teacher_reference_count(
+    training_by_domain: dict[str, dict[str, Any]],
+    available_by_domain: dict[str, int],
+    update_index: int,
+) -> int:
+    """Select one shared reference count for a fused teacher update."""
+
+    schedules: set[tuple[int, ...]] = set()
+    for domain, training in training_by_domain.items():
+        available = int(available_by_domain[domain])
+        raw = training.get("native_teacher_reference_counts")
+        schedule = tuple(int(value) for value in (raw or [available]))
+        if not schedule or min(schedule) <= 0 or max(schedule) > available:
+            raise ValueError(
+                f"Invalid {domain} teacher reference schedule {schedule}; "
+                f"available={available}"
+            )
+        schedules.add(schedule)
+    if len(schedules) != 1:
+        raise ValueError("Fused teacher domains require one reference-count schedule")
+    schedule = next(iter(schedules))
+    return schedule[int(update_index) % len(schedule)]
+
+
 def _pilot_stage(step: int, training: dict[str, Any]) -> dict[str, Any]:
     schedule = list(training.get("reference_schedule", []))
     if not schedule:
@@ -924,6 +948,7 @@ def _native_centered_teacher_step(
     step: int,
     metric_prefix: str = "native_teacher",
     probe_index_override: int | None = None,
+    reference_count_override: int | None = None,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     references, reference_mask = _reference_inputs(batch, device, "heldout")
     rows = min(
@@ -946,6 +971,23 @@ def _native_centered_teacher_step(
         if probe_index_override is not None
         else max(0, step - int(training.get("native_teacher_start_step", 0)))
     )
+    reference_schedule = training.get("native_teacher_reference_counts")
+    reference_count = (
+        int(reference_count_override)
+        if reference_count_override is not None
+        else int(
+            reference_schedule[probe_index % len(reference_schedule)]
+            if reference_schedule
+            else references.shape[1]
+        )
+    )
+    if reference_count <= 0 or reference_count > references.shape[1]:
+        raise ValueError(
+            f"Teacher reference count {reference_count} exceeds available "
+            f"count {references.shape[1]}"
+        )
+    references = references[:, :reference_count]
+    reference_mask = reference_mask[:, :reference_count]
     content_index = probe_index % contents
     timestep_index = (probe_index // contents) % timestep_count
     noisy = tensors["noisy_inputs"][content_index, timestep_index].to(
@@ -996,6 +1038,7 @@ def _native_centered_teacher_step(
         {
             "native_teacher_content_index": student.new_tensor(content_index),
             "native_teacher_timestep": timestep.detach().float(),
+            "native_teacher_reference_count": student.new_tensor(reference_count),
         }
     )
     if metric_prefix != "native_teacher":
@@ -1040,8 +1083,8 @@ def _dual_domain_centered_teacher_step(
             artist_indices,
             rows,
         ))
-    reference_counts = {item[2].shape[1] for item in prepared}
-    if len(reference_counts) != 1:
+    available_reference_counts = {item[2].shape[1] for item in prepared}
+    if len(available_reference_counts) != 1:
         raise ValueError("Fused teacher domains require the same reference count")
 
     tensors = bank.tensors
@@ -1056,6 +1099,11 @@ def _dual_domain_centered_teacher_step(
         int(probe_index_override)
         if probe_index_override is not None
         else max(0, step - next(iter(starts)))
+    )
+    reference_count = _scheduled_teacher_reference_count(
+        training_by_domain,
+        {item[0]: int(item[2].shape[1]) for item in prepared},
+        probe_index,
     )
     total_probes = contents * timestep_count
     cycle, position = divmod(probe_index, total_probes)
@@ -1083,8 +1131,12 @@ def _dual_domain_centered_teacher_step(
     timestep = tensors["timesteps"][timestep_index].to(
         device=device, dtype=torch.bfloat16
     )
-    references = torch.cat([item[2] for item in prepared])
-    reference_mask = torch.cat([item[3] for item in prepared])
+    references = torch.cat(
+        [item[2][:, :reference_count] for item in prepared]
+    )
+    reference_mask = torch.cat(
+        [item[3][:, :reference_count] for item in prepared]
+    )
     total_rows = references.shape[0]
     with torch.autocast(
         device_type=torch.device(device).type,
@@ -1124,6 +1176,9 @@ def _dual_domain_centered_teacher_step(
             "native_teacher_update_index": domain_loss.new_tensor(probe_index),
             "native_teacher_probe_cycle": domain_loss.new_tensor(cycle),
             "native_teacher_probe_position": domain_loss.new_tensor(position),
+            "native_teacher_reference_count": domain_loss.new_tensor(
+                reference_count
+            ),
         })
         metrics.update({
             (
@@ -1152,6 +1207,7 @@ def _domain_teacher_training(
         "scale_floor",
         "batch_rows",
         "references",
+        "reference_counts",
     ):
         if key in domain:
             result[f"native_teacher_{key}"] = domain[key]
@@ -1170,25 +1226,44 @@ def _evaluate_native_teacher_domain(
     batches: int,
     step: int,
 ) -> dict[str, float]:
-    totals: dict[str, float] = defaultdict(float)
-    counts: dict[str, int] = defaultdict(int)
-    with torch.no_grad():
-        for index in range(max(1, int(batches))):
-            _, metrics = _native_centered_teacher_step(
-                anima,
-                tokenizer,
-                bank,
-                loader.load_step(index),
-                device,
-                training,
-                step=step,
-                metric_prefix=metric_prefix,
-                probe_index_override=index,
-            )
-            for key, value in metrics.items():
-                totals[key] += float(value)
-                counts[key] += 1
-    return {key: value / counts[key] for key, value in totals.items()}
+    reference_counts = [
+        int(value)
+        for value in training.get(
+            "native_teacher_reference_counts",
+            [training.get("native_teacher_references", 4)],
+        )
+    ]
+    result: dict[str, float] = {}
+    for reference_count in reference_counts:
+        totals: dict[str, float] = defaultdict(float)
+        counts: dict[str, int] = defaultdict(int)
+        with torch.no_grad():
+            for index in range(max(1, int(batches))):
+                _, metrics = _native_centered_teacher_step(
+                    anima,
+                    tokenizer,
+                    bank,
+                    loader.load_step(index),
+                    device,
+                    training,
+                    step=step,
+                    metric_prefix=metric_prefix,
+                    probe_index_override=index,
+                    reference_count_override=reference_count,
+                )
+                for key, value in metrics.items():
+                    totals[key] += float(value)
+                    counts[key] += 1
+        averaged = {key: value / counts[key] for key, value in totals.items()}
+        result.update(
+            {
+                f"references_{reference_count}/{key}": value
+                for key, value in averaged.items()
+            }
+        )
+        if reference_count == reference_counts[-1]:
+            result.update(averaged)
+    return result
 
 
 def _artist_flow_ranking_loss(
@@ -2246,7 +2321,13 @@ def _train_variant(
                 cfg,
                 split=str(human_cfg.get("source_split", "train")),
             )
-            references = int(human_cfg.get("references", 4))
+            reference_counts = [
+                int(value)
+                for value in human_cfg.get(
+                    "reference_counts", [human_cfg.get("references", 4)]
+                )
+            ]
+            references = max(reference_counts)
             loader_cfg.update(
                 {
                     "batch_size": int(human_cfg.get("batch_rows", 4)),
@@ -2277,7 +2358,13 @@ def _train_variant(
                 split="train",
                 style_ids=train_style_ids,
                 batch_size=int(synthetic_cfg.get("batch_rows", 4)),
-                references=int(synthetic_cfg.get("references", 4)),
+                references=max(
+                    int(value)
+                    for value in synthetic_cfg.get(
+                        "reference_counts",
+                        [synthetic_cfg.get("references", 4)],
+                    )
+                ),
                 seed=seed ^ 0x51A7_0001,
                 token_lru_shards=int(synthetic_cfg.get("token_lru_shards", 8)),
                 ram_resident_tokens=bool(
@@ -2294,7 +2381,13 @@ def _train_variant(
                 split="validation",
                 style_ids=validation_style_ids,
                 batch_size=int(synthetic_cfg.get("batch_rows", 4)),
-                references=int(synthetic_cfg.get("references", 4)),
+                references=max(
+                    int(value)
+                    for value in synthetic_cfg.get(
+                        "reference_counts",
+                        [synthetic_cfg.get("references", 4)],
+                    )
+                ),
                 seed=seed ^ 0x51A7_0002,
                 token_lru_shards=int(synthetic_cfg.get("token_lru_shards", 8)),
                 ram_resident_tokens=bool(
@@ -2421,6 +2514,7 @@ def _train_variant(
     base_lr = float(training.get("learning_rate", 1e-4))
     warmup = int(training.get("warmup_steps", 500))
     minimum_ratio = float(training.get("minimum_lr_ratio", 0.1))
+    lr_schedule_total_steps = int(training.get("lr_schedule_total_steps", steps))
     max_grad_norm = float(training.get("max_grad_norm", 1.0))
     log_every = int(training.get("log_every", 10))
     validation_every = int(training.get("validation_every", 250))
@@ -2521,7 +2615,7 @@ def _train_variant(
             schedule_start = int(training.get("lr_schedule_start_step", 0))
             multiplier = _learning_rate_multiplier(
                 step - schedule_start,
-                steps - schedule_start,
+                lr_schedule_total_steps - schedule_start,
                 warmup,
                 minimum_ratio,
             )

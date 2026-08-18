@@ -191,3 +191,34 @@ Anima 출력에 남아 있었다. 따라서 2,000 step은 안정성 gate만 통�
 스타일 재현 gate는 통과하지 못했다. Artist contrastive ramp가 끝나는 3,000
 step까지만 한정 연장해 common-output, 4/8-reference, fixed-reference 표현이
 개선되는지를 확인한 뒤 최대 8,000-step 연장 여부를 다시 결정한다.
+
+### 3,000-step gate와 v4 계획
+
+v3c의 3,000-step 결과는 heldout improvement `0.00140 ± 0.00291`,
+correct-vs-wrong advantage `0.00484`였다. Human/synthetic teacher cosine은
+`0.115/0.141`, projection coefficient는 `0.057/0.073`까지 올랐지만
+common-output ratio가 `0.761/0.730`으로 여전히 높았다. Reference 수별
+improvement도 2장은 `0.00330`인 반면 1/4/8장은 각각
+`-0.00034/-0.00048/-0.00072`였다. 외부 고정 레퍼런스에서는 색상 정도만
+달라지고 얼굴·선화·명암이 공통 Anima 출력에 남았다. 따라서 현 구조를 그대로
+8,000 step까지 연장하지 않는다.
+
+Grouped head의 sample-independent slot embedding을 추론 시 제거한 진단도
+heldout `0.00135`, common-output `0.759/0.728`, 4/8-reference
+`-0.00057/-0.00070`로 사실상 동일했다. Additive slot bias 하나가 원인은
+아니며, 주된 문제는 teacher가 항상 4-reference에만 적용되는 반면 실제 flow
+학습은 1-reference가 45%인 서로 다른 reference-count 분포를 사용한다는 점이다.
+
+다음 v4는 v3c step-3,000을 출발점으로 다음 한 가지만 우선 검증한다.
+
+- Human/synthetic centered teacher 한 번의 Anima forward 안에서 reference 수를
+  update마다 `1 -> 2 -> 4`로 순환한다.
+- 모든 reference 수가 같은 작가에 대한 동일한 centered native effect의 방향과
+  절대 투영 크기를 배우게 한다. Teacher loss 세기와 cadence는 유지한다.
+- Teacher update가 사용한 reference 수를 로그에 남기고 validation에서도
+  1/2/4-reference teacher 성능을 분리해 확인한다.
+- 1,000 step만 추가 학습하여 step-4,000에서 heldout improvement,
+  teacher projection, 1/2/4/8-reference 성능과 외부 고정 시트를 비교한다.
+- 4/8-reference와 고정 시트가 함께 개선될 때만 8,000 step까지 연장한다.
+  개선되지 않으면 단순 loss 증량 대신 reference pooling에 zero-init consensus
+  residual을 추가하는 구조 변경으로 전환한다.

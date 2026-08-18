@@ -3,9 +3,11 @@ from __future__ import annotations
 import torch
 
 from anima_style_data.dual_query_style_training import (
+    _domain_teacher_training,
     _native_artist_teacher_objective,
     _same_artist_functional_loss,
     _scheduled_teacher_gradient_scale,
+    _scheduled_teacher_reference_count,
     _teacher_projected_effect_loss,
 )
 from anima_style_data.global_query_style_tokenizer import (
@@ -213,6 +215,26 @@ def test_sparse_teacher_updates_can_preserve_expected_gradient_pressure():
     assert _scheduled_teacher_gradient_scale(
         4, {"dual_domain_teacher_scale_by_cadence": True}
     ) == 4.0
+
+
+def test_fused_teacher_cycles_one_two_four_references_for_both_domains():
+    domain_training = {
+        "human_teacher": {"native_teacher_reference_counts": [1, 2, 4]},
+        "synthetic_teacher": {"native_teacher_reference_counts": [1, 2, 4]},
+    }
+    available = {"human_teacher": 4, "synthetic_teacher": 4}
+    assert [
+        _scheduled_teacher_reference_count(domain_training, available, update)
+        for update in range(6)
+    ] == [1, 2, 4, 1, 2, 4]
+
+
+def test_domain_teacher_config_preserves_reference_count_curriculum():
+    result = _domain_teacher_training(
+        {}, {"references": 4, "reference_counts": [1, 2, 4]}
+    )
+    assert result["native_teacher_references"] == 4
+    assert result["native_teacher_reference_counts"] == [1, 2, 4]
 
 
 def test_centered_functional_consistency_ignores_view_common_effects():

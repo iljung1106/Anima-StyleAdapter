@@ -2678,7 +2678,7 @@ slot_preserving_global_query_style_tokenizer:
     vae_batch_size: 4
 
 typed_multi_descriptor_compact_style_tokenizer:
-  output_directory: typed_multi_descriptor_grouped_8k_v3c_centered
+  output_directory: typed_multi_descriptor_grouped_8k_v4_reference_curriculum
   seed: 20260818
   train_split: train
   validation_split: validation
@@ -2736,13 +2736,16 @@ typed_multi_descriptor_compact_style_tokenizer:
     learnable_output_gain: false
   training:
     device: cuda
-    steps: 8000
+    steps: 4000
     learning_rate: 0.0001
     betas: [0.9, 0.999]
     adam_eps: 0.00000001
     weight_decay: 0.01
     warmup_steps: 400
     minimum_lr_ratio: 0.10
+    # This is a 3k -> 4k gate, but preserve the LR trajectory of the planned
+    # full 8k run instead of decaying to the minimum at the temporary gate.
+    lr_schedule_total_steps: 8000
     max_grad_norm: 1.0
     gradient_accumulation_steps: 4
     fused_adamw: true
@@ -2756,8 +2759,8 @@ typed_multi_descriptor_compact_style_tokenizer:
     prefetch_workers: 2
     prefetch_batches: 6
     resume: true
-    initial_checkpoint: typed_multi_descriptor_grouped_8k_v3/checkpoints/step-0001000.pt
-    initial_history: typed_multi_descriptor_grouped_8k_v3/history.json
+    initial_checkpoint: typed_multi_descriptor_grouped_8k_v3c_centered/checkpoints/step-0003000.pt
+    initial_history: typed_multi_descriptor_grouped_8k_v3c_centered/history.json
     pilot_enabled: true
     reference_schedule:
       - name: target_excluded_1_8
@@ -2881,6 +2884,7 @@ typed_multi_descriptor_compact_style_tokenizer:
         scale_floor: 0.0001
         batch_rows: 4
         references: 4
+        reference_counts: [1, 2, 4]
         prefetch_workers: 1
         prefetch_batches: 4
         ram_resident_tokens: true
@@ -2895,6 +2899,7 @@ typed_multi_descriptor_compact_style_tokenizer:
         scale_floor: 0.0001
         batch_rows: 4
         references: 4
+        reference_counts: [1, 2, 4]
         token_lru_shards: 8
         prefetch_workers: 1
         prefetch_batches: 4
@@ -2917,8 +2922,8 @@ typed_multi_descriptor_compact_style_tokenizer:
     wandb:
       enabled: true
       project: anima-style-adapter
-      name: typed-multi-descriptor-grouped-8k-v3c-centered-consistency
-      id: typed-multi-descriptor-grouped-8k-v3c-centered-consistency
+      name: typed-multi-descriptor-grouped-v4-reference-curriculum
+      id: typed-multi-descriptor-grouped-v4-reference-curriculum
   fixed_reference_sampling:
     cache_directory: dual_query_external_reference_cache_v1
     device: cuda
