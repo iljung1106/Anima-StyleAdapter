@@ -2952,7 +2952,7 @@ typed_multi_descriptor_compact_style_tokenizer:
     vae_batch_size: 4
 
 single_stage_typed_attention_style_tokenizer:
-  output_directory: compact_single_stage_typed_attention_5k_dual_domain_2k_v1
+  output_directory: compact_single_stage_typed_attention_2k_dual_domain_8k_v1
   seed: 20260821
   train_split: train
   validation_split: validation
@@ -2999,7 +2999,7 @@ single_stage_typed_attention_style_tokenizer:
     ff_dim: 2048
   training:
     device: cuda
-    steps: 2000
+    steps: 8000
     learning_rate: 0.0001
     betas: [0.9, 0.999]
     adam_eps: 0.00000001
@@ -3022,7 +3022,7 @@ single_stage_typed_attention_style_tokenizer:
     pilot_enabled: true
     reference_schedule:
       - name: target_excluded_1_8
-        end_step: 2000
+        end_step: 8000
         exact_self: false
         min_references: 1
         max_references: 8
@@ -3052,7 +3052,7 @@ single_stage_typed_attention_style_tokenizer:
     wrong_flow_ranking_weight: 1.0
     dual_domain_teacher_schedule:
       - {end_step: 500, every: 1}
-      - {end_step: 2000, every: 2}
+      - {end_step: 8000, every: 2}
     dual_domain_teacher_scale_by_cadence: false
     native_effect_timestep_weighting:
       enabled: true
@@ -3065,7 +3065,9 @@ single_stage_typed_attention_style_tokenizer:
       every: 1
       fuse_domain_forward: true
       bank_config_key: dual_domain_native_teacher
-      synthetic_reference_cache: synthetic_teacher_500x16/dual_query_reference_tokens_v8_step10000
+      synthetic_reference_caches:
+        - synthetic_teacher_500x16/dual_query_reference_tokens_v8_step10000
+        - synthetic_teacher_additional_1500x6/dual_query_reference_tokens_v8_step10000
       validation_batches: 16
       human:
         source_split: train
@@ -3116,8 +3118,8 @@ single_stage_typed_attention_style_tokenizer:
     wandb:
       enabled: true
       project: anima-style-adapter
-      name: compact-single-stage-typed-attention-5k-dual-domain-2k-v1
-      id: compact-single-stage-typed-attention-5k-dual-domain-2k-v1
+      name: compact-single-stage-typed-attention-2k-dual-domain-8k-v1
+      id: compact-single-stage-typed-attention-2k-dual-domain-8k-v1
   fixed_reference_sampling:
     cache_directory: dual_query_external_reference_cache_v1
     device: cuda
@@ -3554,6 +3556,7 @@ synthetic_teacher_additional:
   output_directory: synthetic_teacher_additional_1500x6
   device: cuda
   seed: 20260822
+  image_id_base: 20000000000
   artist_count: 1500
   contents_per_artist: 6
   female_contents: 5
@@ -3595,13 +3598,22 @@ synthetic_teacher_additional:
     heldout_contents: [4, 5]
   dual_query_token_cache:
     output_directory: dual_query_reference_tokens_v8_step10000
+    resampler_checkpoint: dual_query_resampler_bprime_v8/checkpoints/step-010000.pt
     device: cuda
     batch_size: 64
     shard_rows: 512
-    reader_workers: 8
-    prefetch_batches: 12
+    reader_workers: 32
+    prefetch_batches: 16
     writer_workers: 2
     pending_writes: 2
+    latent_lru_shards: 2
+    semantic_dim: 1536
+    vae_channels: 16
+    amp_dtype: bfloat16
+    model_cache_directory: /workspace/Anima-StyleAdapter/data/anima500k-human/cradio_model_cache
+    preprocess:
+      max_side: 512
+      max_pixels: 262144
 
 real_artist_teacher:
   output_directory: real_artist_teacher_5000

@@ -65,6 +65,7 @@ def test_synthetic_plan_uses_raw_artist_names_and_keeps_style_ids(tmp_path):
         "synthetic_teacher": {
             "output_directory": "synthetic",
             "seed": 7,
+            "image_id_base": 20_000,
             "artist_count": 4,
             "contents_per_artist": 2,
             "female_contents": 1,
@@ -84,6 +85,7 @@ def test_synthetic_plan_uses_raw_artist_names_and_keeps_style_ids(tmp_path):
     artist_rows = [row for row in plan if row["kind"] == "artist"]
 
     assert len({row["artist"] for row in artist_rows}) == 4
+    assert min(int(row["id"]) for row in plan) == 20_000
     assert not {"artist_0", "artist_1"} & {
         row["artist"] for row in artist_rows
     }

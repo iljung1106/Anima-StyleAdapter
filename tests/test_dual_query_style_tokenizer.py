@@ -78,6 +78,43 @@ def test_teacher_reference_loader_can_use_available_style_intersection(tmp_path)
         )
 
 
+def test_teacher_reference_loader_combines_disjoint_cache_roots(tmp_path):
+    roots = [tmp_path / "old", tmp_path / "additional"]
+    styles = ["human:old", "human:new"]
+    for root, style, offset in zip(roots, styles, (0, 100), strict=True):
+        root.mkdir()
+        write_records(
+            root / "manifest.parquet",
+            [
+                {
+                    "id": offset + index,
+                    "style_id": style,
+                    "split": "train",
+                    "token_shard": "part-00000.safetensors",
+                    "token_row": index,
+                }
+                for index in range(2)
+            ],
+        )
+        save_file(
+            {"tokens": torch.full((2, 3, 8), float(offset + 1))},
+            root / "part-00000.safetensors",
+        )
+
+    loader = CachedTeacherReferenceLoader(
+        roots,
+        split="train",
+        style_ids=styles,
+        batch_size=2,
+        references=2,
+        seed=7,
+    )
+    batch = loader.load_step(0)
+
+    assert {episode.style_id for episode in batch["episodes"]} == set(styles)
+    assert set(batch["cached_reference_tokens"][:, 0, 0].tolist()) == {1.0, 101.0}
+
+
 def test_reference_set_is_order_invariant():
     torch.manual_seed(31)
     model = _model(include_summary=True)

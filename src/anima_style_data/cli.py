@@ -201,6 +201,10 @@ def build_parser() -> argparse.ArgumentParser:
             "synthetic-reference-additional",
             "Generate the non-overlapping additional synthetic reference corpus",
         ),
+        (
+            "synthetic-reference-token-cache",
+            "Directly cache C-RADIO plus frozen Resampler synthetic tokens",
+        ),
         ("synthetic-teacher-benchmark", "Validate SPEED and batched VAE before production"),
         ("synthetic-teacher-kv", "Cache factorized native Anima K/V/O teacher targets"),
         ("real-artist-teacher-kv", "Cache 5k real-artist text and native K/V/O teacher targets"),
@@ -535,6 +539,12 @@ def main() -> None:
         from .synthetic_teacher import build_additional_synthetic_reference_images
 
         _run(build_additional_synthetic_reference_images, config, destination)
+    elif args.command == "synthetic-reference-token-cache":
+        from .synthetic_reference_pipeline import (
+            cache_additional_synthetic_dual_query_tokens,
+        )
+
+        _run(cache_additional_synthetic_dual_query_tokens, config, destination)
     elif args.command == "synthetic-teacher-benchmark":
         from .synthetic_teacher import benchmark_synthetic_teacher_cache
 

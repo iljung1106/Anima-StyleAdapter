@@ -26,6 +26,8 @@ Dual-query Resampler와 Frozen Anima는 유지하며 새 Style Tokenizer만 학�
   `500명 x 8 content x 2 seed = 8,000장`은 그대로 재사용하고, 우선 기존 500명과
   겹치지 않는 1,500명을 골라 `6 content x 1 seed = 9,000장`만 추가한다. 이 단계의
   결과를 확인한 뒤 나머지 작가 생성 여부를 결정한다.
+- 기존 synthetic image ID 영역과 합칠 때 충돌하지 않도록 신규 1,500명 cache는
+  `20,000,000,000`부터 별도 image ID namespace를 사용한다.
 - Human/synthetic 양쪽 모두 1/2/4-reference teacher batch를 만든다. Synthetic
   domain에서는 기존 500명 캐시와 신규 1,500명 캐시를 하나의 학습 pool로 합치되,
   동일 작가가 두 캐시에 중복되지 않도록 생성 plan 단계에서 기존 manifest를
@@ -154,6 +156,24 @@ baseline의 `0.00075`를 시작점으로 사용한다.
 - W&B에는 heldout paired-flow improvement, correct-vs-wrong advantage,
   1/2/4/8-reference 성능, human/synthetic teacher cosine·projection·RMS,
   common-output ratio와 최종 token RMS 분포를 기록한다.
+
+### 캐시 및 실행 순서
+
+1. `synthetic-reference-additional`로 신규 1,500명 x 6장의 image, Qwen VAE latent,
+   text conditioning을 resumable shard로 만든다.
+2. `synthetic-reference-token-cache`에서 WebP decode를 미리 prefetch하고 C-RADIO
+   L18/L24 spatial feature와 Frozen Dual-query Resampler를 같은 GPU pipeline에서
+   연속 실행한다. L18/L24 중간 feature는 NFS에 저장하거나 다시 읽지 않고 최종
+   `84 x 1024` token과 512-D descriptor만 저장한다.
+3. 학습 loader는 기존 500명 token root와 신규 1,500명 token root를 하나의
+   artist-balanced synthetic pool로 읽는다. Root마다 같은 `part-*.safetensors`
+   파일명이 존재하므로 `(root, shard)`를 cache key로 사용한다.
+4. `single-stage-typed-attention-smoke`로 real Anima forward, 두 synthetic root,
+   timestep weighting과 resume checkpoint를 검증한 뒤
+   `single-stage-typed-attention-train`을 시작한다.
+
+이미지 생성, direct token cache와 8K 학습은 각각 독립적으로 재개 가능하다. 생성이
+완료되지 않았거나 신규 token manifest가 없으면 학습을 시작하지 않는다.
 
 4,000-step 중간 gate에서 기존 최고 소형 baseline의 heldout improvement `0.00546`와
 selection score `0.00961`을 비교한다. 정량 성능과 fixed-reference의 선화·명암·형태

@@ -534,7 +534,7 @@ class CachedTeacherReferenceLoader:
 
     def __init__(
         self,
-        token_root: Path,
+        token_root: Path | list[Path],
         *,
         split: str,
         style_ids: list[str],
@@ -546,7 +546,16 @@ class CachedTeacherReferenceLoader:
         ram_preload_workers: int = 8,
         strict_style_ids: bool = True,
     ) -> None:
-        self.token_root = token_root
+        token_roots = (
+            [Path(token_root)]
+            if isinstance(token_root, (str, Path))
+            else [Path(value) for value in token_root]
+        )
+        if not token_roots:
+            raise ValueError("At least one teacher token root is required")
+        self.token_root = token_roots[0]
+        self.token_roots = token_roots
+        root_label = ",".join(root.name for root in token_roots)
         self.batch_size = int(batch_size)
         self.references = int(references)
         self.seed = int(seed)
@@ -554,10 +563,13 @@ class CachedTeacherReferenceLoader:
             raise ValueError("Teacher batch and reference counts must be positive")
         allowed = set(style_ids)
         grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
-        for row in read_records(token_root / "manifest.parquet"):
-            style_id = str(row["style_id"])
-            if str(row.get("split", "train")) == split and style_id in allowed:
-                grouped[style_id].append(row)
+        for root_index, root in enumerate(token_roots):
+            for row in read_records(root / "manifest.parquet"):
+                style_id = str(row["style_id"])
+                if str(row.get("split", "train")) == split and style_id in allowed:
+                    grouped[style_id].append(
+                        {**row, "_token_root_index": root_index}
+                    )
         self.by_style = {
             style_id: sorted(rows, key=lambda row: int(row["id"]))
             for style_id, rows in grouped.items()
@@ -566,24 +578,27 @@ class CachedTeacherReferenceLoader:
         missing = sorted(allowed - set(self.by_style))
         if missing and strict_style_ids:
             raise RuntimeError(
-                f"Reference cache {token_root} is missing {len(missing)} "
+                f"Reference cache {root_label} is missing {len(missing)} "
                 f"teacher artists for split {split!r}"
             )
         self.styles = sorted(self.by_style)
         if not self.styles:
             raise RuntimeError(
-                f"Reference cache {token_root} has no teacher artists for "
+                f"Reference cache {root_label} has no teacher artists for "
                 f"split {split!r}"
             )
         if missing:
             print(
-                f"teacher reference intersection {token_root.name} split={split}: "
+                f"teacher reference intersection {root_label} split={split}: "
                 f"{len(self.styles)}/{len(allowed)} styles",
                 flush=True,
             )
-        self.shards = _FullTokenShardLRU(token_root, token_lru_shards)
+        self.shards = [
+            _FullTokenShardLRU(root, token_lru_shards) for root in token_roots
+        ]
         if ram_resident_tokens:
-            self.shards.preload(ram_preload_workers)
+            for shards in self.shards:
+                shards.preload(ram_preload_workers)
 
     @staticmethod
     def _pin(value: torch.Tensor) -> torch.Tensor:
@@ -601,12 +616,16 @@ class CachedTeacherReferenceLoader:
             for style_id in styles
         ]
         rows = [row for group in selected for row in group]
-        grouped_rows: dict[str, list[tuple[int, dict[str, Any]]]] = defaultdict(list)
+        grouped_rows: dict[
+            tuple[int, str], list[tuple[int, dict[str, Any]]]
+        ] = defaultdict(list)
         for index, row in enumerate(rows):
-            grouped_rows[str(row["token_shard"])].append((index, row))
+            grouped_rows[
+                (int(row["_token_root_index"]), str(row["token_shard"]))
+            ].append((index, row))
         values: list[torch.Tensor | None] = [None] * len(rows)
-        for shard_name, shard_rows in grouped_rows.items():
-            shard = self.shards.get(shard_name)
+        for (root_index, shard_name), shard_rows in grouped_rows.items():
+            shard = self.shards[root_index].get(shard_name)
             for index, row in shard_rows:
                 values[index] = shard[int(row["token_row"])]
         if any(value is None for value in values):

@@ -2474,9 +2474,12 @@ def _train_variant(
             )
             return DualQueryCachedStyleLoader(destination, loader_cfg)
 
-        synthetic_root = destination / str(
-            dual_domain_cfg["synthetic_reference_cache"]
-        )
+        synthetic_cache_values = dual_domain_cfg.get("synthetic_reference_caches")
+        if synthetic_cache_values is None:
+            synthetic_cache_values = [dual_domain_cfg["synthetic_reference_cache"]]
+        synthetic_roots = [
+            destination / str(value) for value in synthetic_cache_values
+        ]
         dual_domain_train_loaders["human_teacher"] = build_human_domain(
             train_style_ids,
             split=human_train_split,
@@ -2487,7 +2490,7 @@ def _train_variant(
         )
         dual_domain_train_loaders["synthetic_teacher"] = (
             CachedTeacherReferenceLoader(
-                synthetic_root,
+                synthetic_roots,
                 split="train",
                 style_ids=train_style_ids,
                 batch_size=int(synthetic_cfg.get("batch_rows", 4)),
@@ -2511,7 +2514,7 @@ def _train_variant(
         )
         dual_domain_validation_loaders["synthetic_teacher"] = (
             CachedTeacherReferenceLoader(
-                synthetic_root,
+                synthetic_roots,
                 split="validation",
                 # Synthetic references have their own 450/25/25 split inside
                 # the 500-artist subset (which was originally sampled from

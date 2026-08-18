@@ -110,6 +110,7 @@ def build_synthetic_teacher_plan(
     content_count = int(cfg.get("contents_per_artist", 8))
     female_contents = int(cfg.get("female_contents", 7))
     seeds_per_content = int(cfg.get("seeds_per_content", 2))
+    image_id_base = int(cfg.get("image_id_base", 10_000_000_000))
     if not 0 <= female_contents <= content_count:
         raise ValueError("female_contents must be between zero and contents_per_artist")
     source_splits = {
@@ -234,7 +235,7 @@ def build_synthetic_teacher_plan(
     control_ids: dict[tuple[int, int], int] = {}
     for content in content_rows:
         for seed_index, generation_seed in enumerate(seed_values):
-            image_id = 10_000_000_000 + len(plan)
+            image_id = image_id_base + len(plan)
             control_ids[(int(content["content_index"]), seed_index)] = image_id
             plan.append({
                 "id": image_id, "synthetic_index": len(plan), "kind": "content_control",
@@ -268,7 +269,7 @@ def build_synthetic_teacher_plan(
         for content in content_rows:
             for seed_index, generation_seed in enumerate(seed_values):
                 item_index = len(plan)
-                image_id = 10_000_000_000 + item_index
+                image_id = image_id_base + item_index
                 plan.append({
                     "id": image_id, "synthetic_index": item_index, "kind": "artist",
                     "artist_index": artist_index, "artist": artist, "style_id": style_id,
@@ -292,6 +293,7 @@ def build_synthetic_teacher_plan(
         "seeds_per_content": len(seed_values), "artist_images": len(artists) * len(content_rows) * len(seed_values),
         "content_controls": len(content_rows) * len(seed_values), "images": len(plan),
         "prompts": len(prompts), "seed_values": seed_values,
+        "image_id_base": image_id_base,
         "artist_split_counts": dict(Counter(artist_splits.values())),
         "excluded_artists": len(excluded_artists),
         "literal_parentheses_are_tokenized_directly": True,
