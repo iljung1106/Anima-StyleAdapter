@@ -3179,6 +3179,35 @@ typed_attention_small_visual_sweep:
     batch_size: 4
     vae_batch_size: 4
 
+# One fixed prompt/noise across held-out validation artists. Each artist is
+# represented by exactly one real image; only reference identity and the
+# explicit style-only multiplier vary.
+validation_artist_strength_sweep:
+  output_directory: diagnostics/typed-step4000-validation-artists-1ref-1x-2x
+  source_config_section: single_stage_typed_attention_style_tokenizer
+  device: cuda
+  selection_seed: 20260825
+  artists: 8
+  style_multipliers: [1.0, 2.0]
+  typed_checkpoint: compact_single_stage_typed_attention_2k_dual_domain_8k_v1/checkpoints/step-0004000.pt
+  typed_token_cache: dual_query_reference_tokens_v8_step10000
+  loader:
+    batch_size: 1
+    artist_balanced: true
+    ram_resident_tokens: false
+    text_lru_shards: 2
+    latent_lru_shards: 2
+    token_lru_shards: 4
+  generation:
+    width: 832
+    height: 1024
+    cfg: 4.0
+    steps: 30
+    flow_shift: 3.0
+    seed: 20260825
+    batch_size: 4
+    vae_batch_size: 4
+
 style_tokenizer_selection:
   source_config_section: style_tokenizer_generalization
   device: cuda
