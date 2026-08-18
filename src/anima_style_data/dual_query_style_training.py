@@ -2247,6 +2247,35 @@ def _selection_score(row: dict[str, Any]) -> float:
     return heldout + 0.5 * (heldout - wrong) + 0.25 * exact
 
 
+def _build_style_tokenizer(
+    configured_model: dict[str, Any], device: str
+) -> torch.nn.Module:
+    model_cfg = dict(configured_model)
+    architecture = str(model_cfg.pop("architecture", "flat_set"))
+    if architecture == "flat_set":
+        tokenizer = DualQuerySetStyleTokenizer(**model_cfg)
+    elif architecture == "hierarchical":
+        tokenizer = HierarchicalDualQueryStyleTokenizer(**model_cfg)
+    elif architecture == "compact":
+        tokenizer = CompactDualQueryStyleTokenizer(**model_cfg)
+    elif architecture == "global_query_memory":
+        tokenizer = GlobalQueryMemoryStyleTokenizer(**model_cfg)
+    elif architecture == "slot_preserving_global_query":
+        tokenizer = SlotPreservingGlobalQueryStyleTokenizer(**model_cfg)
+    elif architecture == "typed_multi_descriptor_compact":
+        tokenizer = TypedMultiDescriptorCompactStyleTokenizer(**model_cfg)
+    elif architecture == "single_stage_typed_attention":
+        # Summary tokens are a fixed third input type in this architecture,
+        # not the legacy ON/OFF ablation used by older tokenizers.
+        model_cfg.pop("include_artist_summary", None)
+        tokenizer = SingleStageTypedAttentionStyleTokenizer(**model_cfg)
+    else:
+        raise ValueError(
+            f"Unknown Dual-query StyleTokenizer architecture {architecture!r}"
+        )
+    return tokenizer.to(device)
+
+
 def _train_variant(
     config: dict[str, Any],
     destination: Path,
@@ -2568,26 +2597,8 @@ def _train_variant(
             flush=True,
         )
     cache_summary = _cache_summary(destination, cfg)
-    model_cfg = dict(cfg["model"])
-    architecture = str(model_cfg.pop("architecture", "flat_set"))
-    if architecture == "flat_set":
-        tokenizer = DualQuerySetStyleTokenizer(**model_cfg).to(device)
-    elif architecture == "hierarchical":
-        tokenizer = HierarchicalDualQueryStyleTokenizer(**model_cfg).to(device)
-    elif architecture == "compact":
-        tokenizer = CompactDualQueryStyleTokenizer(**model_cfg).to(device)
-    elif architecture == "global_query_memory":
-        tokenizer = GlobalQueryMemoryStyleTokenizer(**model_cfg).to(device)
-    elif architecture == "slot_preserving_global_query":
-        tokenizer = SlotPreservingGlobalQueryStyleTokenizer(**model_cfg).to(device)
-    elif architecture == "typed_multi_descriptor_compact":
-        tokenizer = TypedMultiDescriptorCompactStyleTokenizer(**model_cfg).to(device)
-    elif architecture == "single_stage_typed_attention":
-        tokenizer = SingleStageTypedAttentionStyleTokenizer(**model_cfg).to(device)
-    else:
-        raise ValueError(
-            f"Unknown Dual-query StyleTokenizer architecture {architecture!r}"
-        )
+    architecture = str(cfg["model"].get("architecture", "flat_set"))
+    tokenizer = _build_style_tokenizer(cfg["model"], device)
     output = destination / output_name
     checkpoints = output / "checkpoints"
     checkpoints.mkdir(parents=True, exist_ok=True)

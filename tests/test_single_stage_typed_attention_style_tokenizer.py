@@ -5,6 +5,7 @@ import torch
 from anima_style_data.single_stage_typed_attention_style_tokenizer import (
     SingleStageTypedAttentionStyleTokenizer,
 )
+from anima_style_data.dual_query_style_training import _build_style_tokenizer
 
 
 def _model() -> SingleStageTypedAttentionStyleTokenizer:
@@ -59,3 +60,25 @@ def test_single_stage_typed_attention_keeps_type_paths_separate_and_trainable():
     assert all(query.grad is not None for query in model.queries)
     assert model.reader.attention.in_proj_weight.grad is not None
 
+
+def test_common_trainer_ignores_legacy_summary_toggle_for_single_stage_model():
+    model = _build_style_tokenizer(
+        {
+            "architecture": "single_stage_typed_attention",
+            "include_artist_summary": True,
+            "dim": 32,
+            "spatial_tokens": 8,
+            "global_tokens": 4,
+            "artist_summary_tokens": 2,
+            "spatial_output_tokens": 4,
+            "global_output_tokens": 2,
+            "artist_output_tokens": 2,
+            "heads": 4,
+            "ff_dim": 64,
+        },
+        "cpu",
+    )
+
+    assert isinstance(model, SingleStageTypedAttentionStyleTokenizer)
+    assert model.cached_tokens == 14
+    assert model.output_tokens == 8
