@@ -695,6 +695,22 @@ def train_detail_style_cross_attention(
                 reader_parameters + kv_parameters,
                 float(training.get("max_grad_norm", 1.0)),
             )
+            if not bool(torch.isfinite(grad_norm)):
+                nonfinite = []
+                for prefix, module in (("reader", reader), ("adapter", adapter)):
+                    for name, parameter in module.named_parameters():
+                        if parameter.grad is not None and not bool(
+                            torch.isfinite(parameter.grad).all()
+                        ):
+                            nonfinite.append(f"{prefix}.{name}")
+                            if len(nonfinite) == 16:
+                                break
+                    if len(nonfinite) == 16:
+                        break
+                raise FloatingPointError(
+                    "Non-finite gradients before optimizer step: "
+                    + ", ".join(nonfinite)
+                )
             optimizer.step()
             if step == 1 or step % log_every == 0:
                 if device.startswith("cuda"):

@@ -177,6 +177,7 @@ def test_same_q_internal_teacher_produces_live_gradient_and_calibrates_alpha():
     adapter.set_style_context(style)
     adapter.set_teacher_context(teacher)
     adapter.begin_alpha_calibration()
+    adapter.alpha[0] = 0
 
     for block_index, block in enumerate(anima.blocks):
         block.cross_attn.qkv_calls = 0
@@ -199,6 +200,11 @@ def test_same_q_internal_teacher_produces_live_gradient_and_calibrates_alpha():
 
     assert torch.isfinite(loss)
     assert style.grad is not None and style.grad.norm() > 0
+    assert torch.isfinite(style.grad).all()
+    assert all(
+        parameter.grad is None or torch.isfinite(parameter.grad).all()
+        for parameter in adapter.parameters()
+    )
     assert metrics["internal_teacher_cosine"].isfinite()
     assert len(calibration["alpha"]) == 2
     assert all(0 <= value <= 2.0 for value in calibration["alpha"])

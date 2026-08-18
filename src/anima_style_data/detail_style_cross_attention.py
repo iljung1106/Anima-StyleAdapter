@@ -652,7 +652,14 @@ class FreshKVStyleCrossAttention(nn.Module):
             dim=1
         ).clamp_min(1e-8)
         projection = coefficient[:, None] * flat_teacher
-        orthogonal = (flat_student - projection).square().mean(dim=1).sqrt() / scale
+        orthogonal_ratio_squared = (
+            (flat_student - projection).square().mean(dim=1)
+            / scale.square().clamp_min(1e-8)
+        )
+        # The RMS form is logging-only. Differentiating sqrt(x)^2 at x=0
+        # creates a 0*inf NaN for alpha-disabled blocks; optimize energy
+        # directly and take the root only after detaching.
+        orthogonal_ratio = orthogonal_ratio_squared.detach().sqrt()
         valid = teacher_rms >= torch.quantile(teacher_rms.detach(), 0.10)
         self._internal_terms.append(
             (
@@ -661,7 +668,8 @@ class FreshKVStyleCrossAttention(nn.Module):
                     "huber": normalized_huber,
                     "cosine": cosine,
                     "coefficient": coefficient,
-                    "orthogonal_ratio": orthogonal,
+                    "orthogonal_ratio": orthogonal_ratio,
+                    "orthogonal_ratio_squared": orthogonal_ratio_squared,
                     "teacher_rms": teacher_rms,
                     "student_rms": student_rms,
                     "valid": valid,
@@ -693,7 +701,7 @@ class FreshKVStyleCrossAttention(nn.Module):
             )
             upper = selected_mean(F.relu(coefficient - float(rho_max)).square())
             direction = selected_mean(1.0 - metrics["cosine"])
-            orthogonal = selected_mean(metrics["orthogonal_ratio"].square())
+            orthogonal = selected_mean(metrics["orthogonal_ratio_squared"])
             losses.append(
                 0.25 * huber + 0.10 * direction + 0.05 * (floor + upper)
                 + 0.02 * orthogonal
@@ -701,7 +709,7 @@ class FreshKVStyleCrossAttention(nn.Module):
             local = {
                 key: selected_mean(value.detach().float())
                 for key, value in metrics.items()
-                if key != "valid"
+                if key not in {"valid", "orthogonal_ratio_squared"}
             }
             local["valid_fraction"] = valid.float().mean()
             local.update({"floor": floor.detach(), "upper": upper.detach()})
