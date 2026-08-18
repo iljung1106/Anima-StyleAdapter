@@ -3208,6 +3208,22 @@ validation_artist_strength_sweep:
     batch_size: 4
     vae_batch_size: 4
 
+fixed_reference_strength_sweep:
+  output_directory: diagnostics/typed-step4000-fixed-samples-1ref-1x-2x
+  source_config_section: single_stage_typed_attention_style_tokenizer
+  device: cuda
+  style_multipliers: [1.0, 2.0]
+  typed_checkpoint: compact_single_stage_typed_attention_2k_dual_domain_8k_v1/checkpoints/step-0004000.pt
+  generation:
+    width: 832
+    height: 1024
+    cfg: 4.0
+    steps: 30
+    flow_shift: 3.0
+    seed: 20260825
+    batch_size: 4
+    vae_batch_size: 4
+
 style_tokenizer_selection:
   source_config_section: style_tokenizer_generalization
   device: cuda

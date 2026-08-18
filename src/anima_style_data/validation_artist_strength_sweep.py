@@ -151,6 +151,52 @@ def _prepare_cases(
     return cases, metadata
 
 
+def _prepare_fixed_cases(
+    config: dict[str, Any],
+    destination: Path,
+    cfg: dict[str, Any],
+    device: str,
+) -> tuple[list[ArtistCase], dict[str, Any]]:
+    sample = load_dual_query_external_sample(config, destination)
+    tokenizer, metadata = _load_typed_tokenizer(
+        destination / str(cfg["typed_checkpoint"]), device
+    )
+    references = sample["reference_tokens"].to(
+        device, dtype=torch.bfloat16, non_blocking=True
+    )[:, None]
+    reference_mask = torch.ones(
+        references.shape[:2], device=device, dtype=torch.bool
+    )
+    with torch.inference_mode(), torch.autocast(
+        "cuda", dtype=torch.bfloat16, enabled=device.startswith("cuda")
+    ):
+        tokens = tokenizer(references, reference_mask).to(
+            "cpu", dtype=torch.bfloat16
+        )
+    cases = [
+        ArtistCase(
+            index=index,
+            style_id=path.parent.name,
+            target_id=-1,
+            reference_id=index,
+            reference_path=path,
+            style_tokens=tokens[index - 1 : index].contiguous(),
+        )
+        for index, path in enumerate(sample["paths"], start=1)
+    ]
+    for case in cases:
+        print(
+            f"prepared fixed reference {case.index}/{len(cases)} "
+            f"name={case.style_id}",
+            flush=True,
+        )
+    del tokenizer, references, reference_mask, tokens
+    gc.collect()
+    if device.startswith("cuda"):
+        torch.cuda.empty_cache()
+    return cases, metadata
+
+
 def _fixed_conditions(
     config: dict[str, Any], destination: Path, cfg: dict[str, Any]
 ) -> tuple[torch.Tensor, torch.Tensor, int, dict[str, Any]]:
@@ -258,6 +304,9 @@ def _make_overview(
     multipliers: list[float],
     prompt: str,
     seed: int,
+    *,
+    title: str = "VALIDATION / ONE REFERENCE",
+    label_prefix: str = "VAL",
 ) -> Image.Image:
     base = images["base"][0]
     size = base.size
@@ -265,7 +314,7 @@ def _make_overview(
     sheet.paste(
         _title_tile(
             size,
-            "VALIDATION / ONE REFERENCE",
+            title,
             f"same prompt + same seed={seed}\nrow 1: reference (padded)\nrow 2: 1x\nrow 3: 2x\n\n{prompt}",
         ),
         (0, 0),
@@ -277,11 +326,21 @@ def _make_overview(
     for column, case in enumerate(cases, start=1):
         with Image.open(case.reference_path) as source:
             reference = _fit_with_padding(source, size)
-        _label(reference, [f"VAL {case.index:02d}", case.style_id, "REFERENCE 1/1"])
+        _label(
+            reference,
+            [f"{label_prefix} {case.index:02d}", case.style_id, "REFERENCE 1/1"],
+        )
         sheet.paste(reference, (column * size[0], 0))
         for row, multiplier in enumerate(multipliers, start=1):
             image = images[f"artist::{case.index}::{multiplier:g}"][0].copy()
-            _label(image, [f"VAL {case.index:02d}", case.style_id, f"STYLE {multiplier:g}x"])
+            _label(
+                image,
+                [
+                    f"{label_prefix} {case.index:02d}",
+                    case.style_id,
+                    f"STYLE {multiplier:g}x",
+                ],
+            )
             sheet.paste(image, (column * size[0], row * size[1]))
     return sheet
 
@@ -372,12 +431,102 @@ def generate_validation_artist_sweep(
     return summary
 
 
+def generate_fixed_reference_sweep(
+    config: dict[str, Any], destination: Path
+) -> dict[str, Any]:
+    cfg = dict(config["fixed_reference_strength_sweep"])
+    device = str(cfg.get("device", "cuda"))
+    output = destination / str(cfg["output_directory"])
+    raw_root = output / "raw"
+    artist_root = output / "references"
+    raw_root.mkdir(parents=True, exist_ok=True)
+    artist_root.mkdir(parents=True, exist_ok=True)
+    cases, checkpoint = _prepare_fixed_cases(config, destination, cfg, device)
+    positive, negative, length, prompt_info = _fixed_conditions(
+        config, destination, cfg
+    )
+    images = _generate(
+        config, destination, cfg, cases, positive, negative, length, device
+    )
+    generation = dict(cfg["generation"])
+    multipliers = [float(value) for value in cfg["style_multipliers"]]
+    if multipliers != [1.0, 2.0]:
+        raise ValueError("This comparison contract requires strengths [1.0, 2.0]")
+    base = images["base"][0]
+    base.save(raw_root / "no-style.png")
+    records = []
+    for case in cases:
+        stem = f"fixed-{case.index:02d}-{_slug(case.style_id)}"
+        with Image.open(case.reference_path) as source:
+            reference = _fit_with_padding(source, base.size)
+        reference.save(raw_root / f"{stem}-reference-padded.png")
+        styled = []
+        for multiplier in multipliers:
+            image = images[f"artist::{case.index}::{multiplier:g}"][0]
+            image.save(raw_root / f"{stem}-style-{multiplier:g}x.png")
+            styled.append(image)
+        sheet = Image.new("RGB", (4 * base.width, base.height), "white")
+        cells = [reference, base] + styled
+        names = ["REFERENCE 1/1", "NO STYLE", "STYLE 1x", "STYLE 2x"]
+        for column, (cell, name) in enumerate(zip(cells, names, strict=True)):
+            value = cell.copy()
+            _label(value, [f"FIXED {case.index:02d} | {case.style_id}", name])
+            sheet.paste(value, (column * base.width, 0))
+        sheet_path = artist_root / f"{stem}.png"
+        sheet.save(sheet_path, compress_level=4)
+        records.append(
+            {
+                "index": case.index,
+                "name": case.style_id,
+                "reference_path": str(case.reference_path),
+                "sheet": str(sheet_path),
+            }
+        )
+    overview = output / "fixed-references-one-reference-1x-2x.png"
+    _make_overview(
+        cases,
+        images,
+        multipliers,
+        prompt_info["prompt"],
+        int(generation["seed"]),
+        title="FIXED SAMPLES / ONE REFERENCE",
+        label_prefix="FIXED",
+    ).save(overview, compress_level=4)
+    summary = {
+        "contract": {
+            "source": "fixed_reference_sampling/TestSample1-7",
+            "references": len(cases),
+            "references_per_result": 1,
+            "same_prompt_for_all_references": True,
+            "same_seed_for_all_references": True,
+            "strengths": multipliers,
+            "strength_formula": "uncond + cfg*text_delta + cfg*strength*style_delta",
+        },
+        "checkpoint": checkpoint,
+        "generation": generation,
+        **prompt_info,
+        "overview": str(overview),
+        "references": records,
+    }
+    (output / "summary.json").write_text(
+        json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    print(json.dumps(summary, ensure_ascii=False, indent=2), flush=True)
+    return summary
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", required=True)
     parser.add_argument("--smoke", action="store_true")
+    parser.add_argument("--fixed", action="store_true")
     args = parser.parse_args()
     config = load_config(args.config)
+    if args.fixed:
+        if args.smoke:
+            raise ValueError("--smoke is only supported by the validation sweep")
+        generate_fixed_reference_sweep(config, output_dir(config))
+        return
     if args.smoke:
         config = copy.deepcopy(config)
         cfg = config["validation_artist_strength_sweep"]
