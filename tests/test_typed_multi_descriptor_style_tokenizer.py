@@ -3,6 +3,7 @@ from __future__ import annotations
 import torch
 
 from anima_style_data.dual_query_style_training import (
+    _dual_domain_human_splits,
     _domain_teacher_training,
     _native_artist_teacher_objective,
     _same_artist_functional_loss,
@@ -243,6 +244,13 @@ def test_teacher_heldout_exclusions_are_local_to_training_loader():
         "split": "validation",
         "excluded_style_ids": ["existing"],
     }
+
+
+def test_dual_domain_human_validation_uses_validation_split():
+    assert _dual_domain_human_splits(
+        {"train_split": "train", "validation_split": "validation"},
+        {"source_split": "train"},
+    ) == ("train", "validation")
 
 
 def test_domain_teacher_config_preserves_reference_count_curriculum():

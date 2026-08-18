@@ -100,6 +100,15 @@ def _with_excluded_style_ids(
     return result
 
 
+def _dual_domain_human_splits(
+    cfg: dict[str, Any], human_cfg: dict[str, Any]
+) -> tuple[str, str]:
+    return (
+        str(human_cfg.get("source_split", cfg.get("train_split", "train"))),
+        str(cfg.get("validation_split", "validation")),
+    )
+
+
 def _cache_summary(destination: Path, cfg: dict[str, Any]) -> dict[str, Any]:
     path = destination / str(cfg["cache"]["output_directory"]) / "summary.json"
     summary = json.loads(path.read_text(encoding="utf-8"))
@@ -2329,12 +2338,15 @@ def _train_variant(
         ]
         human_cfg = dict(dual_domain_cfg["human"])
         synthetic_cfg = dict(dual_domain_cfg["synthetic"])
+        human_train_split, human_validation_split = _dual_domain_human_splits(
+            cfg, human_cfg
+        )
 
-        def build_human_domain(style_ids: list[str]):
+        def build_human_domain(style_ids: list[str], *, split: str):
             loader_cfg = _loader_config(
                 config,
                 cfg,
-                split=str(human_cfg.get("source_split", "train")),
+                split=split,
             )
             reference_counts = [
                 int(value)
@@ -2362,10 +2374,12 @@ def _train_variant(
             dual_domain_cfg["synthetic_reference_cache"]
         )
         dual_domain_train_loaders["human_teacher"] = build_human_domain(
-            train_style_ids
+            train_style_ids,
+            split=human_train_split,
         )
         dual_domain_validation_loaders["human_teacher"] = build_human_domain(
-            validation_style_ids
+            validation_style_ids,
+            split=human_validation_split,
         )
         dual_domain_train_loaders["synthetic_teacher"] = (
             CachedTeacherReferenceLoader(
