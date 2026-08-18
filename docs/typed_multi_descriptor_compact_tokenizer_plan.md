@@ -161,3 +161,12 @@ self improvement는 `0.00371`, wrong-reference는 `-0.00476`, artist retrieval�
 Frozen-Anima velocity residual이 두 disjoint same-artist reference view에서
 일치하도록 한다. 1,250/1,500/2,000-step에서 heldout·multi-reference 성능과
 reference-view difference가 함께 개선되는지 확인한다.
+
+1,250-step 검증에서는 raw same-artist consistency 강화가 전 작가 공통 방향을
+키우는 실패가 확인됐다. Human/synthetic common-output ratio가 각각
+`0.731/0.659 -> 0.755/0.790`으로 악화되고 selection score도
+`0.00365 -> 0.00303`으로 하락했다. 따라서 이 체크포인트는 폐기 후보로
+보존하고 v3의 step-1,000에서 다시 분기한다. 새 v3c는 각 reference view에서
+동일 prompt/noise/timestep을 공유하는 artist batch 평균 residual을 먼저 뺀 뒤,
+남은 artist-specific residual끼리만 consistency를 계산한다. Weight는 과도했던
+`0.05`에서 `0.01`로 낮추고 cadence 2와 projected teacher weight 1.0은 유지한다.

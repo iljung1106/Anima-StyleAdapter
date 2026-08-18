@@ -517,6 +517,7 @@ def _same_artist_functional_loss(
     *,
     direction_fraction: float,
     huber_beta: float,
+    center_across_artists: bool = False,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """Match two disjoint reference views in frozen-Anima velocity space."""
 
@@ -524,6 +525,18 @@ def _same_artist_functional_loss(
         raise ValueError("Functional reference views must have the same shape")
     if valid.shape != first_deltas.shape[:1]:
         raise ValueError("Functional reference-view validity has the wrong shape")
+    weights = valid.to(first_deltas.dtype)
+    if center_across_artists:
+        enough_artists = weights.sum().ge(2)
+        weights = weights * enough_artists.to(weights.dtype)
+        broadcast = weights.reshape(-1, *([1] * (first_deltas.ndim - 1)))
+        denominator = weights.sum().clamp_min(1.0)
+        first_common = (first_deltas * broadcast).sum(dim=0, keepdim=True)
+        first_deltas = first_deltas - first_common / denominator
+        second_common = (second_deltas.detach() * broadcast).sum(
+            dim=0, keepdim=True
+        )
+        second_deltas = second_deltas - second_common / denominator
     dimensions = tuple(range(1, first_deltas.ndim))
     first_flat = first_deltas.flatten(1)
     second_flat = second_deltas.detach().flatten(1)
@@ -540,7 +553,7 @@ def _same_artist_functional_loss(
         beta=float(huber_beta),
         reduction="none",
     )
-    weights = valid.to(direction.dtype)
+    weights = weights.to(direction.dtype)
     denominator = weights.sum().clamp_min(1.0)
     direction_loss = (direction * weights).sum() / denominator
     magnitude_loss = (magnitude * weights).sum() / denominator
@@ -1348,6 +1361,9 @@ def _pilot_functional_probe_step(
             training.get("same_artist_functional_direction_fraction", 0.75)
         ),
         huber_beta=float(training.get("same_artist_functional_huber_beta", 0.10)),
+        center_across_artists=bool(
+            training.get("same_artist_functional_center_across_artists", False)
+        ),
     )
     centered_loss, centered_metrics = _centered_artist_effect_loss(
         first_deltas, floor=centered_floor

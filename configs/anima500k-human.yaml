@@ -2678,7 +2678,7 @@ slot_preserving_global_query_style_tokenizer:
     vae_batch_size: 4
 
 typed_multi_descriptor_compact_style_tokenizer:
-  output_directory: typed_multi_descriptor_grouped_8k_v3
+  output_directory: typed_multi_descriptor_grouped_8k_v3c_centered
   seed: 20260818
   train_split: train
   validation_split: validation
@@ -2789,9 +2789,10 @@ typed_multi_descriptor_compact_style_tokenizer:
     functional_probe_every: 2
     functional_probe_batch_rows: 4
     functional_probe_references: 4
-    same_artist_functional_weight: 0.05
+    same_artist_functional_weight: 0.01
     same_artist_functional_direction_fraction: 0.75
     same_artist_functional_huber_beta: 0.10
+    same_artist_functional_center_across_artists: true
     centered_artist_effect_weight: 0.0
     functional_common_output_weight: 0.0
 
@@ -2914,8 +2915,8 @@ typed_multi_descriptor_compact_style_tokenizer:
     wandb:
       enabled: true
       project: anima-style-adapter
-      name: typed-multi-descriptor-grouped-8k-v3b-consistency
-      id: typed-multi-descriptor-grouped-8k-v3b-consistency
+      name: typed-multi-descriptor-grouped-8k-v3c-centered-consistency
+      id: typed-multi-descriptor-grouped-8k-v3c-centered-consistency
   fixed_reference_sampling:
     cache_directory: dual_query_external_reference_cache_v1
     device: cuda

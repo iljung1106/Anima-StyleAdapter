@@ -4,6 +4,7 @@ import torch
 
 from anima_style_data.dual_query_style_training import (
     _native_artist_teacher_objective,
+    _same_artist_functional_loss,
     _scheduled_teacher_gradient_scale,
     _teacher_projected_effect_loss,
 )
@@ -197,3 +198,42 @@ def test_sparse_teacher_updates_can_preserve_expected_gradient_pressure():
     assert _scheduled_teacher_gradient_scale(
         4, {"dual_domain_teacher_scale_by_cadence": True}
     ) == 4.0
+
+
+def test_centered_functional_consistency_ignores_view_common_effects():
+    artist_effect = torch.tensor(
+        [[[[1.0, 0.0]]], [[[-1.0, 0.0]]], [[[0.0, 1.0]]], [[[0.0, -1.0]]]]
+    )
+    first = artist_effect + torch.tensor([[[[2.0, 2.0]]]])
+    second = artist_effect + torch.tensor([[[[-3.0, 4.0]]]])
+    loss, metrics = _same_artist_functional_loss(
+        first,
+        second,
+        torch.ones(4, dtype=torch.bool),
+        direction_fraction=0.75,
+        huber_beta=0.10,
+        center_across_artists=True,
+    )
+    assert float(loss) < 1e-7
+    assert float(metrics["functional_same_artist_cosine"]) > 0.999
+
+
+def test_centered_functional_consistency_does_not_reward_global_collapse():
+    collapsed = torch.ones(4, 1, 1, 2)
+    raw_loss, _ = _same_artist_functional_loss(
+        collapsed,
+        collapsed,
+        torch.ones(4, dtype=torch.bool),
+        direction_fraction=0.75,
+        huber_beta=0.10,
+    )
+    centered_loss, _ = _same_artist_functional_loss(
+        collapsed,
+        collapsed,
+        torch.ones(4, dtype=torch.bool),
+        direction_fraction=0.75,
+        huber_beta=0.10,
+        center_across_artists=True,
+    )
+    assert float(raw_loss) < 1e-7
+    assert float(centered_loss) > 0.70
