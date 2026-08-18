@@ -583,7 +583,7 @@ class FreshKVStyleCrossAttention(nn.Module):
         if self._style_enabled is not None:
             style_attended = style_attended * self._style_enabled.to(
                 device=style_attended.device, dtype=style_attended.dtype
-            )[:, None, None, None]
+            )[:, None, None]
         alpha = self.alpha[block_index].to(style_attended.dtype) * float(
             self._style_strength
         )

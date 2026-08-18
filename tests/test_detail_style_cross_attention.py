@@ -145,7 +145,9 @@ def test_style_uses_separate_softmax_one_native_o_and_trains_fresh_kv():
         context_dim=6, blocks=2, initial_alpha=0.2
     )
     adapter.initialize_from_anima(anima)
-    adapter.set_style_context(torch.randn(2, 3, 6))
+    adapter.set_style_context(
+        torch.randn(2, 3, 6), enabled=torch.tensor([True, False])
+    )
     cross = anima.blocks[0].cross_attn
     cross.qkv_calls = 0
     cross.output_proj.calls = 0
@@ -160,6 +162,7 @@ def test_style_uses_separate_softmax_one_native_o_and_trains_fresh_kv():
     assert adapter.style_k[0].weight.grad is not None
     assert adapter.style_v[0].weight.grad is not None
     assert anima.blocks[0].cross_attn.output_proj.weight.grad is None
+    assert output.shape == (2, 5, 8)
 
 
 def test_same_q_internal_teacher_produces_live_gradient_and_calibrates_alpha():
