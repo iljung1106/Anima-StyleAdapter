@@ -3972,6 +3972,7 @@ detail_preserving_style_cross_attention:
       common_output_start_step: 500
       common_output_ramp_end_step: 1500
       common_output_weight: 0.05
+      common_output_denominator: teacher_centered_rms
       common_output_threshold_start: 0.85
       common_output_threshold_end: 0.60
       common_output_threshold_end_step: 10000
