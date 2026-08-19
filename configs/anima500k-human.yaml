@@ -3900,6 +3900,15 @@ detail_preserving_style_cross_attention:
     key_subspace_weight: 0.15
     value_subspace_weight: 0.15
     effect_rms_weight: 0.10
+  shared_kv_selection:
+    result: diagnostics/detail_style_block_similarity_v1/summary.json
+    bases: 4
+    medoid_blocks: [3, 12, 18, 26]
+    block_to_base: [0, 0, 0, 0, 0, 0, 0, 0,
+                    1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+                    2, 2,
+                    3, 3, 3, 3, 3, 3, 3, 3]
+    block_delta_rank: 64
   teacher:
     bank_config_key: dual_domain_native_teacher
     context_cache: native_artist_post_llm_context_5000_v1

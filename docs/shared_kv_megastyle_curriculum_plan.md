@@ -49,6 +49,25 @@ zero-init한다. Q, O 및 `gate_cross(t)`는 block별 native Anima 모듈을 그
 복합 거리에 4-medoids를 적용한다. 각 cluster의 medoid native K/V가 Shared Base
 초기값 후보이며, 최종 JSON에 cluster, medoid, 상대 block gain을 모두 기록한다.
 
+### 2026-08-19 측정 결과
+
+Frozen Anima에서 4개 content, 전체 teacher timestep, 1,024개의 무작위 train-artist
+관측을 사용했다. 각 block에서 16개 spatial 위치를 뽑아 256차원 공통 random
+projection 뒤 linear CKA를 계산했다.
+
+| Shared Base | native medoid | 할당 block |
+|---|---:|---|
+| 0 | 3 | 0--7 |
+| 1 | 12 | 8--17 |
+| 2 | 18 | 18--19 |
+| 3 | 26 | 20--27 |
+
+cluster별 평균 내부 유사도는 각각 `0.440 / 0.649 / 0.558 / 0.541`이고, 여섯
+cluster 쌍의 평균 외부 유사도는 `0.303`이다. 전체 내부 평균은 `0.547`로 외부보다
+`0.244` 높다. 따라서 네 base는 `L3, L12, L18, L26`의 native K/V로 초기화한다.
+원본 전체 행렬과 block별 teacher RMS/상대 gain은 원격 산출물
+`diagnostics/detail_style_block_similarity_v1/summary.json`에 보존한다.
+
 ## Metric-gated curriculum과 LR
 
 초기에는 exact-self와 dense centered residual teacher로 방향과 절대 크기를 함께
