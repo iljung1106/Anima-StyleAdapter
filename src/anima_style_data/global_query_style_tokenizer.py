@@ -526,7 +526,16 @@ class MultiPromptDualQueryCachedStyleLoader(DualQueryCachedStyleLoader):
         self.prompt_mode_weights = {
             key: value / total for key, value in self.prompt_mode_weights.items()
         }
-        self.quality_probability = float(prompt_cfg.get("quality_probability", 0.50))
+        # Prompt-mode weights live under ``prompt_modes`` while the train and
+        # validation quality probabilities are loader-level settings.  Honor
+        # the explicit loader value so validation_quality_probability=0 is not
+        # silently replaced by the historical 0.50 default.
+        self.quality_probability = float(
+            cfg.get(
+                "quality_probability",
+                prompt_cfg.get("quality_probability", 0.50),
+            )
+        )
         if not 0 <= self.quality_probability <= 1:
             raise ValueError("quality_probability must be in [0,1]")
         self.empty_warmup_steps = int(prompt_cfg.get("empty_warmup_steps", 0))

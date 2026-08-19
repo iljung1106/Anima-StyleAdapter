@@ -3888,8 +3888,11 @@ detail_preserving_style_cross_attention:
     reader_layers: 2
     reader_ff_dim: 3072
     mixer_ff_dim: 3072
+    mixer_layers: 2
     position_gain: 0.1
     type_preference_bias: 1.0
+    same_slot_attention_bias: 1.0
+    reference_identity_gain: 0.25
     slot_type_counts: [16, 8, 4]
     strict_v1: true
   adapter:
@@ -3904,6 +3907,10 @@ detail_preserving_style_cross_attention:
                     3, 3, 3, 3, 3, 3, 3, 3]
     delta_rank: 64
     delta_scale: 1.0
+    # Open block-local K/V directions from the first backward pass without
+    # letting random deltas dominate the four full-rank shared bases.
+    delta_k_init_scale: 0.01
+    delta_v_init_scale: 0.03
     mix_logit_scale: 4.0
     # Absolute strength is calibrated independently for every block and
     # timestep bin. global_gain is the only post-calibration strength control;
@@ -4010,15 +4017,16 @@ detail_preserving_style_cross_attention:
       target_mix_max_references: 4
       target_anneal_min_references: 1
       target_anneal_max_references: 8
-    style_dropout: 0.05
     reconstruction_weight: 0.01
     reconstruction_final_weight: 0.01
     reconstruction_hold_steps: 20000
-    functional_start_step: 500
-    functional_every: 4
+    # Correct-vs-wrong cyclic ranking starts as soon as the branch has a
+    # measurable output, reaches full strength at step 750, and remains on.
+    functional_start_step: 250
+    functional_full_step: 750
+    functional_every: 1
     functional_margin: 0.01
-    # Deferred until heldout paired improvement is reliably positive.
-    functional_weight: 0.0
+    functional_weight: 0.10
     teacher_batch_rows: 4
     teacher_references: 4
     teacher_every_step_until: 500

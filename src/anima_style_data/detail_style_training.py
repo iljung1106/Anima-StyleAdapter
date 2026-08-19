@@ -328,13 +328,7 @@ def _flow_step(
         enabled=torch.device(device).type == "cuda",
     ):
         output = reader(references, reference_mask, reconstruct=train_auxiliaries)
-        dropout = float(training.get("style_dropout", 0.05))
-        enabled = torch.ones(latents.shape[0], dtype=torch.bool, device=device)
-        if reader.training and dropout > 0:
-            enabled = torch.rand(
-                latents.shape[0], device=device, generator=generator
-            ) >= dropout
-        adapter.set_style_context(output.tokens, enabled=enabled)
+        adapter.set_style_context(output.tokens)
         adapter.set_timesteps(timesteps)
         try:
             prediction = anima(
@@ -360,7 +354,7 @@ def _flow_step(
         "target_probability": flow_loss.new_tensor(
             float(curriculum["target_probability"])
         ),
-        "style_enabled_fraction": enabled.float().mean(),
+        "style_enabled_fraction": flow_loss.new_tensor(1.0),
         "timestep_mean": timesteps.detach().mean(),
         "megastyle_batch": flow_loss.new_tensor(
             float(str(batch.get("data_domain", "anima")) == "megastyle")
@@ -384,7 +378,7 @@ def _flow_step(
     need_wrong = (
         train_auxiliaries
         and float(training.get("functional_weight", 0.0)) > 0
-        and step >= int(training.get("functional_start_step", 500))
+        and step >= int(training.get("functional_start_step", 250))
         and step % int(training.get("functional_every", 4)) == 0
         and prediction.shape[0] >= 2
     )
@@ -428,7 +422,10 @@ def _flow_step(
             margin=float(training.get("functional_margin", 0.01)),
         )
         weight = _ramp(
-            step, 500, 1_500, float(training.get("functional_weight", 0.10))
+            step,
+            int(training.get("functional_start_step", 250)),
+            int(training.get("functional_full_step", 750)),
+            float(training.get("functional_weight", 0.10)),
         )
         total = total + weight * ranking
         metrics.update(ranking_metrics)

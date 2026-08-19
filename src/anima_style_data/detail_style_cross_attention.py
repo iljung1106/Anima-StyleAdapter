@@ -2,9 +2,9 @@
 
 The frozen Dual-query Resampler supplies 64 spatial, 16 global, and four
 artist-summary tokens per reference.  This module reads each reference into 28
-canonical, reference-conditioned slots, pools matching slots across the
-unordered reference set, and injects the result through fresh block-local K/V
-projections.  Native Anima Q, O, output dropout, and gate_cross remain frozen.
+canonical slots, lets 28 output queries softly align across the complete
+reference-by-slot memory set, and injects the result through fresh block-local
+K/V projections. Native Anima Q, O, output dropout, and gate_cross remain frozen.
 """
 
 from __future__ import annotations
@@ -171,7 +171,7 @@ class _CrossSlotBlock(nn.Module):
 
 
 class DetailPreservingTypedSlotReader(nn.Module):
-    """Convert each 84-token reference into a fixed 28-token style set."""
+    """Read 84-token references and softly align them into 28 style slots."""
 
     def __init__(
         self,
@@ -185,8 +185,11 @@ class DetailPreservingTypedSlotReader(nn.Module):
         reader_layers: int = 2,
         reader_ff_dim: int = 3072,
         mixer_ff_dim: int = 3072,
+        mixer_layers: int = 2,
         position_gain: float = 0.1,
         type_preference_bias: float = 1.0,
+        same_slot_attention_bias: float = 1.0,
+        reference_identity_gain: float = 0.25,
         slot_type_counts: tuple[int, int, int] = (16, 8, 4),
         strict_v1: bool = True,
     ) -> None:
@@ -200,6 +203,12 @@ class DetailPreservingTypedSlotReader(nn.Module):
             raise ValueError("spatial_tokens must form a square grid")
         if sum(slot_type_counts) != output_tokens:
             raise ValueError("slot_type_counts must sum to output_tokens")
+        if mixer_layers <= 0:
+            raise ValueError("mixer_layers must be positive")
+        if same_slot_attention_bias <= 0 or reference_identity_gain <= 0:
+            raise ValueError(
+                "same_slot_attention_bias and reference_identity_gain must be positive"
+            )
         self.dim = int(dim)
         self.spatial_tokens = int(spatial_tokens)
         self.global_tokens = int(global_tokens)
@@ -207,6 +216,8 @@ class DetailPreservingTypedSlotReader(nn.Module):
         self.cached_tokens = spatial_tokens + global_tokens + summary_tokens
         self.output_tokens = int(output_tokens)
         self.position_gain = float(position_gain)
+        self.same_slot_attention_bias = float(same_slot_attention_bias)
+        self.reference_identity_gain = float(reference_identity_gain)
 
         self.input_norms = nn.ModuleList(nn.LayerNorm(dim) for _ in range(3))
         self.input_projections = nn.ModuleList(
@@ -224,6 +235,11 @@ class DetailPreservingTypedSlotReader(nn.Module):
             self.type_preference.scatter_(
                 1, preferred[:, None], float(type_preference_bias)
             )
+        self.register_buffer(
+            "output_slot_type_ids",
+            preferred,
+            persistent=True,
+        )
         self.register_buffer(
             "spatial_position",
             _sincos_2d(side, dim),
@@ -245,10 +261,21 @@ class DetailPreservingTypedSlotReader(nn.Module):
         )
         self.set_query = nn.Parameter(torch.empty(output_tokens, dim))
         self.set_norm = nn.LayerNorm(dim)
+        self.reference_identity_norm = nn.LayerNorm(dim)
+        self.reference_identity_projection = nn.Linear(dim, dim, bias=False)
+        self.pool_type_embeddings = nn.Parameter(torch.empty(3, dim))
+        self.pool_type_preference = nn.Parameter(torch.zeros(output_tokens, 3))
+        with torch.no_grad():
+            self.pool_type_preference.scatter_(
+                1, preferred[:, None], float(type_preference_bias)
+            )
         self.set_attention = _BiasFreeAttention(dim, heads)
         self.set_ff_norm = nn.LayerNorm(dim)
         self.set_ff = _SwiGLU(dim, reader_ff_dim)
-        self.mixer = _CrossSlotBlock(dim, heads, mixer_ff_dim)
+        self.mixers = nn.ModuleList(
+            _CrossSlotBlock(dim, heads, mixer_ff_dim)
+            for _ in range(mixer_layers)
+        )
 
         self.reconstruction_queries = nn.Parameter(
             torch.empty(self.cached_tokens, dim)
@@ -268,6 +295,7 @@ class DetailPreservingTypedSlotReader(nn.Module):
         nn.init.normal_(self.type_embeddings, std=std)
         nn.init.normal_(self.slot_identity, std=std)
         nn.init.normal_(self.set_query, std=std)
+        nn.init.normal_(self.pool_type_embeddings, std=std)
         nn.init.normal_(self.reconstruction_queries, std=std)
 
     def _typed_memory(
@@ -316,22 +344,59 @@ class DetailPreservingTypedSlotReader(nn.Module):
         self, per_reference: torch.Tensor, reference_mask: torch.Tensor
     ) -> torch.Tensor:
         batch, references, slots, dim = per_reference.shape
-        values = per_reference.permute(0, 2, 1, 3).reshape(batch * slots, references, dim)
-        query = self.set_query.to(values.dtype)[None].expand(batch, -1, -1)
-        query = query.reshape(batch * slots, 1, dim)
-        mask = reference_mask[:, None].expand(-1, slots, -1).reshape(
-            batch * slots, references
+        normalized = self.set_norm(per_reference)
+        reference_identity = self.reference_identity_projection(
+            self.reference_identity_norm(normalized.mean(dim=2))
+        )
+        reference_identity = (
+            self.reference_identity_gain
+            * reference_identity
+            * reference_mask[:, :, None].to(reference_identity.dtype)
+        )
+        slot_identity = self.slot_identity.to(normalized.dtype)
+        slot_type = self.pool_type_embeddings[
+            self.output_slot_type_ids
+        ].to(normalized.dtype)
+        memory_key = (
+            normalized
+            + slot_identity[None, None]
+            + slot_type[None, None]
+            + reference_identity[:, :, None]
+        ).reshape(batch, references * slots, dim)
+        # Metadata changes routing, not the visual payload.  Keeping values as
+        # normalized per-reference content avoids leaking arbitrary identity
+        # embeddings into the final Anima context.
+        memory_value = normalized.reshape(batch, references * slots, dim)
+        memory_slot_ids = torch.arange(slots, device=normalized.device).repeat(
+            references
+        )
+        memory_type_ids = self.output_slot_type_ids[memory_slot_ids]
+        type_bias = self.pool_type_preference[:, memory_type_ids].to(
+            normalized.dtype
+        )
+        same_slot = (
+            torch.arange(slots, device=normalized.device)[:, None]
+            == memory_slot_ids[None]
+        ).to(normalized.dtype)
+        attention_bias = type_bias + self.same_slot_attention_bias * same_slot
+        query = (
+            self.set_query.to(normalized.dtype) + slot_identity
+        )[None].expand(batch, -1, -1)
+        mask = ~reference_mask[:, :, None].expand(-1, -1, slots).reshape(
+            batch, references * slots
         )
         pooled, _ = self.set_attention(
             query,
-            self.set_norm(values),
-            self.set_norm(values),
-            key_padding_mask=~mask,
+            memory_key,
+            memory_value,
+            attention_bias=attention_bias,
+            key_padding_mask=mask,
         )
-        pooled = pooled.reshape(batch, slots, dim)
         pooled = pooled + self.set_ff(self.set_ff_norm(pooled))
         identity = self.slot_identity.to(pooled.dtype).unsqueeze(0)
-        return self.mixer(pooled, identity)
+        for mixer in self.mixers:
+            pooled = mixer(pooled, identity)
+        return pooled
 
     def forward(
         self,
@@ -1449,12 +1514,16 @@ class SharedBaseKVStyleCrossAttention(FreshKVStyleCrossAttention):
         ),
         delta_rank: int = 64,
         delta_scale: float = 1.0,
+        delta_k_init_scale: float = 0.01,
+        delta_v_init_scale: float = 0.03,
         mix_logit_scale: float = 4.0,
         global_gain: float = 1.0,
         relative_block_gain: list[float] | tuple[float, ...] | None = None,
     ) -> None:
         if shared_bases <= 0 or delta_rank <= 0:
             raise ValueError("shared_bases and delta_rank must be positive")
+        if delta_k_init_scale <= 0 or delta_v_init_scale <= 0:
+            raise ValueError("Block-delta initialization scales must be positive")
         if len(medoid_blocks) != shared_bases:
             raise ValueError("medoid_blocks must contain one block per shared base")
         if len(block_to_base) != blocks:
@@ -1471,6 +1540,8 @@ class SharedBaseKVStyleCrossAttention(FreshKVStyleCrossAttention):
         self.shared_bases = int(shared_bases)
         self.delta_rank = int(delta_rank)
         self.delta_scale = float(delta_scale)
+        self.delta_k_init_scale = float(delta_k_init_scale)
+        self.delta_v_init_scale = float(delta_v_init_scale)
         self.global_gain = float(global_gain)
         self.medoid_blocks = tuple(int(value) for value in medoid_blocks)
         self.register_buffer(
@@ -1537,20 +1608,20 @@ class SharedBaseKVStyleCrossAttention(FreshKVStyleCrossAttention):
         native = anima.blocks[0].cross_attn.output_proj.weight
         for _ in range(self.blocks):
             modules = []
-            for input_dim, result_dim, zero in (
-                (self.context_dim, self.delta_rank, False),
-                (self.delta_rank, output_dim, True),
-                (self.context_dim, self.delta_rank, False),
-                (self.delta_rank, output_dim, True),
+            for input_dim, result_dim, init_scale in (
+                (self.context_dim, self.delta_rank, 1.0),
+                (self.delta_rank, output_dim, self.delta_k_init_scale),
+                (self.context_dim, self.delta_rank, 1.0),
+                (self.delta_rank, output_dim, self.delta_v_init_scale),
             ):
                 module = nn.Linear(
                     input_dim, result_dim, bias=False,
                     device=native.device, dtype=native.dtype,
                 )
-                if zero:
-                    nn.init.zeros_(module.weight)
-                else:
-                    nn.init.xavier_uniform_(module.weight)
+                nn.init.xavier_uniform_(module.weight)
+                if init_scale != 1.0:
+                    with torch.no_grad():
+                        module.weight.mul_(float(init_scale))
                 modules.append(module)
             k_down, k_up, v_down, v_up = modules
             self.delta_k_down.append(k_down)

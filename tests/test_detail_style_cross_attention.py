@@ -118,8 +118,11 @@ def test_reader_is_reference_order_invariant_and_reconstructs_every_valid_view()
     )
     loss.backward()
     assert model.slot_identity.grad is not None
+    assert model.reference_identity_projection.weight.grad is not None
+    assert model.pool_type_embeddings.grad is not None
     assert model.input_projections[0].weight.grad is not None
     assert model.reconstruction_output.weight.grad is not None
+    assert len(model.mixers) == 2
     assert not hasattr(model, "log_output_rms")
 
 
@@ -319,8 +322,13 @@ def test_shared_xavier_bases_are_cached_and_block_deltas_train():
     assert not torch.allclose(adapter.base_k[0].weight, adapter.base_k[1].weight)
     assert torch.isfinite(adapter.base_k[0].weight).all()
     assert torch.isfinite(adapter.base_v[1].weight).all()
-    assert all(torch.count_nonzero(module.weight) == 0 for module in adapter.delta_k_up)
-    assert all(torch.count_nonzero(module.weight) == 0 for module in adapter.delta_v_up)
+    assert all(torch.count_nonzero(module.weight) > 0 for module in adapter.delta_k_up)
+    assert all(torch.count_nonzero(module.weight) > 0 for module in adapter.delta_v_up)
+    assert all(
+        module.weight.float().square().mean().sqrt()
+        < adapter.base_k[0].weight.float().square().mean().sqrt() * 0.1
+        for module in adapter.delta_k_up
+    )
     torch.testing.assert_close(adapter.alpha, torch.tensor([0.75, 1.25]))
 
     calls = [0, 0, 0, 0]
@@ -345,6 +353,8 @@ def test_shared_xavier_bases_are_cached_and_block_deltas_train():
 
     assert calls == [1, 1, 1, 1]
     assert adapter.base_k[0].weight.grad is not None
+    assert adapter.delta_k_down[0].weight.grad is not None
+    assert adapter.delta_v_down[1].weight.grad is not None
     assert adapter.delta_k_up[0].weight.grad is not None
     assert adapter.delta_v_up[1].weight.grad is not None
     assert adapter.base_mix_logits.grad is not None
