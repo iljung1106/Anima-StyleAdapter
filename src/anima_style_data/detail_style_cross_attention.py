@@ -417,6 +417,7 @@ class FreshKVStyleCrossAttention(nn.Module):
         self._calibration_bin_edges: tuple[float, ...] = (0.0, 1.000001)
         self._calibration_bin_index: int | None = None
         self._calibration_inject_style = False
+        self._calibration_measured_alpha = torch.empty(0)
         self._calibration_teacher: list[list[list[torch.Tensor]]] = []
         self._calibration_student: list[list[list[torch.Tensor]]] = []
         self._calibration_raw_residual: list[list[list[torch.Tensor]]] = []
@@ -536,6 +537,7 @@ class FreshKVStyleCrossAttention(nn.Module):
         # diagnostics of that old behaviour.
         if reset_alpha:
             self.alpha.fill_(1.0)
+        self._calibration_measured_alpha = self.alpha.detach().float().clone()
 
     def set_alpha_calibration_timestep(self, timestep: float) -> None:
         if not self._calibration:
@@ -717,6 +719,7 @@ class FreshKVStyleCrossAttention(nn.Module):
             "minimum_alpha": float(minimum),
             "maximum_alpha": float(maximum),
             "alpha": alpha.detach().cpu().tolist(),
+            "measured_alpha": self._calibration_measured_alpha.cpu().tolist(),
             "alpha_applied": bool(apply_alpha),
             "recommended_lower_multiplier": float(recommended_lower_multiplier),
             "recommended_upper_multiplier": float(recommended_upper_multiplier),
@@ -835,7 +838,8 @@ class FreshKVStyleCrossAttention(nn.Module):
                 cross_attention, effective_style_attended
             )
             raw_delta = (
-                self._native_output_weight(cross_attention, style_attended)
+                student_delta.float()
+                / max(abs(float(alpha.detach().float())), 1e-8)
                 if self._calibration
                 else None
             )
