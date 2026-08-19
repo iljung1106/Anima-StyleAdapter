@@ -3908,7 +3908,7 @@ detail_preserving_style_cross_attention:
     # Absolute block scales are calibrated against the native artist residual.
     # This mean-one profile retains only the measured inter-block differences;
     # global_gain independently controls the overall style strength.
-    global_gain: 0.25
+    global_gain: 1.0
     relative_block_gain: [0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5,
                           0.5, 0.513159, 1.262426, 1.656704, 1.659147, 1.786944,
                           1.558835, 1.786944, 1.106528, 1.232676, 1.510143, 1.550927,
@@ -4024,7 +4024,7 @@ detail_preserving_style_cross_attention:
     alpha_calibration_batches: 32
     alpha_calibration_timestep_bin_edges: [0.0, 0.325, 0.625, 0.86, 1.000001]
     alpha_calibration_minimum: 0.000001
-    alpha_calibration_maximum: 2.0
+    alpha_calibration_maximum: 8.0
     teacher_objective:
       native_teacher_start_step: 1
       native_teacher_ramp_steps: 250
