@@ -568,6 +568,11 @@ def _calibrate_alpha(
         apply_alpha=apply_alpha,
         recommended_lower_multiplier=recommended_lower_multiplier,
         recommended_upper_multiplier=recommended_upper_multiplier,
+        fixed_output_quantile=(
+            float(training["fixed_output_quantile"])
+            if training.get("fixed_output_quantile") is not None
+            else None
+        ),
     )
     reader.train(reader_was_training)
     return result
@@ -924,6 +929,10 @@ def train_detail_style_cross_attention(
                 "native_upper_by_timestep": calibration[
                     "native_upper_by_timestep"
                 ],
+                "native_fixed_output_by_timestep": calibration[
+                    "native_fixed_output_by_timestep"
+                ],
+                "fixed_output_quantile": calibration["fixed_output_quantile"],
                 "relative_block_gain": "disabled",
                 "medoid_blocks": list(adapter.medoid_blocks),
                 "block_to_base": adapter.block_to_base.detach().cpu().tolist(),

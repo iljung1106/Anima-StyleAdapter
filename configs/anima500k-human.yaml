@@ -3830,7 +3830,7 @@ real_artist_teacher:
 # Detail-preserving typed-slot, separate-softmax Style Cross-Attention v1.
 # Contract: docs/detail_preserving_style_cross_attention_plan.md
 detail_preserving_style_cross_attention:
-  output_directory: detail_preserving_style_cross_attention_shared_kv_timestep_v4_20k
+  output_directory: detail_preserving_style_cross_attention_shared_kv_fixed_p75_v5_20k
   seed: 20260819
   train_split: train
   validation_split: validation
@@ -4020,10 +4020,10 @@ detail_preserving_style_cross_attention:
     functional_weight: 0.10
     same_artist_weight: 0.05
     internal_teacher_weight: 0.25
-    # The lower bound acts on the positive projection onto the native artist
-    # direction, not total RMS. The upper bound weakly caps total residual RMS.
-    internal_aligned_floor_weight: 1.0
-    internal_total_upper_weight: 0.05
+    # Bootstrap uses a structural post-O/post-native-gate P75 constraint, so
+    # the older soft magnitude losses would only duplicate that constraint.
+    internal_aligned_floor_weight: 0.0
+    internal_total_upper_weight: 0.0
     teacher_batch_rows: 4
     teacher_references: 4
     teacher_every_step_until: 500
@@ -4036,6 +4036,9 @@ detail_preserving_style_cross_attention:
     alpha_calibration_timestep_bin_edges: [0.0, 0.325, 0.625, 0.86, 1.000001]
     alpha_calibration_minimum: 0.000001
     alpha_calibration_maximum: 8.0
+    # Keep every active row at the native artist-effect 75th percentile after
+    # native full-rank O and gate_cross(t). No trainable style gate is used.
+    fixed_output_quantile: 0.75
     teacher_objective:
       native_teacher_start_step: 1
       native_teacher_ramp_steps: 250
@@ -4092,8 +4095,8 @@ detail_preserving_style_cross_attention:
     wandb:
       enabled: true
       project: anima-style-adapter
-      name: detail-style-shared-kv-timestep-v4-20k-megastyle15
-      id: detail-style-shared-kv-timestep-v4-20k-megastyle15
+      name: detail-style-shared-kv-fixed-p75-v5-20k-megastyle15
+      id: detail-style-shared-kv-fixed-p75-v5-20k-megastyle15
   sampling:
     width: 768
     height: 768

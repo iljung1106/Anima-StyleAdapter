@@ -825,6 +825,13 @@ def _same_q_block_forward(
 
     normalized = block.layer_norm_cross_attn(x) * (1 + scale_cross) + shift_cross
     adapter = block.__dict__["_style_controller"]()
+    set_gate_context = getattr(adapter, "set_block_gate_context", None)
+    if set_gate_context is not None:
+        set_gate_context(
+            block.__dict__["_same_q_style_block_index"],
+            gate_cross,
+            (frames, height, width),
+        )
     result = adapter.merged_cross_attention(
         block.__dict__["_same_q_style_block_index"],
         rearrange(normalized, "b t h w d -> b (t h w) d"),

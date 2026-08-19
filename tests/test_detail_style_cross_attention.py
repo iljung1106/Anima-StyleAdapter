@@ -260,6 +260,34 @@ def test_timestep_strength_profile_interpolates_per_block_and_keeps_bounds():
     torch.testing.assert_close(upper, torch.tensor([1.2, 1.3, 1.8]))
 
 
+def test_fixed_output_strength_matches_post_native_gate_p75_and_preserves_disabled_rows():
+    torch.manual_seed(111)
+    anima = _Anima(blocks=1).requires_grad_(False)
+    adapter = FreshKVStyleCrossAttention(context_dim=6, blocks=1)
+    adapter.initialize_from_anima(anima)
+    adapter.configure_fixed_output_strength(
+        timestep_bin_edges=(0.0, 1.000001),
+        native_fixed_output_by_timestep=torch.tensor([[0.35]]),
+    )
+    adapter.set_timesteps(torch.tensor([0.5, 0.5]))
+    adapter.set_style_context(
+        torch.randn(2, 3, 6), enabled=torch.tensor([True, False])
+    )
+    hidden = torch.randn(2, 5, 8)
+    text = torch.randn(2, 4, 6)
+    gate = torch.tensor([0.5, 1.5]).reshape(2, 1, 1, 1, 1).expand(-1, -1, -1, -1, 8)
+    cross = anima.blocks[0].cross_attn
+    clean = cross(hidden, None, text)
+    adapter.set_block_gate_context(0, gate, (1, 1, 5))
+    actual = adapter.merged_cross_attention(0, hidden, text, cross, None)
+
+    gated_delta = (actual - clean) * gate.reshape(2, 1, 8)
+    rms = gated_delta.float().square().mean(dim=(1, 2)).sqrt()
+    assert rms[0].item() == pytest.approx(0.35, rel=2e-5)
+    assert rms[1].item() == pytest.approx(0.0, abs=1e-7)
+    torch.testing.assert_close(actual[1], clean[1], atol=2e-6, rtol=2e-5)
+
+
 def test_shared_native_bases_are_cached_and_block_deltas_train():
     torch.manual_seed(113)
     anima = _Anima().requires_grad_(False)

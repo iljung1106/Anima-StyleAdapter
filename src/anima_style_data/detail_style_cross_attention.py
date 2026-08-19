@@ -425,7 +425,16 @@ class FreshKVStyleCrossAttention(nn.Module):
         self.register_buffer(
             "timestep_strength_enabled", torch.tensor(False), persistent=True
         )
+        self.register_buffer(
+            "native_fixed_output_by_timestep",
+            torch.zeros(4, blocks, dtype=torch.float32),
+            persistent=True,
+        )
+        self.register_buffer(
+            "fixed_output_strength_enabled", torch.tensor(False), persistent=True
+        )
         self._timestep_strength_active = False
+        self._fixed_output_strength_active = False
         self._style_context: torch.Tensor | None = None
         self._style_enabled: torch.Tensor | None = None
         self._style_strength = 1.0
@@ -443,6 +452,9 @@ class FreshKVStyleCrossAttention(nn.Module):
                 torch.Tensor,
             ],
         ] = {}
+        self._block_gate_context: dict[
+            int, tuple[torch.Tensor, tuple[int, int, int]]
+        ] = {}
         self._internal_terms: list[tuple[int, dict[str, torch.Tensor]]] = []
         self._calibration = False
         self._calibration_bin_edges: tuple[float, ...] = (0.0, 1.000001)
@@ -458,6 +470,9 @@ class FreshKVStyleCrossAttention(nn.Module):
         self._calibration_orthogonal_rms: list[list[list[torch.Tensor]]] = []
         self._runtime_ratios: list[torch.Tensor | None] = [None] * blocks
         self._runtime_alphas: list[torch.Tensor | None] = [None] * blocks
+        self._runtime_fixed_targets: list[torch.Tensor | None] = [None] * blocks
+        self._runtime_fixed_actuals: list[torch.Tensor | None] = [None] * blocks
+        self._runtime_fixed_scales: list[torch.Tensor | None] = [None] * blocks
         self._initialized = False
 
     def initialize_from_anima(self, anima: nn.Module) -> None:
@@ -559,10 +574,46 @@ class FreshKVStyleCrossAttention(nn.Module):
         self.timestep_strength_enabled.fill_(True)
         self._timestep_strength_active = True
 
+    @torch.no_grad()
+    def configure_fixed_output_strength(
+        self,
+        *,
+        timestep_bin_edges: tuple[float, ...] | list[float],
+        native_fixed_output_by_timestep: torch.Tensor,
+    ) -> None:
+        """Fix post-native-gate style RMS to a measured native target.
+
+        The target is defined on ``gate_cross(t) * O(style_attention)``.  It
+        therefore controls the residual that Anima actually receives, rather
+        than a pre-O attention norm or an indirect alpha coefficient.
+        """
+
+        edges = torch.as_tensor(
+            timestep_bin_edges, dtype=torch.float32, device=self.alpha.device
+        )
+        expected = (edges.numel() - 1, self.blocks)
+        if edges.numel() < 2 or not bool((edges[1:] > edges[:-1]).all()):
+            raise ValueError("timestep_bin_edges must be strictly increasing")
+        if tuple(native_fixed_output_by_timestep.shape) != expected:
+            raise ValueError(f"Fixed output tensor must have shape {expected}")
+        if not bool(torch.isfinite(native_fixed_output_by_timestep).all()) or bool(
+            (native_fixed_output_by_timestep <= 0).any()
+        ):
+            raise ValueError("Fixed output targets must be finite and positive")
+        self.strength_timestep_centers = 0.5 * (edges[:-1] + edges[1:])
+        self.native_fixed_output_by_timestep = (
+            native_fixed_output_by_timestep.detach().float().to(self.alpha.device)
+        )
+        self.fixed_output_strength_enabled.fill_(True)
+        self._fixed_output_strength_active = True
+
     def restore_timestep_strength_state(self) -> None:
         """Refresh the host-side fast path once after loading a checkpoint."""
         self._timestep_strength_active = bool(
             self.timestep_strength_enabled.detach().cpu().item()
+        )
+        self._fixed_output_strength_active = bool(
+            self.fixed_output_strength_enabled.detach().cpu().item()
         )
 
     def _interpolate_timestep_values(
@@ -625,6 +676,25 @@ class FreshKVStyleCrossAttention(nn.Module):
             ),
         )
 
+    def _fixed_output_target(self, block_index: int, batch: int) -> torch.Tensor:
+        if not self._fixed_output_strength_active:
+            raise RuntimeError("Fixed output strength is not configured")
+        base = self._interpolate_timestep_values(
+            self.native_fixed_output_by_timestep, block_index, batch
+        )
+        gain = float(getattr(self, "global_gain", 1.0)) * float(
+            self._style_strength
+        )
+        return base * gain
+
+    def set_block_gate_context(
+        self,
+        block_index: int,
+        gate_cross: torch.Tensor,
+        spatial_shape: tuple[int, int, int],
+    ) -> None:
+        self._block_gate_context[int(block_index)] = (gate_cross, spatial_shape)
+
     def clear_style_tokens(self) -> None:
         self._style_context = None
         self._style_enabled = None
@@ -633,6 +703,7 @@ class FreshKVStyleCrossAttention(nn.Module):
         self._timesteps = None
         self._timestep_interpolation = None
         self._pending_internal.clear()
+        self._block_gate_context.clear()
 
     def reset_internal_teacher(self) -> None:
         self._pending_internal.clear()
@@ -684,6 +755,8 @@ class FreshKVStyleCrossAttention(nn.Module):
         if reset_alpha:
             self.timestep_strength_enabled.fill_(False)
             self._timestep_strength_active = False
+            self.fixed_output_strength_enabled.fill_(False)
+            self._fixed_output_strength_active = False
             self.alpha.fill_(1.0)
         self._calibration_measured_alpha = self.alpha.detach().float().clone()
 
@@ -707,11 +780,14 @@ class FreshKVStyleCrossAttention(nn.Module):
         apply_alpha: bool = True,
         recommended_lower_multiplier: float = 1.5,
         recommended_upper_multiplier: float = 1.5,
+        fixed_output_quantile: float | None = None,
     ) -> dict[str, Any]:
         if not self._calibration:
             raise RuntimeError("Alpha calibration was not started")
         if minimum <= 0 or maximum < minimum or global_gain <= 0:
             raise ValueError("Calibration scales must be positive and ordered")
+        if fixed_output_quantile is not None and not 0.0 < fixed_output_quantile < 1.0:
+            raise ValueError("fixed_output_quantile must be between zero and one")
 
         bins = len(self._calibration_bin_edges) - 1
         teacher_by_bin = torch.full(
@@ -721,6 +797,7 @@ class FreshKVStyleCrossAttention(nn.Module):
         raw_residual_by_bin = torch.full_like(teacher_by_bin, float("nan"))
         raw_attention_by_bin = torch.full_like(teacher_by_bin, float("nan"))
         native_p95_by_bin = torch.full_like(teacher_by_bin, float("nan"))
+        native_fixed_by_bin = torch.full_like(teacher_by_bin, float("nan"))
         per_bin_ratio = torch.full_like(teacher_by_bin, float("nan"))
         cell_values: list[list[dict[str, torch.Tensor] | None]] = [
             [None for _ in range(self.blocks)] for _ in range(bins)
@@ -757,6 +834,9 @@ class FreshKVStyleCrossAttention(nn.Module):
                 orthogonal_samples = torch.cat(orthogonal_values).float()
                 teacher = teacher_samples.median()
                 teacher_p95 = teacher_samples.quantile(0.95)
+                teacher_fixed = teacher_samples.quantile(
+                    0.75 if fixed_output_quantile is None else fixed_output_quantile
+                )
                 student = student_samples.median()
                 raw_residual = raw_residual_samples.median()
                 attention = attention_samples.median()
@@ -766,6 +846,7 @@ class FreshKVStyleCrossAttention(nn.Module):
                 raw_residual_by_bin[bin_index, block] = raw_residual
                 raw_attention_by_bin[bin_index, block] = attention
                 native_p95_by_bin[bin_index, block] = teacher_p95
+                native_fixed_by_bin[bin_index, block] = teacher_fixed
                 per_bin_ratio[bin_index, block] = ratio
                 ratios.append(ratio)
                 cell_values[bin_index][block] = {
@@ -792,13 +873,16 @@ class FreshKVStyleCrossAttention(nn.Module):
         alpha_by_timestep = per_bin_ratio.clone()
         lower_source = teacher_by_bin.clone()
         upper_source = native_p95_by_bin.clone()
+        fixed_source = native_fixed_by_bin.clone()
         for block in range(self.blocks):
             observed = torch.isfinite(per_bin_ratio[:, block])
             alpha_by_timestep[~observed, block] = base_alpha[block]
             native_fallback = teacher_by_bin[observed, block].median()
             p95_fallback = native_p95_by_bin[observed, block].median()
+            fixed_fallback = native_fixed_by_bin[observed, block].median()
             lower_source[~observed, block] = native_fallback
             upper_source[~observed, block] = p95_fallback
+            fixed_source[~observed, block] = fixed_fallback
         alpha_by_timestep = alpha_by_timestep.clamp(
             min=float(minimum), max=float(maximum)
         )
@@ -816,6 +900,11 @@ class FreshKVStyleCrossAttention(nn.Module):
                 native_lower_by_timestep=native_lower_by_timestep,
                 native_upper_by_timestep=native_upper_by_timestep,
             )
+            if fixed_output_quantile is not None:
+                self.configure_fixed_output_strength(
+                    timestep_bin_edges=self._calibration_bin_edges,
+                    native_fixed_output_by_timestep=fixed_source.clamp_min(1e-8),
+                )
         self._calibration = False
         self._calibration_bin_index = None
 
@@ -900,6 +989,13 @@ class FreshKVStyleCrossAttention(nn.Module):
             "alpha_by_timestep": serializable(alpha_by_timestep),
             "native_lower_by_timestep": serializable(native_lower_by_timestep),
             "native_upper_by_timestep": serializable(native_upper_by_timestep),
+            "native_fixed_output_by_timestep": serializable(fixed_source),
+            "fixed_output_quantile": (
+                None if fixed_output_quantile is None else float(fixed_output_quantile)
+            ),
+            "fixed_output_applied": bool(
+                apply_alpha and fixed_output_quantile is not None
+            ),
             "measured_alpha": self._calibration_measured_alpha.cpu().tolist(),
             "alpha_applied": bool(apply_alpha),
             "recommended_lower_multiplier": float(recommended_lower_multiplier),
@@ -989,6 +1085,72 @@ class FreshKVStyleCrossAttention(nn.Module):
             style_attended = style_attended * self._style_enabled.to(
                 device=style_attended.device, dtype=style_attended.dtype
             )[:, None, None]
+        fixed_output = self._fixed_output_strength_active and not self._calibration
+        if fixed_output:
+            gate_context = self._block_gate_context.pop(block_index, None)
+            if gate_context is None:
+                raise RuntimeError(
+                    "set_block_gate_context() is required before fixed-strength "
+                    "style attention"
+                )
+            gate_cross, spatial_shape = gate_context
+            frames, height, width = spatial_shape
+            raw_style_delta = self._native_output_weight(
+                cross_attention, style_attended
+            )
+            gate = gate_cross.expand(-1, frames, height, width, -1).reshape(
+                raw_style_delta.shape[0], -1, raw_style_delta.shape[-1]
+            )
+            dimensions = tuple(range(1, raw_style_delta.ndim))
+            gated_raw = raw_style_delta.float() * gate.float()
+            raw_rms = gated_raw.square().mean(dim=dimensions).sqrt()
+            target = self._fixed_output_target(
+                block_index, raw_style_delta.shape[0]
+            ).to(raw_rms.device)
+            scale = torch.where(
+                raw_rms > 1e-8,
+                target / raw_rms.clamp_min(1e-8),
+                torch.zeros_like(raw_rms),
+            )
+            effective_style_delta = raw_style_delta * scale.to(
+                raw_style_delta.dtype
+            ).reshape(-1, 1, 1)
+            text_output = cross_attention.output_proj(text_attended)
+            merged_output = text_output + effective_style_delta
+            gated_text_rms = (
+                (text_output.detach().float() * gate.float())
+                .square().mean().sqrt().clamp_min(1e-8)
+            )
+            actual_rms = (
+                (effective_style_delta.detach().float() * gate.float())
+                .square().mean(dim=dimensions).sqrt()
+            )
+            self._runtime_ratios[block_index] = actual_rms.mean() / gated_text_rms
+            self._runtime_alphas[block_index] = scale.detach().float().mean()
+            self._runtime_fixed_targets[block_index] = target.detach().float().mean()
+            self._runtime_fixed_actuals[block_index] = actual_rms.detach().float().mean()
+            self._runtime_fixed_scales[block_index] = scale.detach().float().mean()
+
+            if self._teacher_context is not None:
+                teacher_key, teacher_value = self._native_context_kv(
+                    cross_attention, self._teacher_context
+                )
+                teacher_key = teacher_key.to(query.dtype)
+                teacher_value = teacher_value.to(text_value.dtype)
+                teacher_attended = _run_attention(
+                    cross_attention, query, teacher_key, teacher_value, attn_params
+                )
+                teacher_delta = self._native_output_weight(
+                    cross_attention, teacher_attended - text_attended
+                )
+                self._pending_internal[block_index] = (
+                    effective_style_delta,
+                    teacher_delta,
+                    style_attended,
+                    scale.detach().float().reshape(-1, 1, 1),
+                )
+            return cross_attention.output_dropout(merged_output)
+
         alpha = self._effective_alpha(
             block_index,
             style_attended.shape[0],
@@ -1228,6 +1390,18 @@ class FreshKVStyleCrossAttention(nn.Module):
             if active_alpha
             else self.alpha.detach().float().cpu()
         )
+        fixed_targets = [
+            value for value in self._runtime_fixed_targets if value is not None
+        ]
+        fixed_actuals = [
+            value for value in self._runtime_fixed_actuals if value is not None
+        ]
+        fixed_scales = [
+            value for value in self._runtime_fixed_scales if value is not None
+        ]
+        target_values = torch.stack(fixed_targets).float().cpu() if fixed_targets else torch.zeros(1)
+        actual_values = torch.stack(fixed_actuals).float().cpu() if fixed_actuals else torch.zeros(1)
+        scale_values = torch.stack(fixed_scales).float().cpu() if fixed_scales else torch.zeros(1)
         return {
             "style_block_residual_ratio_mean": float(values.mean()),
             "style_block_residual_ratio_max": float(values.max()),
@@ -1237,6 +1411,11 @@ class FreshKVStyleCrossAttention(nn.Module):
             "style_alpha_runtime_mean": float(runtime_alpha.mean()),
             "style_alpha_runtime_max": float(runtime_alpha.max()),
             "style_global_gain": float(getattr(self, "global_gain", 1.0)),
+            "style_fixed_output_enabled": float(self._fixed_output_strength_active),
+            "style_fixed_target_mean": float(target_values.mean()),
+            "style_fixed_actual_mean": float(actual_values.mean()),
+            "style_fixed_scale_mean": float(scale_values.mean()),
+            "style_fixed_scale_max": float(scale_values.max()),
         }
 
 
