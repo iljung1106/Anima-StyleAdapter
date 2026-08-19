@@ -294,7 +294,7 @@ def test_fixed_output_strength_matches_post_native_gate_p75_and_preserves_disabl
     )
 
 
-def test_shared_native_bases_are_cached_and_block_deltas_train():
+def test_shared_xavier_bases_are_cached_and_block_deltas_train():
     torch.manual_seed(113)
     anima = _Anima().requires_grad_(False)
     adapter = SharedBaseKVStyleCrossAttention(
@@ -309,12 +309,15 @@ def test_shared_native_bases_are_cached_and_block_deltas_train():
     )
     adapter.initialize_from_anima(anima)
 
-    torch.testing.assert_close(
+    assert not torch.allclose(
         adapter.base_k[0].weight, anima.blocks[0].cross_attn.k_proj.weight
     )
-    torch.testing.assert_close(
+    assert not torch.allclose(
         adapter.base_v[1].weight, anima.blocks[1].cross_attn.v_proj.weight
     )
+    assert not torch.allclose(adapter.base_k[0].weight, adapter.base_k[1].weight)
+    assert torch.isfinite(adapter.base_k[0].weight).all()
+    assert torch.isfinite(adapter.base_v[1].weight).all()
     assert all(torch.count_nonzero(module.weight) == 0 for module in adapter.delta_k_up)
     assert all(torch.count_nonzero(module.weight) == 0 for module in adapter.delta_v_up)
     torch.testing.assert_close(adapter.alpha, torch.tensor([0.75, 1.25]))

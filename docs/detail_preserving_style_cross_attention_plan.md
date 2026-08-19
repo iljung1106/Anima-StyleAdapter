@@ -287,6 +287,26 @@ heldout paired improvement가 통계적으로 양수가 되기 전에는 위 보
 켜지 않는다. 이 최소 실험에서 projection coefficient가 증가하지 않으면 loss
 간 충돌이 아니라 Reader/KV 표현력 또는 주입 경로의 구조적 문제로 판단한다.
 
+### 7.2 Shared-base 초기화 계약 수정(v7)
+
+Shared-base 구현은 메모리와 계산량을 줄이기 위한 구조일 뿐, native text K/V를
+재사용하기 위한 구조가 아니다. v6 구현은 medoid block 3/12/18/26의 native text
+K/V weight를 네 base에 복사하여 본 문서 2절의 확정 원칙을 위반했다.
+
+Style Reader 출력과 Anima post-LLM text context는 차원만 `1024`로 같을 뿐 의미적
+basis와 분포가 다르다. `k_norm`과 `v_norm`은 크기를 안정화하지만 두 표현 공간을
+정렬하지 않는다. 따라서 v7부터는 다음 계약을 사용한다.
+
+- 네 shared full-rank Style K/V base는 서로 독립적으로 Xavier uniform 초기화한다.
+- medoid와 block cluster는 base 공유 범위를 정하는 데만 사용한다.
+- 블록별 rank-64 K/V delta는 down Xavier, up zero 초기화를 유지한다.
+- Anima의 native Q, full-rank O, K/V norm 및 attention backend만 재사용한다.
+- 초기 `alpha_b(t)` calibration은 새 Xavier branch의 출력 크기를 native effect
+  규모에 맞추는 초기화일 뿐, K/V 방향이나 학습 중 RMS를 고정하지 않는다.
+
+v6 체크포인트는 native-text-K/V 초기화 ablation으로만 보존하며 v7의 초기값으로
+재사용하지 않는다.
+
 K/V가 출력을 작게 만드는 방식으로 alpha를 우회할 수 있으므로 고정 alpha만으로
 붕괴 방지가 끝나지는 않는다. 아래의 Teacher-aligned magnitude loss를 함께 쓴다.
 

@@ -1426,7 +1426,7 @@ class FreshKVStyleCrossAttention(nn.Module):
 
 
 class SharedBaseKVStyleCrossAttention(FreshKVStyleCrossAttention):
-    """Four native K/V bases plus a low-rank block-specific residual.
+    """Four fresh Xavier K/V bases plus a low-rank block-specific residual.
 
     The shared full-rank projections are evaluated once per active style
     context.  Each Anima block softly selects the four bases and adds its own
@@ -1503,18 +1503,6 @@ class SharedBaseKVStyleCrossAttention(FreshKVStyleCrossAttention):
         self.delta_v_up = nn.ModuleList()
         self._base_projection_cache: tuple[list[torch.Tensor], list[torch.Tensor]] | None = None
 
-    @staticmethod
-    def _native_projection_weights(
-        cross_attention: nn.Module,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        output_dim = int(cross_attention.n_heads) * int(cross_attention.head_dim)
-        if hasattr(cross_attention, "kv_proj"):
-            key, value = cross_attention.kv_proj.weight.unflatten(
-                0, (2, output_dim)
-            ).unbind(0)
-            return key, value
-        return cross_attention.k_proj.weight, cross_attention.v_proj.weight
-
     def initialize_from_anima(self, anima: nn.Module) -> None:
         if self._initialized:
             return
@@ -1526,27 +1514,22 @@ class SharedBaseKVStyleCrossAttention(FreshKVStyleCrossAttention):
         output_dim: int | None = None
         for block_index in self.medoid_blocks:
             cross = anima.blocks[block_index].cross_attn
-            key_weight, value_weight = self._native_projection_weights(cross)
             current_output_dim = int(cross.n_heads) * int(cross.head_dim)
-            if key_weight.shape != (current_output_dim, self.context_dim):
-                raise ValueError(
-                    "Native Anima K/V dimensions do not match the style context: "
-                    f"{tuple(key_weight.shape)} versus (*,{self.context_dim})"
-                )
             output_dim = current_output_dim if output_dim is None else output_dim
             if current_output_dim != output_dim:
                 raise ValueError("All shared-base blocks must use the same K/V width")
+            native = cross.output_proj.weight
             key = nn.Linear(
                 self.context_dim, output_dim, bias=False,
-                device=key_weight.device, dtype=key_weight.dtype,
+                device=native.device, dtype=native.dtype,
             )
             value = nn.Linear(
                 self.context_dim, output_dim, bias=False,
-                device=value_weight.device, dtype=value_weight.dtype,
+                device=native.device, dtype=native.dtype,
             )
             with torch.no_grad():
-                key.weight.copy_(key_weight)
-                value.weight.copy_(value_weight)
+                nn.init.xavier_uniform_(key.weight)
+                nn.init.xavier_uniform_(value.weight)
             self.base_k.append(key)
             self.base_v.append(value)
 
