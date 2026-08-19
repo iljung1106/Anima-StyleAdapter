@@ -774,6 +774,9 @@ def _sample_query_style_tokenizer_chunk(
             adapter.clear_style_tokens()
         else:
             adapter.set_style_context(style)
+            set_timesteps = getattr(adapter, "set_timesteps", None)
+            if set_timesteps is not None:
+                set_timesteps(timestep.expand(batch_size))
         return anima(
             x, timestep.expand(batch_size), context=text,
             padding_mask=padding_mask, target_input_ids=None,

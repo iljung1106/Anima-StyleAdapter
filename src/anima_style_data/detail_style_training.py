@@ -247,6 +247,7 @@ def _flow_step(
                 latents.shape[0], device=device, generator=generator
             ) >= dropout
         adapter.set_style_context(output.tokens, enabled=enabled)
+        adapter.set_timesteps(timesteps)
         try:
             prediction = anima(
                 noisy.unsqueeze(2), timesteps.to(latents.dtype), context=context,
@@ -324,6 +325,7 @@ def _flow_step(
         ):
             wrong_tokens = reader(wrong_references, wrong_mask).tokens
             adapter.set_style_context(wrong_tokens)
+            adapter.set_timesteps(timesteps)
             try:
                 wrong_prediction = anima(
                     noisy.unsqueeze(2), timesteps.to(latents.dtype), context=context,
@@ -416,6 +418,7 @@ def _teacher_step(
         style = reader(combined_references, combined_mask).tokens
         adapter.reset_internal_teacher()
         adapter.set_style_context(style)
+        adapter.set_timesteps(timestep.expand(rows * 2))
         adapter.set_teacher_context(torch.cat((tagged, tagged)))
         padding = torch.zeros(
             rows * 2, 1, noisy.shape[-2], noisy.shape[-1],
@@ -438,7 +441,14 @@ def _teacher_step(
         student, teacher, objective_cfg, step=step
     )
     internal, internal_metrics = adapter.internal_teacher_loss(
-        rho_min=_rho_min(step), rho_max=1.5
+        rho_min=0.0,
+        rho_max=1.5,
+        aligned_floor_weight=float(
+            training.get("internal_aligned_floor_weight", 1.0)
+        ),
+        total_upper_weight=float(
+            training.get("internal_total_upper_weight", 0.05)
+        ),
     )
     teacher_scale = teacher.float().square().mean(
         dim=tuple(range(1, teacher.ndim))
@@ -489,7 +499,7 @@ def _calibrate_alpha(
     reset_alpha: bool = True,
     inject_style: bool = False,
     apply_alpha: bool = True,
-    recommended_lower_multiplier: float = 1.5,
+    recommended_lower_multiplier: float = 1.0,
     recommended_upper_multiplier: float = 1.5,
 ) -> dict[str, Any]:
     bin_edges = tuple(
@@ -550,15 +560,10 @@ def _calibrate_alpha(
             finally:
                 adapter.clear_style_tokens()
         adapter.internal_teacher_loss(rho_min=0.0)
-    relative = (
-        adapter.relative_block_gain_normalized
-        if isinstance(adapter, SharedBaseKVStyleCrossAttention)
-        else None
-    )
     result = adapter.finish_alpha_calibration(
         minimum=float(training.get("alpha_calibration_minimum", 1e-6)),
         maximum=float(training.get("alpha_calibration_maximum", 2.0)),
-        relative_block_gain=relative,
+        relative_block_gain=None,
         global_gain=float(getattr(adapter, "global_gain", 1.0)),
         apply_alpha=apply_alpha,
         recommended_lower_multiplier=recommended_lower_multiplier,
@@ -706,6 +711,8 @@ def _generate_fixed_reference_sample(
         ):
             for index in range(len(sigmas) - 1):
                 timestep = sigmas[index].expand(batch)
+                if style is not None:
+                    adapter.set_timesteps(timestep)
                 unconditioned = anima(
                     x, timestep, context=negative_batch,
                     padding_mask=padding_mask, target_input_ids=None,
@@ -895,6 +902,7 @@ def train_detail_style_cross_attention(
         resume = torch.load(state_path, map_location="cpu", weights_only=False)
         reader.load_state_dict(resume["reader"], strict=True)
         adapter.load_state_dict(resume["adapter"], strict=True)
+        adapter.restore_timestep_strength_state()
         start_step = int(resume["step"])
     else:
         calibration = _calibrate_alpha(
@@ -905,17 +913,18 @@ def train_detail_style_cross_attention(
         write_json(output / "alpha_calibration.json", calibration)
         if isinstance(adapter, SharedBaseKVStyleCrossAttention):
             write_json(output / "style_strength.json", {
-                "mode": "native_effect_calibrated_with_relative_block_profile",
+                "mode": "block_timestep_native_effect_calibrated",
                 "global_gain": adapter.global_gain,
                 "base_alpha": calibration["base_alpha"],
-                "relative_block_gain_raw": (
-                    adapter.relative_block_gain.detach().float().cpu().tolist()
-                ),
-                "relative_block_gain_normalized": (
-                    adapter.relative_block_gain_normalized.detach()
-                    .float().cpu().tolist()
-                ),
                 "alpha": adapter.alpha.detach().float().cpu().tolist(),
+                "alpha_by_timestep": calibration["alpha_by_timestep"],
+                "native_lower_by_timestep": calibration[
+                    "native_lower_by_timestep"
+                ],
+                "native_upper_by_timestep": calibration[
+                    "native_upper_by_timestep"
+                ],
+                "relative_block_gain": "disabled",
                 "medoid_blocks": list(adapter.medoid_blocks),
                 "block_to_base": adapter.block_to_base.detach().cpu().tolist(),
             })
@@ -1316,6 +1325,7 @@ def profile_detail_style_block_timestep_strength(
     state = torch.load(checkpoint, map_location="cpu", weights_only=False)
     reader.load_state_dict(state["reader"], strict=True)
     adapter.load_state_dict(state["adapter"], strict=True)
+    adapter.restore_timestep_strength_state()
     checkpoint_step = int(state.get("step", 0))
     del state
 
@@ -1459,6 +1469,7 @@ def backfill_detail_style_fixed_samples(
         state = torch.load(checkpoint, map_location="cpu", weights_only=False)
         reader.load_state_dict(state["reader"], strict=True)
         adapter.load_state_dict(state["adapter"], strict=True)
+        adapter.restore_timestep_strength_state()
         del state
         result = _generate_fixed_reference_sample(
             prepared, config, destination, anima, reader, adapter,

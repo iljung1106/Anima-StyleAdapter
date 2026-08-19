@@ -234,6 +234,32 @@ def test_same_q_internal_teacher_produces_live_gradient_and_calibrates_alpha():
     assert calibration["block_timestep_profiles"][1]["blocks"][0]["samples"] == 3
 
 
+def test_timestep_strength_profile_interpolates_per_block_and_keeps_bounds():
+    adapter = FreshKVStyleCrossAttention(
+        context_dim=6, blocks=2, initial_alpha=0.2
+    )
+    adapter.configure_timestep_strength(
+        timestep_bin_edges=(0.0, 0.25, 0.75, 1.0),
+        alpha_by_timestep=torch.tensor([[1.0, 2.0], [3.0, 4.0], [5.0, 8.0]]),
+        native_lower_by_timestep=torch.tensor(
+            [[0.1, 0.2], [0.3, 0.4], [0.5, 0.8]]
+        ),
+        native_upper_by_timestep=torch.tensor(
+            [[1.1, 1.2], [1.3, 1.4], [1.5, 1.8]]
+        ),
+    )
+    adapter.set_timesteps(torch.tensor([0.125, 0.3125, 0.875]))
+
+    alpha = adapter._effective_alpha(
+        0, 3, device=torch.device("cpu"), dtype=torch.float32
+    ).flatten()
+    lower, upper = adapter._native_strength_bounds(1, 3)
+
+    torch.testing.assert_close(alpha, torch.tensor([1.0, 2.0, 5.0]))
+    torch.testing.assert_close(lower, torch.tensor([0.2, 0.3, 0.8]))
+    torch.testing.assert_close(upper, torch.tensor([1.2, 1.3, 1.8]))
+
+
 def test_shared_native_bases_are_cached_and_block_deltas_train():
     torch.manual_seed(113)
     anima = _Anima().requires_grad_(False)

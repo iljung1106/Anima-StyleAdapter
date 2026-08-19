@@ -3830,7 +3830,7 @@ real_artist_teacher:
 # Detail-preserving typed-slot, separate-softmax Style Cross-Attention v1.
 # Contract: docs/detail_preserving_style_cross_attention_plan.md
 detail_preserving_style_cross_attention:
-  output_directory: detail_preserving_style_cross_attention_shared_kv_calibrated_v3_20k
+  output_directory: detail_preserving_style_cross_attention_shared_kv_timestep_v4_20k
   seed: 20260819
   train_split: train
   validation_split: validation
@@ -3905,15 +3905,10 @@ detail_preserving_style_cross_attention:
     delta_rank: 64
     delta_scale: 1.0
     mix_logit_scale: 4.0
-    # Absolute block scales are calibrated against the native artist residual.
-    # This mean-one profile retains only the measured inter-block differences;
-    # global_gain independently controls the overall style strength.
+    # Absolute strength is calibrated independently for every block and
+    # timestep bin. global_gain is the only post-calibration strength control;
+    # the old static relative_block_gain profile is deliberately disabled.
     global_gain: 1.0
-    relative_block_gain: [0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5,
-                          0.5, 0.513159, 1.262426, 1.656704, 1.659147, 1.786944,
-                          1.558835, 1.786944, 1.106528, 1.232676, 1.510143, 1.550927,
-                          1.137174, 1.786944, 1.506362, 1.649759, 0.726383, 0.730984,
-                          0.848965, 0.893472]
   strength_profile:
     output_directory: diagnostics/detail_style_block_timestep_strength_v1
     checkpoint: checkpoints/step-0001000.pt
@@ -3922,7 +3917,7 @@ detail_preserving_style_cross_attention:
     batch_size: 4
     references: 4
     timestep_bin_edges: [0.0, 0.325, 0.625, 0.86, 1.000001]
-    recommended_lower_multiplier: 1.5
+    recommended_lower_multiplier: 1.0
     recommended_upper_multiplier: 1.5
   block_similarity:
     output_directory: diagnostics/detail_style_block_similarity_v1
@@ -4025,12 +4020,18 @@ detail_preserving_style_cross_attention:
     functional_weight: 0.10
     same_artist_weight: 0.05
     internal_teacher_weight: 0.25
+    # The lower bound acts on the positive projection onto the native artist
+    # direction, not total RMS. The upper bound weakly caps total residual RMS.
+    internal_aligned_floor_weight: 1.0
+    internal_total_upper_weight: 0.05
     teacher_batch_rows: 4
     teacher_references: 4
     teacher_every_step_until: 500
     teacher_every_after_bootstrap: 2
-    # Cover the entire 4-content x 8-timestep teacher grid once.  Static
-    # per-block alpha uses the median native/raw residual ratio across bins.
+    # Cover the complete 4-content x 8-timestep teacher grid once. Each of the
+    # 28 blocks receives four independent alpha values which are linearly
+    # interpolated at runtime. Native median is the aligned lower target and
+    # 1.5 x native P95 is the weak total-RMS cap.
     alpha_calibration_batches: 32
     alpha_calibration_timestep_bin_edges: [0.0, 0.325, 0.625, 0.86, 1.000001]
     alpha_calibration_minimum: 0.000001
@@ -4091,8 +4092,8 @@ detail_preserving_style_cross_attention:
     wandb:
       enabled: true
       project: anima-style-adapter
-      name: detail-style-shared-kv-calibrated-v3-20k-megastyle15
-      id: detail-style-shared-kv-calibrated-v3-20k-megastyle15
+      name: detail-style-shared-kv-timestep-v4-20k-megastyle15
+      id: detail-style-shared-kv-timestep-v4-20k-megastyle15
   sampling:
     width: 768
     height: 768
