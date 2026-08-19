@@ -409,7 +409,6 @@ class FreshKVStyleCrossAttention(nn.Module):
                 torch.Tensor,
                 torch.Tensor,
                 torch.Tensor,
-                torch.Tensor | None,
             ],
         ] = {}
         self._internal_terms: list[tuple[int, dict[str, torch.Tensor]]] = []
@@ -420,7 +419,6 @@ class FreshKVStyleCrossAttention(nn.Module):
         self._calibration_measured_alpha = torch.empty(0)
         self._calibration_teacher: list[list[list[torch.Tensor]]] = []
         self._calibration_student: list[list[list[torch.Tensor]]] = []
-        self._calibration_raw_residual: list[list[list[torch.Tensor]]] = []
         self._calibration_raw_attention: list[list[list[torch.Tensor]]] = []
         self._calibration_cosine: list[list[list[torch.Tensor]]] = []
         self._calibration_aligned_rms: list[list[list[torch.Tensor]]] = []
@@ -516,9 +514,6 @@ class FreshKVStyleCrossAttention(nn.Module):
         self._calibration_student = [
             [[] for _ in range(bins)] for _ in range(self.blocks)
         ]
-        self._calibration_raw_residual = [
-            [[] for _ in range(bins)] for _ in range(self.blocks)
-        ]
         self._calibration_raw_attention = [
             [[] for _ in range(bins)] for _ in range(self.blocks)
         ]
@@ -581,7 +576,6 @@ class FreshKVStyleCrossAttention(nn.Module):
             for bin_index in range(bins):
                 teacher_values = self._calibration_teacher[block][bin_index]
                 student_values = self._calibration_student[block][bin_index]
-                raw_residual_values = self._calibration_raw_residual[block][bin_index]
                 attention_values = self._calibration_raw_attention[block][bin_index]
                 cosine_values = self._calibration_cosine[block][bin_index]
                 aligned_values = self._calibration_aligned_rms[block][bin_index]
@@ -589,13 +583,19 @@ class FreshKVStyleCrossAttention(nn.Module):
                 if (
                     not teacher_values
                     or not student_values
-                    or not raw_residual_values
                     or not attention_values
                 ):
                     continue
                 teacher_samples = torch.cat(teacher_values).float()
                 student_samples = torch.cat(student_values).float()
-                raw_residual_samples = torch.cat(raw_residual_values).float()
+                measured_alpha = self._calibration_measured_alpha[block].abs().clamp_min(
+                    1e-8
+                )
+                # Student RMS is measured after removing the batch-common
+                # component.  Derive the corresponding alpha=1 artist-specific
+                # residual from that same centered quantity; measuring a second
+                # uncentered tensor would mix common output into the denominator.
+                raw_residual_samples = student_samples / measured_alpha
                 attention_samples = torch.cat(attention_values).float()
                 cosine_samples = torch.cat(cosine_values).float()
                 aligned_samples = torch.cat(aligned_values).float()
@@ -712,7 +712,9 @@ class FreshKVStyleCrossAttention(nn.Module):
             "raw_style_attention_rms_by_timestep_bin": serializable(
                 raw_attention_by_bin
             ),
-            "teacher_to_raw_ratio_by_timestep_bin": serializable(per_bin_ratio),
+            "teacher_to_centered_raw_ratio_by_timestep_bin": serializable(
+                per_bin_ratio
+            ),
             "base_alpha": base_alpha.detach().cpu().tolist(),
             "relative_block_gain_normalized": relative.detach().cpu().tolist(),
             "global_gain": float(global_gain),
@@ -727,7 +729,6 @@ class FreshKVStyleCrossAttention(nn.Module):
         }
         self._calibration_teacher = []
         self._calibration_student = []
-        self._calibration_raw_residual = []
         self._calibration_raw_attention = []
         self._calibration_cosine = []
         self._calibration_aligned_rms = []
@@ -837,14 +838,8 @@ class FreshKVStyleCrossAttention(nn.Module):
             student_delta = self._native_output_weight(
                 cross_attention, effective_style_attended
             )
-            raw_delta = (
-                student_delta.float()
-                / max(abs(float(alpha.detach().float())), 1e-8)
-                if self._calibration
-                else None
-            )
             self._pending_internal[block_index] = (
-                student_delta, teacher_delta, style_attended, raw_delta
+                student_delta, teacher_delta, style_attended
             )
         return cross_attention.output_dropout(cross_attention.output_proj(merged))
 
@@ -857,15 +852,13 @@ class FreshKVStyleCrossAttention(nn.Module):
         pair = self._pending_internal.pop(block_index, None)
         if pair is None:
             return
-        student, teacher, raw_style_attention, raw_style_residual = pair
+        student, teacher, raw_style_attention = pair
         frames, height, width = spatial_shape
         gate = gate_cross.expand(-1, frames, height, width, -1).reshape(
             student.shape[0], -1, student.shape[-1]
         )
         student = student * gate
         teacher = teacher * gate
-        if raw_style_residual is not None:
-            raw_style_residual = raw_style_residual * gate
         if student.shape[0] > 1:
             student = student - student.mean(dim=0, keepdim=True)
             teacher = teacher - teacher.mean(dim=0, keepdim=True)
@@ -877,10 +870,6 @@ class FreshKVStyleCrossAttention(nn.Module):
                 raise RuntimeError("Calibration timestep was not set before forward")
             bin_index = self._calibration_bin_index
             raw_attention_rms = raw_style_attention.detach().float().square().mean(
-                dim=dimensions
-            ).sqrt()
-            assert raw_style_residual is not None
-            raw_residual_rms = raw_style_residual.detach().float().square().mean(
                 dim=dimensions
             ).sqrt()
             student_flat = student.detach().float().flatten(1)
@@ -903,9 +892,6 @@ class FreshKVStyleCrossAttention(nn.Module):
             )
             self._calibration_student[block_index][bin_index].append(
                 student_rms.detach()
-            )
-            self._calibration_raw_residual[block_index][bin_index].append(
-                raw_residual_rms.detach()
             )
             self._calibration_raw_attention[block_index][bin_index].append(
                 raw_attention_rms.detach()

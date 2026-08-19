@@ -181,10 +181,10 @@ def test_same_q_internal_teacher_produces_live_gradient_and_calibrates_alpha():
     adapter.set_style_context(style)
     adapter.set_teacher_context(teacher)
     adapter.begin_alpha_calibration(
-        timestep_bin_edges=(0.0, 0.5, 1.000001)
+        timestep_bin_edges=(0.0, 0.5, 1.000001),
+        reset_alpha=False,
     )
     adapter.set_alpha_calibration_timestep(0.75)
-    adapter.alpha[0] = 0
 
     for block_index, block in enumerate(anima.blocks):
         hidden = torch.randn(3, 5, 8)
@@ -224,6 +224,12 @@ def test_same_q_internal_teacher_produces_live_gradient_and_calibrates_alpha():
         value is not None
         for value in calibration["raw_style_attention_rms_by_timestep_bin"][1]
     )
+    assert calibration["measured_alpha"] == pytest.approx([0.2, 0.2])
+    profile = calibration["block_timestep_profiles"][1]["blocks"]
+    for block in profile:
+        effective = block["effective_style_residual_rms"]["median"]
+        raw = block["raw_style_residual_rms"]["median"]
+        assert effective / raw == pytest.approx(0.2, rel=1e-5)
     assert len(calibration["block_timestep_profiles"]) == 2
     assert calibration["block_timestep_profiles"][1]["blocks"][0]["samples"] == 3
 
