@@ -482,6 +482,8 @@ def _make_sheet(
     small: list[Image.Image] | None,
     current: list[Image.Image],
     size: tuple[int, int],
+    *,
+    current_label: str = "LARGE TOKENIZER",
 ) -> Image.Image:
     reference_cells = []
     for index, path in enumerate(paths, start=1):
@@ -495,7 +497,7 @@ def _make_sheet(
         rows.append(small)
         row_names.append("SMALL TOKENIZER")
     rows.append(current)
-    row_names.append("LARGE TOKENIZER")
+    row_names.append(current_label)
     sheet = Image.new("RGB", (size[0] * 8, size[1] * len(rows)), "white")
     for row_index, (name, values) in enumerate(zip(row_names, rows, strict=True)):
         baseline = base.copy()
