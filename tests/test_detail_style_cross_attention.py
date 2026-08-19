@@ -15,6 +15,7 @@ from anima_style_data.detail_style_cross_attention import (  # noqa: E402
 from anima_style_data.detail_style_training import (  # noqa: E402
     _audit_student_prompts,
     _delayed_learning_rate_multiplier,
+    _minimal_native_teacher_objective,
 )
 
 
@@ -351,6 +352,36 @@ def test_delayed_lr_holds_peak_until_requested_decay_step():
     assert _delayed_learning_rate_multiplier(6_000, 20_000, 500, 12_000, 0.1) == 1.0
     assert _delayed_learning_rate_multiplier(12_000, 20_000, 500, 12_000, 0.1) == 1.0
     assert _delayed_learning_rate_multiplier(20_000, 20_000, 500, 12_000, 0.1) == pytest.approx(0.1)
+
+
+def test_minimal_teacher_projection_prevents_zero_output_without_total_rms_fix():
+    torch.manual_seed(127)
+    teacher = torch.randn(4, 3, 5)
+    collapsed = torch.zeros_like(teacher, requires_grad=True)
+    config = {
+        "residual_weight": 0.20,
+        "projection_weight": 0.15,
+        "projection_floor_start": 0.25,
+        "projection_floor_end": 1.0,
+        "projection_floor_start_step": 1,
+        "projection_floor_end_step": 1000,
+        "orthogonal_weight": 0.05,
+        "orthogonal_ratio_maximum": 0.50,
+    }
+    collapsed_loss, collapsed_metrics = _minimal_native_teacher_objective(
+        collapsed, teacher, config, step=1000
+    )
+    aligned_loss, aligned_metrics = _minimal_native_teacher_objective(
+        teacher.clone().requires_grad_(True), teacher, config, step=1000
+    )
+    collapsed_loss.backward()
+
+    assert collapsed.grad is not None
+    assert torch.count_nonzero(collapsed.grad) > 0
+    assert float(collapsed_metrics["native_teacher_projection_coefficient"]) == pytest.approx(0.0)
+    assert float(collapsed_metrics["native_teacher_projection_floor_loss"]) == pytest.approx(1.0)
+    assert float(aligned_metrics["native_teacher_projection_coefficient"]) == pytest.approx(1.0)
+    assert float(aligned_loss) < float(collapsed_loss)
 
 
 def test_student_prompt_audit_uses_tag_boundaries_not_substrings():

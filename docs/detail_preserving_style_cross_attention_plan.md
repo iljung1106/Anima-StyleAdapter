@@ -217,6 +217,76 @@ alpha_b = clamp(m^teacher_b / (m^student_b + eps), 0.02, 2.0)
 나머지 block의 alpha는 첫 10k 실험 내내 optimizer와 checkpoint의 trainable
 parameter에서 제외한다. 추론에는 전역 strength `s`만 노출한다.
 
+### 7.1 최소 목적함수 재시작(v6)
+
+P75 hard-RMS 실험은 각 블록의 `gate_cross(t) * O(style attention)` RMS를
+안정적으로 고정했지만, 최종 artist-specific velocity 방향을 만들지 못했다.
+매 forward의
+
+\[
+r'_b=T_b(t)\frac{r_b}{\operatorname{RMS}(r_b)}
+\]
+
+정규화는 출력 크기 방향의 gradient를 제거했고, 모델은 raw token/K/V 크기를
+키우면서도 최종 효과를 늘릴 수 없었다. 따라서 v6에서는 calibration을 초기
+`alpha_b(t)` 설정에만 사용하고 학습 중 hard RMS 정규화는 사용하지 않는다.
+
+작가 없는 동일 `x_t`, content, timestep의 frozen Anima 출력을 `v_null`, 스타일
+출력을 `v_style`이라 하고, 학생 효과와 teacher 효과를 다음처럼 둔다.
+
+\[
+\Delta_s=v_{style}-v_{null},\qquad
+\Delta_T=\text{centered native artist residual}
+\]
+
+한 teacher batch 안에서 학생과 teacher를 각각 artist 축으로 centering한다.
+작은 출력 붕괴는 전체 RMS 하한이 아니라 teacher 방향의 signed projection으로
+막는다.
+
+\[
+a=\frac{\langle\Delta_s,\Delta_T\rangle}
+        {\|\Delta_T\|^2+\epsilon},\qquad
+L_{floor}=[\rho_{min}-a]_+^2
+\]
+
+`rho_min`은 step 1의 `0.25`에서 step 1,000의 `1.0`까지 선형 증가한다. 공통
+출력이나 teacher와 직교한 잡음은 이 하한을 만족시킬 수 없다. 직교 성분은
+
+\[
+\Delta_\perp=\Delta_s-a\Delta_T,\qquad
+L_\perp=\left[\frac{\|\Delta_\perp\|}{\|\Delta_T\|+\epsilon}-0.5\right]_+^2
+\]
+
+로 제한한다. 별도의 전체 RMS 하한/고정은 두지 않는다.
+
+초기 학습 목적함수는 다음 다섯 항만 사용한다.
+
+\[
+L=1.0L_{flow}
+ +0.20L_{teacher\ residual\ Huber}
+ +0.15L_{floor}
+ +0.05L_{\perp}
+ +0.01L_{reconstruction}
+\]
+
+teacher residual Huber는 각 행의 teacher RMS로 정규화한다. native timestep
+통계의 `[0.75, 1.33]` 가중은 loss 종류가 아니라 teacher/flow sampling 보정으로
+그대로 유지한다. 초기 500 step은 teacher를 매 step, 이후에는 두 step마다
+사용한다.
+
+다음 항은 끄고 지표 또는 후속 실험으로만 남긴다.
+
+- internal block teacher
+- same-artist consistency
+- centered-energy 및 common-output penalty
+- artist contrastive 및 artist ranking
+- correct-vs-wrong functional ranking
+- projection coefficient ceiling
+
+heldout paired improvement가 통계적으로 양수가 되기 전에는 위 보조항을 다시
+켜지 않는다. 이 최소 실험에서 projection coefficient가 증가하지 않으면 loss
+간 충돌이 아니라 Reader/KV 표현력 또는 주입 경로의 구조적 문제로 판단한다.
+
 K/V가 출력을 작게 만드는 방식으로 alpha를 우회할 수 있으므로 고정 alpha만으로
 붕괴 방지가 끝나지는 않는다. 아래의 Teacher-aligned magnitude loss를 함께 쓴다.
 

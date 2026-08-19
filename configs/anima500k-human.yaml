@@ -3830,7 +3830,7 @@ real_artist_teacher:
 # Detail-preserving typed-slot, separate-softmax Style Cross-Attention v1.
 # Contract: docs/detail_preserving_style_cross_attention_plan.md
 detail_preserving_style_cross_attention:
-  output_directory: detail_preserving_style_cross_attention_shared_kv_fixed_p75_v5b_20k
+  output_directory: detail_preserving_style_cross_attention_shared_kv_minimal_v6_20k
   seed: 20260819
   train_split: train
   validation_split: validation
@@ -4011,19 +4011,14 @@ detail_preserving_style_cross_attention:
       target_anneal_min_references: 1
       target_anneal_max_references: 8
     style_dropout: 0.05
-    reconstruction_weight: 0.05
+    reconstruction_weight: 0.01
     reconstruction_final_weight: 0.01
-    reconstruction_hold_steps: 2000
+    reconstruction_hold_steps: 20000
     functional_start_step: 500
     functional_every: 4
     functional_margin: 0.01
-    functional_weight: 0.10
-    same_artist_weight: 0.05
-    internal_teacher_weight: 0.25
-    # Bootstrap uses a structural post-O/post-native-gate P75 constraint, so
-    # the older soft magnitude losses would only duplicate that constraint.
-    internal_aligned_floor_weight: 0.0
-    internal_total_upper_weight: 0.0
+    # Deferred until heldout paired improvement is reliably positive.
+    functional_weight: 0.0
     teacher_batch_rows: 4
     teacher_references: 4
     teacher_every_step_until: 500
@@ -4036,50 +4031,20 @@ detail_preserving_style_cross_attention:
     alpha_calibration_timestep_bin_edges: [0.0, 0.325, 0.625, 0.86, 1.000001]
     alpha_calibration_minimum: 0.000001
     alpha_calibration_maximum: 8.0
-    # Keep every active row at the native artist-effect 75th percentile after
-    # native full-rank O and gate_cross(t). No trainable style gate is used.
-    fixed_output_quantile: 0.75
+    # Alpha calibration is initialization only. Do not renormalize every
+    # forward: the aligned projection floor must retain a radial gradient.
+    fixed_output_quantile: null
     teacher_objective:
-      native_teacher_start_step: 1
-      native_teacher_ramp_steps: 250
-      native_teacher_weight: 0.10
-      native_teacher_direction_weight: 0.10
-      native_teacher_magnitude_weight: 0.05
+      residual_weight: 0.20
       native_teacher_huber_beta: 0.10
       native_teacher_scale_floor: 0.0001
-      center_student_teacher: true
-      teacher_projected_effect_start_step: 250
-      teacher_projected_effect_ramp_steps: 750
-      teacher_projected_effect_weight: 0.05
-      teacher_projection_floor_start_step: 250
-      teacher_projection_floor_end_step: 1000
-      teacher_projection_floor_start: 0.0
-      teacher_projection_floor_end: 0.5
-      teacher_projection_coefficient_maximum: 1.5
-      teacher_projection_orthogonal_maximum: 0.5
-      teacher_projection_orthogonal_weight: 0.4
-      artist_teacher_contrastive_start_step: 500
-      artist_teacher_contrastive_ramp_end_step: 1500
-      artist_teacher_contrastive_weight: 0.05
-      artist_teacher_ranking_start_step: 500
-      artist_teacher_ranking_ramp_end_step: 1500
-      artist_teacher_ranking_weight: 0.10
-      artist_teacher_temperature: 0.07
-      artist_teacher_ranking_margin: 0.10
-      common_output_start_step: 500
-      common_output_ramp_end_step: 1500
-      common_output_weight: 0.05
-      common_output_denominator: teacher_centered_rms
-      common_output_threshold_start: 0.85
-      common_output_threshold_end: 0.60
-      common_output_threshold_end_step: 20000
-      centered_energy_start_step: 500
-      centered_energy_ramp_end_step: 1500
-      centered_energy_ratio_start: 0.30
-      centered_energy_ratio_end: 0.80
-      centered_energy_ratio_maximum: 1.40
-      centered_energy_weight: 0.05
-      centered_energy_weight_ramp_end_step: 1500
+      projection_weight: 0.15
+      projection_floor_start_step: 1
+      projection_floor_end_step: 1000
+      projection_floor_start: 0.25
+      projection_floor_end: 1.0
+      orthogonal_weight: 0.05
+      orthogonal_ratio_maximum: 0.50
     prefetch_workers: 2
     prefetch_batches: 6
     log_every: 10
@@ -4095,8 +4060,8 @@ detail_preserving_style_cross_attention:
     wandb:
       enabled: true
       project: anima-style-adapter
-      name: detail-style-shared-kv-fixed-p75-v5b-20k-megastyle15
-      id: detail-style-shared-kv-fixed-p75-v5b-20k-megastyle15
+      name: detail-style-shared-kv-minimal-v6-20k-megastyle15
+      id: detail-style-shared-kv-minimal-v6-20k-megastyle15
   sampling:
     width: 768
     height: 768

@@ -27,7 +27,6 @@ from .dual_query_style_tokenizer import CachedTeacherReferenceLoader
 from .dual_query_style_training import (
     _artist_flow_ranking_loss,
     _build_native_effect_timestep_weighting,
-    _native_artist_teacher_objective,
     _native_effect_weights_for_timesteps,
 )
 from .global_query_style_tokenizer import MultiPromptDualQueryCachedStyleLoader
@@ -193,6 +192,95 @@ def _ramp(step: int, start: int, end: int, maximum: float) -> float:
     return float(maximum) * min(1.0, (step - start + 1) / max(1, end - start + 1))
 
 
+def _minimal_native_teacher_objective(
+    student_delta: torch.Tensor,
+    teacher_delta: torch.Tensor,
+    training: dict[str, Any],
+    *,
+    step: int,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Align a centered functional residual without fixing its total RMS.
+
+    The positive teacher-axis projection is the anti-collapse constraint.  A
+    common or orthogonal residual cannot satisfy it, while the direct residual
+    regression and orthogonal cap keep the deliberately one-sided floor from
+    producing destructive excess energy.
+    """
+
+    if student_delta.shape != teacher_delta.shape or student_delta.shape[0] < 2:
+        raise ValueError("Minimal teacher objective needs matching artist batches")
+    student = student_delta.float()
+    teacher = teacher_delta.detach().float()
+    student = student - student.mean(dim=0, keepdim=True)
+    teacher = teacher - teacher.mean(dim=0, keepdim=True)
+    dimensions = tuple(range(1, student.ndim))
+    scale_floor = float(training.get("native_teacher_scale_floor", 1e-4))
+    teacher_power = teacher.square().mean(dim=dimensions).clamp_min(
+        scale_floor**2
+    )
+    teacher_rms = teacher_power.sqrt()
+    scale = teacher_rms.reshape(-1, *([1] * (student.ndim - 1)))
+    residual = F.smooth_l1_loss(
+        (student - teacher) / scale,
+        torch.zeros_like(student),
+        beta=float(training.get("native_teacher_huber_beta", 0.10)),
+    )
+
+    coefficient = (student * teacher).mean(dim=dimensions) / teacher_power
+    coefficient_view = coefficient.reshape(-1, *([1] * (student.ndim - 1)))
+    orthogonal = student - coefficient_view * teacher
+    orthogonal_ratio = orthogonal.square().mean(dim=dimensions).sqrt() / teacher_rms
+    floor_start_step = int(training.get("projection_floor_start_step", 1))
+    floor_end_step = int(training.get("projection_floor_end_step", 1_000))
+    floor_start = float(training.get("projection_floor_start", 0.25))
+    floor_end = float(training.get("projection_floor_end", 1.0))
+    if step <= floor_start_step:
+        projection_floor = floor_start
+    else:
+        progress = min(
+            1.0,
+            (step - floor_start_step)
+            / max(1, floor_end_step - floor_start_step),
+        )
+        projection_floor = floor_start + progress * (floor_end - floor_start)
+    projection = F.relu(projection_floor - coefficient).square().mean()
+    orthogonal_maximum = float(training.get("orthogonal_ratio_maximum", 0.50))
+    orthogonal_loss = F.relu(
+        orthogonal_ratio - orthogonal_maximum
+    ).square().mean()
+
+    residual_weight = float(training.get("residual_weight", 0.20))
+    projection_weight = float(training.get("projection_weight", 0.15))
+    orthogonal_weight = float(training.get("orthogonal_weight", 0.05))
+    weighted_residual = residual_weight * residual
+    weighted_projection = projection_weight * projection
+    weighted_orthogonal = orthogonal_weight * orthogonal_loss
+    total = weighted_residual + weighted_projection + weighted_orthogonal
+    student_rms = student.square().mean(dim=dimensions).sqrt()
+    cosine = F.cosine_similarity(student.flatten(1), teacher.flatten(1), dim=-1)
+    return total, {
+        "native_teacher_residual_loss": residual.detach(),
+        "native_teacher_residual_weighted_loss": weighted_residual.detach(),
+        "native_teacher_projection_floor": residual.new_tensor(projection_floor),
+        "native_teacher_projection_floor_loss": projection.detach(),
+        "native_teacher_projection_weighted_loss": weighted_projection.detach(),
+        "native_teacher_projection_coefficient": coefficient.detach().mean(),
+        "native_teacher_projection_positive_fraction": (
+            coefficient.detach() > 0
+        ).float().mean(),
+        "native_teacher_orthogonal_ratio": orthogonal_ratio.detach().mean(),
+        "native_teacher_orthogonal_loss": orthogonal_loss.detach(),
+        "native_teacher_orthogonal_weighted_loss": weighted_orthogonal.detach(),
+        "native_teacher_cosine": cosine.detach().mean(),
+        "native_teacher_centered_student_rms": student_rms.detach().mean(),
+        "native_teacher_centered_target_rms": teacher_rms.detach().mean(),
+        "native_teacher_centered_student_to_target_rms": (
+            student_rms.detach() / teacher_rms.detach()
+        ).mean(),
+        "native_teacher_minimal_loss": total.detach(),
+    }
+
+
 def _rho_min(step: int) -> float:
     if step <= 250:
         return 0.0
@@ -295,6 +383,7 @@ def _flow_step(
 
     need_wrong = (
         train_auxiliaries
+        and float(training.get("functional_weight", 0.0)) > 0
         and step >= int(training.get("functional_start_step", 500))
         and step % int(training.get("functional_every", 4)) == 0
         and prediction.shape[0] >= 2
@@ -393,90 +482,44 @@ def _teacher_step(
     base_context = tensors["base_context"][content_index : content_index + 1].to(
         device=device, dtype=torch.bfloat16, non_blocking=True
     )
-    tagged = contexts.get(style_ids, content_index).to(
-        device=device, dtype=torch.bfloat16, non_blocking=True
-    )
     timestep = tensors["timesteps"][timestep_index].to(
         device=device, dtype=torch.bfloat16
     )
 
-    # Two disjoint reference views share x_t, text, timestep and teacher.  One
-    # fused forward supplies both the functional consistency signal and dense
-    # same-Q supervision without a second Anima graph.
-    positions = torch.arange(mask.shape[1], device=device)[None]
-    first_mask = mask & positions.remainder(2).eq(0)
-    second_mask = mask & positions.remainder(2).eq(1)
-    has_two = mask.sum(dim=1).ge(2)
-    second_mask = torch.where(has_two[:, None], second_mask, first_mask)
-    combined_references = torch.cat((references, references))
-    combined_mask = torch.cat((first_mask, second_mask))
     with torch.autocast(
         device_type=torch.device(device).type,
         dtype=torch.bfloat16,
         enabled=torch.device(device).type == "cuda",
     ):
-        style = reader(combined_references, combined_mask).tokens
-        adapter.reset_internal_teacher()
+        style = reader(references, mask).tokens
         adapter.set_style_context(style)
-        adapter.set_timesteps(timestep.expand(rows * 2))
-        adapter.set_teacher_context(torch.cat((tagged, tagged)))
+        adapter.set_timesteps(timestep.expand(rows))
         padding = torch.zeros(
-            rows * 2, 1, noisy.shape[-2], noisy.shape[-1],
+            rows, 1, noisy.shape[-2], noisy.shape[-1],
             device=device, dtype=noisy.dtype,
         )
         try:
             prediction = anima(
-                noisy.expand(rows * 2, -1, -1, -1).unsqueeze(2),
-                timestep.expand(rows * 2),
-                context=base_context.expand(rows * 2, -1, -1),
+                noisy.expand(rows, -1, -1, -1).unsqueeze(2),
+                timestep.expand(rows),
+                context=base_context.expand(rows, -1, -1),
                 padding_mask=padding, target_input_ids=None,
             ).squeeze(2).float()
         finally:
             adapter.clear_style_tokens()
-    first, second = (prediction - base).chunk(2)
-    student = 0.5 * (first + second)
+    student = prediction - base
     objective_cfg = dict(training)
     objective_cfg.update(dict(training.get("teacher_objective", {})))
-    final_loss, metrics = _native_artist_teacher_objective(
+    final_loss, metrics = _minimal_native_teacher_objective(
         student, teacher, objective_cfg, step=step
-    )
-    internal, internal_metrics = adapter.internal_teacher_loss(
-        rho_min=0.0,
-        rho_max=1.5,
-        aligned_floor_weight=float(
-            training.get("internal_aligned_floor_weight", 1.0)
-        ),
-        total_upper_weight=float(
-            training.get("internal_total_upper_weight", 0.05)
-        ),
-    )
-    teacher_scale = teacher.float().square().mean(
-        dim=tuple(range(1, teacher.ndim))
-    ).sqrt().clamp_min(1e-4)
-    consistency = (
-        (first - second).float().square().mean(
-            dim=tuple(range(1, first.ndim))
-        ).sqrt() / teacher_scale
-    ).mean()
-    consistency_weight = _ramp(
-        step, 500, 1_500, float(training.get("same_artist_weight", 0.05))
     )
     timestep_weight = _native_effect_weights_for_timesteps(
         timestep.float().reshape(1), timestep_weighting
     )[0]
-    internal_weight = float(training.get("internal_teacher_weight", 0.25))
-    total = timestep_weight * (
-        final_loss + internal_weight * internal
-        + consistency_weight * consistency
-    )
-    metrics.update(internal_metrics)
+    total = timestep_weight * final_loss
     metrics.update({
-        "same_artist_consistency_loss": consistency.detach(),
-        "same_artist_consistency_weight": consistency.new_tensor(
-            consistency_weight
-        ),
         "teacher_timestep_weight": timestep_weight.detach(),
-        "teacher_content_index": consistency.new_tensor(content_index),
+        "teacher_content_index": total.new_tensor(content_index),
         "teacher_timestep": timestep.detach().float(),
         "teacher_total_loss": total.detach(),
         "teacher_student_view_rms": student.detach().square().mean().sqrt(),
