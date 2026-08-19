@@ -13,6 +13,16 @@ megastyle:
   revision: 5625ac67efa1210e19bf138c0644b16aeaed252a
   source_directory: ../megastyle-1.4m/source
   download_workers: 16
+  subset:
+    output_directory: ../megastyle-1.4m
+    style_count: 5000
+    images_per_style: 8
+    validation_styles: 250
+    seed: 20260819
+    seed_styles: 256
+    image_workers: 32
+    pending_writes: 256
+    resampler_batch_size: 64
 
 # Kept for the common pipeline configuration contract. Selection is already
 # encoded in the source dataset; 50 candidates are retained before dedup.

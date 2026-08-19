@@ -265,7 +265,9 @@ def _resolve_model_files(cfg: dict[str, Any], destination: Path) -> dict[str, st
 
     repo_id = str(cfg.get("repo_id", "circlestone-labs/Anima"))
     revision = str(cfg.get("revision", "main"))
-    cache_dir = destination / "anima_model_cache"
+    cache_dir = Path(cfg.get("cache_directory", destination / "anima_model_cache"))
+    if not cache_dir.is_absolute():
+        cache_dir = destination / cache_dir
     cache_dir.mkdir(parents=True, exist_ok=True)
     filenames = {
         "qwen3": str(

@@ -242,6 +242,8 @@ def build_parser() -> argparse.ArgumentParser:
         ("offline-kvo-phase-b", "Jointly tune the Resampler top and connector"),
         ("offline-kvo-phase-b-smoke", "Run two Phase-B joint-tuning steps"),
         ("prepare", "Run selection, download, and duplicate removal"),
+        ("megastyle-prepare", "Select and materialize the content-overlap 40k subset"),
+        ("megastyle-cache", "Cache C-RADIO, VAE, Resampler and text for MegaStyle 40k"),
         ("all", "Run every stage, including tagger and C-RADIO models"),
     ):
         subparsers.add_parser(command, help=help_text)
@@ -266,6 +268,14 @@ def main() -> None:
         from .megastyle import download_megastyle
 
         _run(download_megastyle, config, destination)
+    elif args.command in {"megastyle-prepare", "megastyle-cache"}:
+        from .megastyle import cache_megastyle_subset, prepare_megastyle_subset
+
+        stage = {
+            "megastyle-prepare": prepare_megastyle_subset,
+            "megastyle-cache": cache_megastyle_subset,
+        }[args.command]
+        _run(stage, config, destination)
     elif args.command == "dedup":
         _run(deduplicate, config, destination)
     elif args.command == "tag":
