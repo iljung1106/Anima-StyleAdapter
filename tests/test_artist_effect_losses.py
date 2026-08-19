@@ -2,6 +2,7 @@ import torch
 
 from anima_style_data.artist_effect_losses import (
     centered_functional_artist_loss,
+    common_output_and_artist_magnitude_loss,
     episodic_artist_prototype_loss,
 )
 
@@ -47,3 +48,66 @@ def test_episodic_prototype_uses_disjoint_artist_view_as_the_class():
     assert good < bad
     assert metrics["artist_prototype_retrieval_top1"] == 1
     assert metrics["artist_prototype_cosine_gap"] > 0
+
+
+def test_common_output_penalty_rejects_shared_residual_without_shrinking_scale():
+    generator = torch.Generator().manual_seed(31)
+    teacher = torch.randn(4, 3, 16, 16, generator=generator)
+    teacher = teacher - teacher.mean(dim=0, keepdim=True)
+    common = torch.randn(1, 3, 16, 16, generator=generator) * 4.0
+    student = (teacher + common).requires_grad_()
+
+    common_loss, _, metrics = common_output_and_artist_magnitude_loss(
+        teacher,
+        student,
+        common_threshold=0.65,
+        magnitude_lower=0.5,
+        magnitude_upper=1.25,
+    )
+    clean_loss, _, clean_metrics = common_output_and_artist_magnitude_loss(
+        teacher,
+        teacher,
+        common_threshold=0.65,
+        magnitude_lower=0.5,
+        magnitude_upper=1.25,
+    )
+    common_loss.backward()
+
+    assert common_loss > clean_loss
+    assert metrics["functional_artist_student_common_output_ratio"] > 0.9
+    assert clean_metrics["functional_artist_student_common_output_ratio"] < 1e-5
+    assert student.grad is not None
+    assert torch.isfinite(student.grad).all()
+
+
+def test_artist_magnitude_band_uses_teacher_aligned_projection():
+    generator = torch.Generator().manual_seed(37)
+    teacher = torch.randn(4, 3, 16, 16, generator=generator)
+    teacher = teacher - teacher.mean(dim=0, keepdim=True)
+
+    _, good, good_metrics = common_output_and_artist_magnitude_loss(
+        teacher,
+        0.8 * teacher,
+        common_threshold=1.0,
+        magnitude_lower=0.6,
+        magnitude_upper=1.2,
+    )
+    _, small, small_metrics = common_output_and_artist_magnitude_loss(
+        teacher,
+        0.1 * teacher,
+        common_threshold=1.0,
+        magnitude_lower=0.6,
+        magnitude_upper=1.2,
+    )
+    _, large, _ = common_output_and_artist_magnitude_loss(
+        teacher,
+        1.6 * teacher,
+        common_threshold=1.0,
+        magnitude_lower=0.6,
+        magnitude_upper=1.2,
+    )
+
+    assert good < small
+    assert good < large
+    assert good_metrics["functional_artist_magnitude_projection"] > 0.79
+    assert small_metrics["functional_artist_magnitude_projection"] < 0.11

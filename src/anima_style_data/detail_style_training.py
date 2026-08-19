@@ -17,6 +17,7 @@ import torch.nn.functional as F
 
 from .artist_effect_losses import (
     centered_functional_artist_loss,
+    common_output_and_artist_magnitude_loss,
     episodic_artist_prototype_loss,
 )
 from .detail_style_cross_attention import (
@@ -194,6 +195,117 @@ def _ramp(step: int, start: int, end: int, maximum: float) -> float:
     if step < start or maximum <= 0:
         return 0.0
     return float(maximum) * min(1.0, (step - start + 1) / max(1, end - start + 1))
+
+
+def _scheduled_value(
+    step: int, start: int, end: int, initial: float, final: float
+) -> float:
+    if step <= start:
+        return float(initial)
+    progress = min(1.0, (step - start) / max(1, end - start))
+    return float(initial) + progress * (float(final) - float(initial))
+
+
+def _weighted_artist_effect_objective(
+    teacher_delta: torch.Tensor,
+    student_delta: torch.Tensor,
+    style_ids: list[str],
+    training: dict[str, Any],
+    *,
+    step: int,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    pool_scales = tuple(
+        int(value)
+        for value in training.get("artist_effect_pool_scales", [2, 4])
+    )
+    effect, metrics = centered_functional_artist_loss(
+        teacher_delta,
+        student_delta,
+        style_ids,
+        temperature=float(training.get("artist_effect_temperature", 0.10)),
+        pool_scales=pool_scales,
+        repeatability_weight=float(
+            training.get("artist_effect_repeatability_weight", 0.25)
+        ),
+    )
+    common_threshold = _scheduled_value(
+        step,
+        int(training.get("common_output_threshold_start_step", 250)),
+        int(training.get("common_output_threshold_end_step", 2_000)),
+        float(training.get("common_output_threshold_start", 0.90)),
+        float(training.get("common_output_threshold_end", 0.65)),
+    )
+    magnitude_lower = _scheduled_value(
+        step,
+        int(training.get("artist_magnitude_lower_start_step", 250)),
+        int(training.get("artist_magnitude_lower_end_step", 2_000)),
+        float(training.get("artist_magnitude_lower_start", 0.35)),
+        float(training.get("artist_magnitude_lower_end", 0.70)),
+    )
+    magnitude_upper = float(training.get("artist_magnitude_upper", 1.25))
+    common_loss, magnitude_loss, regularizer_metrics = (
+        common_output_and_artist_magnitude_loss(
+            teacher_delta,
+            student_delta,
+            common_threshold=common_threshold,
+            magnitude_lower=magnitude_lower,
+            magnitude_upper=magnitude_upper,
+            magnitude_upper_weight=float(
+                training.get("artist_magnitude_upper_weight", 0.25)
+            ),
+            pool_scales=pool_scales,
+        )
+    )
+    effect_weight = _ramp(
+        step,
+        int(training.get("artist_effect_start_step", 250)),
+        int(training.get("artist_effect_full_step", 1_000)),
+        float(training.get("artist_effect_weight", 0.0)),
+    )
+    common_weight = _ramp(
+        step,
+        int(training.get("common_output_start_step", 250)),
+        int(training.get("common_output_full_step", 1_000)),
+        float(training.get("common_output_weight", 0.0)),
+    )
+    magnitude_weight = _ramp(
+        step,
+        int(training.get("artist_magnitude_start_step", 250)),
+        int(training.get("artist_magnitude_full_step", 1_000)),
+        float(training.get("artist_magnitude_weight", 0.0)),
+    )
+    weighted_effect = effect_weight * effect
+    weighted_common = common_weight * common_loss
+    weighted_magnitude = magnitude_weight * magnitude_loss
+    total = weighted_effect + weighted_common + weighted_magnitude
+    metrics.update(regularizer_metrics)
+    metrics.update({
+        "functional_artist_weight": effect.new_tensor(effect_weight),
+        "functional_artist_weighted_loss": weighted_effect.detach(),
+        "functional_artist_common_output_threshold": effect.new_tensor(
+            common_threshold
+        ),
+        "functional_artist_common_output_weight": effect.new_tensor(
+            common_weight
+        ),
+        "functional_artist_common_output_weighted_loss": (
+            weighted_common.detach()
+        ),
+        "functional_artist_magnitude_lower": effect.new_tensor(
+            magnitude_lower
+        ),
+        "functional_artist_magnitude_upper": effect.new_tensor(
+            magnitude_upper
+        ),
+        "functional_artist_magnitude_weight": effect.new_tensor(
+            magnitude_weight
+        ),
+        "functional_artist_magnitude_weighted_loss": (
+            weighted_magnitude.detach()
+        ),
+        "functional_artist_total_weighted_loss": total.detach(),
+    })
+    return total, metrics
 
 
 def _mean_scalar_rows(rows: list[dict[str, float]]) -> dict[str, float]:
@@ -409,16 +521,30 @@ def _flow_step(
         and step % int(training.get("artist_prototype_every", 2)) == 0
         and prediction.shape[0] >= 2
     )
-    artist_effect_weight = _ramp(
-        step,
-        int(training.get("artist_effect_start_step", 250)),
-        int(training.get("artist_effect_full_step", 1_000)),
-        float(training.get("artist_effect_weight", 0.0)),
+    artist_effect_active_weight = max(
+        _ramp(
+            step,
+            int(training.get("artist_effect_start_step", 250)),
+            int(training.get("artist_effect_full_step", 1_000)),
+            float(training.get("artist_effect_weight", 0.0)),
+        ),
+        _ramp(
+            step,
+            int(training.get("common_output_start_step", 250)),
+            int(training.get("common_output_full_step", 1_000)),
+            float(training.get("common_output_weight", 0.0)),
+        ),
+        _ramp(
+            step,
+            int(training.get("artist_magnitude_start_step", 250)),
+            int(training.get("artist_magnitude_full_step", 1_000)),
+            float(training.get("artist_magnitude_weight", 0.0)),
+        ),
     )
     need_artist_effect = (
         train_auxiliaries
         and artist_domain
-        and artist_effect_weight > 0
+        and artist_effect_active_weight > 0
         and step % int(training.get("artist_effect_every", 4)) == 0
         and prediction.shape[0] >= 2
     )
@@ -529,34 +655,17 @@ def _flow_step(
                         adapter.clear_style_tokens()
             if main_is_heldout:
                 heldout_prediction = prediction
-                artist_effect, artist_effect_metrics = (
-                    centered_functional_artist_loss(
+                weighted_artist_effect, artist_effect_metrics = (
+                    _weighted_artist_effect_objective(
                         target_prediction.detach() - base_prediction,
                         heldout_prediction - base_prediction,
                         style_ids,
-                        temperature=float(
-                            training.get("artist_effect_temperature", 0.10)
-                        ),
-                        pool_scales=tuple(
-                            int(value) for value in training.get(
-                                "artist_effect_pool_scales", [2, 4]
-                            )
-                        ),
-                        repeatability_weight=float(training.get(
-                            "artist_effect_repeatability_weight", 0.25
-                        )),
+                        training,
+                        step=step,
                     )
                 )
-                total = total + artist_effect_weight * artist_effect
+                total = total + weighted_artist_effect
                 metrics.update(artist_effect_metrics)
-                metrics.update({
-                    "functional_artist_weight": flow_loss.new_tensor(
-                        artist_effect_weight
-                    ),
-                    "functional_artist_weighted_loss": (
-                        artist_effect_weight * artist_effect.detach()
-                    ),
-                })
             else:
                 deferred_artist_effect = (
                     target_prediction.detach(),
@@ -638,33 +747,18 @@ def _flow_step(
             finally:
                 adapter.clear_style_tokens()
         assert base_prediction is not None
-        artist_effect, artist_effect_metrics = centered_functional_artist_loss(
+        weighted_artist_effect, artist_effect_metrics = (
+            _weighted_artist_effect_objective(
             target_prediction - base_prediction,
             heldout_prediction - base_prediction,
             style_ids,
-            temperature=float(
-                training.get("artist_effect_temperature", 0.10)
-            ),
-            pool_scales=tuple(
-                int(value)
-                for value in training.get("artist_effect_pool_scales", [2, 4])
-            ),
-            repeatability_weight=float(
-                training.get("artist_effect_repeatability_weight", 0.25)
-            ),
+            training,
+            step=step,
+            )
         )
-        weighted_artist_effect = artist_effect_weight * artist_effect
         total = total + weighted_artist_effect
         reported_loss = reported_loss + weighted_artist_effect.detach()
         metrics.update(artist_effect_metrics)
-        metrics.update({
-            "functional_artist_weight": flow_loss.new_tensor(
-                artist_effect_weight
-            ),
-            "functional_artist_weighted_loss": (
-                weighted_artist_effect.detach()
-            ),
-        })
     metrics["loss"] = reported_loss
     return total, metrics
 
@@ -910,6 +1004,7 @@ def _evaluate_artist_effect_consistency(
     device: str,
     training: dict[str, Any],
     *,
+    step: int,
     batches: int,
     seed: int,
 ) -> dict[str, float]:
@@ -1011,18 +1106,12 @@ def _evaluate_artist_effect_consistency(
                     finally:
                         adapter.clear_style_tokens()
                     predictions.append(prediction)
-            _, effect_metrics = centered_functional_artist_loss(
+            _, effect_metrics = _weighted_artist_effect_objective(
                 predictions[0] - base,
                 predictions[1] - base,
                 style_ids,
-                temperature=float(training.get("artist_effect_temperature", 0.10)),
-                pool_scales=tuple(
-                    int(value)
-                    for value in training.get("artist_effect_pool_scales", [2, 4])
-                ),
-                repeatability_weight=float(
-                    training.get("artist_effect_repeatability_weight", 0.25)
-                ),
+                training,
+                step=step,
             )
             effect_rows.append({
                 key: float(value) for key, value in effect_metrics.items()
@@ -1648,6 +1737,7 @@ def train_detail_style_cross_attention(
                     validation_loader,
                     device,
                     training,
+                    step=step,
                     batches=int(
                         training.get("artist_effect_validation_batches", 2)
                     ),
@@ -1870,6 +1960,10 @@ def smoke_test_detail_style_cross_attention(
         "artist_effect_start_step": 1,
         "artist_effect_full_step": 1,
         "artist_effect_every": 1,
+        "common_output_start_step": 1,
+        "common_output_full_step": 1,
+        "artist_magnitude_start_step": 1,
+        "artist_magnitude_full_step": 1,
         "artist_effect_validation_batches": 1,
         "artist_effect_validation_timesteps": [0.45],
         "artist_prototype_start_step": 1,

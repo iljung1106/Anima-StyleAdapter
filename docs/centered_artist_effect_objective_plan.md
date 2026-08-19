@@ -19,7 +19,22 @@
 
 Functional loss는 250 step부터 시작해 1,000 step에 weight `0.02`가 되며,
 비용을 제한하기 위해 4 step마다 실행한다. Target view는 detach하므로 추가로
-보존되는 Anima backward graph는 heldout student 하나뿐이다.
+필요한 heldout student pass는 primary loss를 먼저 backward한 뒤 순차 실행한다.
+
+## Common output와 artist magnitude
+
+Centered objective는 공통 성분에 불변이므로, raw heldout residual의 작가 평균
+RMS 비율에 별도 hinge loss를 건다. Batch 4의 독립 방향 기준이 약 `0.5`임을
+고려해 threshold를 250→2,000 step 동안 `0.90→0.65`로 낮춘다. Weight는
+250→1,000 step 동안 `0.04`로 ramp한다. 분모 RMS는 detach하여 무관한
+residual energy를 부풀리는 해법을 막는다.
+
+공통 성분만 줄여 전체 출력이 0으로 수축하지 않도록, centered heldout
+residual을 detached exact-target teacher 방향에 투영한 절대 계수를 사용한다.
+투영 하한은 250→2,000 step 동안 `0.35→0.70`, 상한은 `1.25`이며 상한
+penalty는 하한의 `0.25`배다. Weight는 250→1,000 step 동안 `0.05`로
+ramp한다. 전체 RMS가 아니라 teacher 방향 성분에만 하한을 적용하므로
+직교 노이즈나 VAE texture로 크기만 채울 수 없다.
 
 ## Episodic artist prototype
 
@@ -38,11 +53,13 @@ Style K/V 양쪽에 작용한다.
 - reconstruction: `0.01`
 - correct-vs-wrong flow ranking: 최대 `0.05` (250→750)
 - centered functional artist effect: 최대 `0.02` (250→1,000, 매 4 step)
+- raw common-output hinge: 최대 `0.04` (250→1,000, 매 4 step)
+- centered artist-magnitude band: 최대 `0.05` (250→1,000, 매 4 step)
 - episodic artist prototype: 최대 `0.01` (250→1,000, 매 2 step)
 - native centered teacher objective: 기존 주기와 비중 유지
 
-두 artist loss는 작가 label이 명확한 Anima/Danbooru batch에만 적용한다.
-MegaStyle 15% 혼합은 기존 flow/reconstruction 학습에 계속 사용한다.
+모든 학습 batch는 작가 label이 명확한 Anima/Danbooru corpus에서만 가져온다.
+MegaStyle 혼합은 v10부터 비활성화하며 기존 캐시는 삭제하지 않는다.
 
 ## Validation
 

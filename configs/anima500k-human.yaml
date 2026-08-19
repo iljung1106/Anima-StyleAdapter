@@ -3830,7 +3830,7 @@ real_artist_teacher:
 # Detail-preserving typed-slot, separate-softmax Style Cross-Attention v1.
 # Contract: docs/detail_preserving_style_cross_attention_plan.md
 detail_preserving_style_cross_attention:
-  output_directory: detail_preserving_style_cross_attention_artist_effect_v9_20k
+  output_directory: detail_preserving_style_cross_attention_common_mag_v10_20k
   seed: 20260819
   train_split: train
   validation_split: validation
@@ -3866,7 +3866,9 @@ detail_preserving_style_cross_attention:
   # Anima corpus. Once prepared, exactly three of every 20 train microbatches
   # come from this loader in every curriculum phase.
   data_mixture:
-    enabled: true
+    # v10 trains only on artist-labelled Anima/Danbooru episodes. MegaStyle is
+    # retained on disk but excluded from both the curriculum and sampling.
+    enabled: false
     primary_name: anima
     auxiliary_name: megastyle
     auxiliary_fraction: 0.15
@@ -4042,6 +4044,28 @@ detail_preserving_style_cross_attention:
     artist_effect_temperature: 0.10
     artist_effect_pool_scales: [2, 4]
     artist_effect_repeatability_weight: 0.25
+    # Penalize the raw heldout-reference residual shared by every artist. The
+    # threshold respects the finite batch-four floor (~0.5) and tightens only
+    # after the style branch has learned a usable direction.
+    common_output_start_step: 250
+    common_output_full_step: 1000
+    common_output_weight: 0.04
+    common_output_threshold_start_step: 250
+    common_output_threshold_end_step: 2000
+    common_output_threshold_start: 0.90
+    common_output_threshold_end: 0.65
+    # Preserve absolute artist-specific energy only along the centered
+    # exact-target teacher direction. Orthogonal texture noise cannot satisfy
+    # this band, and its weak upper side prevents the earlier texture blow-up.
+    artist_magnitude_start_step: 250
+    artist_magnitude_full_step: 1000
+    artist_magnitude_weight: 0.05
+    artist_magnitude_lower_start_step: 250
+    artist_magnitude_lower_end_step: 2000
+    artist_magnitude_lower_start: 0.35
+    artist_magnitude_lower_end: 0.70
+    artist_magnitude_upper: 1.25
+    artist_magnitude_upper_weight: 0.25
     # A fixed type-wise summary of the 28 output tokens is classified against
     # prototypes built only from a disjoint view of the same artist.
     artist_prototype_start_step: 250
@@ -4093,8 +4117,8 @@ detail_preserving_style_cross_attention:
     wandb:
       enabled: true
       project: anima-style-adapter
-      name: detail-style-artist-effect-v9-20k-megastyle15
-      id: detail-style-artist-effect-v9-20k-megastyle15
+      name: detail-style-common-mag-v10-20k-anima-only
+      id: detail-style-common-mag-v10-20k-anima-only
   sampling:
     width: 768
     height: 768

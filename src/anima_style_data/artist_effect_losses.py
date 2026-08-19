@@ -209,3 +209,77 @@ def centered_functional_artist_loss(
         "functional_artist_view_difference_ratio": view_difference.detach(),
         "functional_artist_effect_rms": effect_rms.detach().mean(),
     }
+
+
+def common_output_and_artist_magnitude_loss(
+    teacher_delta: torch.Tensor,
+    student_delta: torch.Tensor,
+    *,
+    common_threshold: float,
+    magnitude_lower: float,
+    magnitude_upper: float,
+    magnitude_upper_weight: float = 0.25,
+    pool_scales: Sequence[int] = (2, 4),
+) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
+    """Suppress shared output while preserving aligned artist-effect magnitude.
+
+    The common penalty acts on the raw heldout-reference student residual.  Its
+    denominator is detached, so reducing every residual cannot lower the ratio
+    merely by changing its normalization.  The magnitude band is measured only
+    along the centered exact-target teacher direction; orthogonal texture noise
+    therefore cannot satisfy the lower bound.
+    """
+
+    if teacher_delta.shape != student_delta.shape or teacher_delta.shape[0] < 2:
+        raise ValueError("Artist magnitude views need matching artist batches")
+    if not 0.0 <= common_threshold <= 1.0:
+        raise ValueError("common_threshold must be between zero and one")
+    if magnitude_lower < 0 or magnitude_upper < magnitude_lower:
+        raise ValueError("invalid artist magnitude band")
+    if magnitude_upper_weight < 0:
+        raise ValueError("magnitude_upper_weight cannot be negative")
+
+    teacher = teacher_delta.float()
+    student = student_delta.float()
+    dimensions = tuple(range(1, student.ndim))
+    student_rms = student.square().mean(dim=dimensions).sqrt()
+    common_rms = student.mean(dim=0).square().mean().sqrt()
+    # Stop-gradient normalization makes this a directional common-component
+    # penalty instead of an incentive to inflate unrelated residual energy.
+    common_ratio = common_rms / student_rms.mean().detach().clamp_min(1e-8)
+    common_loss = F.relu(common_ratio - float(common_threshold)).square()
+
+    teacher_centered = teacher - teacher.mean(dim=0, keepdim=True)
+    student_centered = student - student.mean(dim=0, keepdim=True)
+    teacher_vector = multiscale_effect_vector(teacher_centered, pool_scales)
+    student_vector = multiscale_effect_vector(student_centered, pool_scales)
+    projection = (
+        (student_vector * teacher_vector).sum(dim=1)
+        / teacher_vector.square().sum(dim=1).clamp_min(1e-8)
+    )
+    lower_loss = F.relu(float(magnitude_lower) - projection).square().mean()
+    upper_loss = F.relu(projection - float(magnitude_upper)).square().mean()
+    magnitude_loss = lower_loss + float(magnitude_upper_weight) * upper_loss
+
+    centered_student_rms = student_centered.square().mean(
+        dim=dimensions
+    ).sqrt().mean()
+    centered_teacher_rms = teacher_centered.square().mean(
+        dim=dimensions
+    ).sqrt().mean()
+    return common_loss, magnitude_loss, {
+        "functional_artist_student_common_output_ratio": common_ratio.detach(),
+        "functional_artist_common_output_loss": common_loss.detach(),
+        "functional_artist_magnitude_projection": projection.detach().mean(),
+        "functional_artist_magnitude_positive_fraction": (
+            projection.detach() > 0
+        ).float().mean(),
+        "functional_artist_magnitude_lower_loss": lower_loss.detach(),
+        "functional_artist_magnitude_upper_loss": upper_loss.detach(),
+        "functional_artist_magnitude_loss": magnitude_loss.detach(),
+        "functional_artist_centered_student_rms": centered_student_rms.detach(),
+        "functional_artist_centered_teacher_rms": centered_teacher_rms.detach(),
+        "functional_artist_centered_student_to_teacher_rms": (
+            centered_student_rms / centered_teacher_rms.clamp_min(1e-8)
+        ).detach(),
+    }
