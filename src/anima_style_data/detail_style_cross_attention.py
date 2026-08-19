@@ -1103,14 +1103,20 @@ class FreshKVStyleCrossAttention(nn.Module):
             )
             dimensions = tuple(range(1, raw_style_delta.ndim))
             gated_raw = raw_style_delta.float() * gate.float()
-            raw_rms = gated_raw.square().mean(dim=dimensions).sqrt()
+            raw_energy = gated_raw.square().mean(dim=dimensions)
+            # A dropped style row is exactly zero. sqrt(x) has an infinite
+            # derivative at x=0, which can produce 0*inf NaNs even when a
+            # later torch.where selects the zero branch. Keep the denominator
+            # differentiable and explicitly mask inactive rows.
+            safe_raw_rms = (raw_energy + 1e-8).sqrt()
             target = self._fixed_output_target(
                 block_index, raw_style_delta.shape[0]
-            ).to(raw_rms.device)
+            ).to(raw_energy.device)
+            active = raw_energy > 0
             scale = torch.where(
-                raw_rms > 1e-8,
-                target / raw_rms.clamp_min(1e-8),
-                torch.zeros_like(raw_rms),
+                active,
+                target / safe_raw_rms,
+                torch.zeros_like(safe_raw_rms),
             )
             effective_style_delta = raw_style_delta * scale.to(
                 raw_style_delta.dtype

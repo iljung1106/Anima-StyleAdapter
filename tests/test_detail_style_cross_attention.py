@@ -286,6 +286,11 @@ def test_fixed_output_strength_matches_post_native_gate_p75_and_preserves_disabl
     assert rms[0].item() == pytest.approx(0.35, rel=2e-5)
     assert rms[1].item() == pytest.approx(0.0, abs=1e-7)
     torch.testing.assert_close(actual[1], clean[1], atol=2e-6, rtol=2e-5)
+    actual.square().mean().backward()
+    assert all(
+        parameter.grad is None or torch.isfinite(parameter.grad).all()
+        for parameter in adapter.parameters()
+    )
 
 
 def test_shared_native_bases_are_cached_and_block_deltas_train():
