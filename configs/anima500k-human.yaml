@@ -3890,8 +3890,8 @@ detail_preserving_style_cross_attention:
     output_directory: diagnostics/detail_style_block_similarity_v1
     device: cuda
     clusters: 4
-    probe_batches: 32
-    artists_per_batch: 4
+    probe_batches: 128
+    artists_per_batch: 8
     token_samples: 16
     projection_dim: 256
     seed: 20260819
