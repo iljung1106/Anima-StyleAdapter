@@ -3830,7 +3830,7 @@ real_artist_teacher:
 # Detail-preserving typed-slot, separate-softmax Style Cross-Attention v1.
 # Contract: docs/detail_preserving_style_cross_attention_plan.md
 detail_preserving_style_cross_attention:
-  output_directory: detail_preserving_style_cross_attention_shared_kv_v2_20k
+  output_directory: detail_preserving_style_cross_attention_shared_kv_calibrated_v3_20k
   seed: 20260819
   train_split: train
   validation_split: validation
@@ -3905,9 +3905,10 @@ detail_preserving_style_cross_attention:
     delta_rank: 64
     delta_scale: 1.0
     mix_logit_scale: 4.0
-    # No alpha calibration and no weak-block suppression.  Global strength is
-    # one; this fixed profile only preserves measured inter-block scale.
-    global_gain: 1.0
+    # Absolute block scales are calibrated against the native artist residual.
+    # This mean-one profile retains only the measured inter-block differences;
+    # global_gain independently controls the overall style strength.
+    global_gain: 0.25
     relative_block_gain: [0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5,
                           0.5, 0.513159, 1.262426, 1.656704, 1.659147, 1.786944,
                           1.558835, 1.786944, 1.106528, 1.232676, 1.510143, 1.550927,
@@ -4018,7 +4019,12 @@ detail_preserving_style_cross_attention:
     teacher_references: 4
     teacher_every_step_until: 500
     teacher_every_after_bootstrap: 2
-    alpha_calibration_batches: 4
+    # Cover the entire 4-content x 8-timestep teacher grid once.  Static
+    # per-block alpha uses the median native/raw residual ratio across bins.
+    alpha_calibration_batches: 32
+    alpha_calibration_timestep_bin_edges: [0.0, 0.325, 0.625, 0.86, 1.000001]
+    alpha_calibration_minimum: 0.000001
+    alpha_calibration_maximum: 2.0
     teacher_objective:
       native_teacher_start_step: 1
       native_teacher_ramp_steps: 250
@@ -4075,8 +4081,8 @@ detail_preserving_style_cross_attention:
     wandb:
       enabled: true
       project: anima-style-adapter
-      name: detail-style-shared-kv-v2-20k-megastyle15
-      id: detail-style-shared-kv-v2-20k-megastyle15
+      name: detail-style-shared-kv-calibrated-v3-20k-megastyle15
+      id: detail-style-shared-kv-calibrated-v3-20k-megastyle15
   sampling:
     width: 768
     height: 768

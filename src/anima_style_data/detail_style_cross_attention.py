@@ -10,6 +10,7 @@ projections.  Native Anima Q, O, output dropout, and gate_cross remain frozen.
 from __future__ import annotations
 
 import math
+from bisect import bisect_right
 from dataclasses import dataclass
 from typing import Any
 
@@ -402,15 +403,16 @@ class FreshKVStyleCrossAttention(nn.Module):
         self._style_enabled: torch.Tensor | None = None
         self._style_strength = 1.0
         self._teacher_context: torch.Tensor | None = None
-        self._pending_internal: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+        self._pending_internal: dict[
+            int, tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+        ] = {}
         self._internal_terms: list[tuple[int, dict[str, torch.Tensor]]] = []
         self._calibration = False
-        self._calibration_teacher: list[list[torch.Tensor]] = [
-            [] for _ in range(blocks)
-        ]
-        self._calibration_student: list[list[torch.Tensor]] = [
-            [] for _ in range(blocks)
-        ]
+        self._calibration_bin_edges: tuple[float, ...] = (0.0, 1.000001)
+        self._calibration_bin_index: int | None = None
+        self._calibration_teacher: list[list[list[torch.Tensor]]] = []
+        self._calibration_student: list[list[list[torch.Tensor]]] = []
+        self._calibration_raw_attention: list[list[list[torch.Tensor]]] = []
         self._runtime_ratios: list[torch.Tensor | None] = [None] * blocks
         self._initialized = False
 
@@ -478,37 +480,131 @@ class FreshKVStyleCrossAttention(nn.Module):
         self._pending_internal.clear()
         self._internal_terms.clear()
 
-    def begin_alpha_calibration(self) -> None:
+    def begin_alpha_calibration(
+        self,
+        *,
+        timestep_bin_edges: tuple[float, ...] = (0.0, 1.000001),
+    ) -> None:
+        edges = tuple(float(value) for value in timestep_bin_edges)
+        if len(edges) < 2 or any(
+            right <= left
+            for left, right in zip(edges[:-1], edges[1:], strict=True)
+        ):
+            raise ValueError("timestep_bin_edges must be strictly increasing")
         self._calibration = True
-        # Calibration measures the raw alpha=1 branch.  Otherwise the result
-        # would be divided by the arbitrary constructor value a second time.
+        self._calibration_bin_edges = edges
+        self._calibration_bin_index = None
+        bins = len(edges) - 1
+        self._calibration_teacher = [
+            [[] for _ in range(bins)] for _ in range(self.blocks)
+        ]
+        self._calibration_student = [
+            [[] for _ in range(bins)] for _ in range(self.blocks)
+        ]
+        self._calibration_raw_attention = [
+            [[] for _ in range(bins)] for _ in range(self.blocks)
+        ]
+        # Calibration measures the raw alpha=1 branch.  The resulting absolute
+        # teacher/raw ratio is combined with only the normalized *relative*
+        # block profile and the independent global strength afterwards.
         self.alpha.fill_(1.0)
-        self._calibration_teacher = [[] for _ in range(self.blocks)]
-        self._calibration_student = [[] for _ in range(self.blocks)]
+
+    def set_alpha_calibration_timestep(self, timestep: float) -> None:
+        if not self._calibration:
+            raise RuntimeError("Alpha calibration was not started")
+        index = bisect_right(self._calibration_bin_edges, float(timestep)) - 1
+        self._calibration_bin_index = min(
+            max(index, 0), len(self._calibration_bin_edges) - 2
+        )
 
     @torch.no_grad()
     def finish_alpha_calibration(
         self,
         *,
-        minimum: float = 0.02,
+        minimum: float = 1e-6,
         maximum: float = 2.0,
-        weak_block_fraction: float = 0.1,
+        relative_block_gain: torch.Tensor | None = None,
+        global_gain: float = 1.0,
     ) -> dict[str, Any]:
-        teacher = torch.stack(
-            [torch.stack(values).median() for values in self._calibration_teacher]
+        if not self._calibration:
+            raise RuntimeError("Alpha calibration was not started")
+        if minimum <= 0 or maximum < minimum or global_gain <= 0:
+            raise ValueError("Calibration scales must be positive and ordered")
+
+        bins = len(self._calibration_bin_edges) - 1
+        teacher_by_bin = torch.full(
+            (bins, self.blocks), float("nan"), device=self.alpha.device
         )
-        student = torch.stack(
-            [torch.stack(values).median() for values in self._calibration_student]
-        )
-        alpha = (teacher / student.clamp_min(1e-8)).clamp(minimum, maximum)
-        alpha[teacher < teacher.median() * float(weak_block_fraction)] = 0
+        student_by_bin = torch.full_like(teacher_by_bin, float("nan"))
+        raw_attention_by_bin = torch.full_like(teacher_by_bin, float("nan"))
+        per_bin_ratio = torch.full_like(teacher_by_bin, float("nan"))
+        base_alpha = torch.empty_like(self.alpha.float())
+        for block in range(self.blocks):
+            ratios = []
+            for bin_index in range(bins):
+                teacher_values = self._calibration_teacher[block][bin_index]
+                student_values = self._calibration_student[block][bin_index]
+                attention_values = self._calibration_raw_attention[block][bin_index]
+                if not teacher_values or not student_values or not attention_values:
+                    continue
+                teacher = torch.stack(teacher_values).median().float()
+                student = torch.stack(student_values).median().float()
+                attention = torch.stack(attention_values).median().float()
+                ratio = teacher / student.clamp_min(1e-8)
+                teacher_by_bin[bin_index, block] = teacher
+                student_by_bin[bin_index, block] = student
+                raw_attention_by_bin[bin_index, block] = attention
+                per_bin_ratio[bin_index, block] = ratio
+                ratios.append(ratio)
+            if not ratios:
+                raise RuntimeError(
+                    f"Alpha calibration did not observe Anima block {block}"
+                )
+            base_alpha[block] = torch.stack(ratios).median()
+
+        if relative_block_gain is None:
+            relative = torch.ones_like(base_alpha)
+        else:
+            relative = relative_block_gain.to(
+                device=base_alpha.device, dtype=base_alpha.dtype
+            )
+            if relative.shape != base_alpha.shape or bool((relative <= 0).any()):
+                raise ValueError("relative_block_gain must be positive per block")
+        relative = relative / relative.mean().clamp_min(1e-8)
+        alpha = (
+            base_alpha * relative * float(global_gain)
+        ).clamp(min=float(minimum), max=float(maximum))
         self.alpha.copy_(alpha.to(self.alpha))
         self._calibration = False
-        return {
-            "teacher_rms": teacher.cpu().tolist(),
-            "student_rms": student.cpu().tolist(),
-            "alpha": alpha.cpu().tolist(),
+        self._calibration_bin_index = None
+
+        def serializable(values: torch.Tensor) -> list[list[float | None]]:
+            return [
+                [None if not math.isfinite(float(value)) else float(value) for value in row]
+                for row in values.detach().cpu()
+            ]
+
+        result = {
+            "timestep_bin_edges": list(self._calibration_bin_edges),
+            "native_artist_residual_rms_by_timestep_bin": serializable(
+                teacher_by_bin
+            ),
+            "raw_style_residual_rms_by_timestep_bin": serializable(student_by_bin),
+            "raw_style_attention_rms_by_timestep_bin": serializable(
+                raw_attention_by_bin
+            ),
+            "teacher_to_raw_ratio_by_timestep_bin": serializable(per_bin_ratio),
+            "base_alpha": base_alpha.detach().cpu().tolist(),
+            "relative_block_gain_normalized": relative.detach().cpu().tolist(),
+            "global_gain": float(global_gain),
+            "minimum_alpha": float(minimum),
+            "maximum_alpha": float(maximum),
+            "alpha": alpha.detach().cpu().tolist(),
         }
+        self._calibration_teacher = []
+        self._calibration_student = []
+        self._calibration_raw_attention = []
+        return result
 
     def _style_kv(
         self, index: int, cross_attention: nn.Module
@@ -608,7 +704,9 @@ class FreshKVStyleCrossAttention(nn.Module):
             student_delta = self._native_output_weight(
                 cross_attention, alpha * style_attended
             )
-            self._pending_internal[block_index] = (student_delta, teacher_delta)
+            self._pending_internal[block_index] = (
+                student_delta, teacher_delta, style_attended
+            )
         return cross_attention.output_dropout(cross_attention.output_proj(merged))
 
     def record_gated_internal_teacher(
@@ -620,7 +718,7 @@ class FreshKVStyleCrossAttention(nn.Module):
         pair = self._pending_internal.pop(block_index, None)
         if pair is None:
             return
-        student, teacher = pair
+        student, teacher, raw_style_attention = pair
         frames, height, width = spatial_shape
         gate = gate_cross.expand(-1, frames, height, width, -1).reshape(
             student.shape[0], -1, student.shape[-1]
@@ -634,8 +732,21 @@ class FreshKVStyleCrossAttention(nn.Module):
         teacher_rms = teacher.float().square().mean(dim=dimensions).sqrt()
         student_rms = student.float().square().mean(dim=dimensions).sqrt()
         if self._calibration:
-            self._calibration_teacher[block_index].append(teacher_rms.median().detach())
-            self._calibration_student[block_index].append(student_rms.median().detach())
+            if self._calibration_bin_index is None:
+                raise RuntimeError("Calibration timestep was not set before forward")
+            bin_index = self._calibration_bin_index
+            raw_attention_rms = raw_style_attention.detach().float().square().mean(
+                dim=dimensions
+            ).sqrt()
+            self._calibration_teacher[block_index][bin_index].append(
+                teacher_rms.median().detach()
+            )
+            self._calibration_student[block_index][bin_index].append(
+                student_rms.median().detach()
+            )
+            self._calibration_raw_attention[block_index][bin_index].append(
+                raw_attention_rms.median().detach()
+            )
         scale = teacher_rms.clamp_min(1e-4)
         broadcast = scale.reshape(-1, 1, 1)
         normalized_huber = F.smooth_l1_loss(
@@ -798,7 +909,15 @@ class SharedBaseKVStyleCrossAttention(FreshKVStyleCrossAttention):
             torch.tensor(gains, dtype=torch.float32),
             persistent=True,
         )
-        self.alpha.copy_(self.relative_block_gain * self.global_gain)
+        self.register_buffer(
+            "relative_block_gain_normalized",
+            self.relative_block_gain / self.relative_block_gain.mean(),
+            persistent=True,
+        )
+        # This is only the pre-calibration value.  Production initialization
+        # replaces it with native-effect-calibrated absolute scales while
+        # retaining this vector solely as a mean-one relative profile.
+        self.alpha.copy_(self.relative_block_gain_normalized * self.global_gain)
         logits = torch.zeros(blocks, shared_bases, dtype=torch.float32)
         logits[torch.arange(blocks), self.block_to_base.cpu()] = float(mix_logit_scale)
         self.base_mix_logits = nn.Parameter(logits)

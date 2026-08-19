@@ -180,7 +180,10 @@ def test_same_q_internal_teacher_produces_live_gradient_and_calibrates_alpha():
     teacher = torch.randn(3, 4, 6)
     adapter.set_style_context(style)
     adapter.set_teacher_context(teacher)
-    adapter.begin_alpha_calibration()
+    adapter.begin_alpha_calibration(
+        timestep_bin_edges=(0.0, 0.5, 1.000001)
+    )
+    adapter.set_alpha_calibration_timestep(0.75)
     adapter.alpha[0] = 0
 
     for block_index, block in enumerate(anima.blocks):
@@ -211,7 +214,12 @@ def test_same_q_internal_teacher_produces_live_gradient_and_calibrates_alpha():
     )
     assert metrics["internal_teacher_cosine"].isfinite()
     assert len(calibration["alpha"]) == 2
-    assert all(0 <= value <= 2.0 for value in calibration["alpha"])
+    assert all(0 < value <= 2.0 for value in calibration["alpha"])
+    assert calibration["native_artist_residual_rms_by_timestep_bin"][0] == [None, None]
+    assert all(
+        value is not None
+        for value in calibration["raw_style_attention_rms_by_timestep_bin"][1]
+    )
 
 
 def test_shared_native_bases_are_cached_and_block_deltas_train():

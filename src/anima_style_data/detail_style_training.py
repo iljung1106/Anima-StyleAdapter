@@ -484,15 +484,29 @@ def _calibrate_alpha(
     loader: CachedTeacherReferenceLoader,
     device: str,
     batches: int,
+    training: dict[str, Any],
 ) -> dict[str, Any]:
-    adapter.begin_alpha_calibration()
+    bin_edges = tuple(
+        float(value)
+        for value in training.get(
+            "alpha_calibration_timestep_bin_edges",
+            (0.0, 0.325, 0.625, 0.86, 1.000001),
+        )
+    )
+    adapter.begin_alpha_calibration(timestep_bin_edges=bin_edges)
     reader.eval()
+    content_count = int(bank.tensors["noisy_inputs"].shape[0])
+    timestep_count = int(bank.tensors["noisy_inputs"].shape[1])
     for index in range(max(1, batches)):
         batch = loader.load_step(index)
         references, mask = _reference_inputs(batch, device, "heldout")
         style_ids = [str(item.style_id) for item in batch["episodes"]]
-        content_index = index % int(bank.tensors["noisy_inputs"].shape[0])
-        timestep_index = index % int(bank.tensors["noisy_inputs"].shape[1])
+        # Traverse all cached timesteps before advancing content.  With the
+        # default 32 probes this covers the complete 4-content x 8-timestep
+        # teacher grid exactly once instead of repeatedly observing only the
+        # diagonal content/timestep pairs.
+        timestep_index = index % timestep_count
+        content_index = (index // timestep_count) % content_count
         noisy = bank.tensors["noisy_inputs"][content_index, timestep_index].to(
             device=device, dtype=torch.bfloat16
         )
@@ -502,6 +516,7 @@ def _calibrate_alpha(
         context = bank.tensors["base_context"][content_index : content_index + 1].to(
             device=device, dtype=torch.bfloat16
         )
+        adapter.set_alpha_calibration_timestep(float(timestep.float().item()))
         tagged = contexts.get(style_ids, content_index).to(
             device=device, dtype=torch.bfloat16, non_blocking=True
         )
@@ -524,7 +539,17 @@ def _calibrate_alpha(
             finally:
                 adapter.clear_style_tokens()
         adapter.internal_teacher_loss(rho_min=0.0)
-    result = adapter.finish_alpha_calibration()
+    relative = (
+        adapter.relative_block_gain_normalized
+        if isinstance(adapter, SharedBaseKVStyleCrossAttention)
+        else None
+    )
+    result = adapter.finish_alpha_calibration(
+        minimum=float(training.get("alpha_calibration_minimum", 1e-6)),
+        maximum=float(training.get("alpha_calibration_maximum", 2.0)),
+        relative_block_gain=relative,
+        global_gain=float(getattr(adapter, "global_gain", 1.0)),
+    )
     reader.train()
     return result
 
@@ -857,20 +882,29 @@ def train_detail_style_cross_attention(
         reader.load_state_dict(resume["reader"], strict=True)
         adapter.load_state_dict(resume["adapter"], strict=True)
         start_step = int(resume["step"])
-    elif isinstance(adapter, SharedBaseKVStyleCrossAttention):
-        write_json(output / "style_strength.json", {
-            "mode": "fixed_global_with_relative_block_profile",
-            "global_gain": adapter.global_gain,
-            "alpha": adapter.alpha.detach().float().cpu().tolist(),
-            "medoid_blocks": list(adapter.medoid_blocks),
-            "block_to_base": adapter.block_to_base.detach().cpu().tolist(),
-        })
     else:
         calibration = _calibrate_alpha(
             anima, reader, adapter, bank, contexts, teacher_loader, device,
             int(training.get("alpha_calibration_batches", 4)),
+            training,
         )
         write_json(output / "alpha_calibration.json", calibration)
+        if isinstance(adapter, SharedBaseKVStyleCrossAttention):
+            write_json(output / "style_strength.json", {
+                "mode": "native_effect_calibrated_with_relative_block_profile",
+                "global_gain": adapter.global_gain,
+                "base_alpha": calibration["base_alpha"],
+                "relative_block_gain_raw": (
+                    adapter.relative_block_gain.detach().float().cpu().tolist()
+                ),
+                "relative_block_gain_normalized": (
+                    adapter.relative_block_gain_normalized.detach()
+                    .float().cpu().tolist()
+                ),
+                "alpha": adapter.alpha.detach().float().cpu().tolist(),
+                "medoid_blocks": list(adapter.medoid_blocks),
+                "block_to_base": adapter.block_to_base.detach().cpu().tolist(),
+            })
 
     reader_parameters = [value for value in reader.parameters() if value.requires_grad]
     kv_parameters = adapter.kv_parameters()
