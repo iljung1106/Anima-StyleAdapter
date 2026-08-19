@@ -4037,6 +4037,10 @@ detail_preserving_style_cross_attention:
     artist_effect_full_step: 1000
     artist_effect_every: 4
     artist_effect_weight: 0.02
+    # Only the auxiliary heldout-reference DiT pass is recomputed during
+    # backward.  Without this, its graph overlaps the primary batch-four graph
+    # and exceeds an H100 80GB at the first artist-effect update.
+    artist_effect_checkpoint_student: true
     artist_effect_temperature: 0.10
     artist_effect_pool_scales: [2, 4]
     artist_effect_repeatability_weight: 0.25

@@ -14,6 +14,7 @@ from typing import Any
 import numpy as np
 import torch
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint as activation_checkpoint
 
 from .artist_effect_losses import (
     centered_functional_artist_loss,
@@ -64,6 +65,46 @@ def _build_style_adapter(cfg: dict[str, Any]) -> FreshKVStyleCrossAttention:
     if architecture == "fresh_per_block":
         return FreshKVStyleCrossAttention(**adapter_cfg)
     raise ValueError(f"Unsupported style adapter architecture: {architecture}")
+
+
+def _checkpointed_style_prediction(
+    anima: torch.nn.Module,
+    adapter: FreshKVStyleCrossAttention,
+    style_tokens: torch.Tensor,
+    noisy: torch.Tensor,
+    timesteps: torch.Tensor,
+    context: torch.Tensor,
+    padding: torch.Tensor,
+) -> torch.Tensor:
+    """Run an auxiliary trainable style view without retaining DiT activations.
+
+    The primary flow graph is still alive when the heldout artist view is
+    evaluated.  Checkpointing only this auxiliary Anima pass avoids holding two
+    full DiT activation graphs at once while leaving the normal training path
+    and its throughput unchanged.
+    """
+
+    def forward(tokens: torch.Tensor, noisy_input: torch.Tensor) -> torch.Tensor:
+        adapter.set_style_context(tokens)
+        adapter.set_timesteps(timesteps)
+        try:
+            return anima(
+                noisy_input.unsqueeze(2),
+                timesteps.to(noisy_input.dtype),
+                context=context,
+                padding_mask=padding,
+                target_input_ids=None,
+            ).squeeze(2).float()
+        finally:
+            adapter.clear_style_tokens()
+
+    return activation_checkpoint(
+        forward,
+        style_tokens,
+        noisy,
+        use_reentrant=False,
+        preserve_rng_state=False,
+    )
 
 
 def _delayed_learning_rate_multiplier(
@@ -534,16 +575,31 @@ def _flow_step(
                     dtype=torch.bfloat16,
                     enabled=torch.device(device).type == "cuda",
                 ):
-                    adapter.set_style_context(heldout_view_tokens)
-                    adapter.set_timesteps(timesteps)
-                    try:
-                        heldout_prediction = anima(
-                            noisy.unsqueeze(2), timesteps.to(latents.dtype),
-                            context=context, padding_mask=padding,
-                            target_input_ids=None,
-                        ).squeeze(2).float()
-                    finally:
-                        adapter.clear_style_tokens()
+                    if bool(training.get(
+                        "artist_effect_checkpoint_student", True
+                    )):
+                        heldout_prediction = _checkpointed_style_prediction(
+                            anima,
+                            adapter,
+                            heldout_view_tokens,
+                            noisy,
+                            timesteps,
+                            context,
+                            padding,
+                        )
+                    else:
+                        adapter.set_style_context(heldout_view_tokens)
+                        adapter.set_timesteps(timesteps)
+                        try:
+                            heldout_prediction = anima(
+                                noisy.unsqueeze(2),
+                                timesteps.to(latents.dtype),
+                                context=context,
+                                padding_mask=padding,
+                                target_input_ids=None,
+                            ).squeeze(2).float()
+                        finally:
+                            adapter.clear_style_tokens()
             artist_effect, artist_effect_metrics = centered_functional_artist_loss(
                 target_prediction.detach() - base_prediction,
                 heldout_prediction - base_prediction,
