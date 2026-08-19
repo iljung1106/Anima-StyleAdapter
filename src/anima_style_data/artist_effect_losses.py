@@ -1,0 +1,211 @@
+"""Artist-repeatable objectives for style tokens and functional flow effects."""
+
+from __future__ import annotations
+
+import math
+from collections.abc import Sequence
+
+import torch
+import torch.nn.functional as F
+
+
+def _style_labels(style_ids: Sequence[str], device: torch.device) -> torch.Tensor:
+    labels: dict[str, int] = {}
+    values = []
+    for style_id in style_ids:
+        if style_id not in labels:
+            labels[style_id] = len(labels)
+        values.append(labels[style_id])
+    return torch.tensor(values, device=device, dtype=torch.long)
+
+
+def _symmetric_multi_positive_nce(
+    first: torch.Tensor,
+    second: torch.Tensor,
+    style_ids: Sequence[str],
+    temperature: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    if first.shape != second.shape or first.ndim != 2:
+        raise ValueError("Contrastive views must share [batch,dim] shape")
+    if len(style_ids) != first.shape[0] or first.shape[0] < 2:
+        raise ValueError("Contrastive views need at least two labelled rows")
+    if temperature <= 0:
+        raise ValueError("temperature must be positive")
+    labels = _style_labels(style_ids, first.device)
+    positive = labels[:, None] == labels[None]
+    first = F.normalize(first.float(), dim=1, eps=1e-8)
+    second = F.normalize(second.float(), dim=1, eps=1e-8)
+    logits = first @ second.T / float(temperature)
+
+    def direction(values: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        log_probability = values.log_softmax(dim=1)
+        return -torch.logsumexp(
+            log_probability.masked_fill(~mask, -torch.inf), dim=1
+        ).mean()
+
+    loss = 0.5 * (
+        direction(logits, positive) + direction(logits.T, positive.T)
+    )
+    return loss, logits * float(temperature), labels
+
+
+def typewise_artist_embedding(
+    tokens: torch.Tensor,
+    slot_type_counts: Sequence[int] = (16, 8, 4),
+) -> torch.Tensor:
+    """Build a fixed, low-capacity artist summary without a classifier head."""
+
+    if tokens.ndim != 3 or sum(int(value) for value in slot_type_counts) != tokens.shape[1]:
+        raise ValueError("slot_type_counts must cover every style token")
+    offsets = [0]
+    for count in slot_type_counts:
+        offsets.append(offsets[-1] + int(count))
+    summaries = [
+        tokens[:, start:end].float().mean(dim=1)
+        for start, end in zip(offsets[:-1], offsets[1:], strict=True)
+    ]
+    return F.normalize(torch.cat(summaries, dim=1), dim=1, eps=1e-8)
+
+
+def episodic_artist_prototype_loss(
+    first_tokens: torch.Tensor,
+    second_tokens: torch.Tensor,
+    style_ids: Sequence[str],
+    *,
+    temperature: float = 0.10,
+    slot_type_counts: Sequence[int] = (16, 8, 4),
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Classify one artist view using prototypes made only from the other view."""
+
+    first = typewise_artist_embedding(first_tokens, slot_type_counts)
+    second = typewise_artist_embedding(second_tokens, slot_type_counts)
+    loss, similarity, labels = _symmetric_multi_positive_nce(
+        first, second, style_ids, temperature
+    )
+    positive = labels[:, None] == labels[None]
+    negative = ~positive
+    positive_similarity = similarity[positive].mean()
+    negative_similarity = (
+        (similarity * negative).sum() / negative.sum().clamp_min(1)
+    )
+    predicted = similarity.argmax(dim=1)
+    retrieval = (labels[predicted] == labels).float().mean()
+    return loss, {
+        "artist_prototype_loss": loss.detach(),
+        "artist_prototype_positive_cosine": positive_similarity.detach(),
+        "artist_prototype_negative_cosine": negative_similarity.detach(),
+        "artist_prototype_cosine_gap": (
+            positive_similarity - negative_similarity
+        ).detach(),
+        "artist_prototype_retrieval_top1": retrieval.detach(),
+    }
+
+
+def multiscale_effect_vector(
+    effect: torch.Tensor,
+    pool_scales: Sequence[int] = (2, 4),
+) -> torch.Tensor:
+    """Create a fixed low/mid-frequency sketch of a latent flow effect."""
+
+    if effect.ndim != 4:
+        raise ValueError("Flow effects must have [batch,channels,height,width] shape")
+    vectors = []
+    for scale in pool_scales:
+        scale = int(scale)
+        if scale <= 0:
+            raise ValueError("pool scales must be positive")
+        if scale > min(effect.shape[-2:]):
+            continue
+        pooled = F.avg_pool2d(effect.float(), kernel_size=scale, stride=scale)
+        flattened = pooled.flatten(1)
+        # Equalize scales by average energy rather than number of elements.
+        vectors.append(flattened / math.sqrt(flattened.shape[1]))
+    if not vectors:
+        raise ValueError("No pool scale fits the flow effect")
+    return torch.cat(vectors, dim=1)
+
+
+def centered_functional_artist_loss(
+    first_delta: torch.Tensor,
+    second_delta: torch.Tensor,
+    style_ids: Sequence[str],
+    *,
+    temperature: float = 0.10,
+    pool_scales: Sequence[int] = (2, 4),
+    repeatability_weight: float = 0.25,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Learn the artist effect shared by two disjoint reference views.
+
+    Both deltas must be evaluated at exactly the same noisy latent, text and
+    timestep.  Centering across artists makes the objective invariant to an
+    artist-independent common output.  Cross-view agreement rejects details
+    that occur in only one reference image.
+    """
+
+    if first_delta.shape != second_delta.shape or first_delta.shape[0] < 2:
+        raise ValueError("Functional artist views need matching artist batches")
+    if repeatability_weight < 0:
+        raise ValueError("repeatability_weight cannot be negative")
+    first_centered = first_delta.float() - first_delta.float().mean(
+        dim=0, keepdim=True
+    )
+    second_centered = second_delta.float() - second_delta.float().mean(
+        dim=0, keepdim=True
+    )
+    first_vector = multiscale_effect_vector(first_centered, pool_scales)
+    second_vector = multiscale_effect_vector(second_centered, pool_scales)
+    contrastive, similarity, labels = _symmetric_multi_positive_nce(
+        first_vector, second_vector, style_ids, temperature
+    )
+    dot = (first_vector * second_vector).sum(dim=1)
+    energy = first_vector.square().sum(dim=1) + second_vector.square().sum(dim=1)
+    repeatable_ratio = 2.0 * dot / energy.clamp_min(1e-8)
+    repeatability = (1.0 - repeatable_ratio).mean()
+    total = contrastive + float(repeatability_weight) * repeatability
+
+    positive = labels[:, None] == labels[None]
+    negative = ~positive
+    positive_similarity = similarity[positive].mean()
+    negative_similarity = (
+        (similarity * negative).sum() / negative.sum().clamp_min(1)
+    )
+    predicted = similarity.argmax(dim=1)
+    retrieval = (labels[predicted] == labels).float().mean()
+
+    artist_mean = 0.5 * (first_vector + second_vector)
+    between_variance = artist_mean.square().mean()
+    within_variance = 0.25 * (first_vector - second_vector).square().mean()
+    functional_icc = between_variance / (
+        between_variance + within_variance
+    ).clamp_min(1e-8)
+    average_effect = 0.5 * (first_delta.float() + second_delta.float())
+    dimensions = tuple(range(1, average_effect.ndim))
+    effect_rms = average_effect.square().mean(dim=dimensions).sqrt()
+    common_rms = average_effect.mean(dim=0).square().mean().sqrt()
+    common_ratio = common_rms / effect_rms.mean().clamp_min(1e-8)
+    view_difference = (
+        (first_delta.float() - second_delta.float())
+        .square().mean(dim=dimensions).sqrt()
+        / (
+            0.5 * (
+                first_delta.float().square().mean(dim=dimensions).sqrt()
+                + second_delta.float().square().mean(dim=dimensions).sqrt()
+            )
+        ).clamp_min(1e-8)
+    ).mean()
+    return total, {
+        "functional_artist_loss": total.detach(),
+        "functional_artist_contrastive_loss": contrastive.detach(),
+        "functional_artist_repeatability_loss": repeatability.detach(),
+        "functional_artist_repeatable_ratio": repeatable_ratio.detach().mean(),
+        "functional_artist_icc": functional_icc.detach(),
+        "functional_artist_positive_cosine": positive_similarity.detach(),
+        "functional_artist_negative_cosine": negative_similarity.detach(),
+        "functional_artist_cosine_gap": (
+            positive_similarity - negative_similarity
+        ).detach(),
+        "functional_artist_retrieval_top1": retrieval.detach(),
+        "functional_artist_common_output_ratio": common_ratio.detach(),
+        "functional_artist_view_difference_ratio": view_difference.detach(),
+        "functional_artist_effect_rms": effect_rms.detach().mean(),
+    }

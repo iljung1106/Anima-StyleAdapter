@@ -3830,7 +3830,7 @@ real_artist_teacher:
 # Detail-preserving typed-slot, separate-softmax Style Cross-Attention v1.
 # Contract: docs/detail_preserving_style_cross_attention_plan.md
 detail_preserving_style_cross_attention:
-  output_directory: detail_preserving_style_cross_attention_soft_memory_v8_20k
+  output_directory: detail_preserving_style_cross_attention_artist_effect_v9_20k
   seed: 20260819
   train_split: train
   validation_split: validation
@@ -4026,7 +4026,30 @@ detail_preserving_style_cross_attention:
     functional_full_step: 750
     functional_every: 1
     functional_margin: 0.01
-    functional_weight: 0.10
+    # Flow-error ranking remains useful, but is weaker now that actual
+    # cross-reference artist effects receive direct supervision.
+    functional_weight: 0.05
+    # Compare detached exact-target and trainable heldout-reference effects at
+    # identical noisy latent/text/timestep conditions.  The batch artist mean
+    # is removed before low/mid-frequency contrastive matching.
+    artist_effect_domains: [anima]
+    artist_effect_start_step: 250
+    artist_effect_full_step: 1000
+    artist_effect_every: 4
+    artist_effect_weight: 0.02
+    artist_effect_temperature: 0.10
+    artist_effect_pool_scales: [2, 4]
+    artist_effect_repeatability_weight: 0.25
+    # A fixed type-wise summary of the 28 output tokens is classified against
+    # prototypes built only from a disjoint view of the same artist.
+    artist_prototype_start_step: 250
+    artist_prototype_full_step: 1000
+    artist_prototype_every: 2
+    artist_prototype_weight: 0.01
+    artist_prototype_temperature: 0.10
+    artist_prototype_slot_type_counts: [16, 8, 4]
+    artist_effect_validation_batches: 2
+    artist_effect_validation_timesteps: [0.2, 0.45, 0.7, 0.9]
     teacher_batch_rows: 4
     teacher_references: 4
     teacher_every_step_until: 500
@@ -4068,8 +4091,8 @@ detail_preserving_style_cross_attention:
     wandb:
       enabled: true
       project: anima-style-adapter
-      name: detail-style-soft-memory-v8-20k-megastyle15
-      id: detail-style-soft-memory-v8-20k-megastyle15
+      name: detail-style-artist-effect-v9-20k-megastyle15
+      id: detail-style-artist-effect-v9-20k-megastyle15
   sampling:
     width: 768
     height: 768

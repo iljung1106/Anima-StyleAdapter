@@ -15,6 +15,10 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+from .artist_effect_losses import (
+    centered_functional_artist_loss,
+    episodic_artist_prototype_loss,
+)
 from .detail_style_cross_attention import (
     DetailPreservingTypedSlotReader,
     FreshKVStyleCrossAttention,
@@ -375,6 +379,35 @@ def _flow_step(
             ),
         })
 
+    artist_domain = str(batch.get("data_domain", "anima")) in {
+        str(value) for value in training.get("artist_effect_domains", ["anima"])
+    }
+    prototype_weight = _ramp(
+        step,
+        int(training.get("artist_prototype_start_step", 250)),
+        int(training.get("artist_prototype_full_step", 1_000)),
+        float(training.get("artist_prototype_weight", 0.0)),
+    )
+    need_prototype = (
+        train_auxiliaries
+        and artist_domain
+        and prototype_weight > 0
+        and step % int(training.get("artist_prototype_every", 2)) == 0
+        and prediction.shape[0] >= 2
+    )
+    artist_effect_weight = _ramp(
+        step,
+        int(training.get("artist_effect_start_step", 250)),
+        int(training.get("artist_effect_full_step", 1_000)),
+        float(training.get("artist_effect_weight", 0.0)),
+    )
+    need_artist_effect = (
+        train_auxiliaries
+        and artist_domain
+        and artist_effect_weight > 0
+        and step % int(training.get("artist_effect_every", 4)) == 0
+        and prediction.shape[0] >= 2
+    )
     need_wrong = (
         train_auxiliaries
         and float(training.get("functional_weight", 0.0)) > 0
@@ -383,7 +416,7 @@ def _flow_step(
         and prediction.shape[0] >= 2
     )
     base_prediction = None
-    if measure_base or need_wrong:
+    if measure_base or need_wrong or need_artist_effect:
         with torch.no_grad(), torch.autocast(
             device_type=torch.device(device).type,
             dtype=torch.bfloat16,
@@ -394,6 +427,135 @@ def _flow_step(
                 noisy.unsqueeze(2), timesteps.to(latents.dtype), context=context,
                 padding_mask=padding, target_input_ids=None,
             ).squeeze(2).float()
+
+    if need_prototype or need_artist_effect:
+        target_references = batch["cached_target_tokens"].to(
+            device, dtype=torch.bfloat16, non_blocking=True
+        )[:, None]
+        target_mask = torch.ones(
+            target_references.shape[:2], device=device, dtype=torch.bool
+        )
+        heldout_references, heldout_mask = _reference_inputs(
+            batch, device, "heldout"
+        )
+        main_is_target = mode == "self" or (
+            mode == "curriculum" and bool(curriculum.get("target_only", False))
+        )
+        main_is_heldout = mode == "heldout" or (
+            mode == "curriculum"
+            and float(curriculum.get("target_probability", 1.0)) == 0.0
+        )
+        with torch.autocast(
+            device_type=torch.device(device).type,
+            dtype=torch.bfloat16,
+            enabled=torch.device(device).type == "cuda",
+        ):
+            target_view_tokens = (
+                output.tokens
+                if main_is_target
+                else reader(target_references, target_mask).tokens
+            )
+            heldout_view_tokens = (
+                output.tokens
+                if main_is_heldout
+                else reader(heldout_references, heldout_mask).tokens
+            )
+        style_ids = [str(item.style_id) for item in batch["episodes"]]
+
+        if need_prototype:
+            prototype, prototype_metrics = episodic_artist_prototype_loss(
+                target_view_tokens,
+                heldout_view_tokens,
+                style_ids,
+                temperature=float(
+                    training.get("artist_prototype_temperature", 0.10)
+                ),
+                slot_type_counts=tuple(
+                    int(value)
+                    for value in training.get(
+                        "artist_prototype_slot_type_counts", [16, 8, 4]
+                    )
+                ),
+            )
+            total = total + prototype_weight * prototype
+            metrics.update(prototype_metrics)
+            metrics.update({
+                "artist_prototype_weight": flow_loss.new_tensor(
+                    prototype_weight
+                ),
+                "artist_prototype_weighted_loss": (
+                    prototype_weight * prototype.detach()
+                ),
+            })
+
+        if need_artist_effect:
+            assert base_prediction is not None
+            # Exact-target style is a detached functional teacher.  Only one
+            # extra Anima graph (the heldout-reference student) is retained.
+            # This keeps the objective practical at batch four while forcing
+            # target-excluded references to reproduce the repeatable artist
+            # component rather than target-specific details.
+            if main_is_target:
+                target_prediction = prediction.detach()
+            else:
+                with torch.no_grad(), torch.autocast(
+                    device_type=torch.device(device).type,
+                    dtype=torch.bfloat16,
+                    enabled=torch.device(device).type == "cuda",
+                ):
+                    adapter.set_style_context(target_view_tokens.detach())
+                    adapter.set_timesteps(timesteps)
+                    try:
+                        target_prediction = anima(
+                            noisy.unsqueeze(2), timesteps.to(latents.dtype),
+                            context=context, padding_mask=padding,
+                            target_input_ids=None,
+                        ).squeeze(2).float()
+                    finally:
+                        adapter.clear_style_tokens()
+            if main_is_heldout:
+                heldout_prediction = prediction
+            else:
+                with torch.autocast(
+                    device_type=torch.device(device).type,
+                    dtype=torch.bfloat16,
+                    enabled=torch.device(device).type == "cuda",
+                ):
+                    adapter.set_style_context(heldout_view_tokens)
+                    adapter.set_timesteps(timesteps)
+                    try:
+                        heldout_prediction = anima(
+                            noisy.unsqueeze(2), timesteps.to(latents.dtype),
+                            context=context, padding_mask=padding,
+                            target_input_ids=None,
+                        ).squeeze(2).float()
+                    finally:
+                        adapter.clear_style_tokens()
+            artist_effect, artist_effect_metrics = centered_functional_artist_loss(
+                target_prediction.detach() - base_prediction,
+                heldout_prediction - base_prediction,
+                style_ids,
+                temperature=float(
+                    training.get("artist_effect_temperature", 0.10)
+                ),
+                pool_scales=tuple(
+                    int(value)
+                    for value in training.get("artist_effect_pool_scales", [2, 4])
+                ),
+                repeatability_weight=float(
+                    training.get("artist_effect_repeatability_weight", 0.25)
+                ),
+            )
+            total = total + artist_effect_weight * artist_effect
+            metrics.update(artist_effect_metrics)
+            metrics.update({
+                "functional_artist_weight": flow_loss.new_tensor(
+                    artist_effect_weight
+                ),
+                "functional_artist_weighted_loss": (
+                    artist_effect_weight * artist_effect.detach()
+                ),
+            })
     if need_wrong:
         wrong_references, wrong_mask = _reference_inputs(batch, device, "wrong_artist")
         # The wrong-reference branch is a comparator, not a target that should be
@@ -671,6 +833,146 @@ def _evaluate(
     reader.train()
     adapter.train()
     return _mean_metrics(rows)
+
+
+@torch.no_grad()
+def _evaluate_artist_effect_consistency(
+    anima: torch.nn.Module,
+    reader: DetailPreservingTypedSlotReader,
+    adapter: FreshKVStyleCrossAttention,
+    loader: MultiPromptDualQueryCachedStyleLoader,
+    device: str,
+    training: dict[str, Any],
+    *,
+    batches: int,
+    seed: int,
+) -> dict[str, float]:
+    """Evaluate repeatable artist effects on matched latent-flow probes."""
+
+    reader.eval()
+    adapter.eval()
+    effect_rows: list[dict[str, float]] = []
+    prototype_rows: list[dict[str, float]] = []
+    timestep_values = [
+        float(value)
+        for value in training.get(
+            "artist_effect_validation_timesteps", [0.2, 0.45, 0.7, 0.9]
+        )
+    ]
+    for batch_index in range(max(1, batches)):
+        batch = loader.load_step(batch_index)
+        target_references = batch["cached_target_tokens"].to(
+            device, dtype=torch.bfloat16, non_blocking=True
+        )[:, None]
+        target_mask = torch.ones(
+            target_references.shape[:2], device=device, dtype=torch.bool
+        )
+        heldout_references, heldout_mask = _reference_inputs(
+            batch, device, "heldout"
+        )
+        style_ids = [str(item.style_id) for item in batch["episodes"]]
+        with torch.autocast(
+            device_type=torch.device(device).type,
+            dtype=torch.bfloat16,
+            enabled=torch.device(device).type == "cuda",
+        ):
+            target_tokens = reader(target_references, target_mask).tokens
+            heldout_tokens = reader(heldout_references, heldout_mask).tokens
+        prototype_loss, prototype_metrics = episodic_artist_prototype_loss(
+            target_tokens,
+            heldout_tokens,
+            style_ids,
+            temperature=float(training.get("artist_prototype_temperature", 0.10)),
+            slot_type_counts=tuple(
+                int(value)
+                for value in training.get(
+                    "artist_prototype_slot_type_counts", [16, 8, 4]
+                )
+            ),
+        )
+        prototype_metrics["artist_prototype_loss"] = prototype_loss.detach()
+        prototype_rows.append({
+            key: float(value) for key, value in prototype_metrics.items()
+        })
+
+        artists = len(style_ids)
+        for timestep_index, timestep_value in enumerate(timestep_values):
+            row_index = (batch_index + timestep_index) % artists
+            latent = batch["latents"][row_index : row_index + 1].to(
+                device, dtype=torch.bfloat16, non_blocking=True
+            )
+            context = batch["conditioning"][row_index : row_index + 1].to(
+                device, dtype=torch.bfloat16, non_blocking=True
+            )
+            generator = torch.Generator(device=device).manual_seed(
+                seed + batch_index * 100_003 + timestep_index * 1_009
+            )
+            noise = torch.randn(
+                latent.shape, device=device, dtype=latent.dtype,
+                generator=generator,
+            )
+            noisy = (1.0 - timestep_value) * latent + timestep_value * noise
+            timestep = torch.full(
+                (artists,), timestep_value, device=device, dtype=torch.float32
+            )
+            padding = torch.zeros(
+                artists, 1, latent.shape[-2], latent.shape[-1],
+                device=device, dtype=latent.dtype,
+            )
+            with torch.autocast(
+                device_type=torch.device(device).type,
+                dtype=torch.bfloat16,
+                enabled=torch.device(device).type == "cuda",
+            ):
+                adapter.clear_style_tokens()
+                base = anima(
+                    noisy.unsqueeze(2), timestep[:1].to(latent.dtype),
+                    context=context, padding_mask=padding[:1],
+                    target_input_ids=None,
+                ).squeeze(2).float()
+
+                predictions = []
+                for tokens in (target_tokens, heldout_tokens):
+                    adapter.set_style_context(tokens)
+                    adapter.set_timesteps(timestep)
+                    try:
+                        prediction = anima(
+                            noisy.expand(artists, -1, -1, -1).unsqueeze(2),
+                            timestep.to(latent.dtype),
+                            context=context.expand(artists, -1, -1),
+                            padding_mask=padding, target_input_ids=None,
+                        ).squeeze(2).float()
+                    finally:
+                        adapter.clear_style_tokens()
+                    predictions.append(prediction)
+            _, effect_metrics = centered_functional_artist_loss(
+                predictions[0] - base,
+                predictions[1] - base,
+                style_ids,
+                temperature=float(training.get("artist_effect_temperature", 0.10)),
+                pool_scales=tuple(
+                    int(value)
+                    for value in training.get("artist_effect_pool_scales", [2, 4])
+                ),
+                repeatability_weight=float(
+                    training.get("artist_effect_repeatability_weight", 0.25)
+                ),
+            )
+            effect_rows.append({
+                key: float(value) for key, value in effect_metrics.items()
+            })
+
+    result = _mean_metrics(effect_rows)
+    result.update(_mean_metrics(prototype_rows))
+    result.update({
+        "artists_per_probe": float(loader.batch_size),
+        "random_retrieval_top1": 1.0 / max(1, loader.batch_size),
+        "timestep_probes": float(len(timestep_values)),
+        "batches": float(max(1, batches)),
+    })
+    reader.train()
+    adapter.train()
+    return result
 
 
 @torch.no_grad()
@@ -1272,6 +1574,18 @@ def train_detail_style_cross_attention(
                     )
                     for mode in ("self", "heldout", "wrong_artist")
                 }
+                validation["artist_effect"] = _evaluate_artist_effect_consistency(
+                    anima,
+                    reader,
+                    adapter,
+                    validation_loader,
+                    device,
+                    training,
+                    batches=int(
+                        training.get("artist_effect_validation_batches", 2)
+                    ),
+                    seed=seed ^ 0xA47157,
+                )
                 row = {"step": step, **validation}
                 history.append(row)
                 write_json(history_path, history)
@@ -1486,6 +1800,14 @@ def smoke_test_detail_style_cross_attention(
         "teacher_batch_rows": 2,
         "functional_start_step": 1,
         "functional_every": 1,
+        "artist_effect_start_step": 1,
+        "artist_effect_full_step": 1,
+        "artist_effect_every": 1,
+        "artist_effect_validation_batches": 1,
+        "artist_effect_validation_timesteps": [0.45],
+        "artist_prototype_start_step": 1,
+        "artist_prototype_full_step": 1,
+        "artist_prototype_every": 1,
     })
     cfg["training"].setdefault("wandb", {})["enabled"] = False
     return train_detail_style_cross_attention(smoke, destination, steps_override=2)
