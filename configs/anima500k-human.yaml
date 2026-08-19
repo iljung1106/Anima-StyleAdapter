@@ -3992,6 +3992,7 @@ detail_preserving_style_cross_attention:
     checkpoint_every: 500
     sample_every: 500
     fixed_sample_every: 1000
+    fixed_sample_strengths: [1.0, 1.5, 2.0]
     resume: true
     wandb:
       enabled: true

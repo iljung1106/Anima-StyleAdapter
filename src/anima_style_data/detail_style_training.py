@@ -535,6 +535,12 @@ def _generate_fixed_reference_sample(
     """Render the fixed TestSample1--7 contract through the style branch."""
 
     cfg = dict(prepared["cfg"])
+    strengths = [
+        float(value) for value in config["detail_preserving_style_cross_attention"]
+        ["training"].get("fixed_sample_strengths", [1.0, 1.5, 2.0])
+    ]
+    if not strengths or any(value <= 0 for value in strengths):
+        raise ValueError("fixed_sample_strengths must contain positive values")
     references = prepared["reference_tokens"][:, None].to(
         device, dtype=torch.bfloat16, non_blocking=True
     )
@@ -573,7 +579,12 @@ def _generate_fixed_reference_sample(
     sigmas = sigmas * shift / (1 + (shift - 1) * sigmas)
     text_cfg = float(cfg["cfg"])
 
-    def denoise(text_batch: torch.Tensor, style: torch.Tensor | None) -> torch.Tensor:
+    def denoise(
+        text_batch: torch.Tensor,
+        style: torch.Tensor | None,
+        *,
+        strength: float = 1.0,
+    ) -> torch.Tensor:
         batch = text_batch.shape[0]
         x = initial_noise.expand(batch, -1, -1, -1, -1).clone()
         negative_batch = negative.expand(batch, -1, -1)
@@ -584,7 +595,7 @@ def _generate_fixed_reference_sample(
         if style is None:
             adapter.clear_style_tokens()
         else:
-            adapter.set_style_context(style)
+            adapter.set_style_context(style, strength=strength)
         with torch.autocast(
             device_type=torch.device(device).type,
             dtype=torch.bfloat16,
@@ -611,13 +622,19 @@ def _generate_fixed_reference_sample(
 
     try:
         base_latents = denoise(positive, None)
-        styled_parts = []
-        for offset in range(0, len(style_tokens), batch_size):
-            style = style_tokens[offset : offset + batch_size]
-            styled_parts.append(
-                denoise(positive.expand(len(style), -1, -1), style)
-            )
-        styled_latents = torch.cat(styled_parts)
+        styled_latents_by_strength = {}
+        for strength in strengths:
+            styled_parts = []
+            for offset in range(0, len(style_tokens), batch_size):
+                style = style_tokens[offset : offset + batch_size]
+                styled_parts.append(
+                    denoise(
+                        positive.expand(len(style), -1, -1),
+                        style,
+                        strength=strength,
+                    )
+                )
+            styled_latents_by_strength[strength] = torch.cat(styled_parts)
     finally:
         adapter.clear_style_tokens()
         if reader_was_training:
@@ -625,48 +642,84 @@ def _generate_fixed_reference_sample(
         if adapter_was_training:
             adapter.train()
 
+    latent_groups = {"base": base_latents}
+    latent_groups.update({
+        f"styled_{strength:g}x": values
+        for strength, values in styled_latents_by_strength.items()
+    })
     decoded = _decode_latents(
         config,
         destination,
-        {"base": base_latents, "styled": styled_latents},
+        latent_groups,
         device,
         int(cfg.get("vae_batch_size", 4)),
     )
     base = decoded["base"][0]
-    styled = decoded["styled"]
     sample_dir = output / "external_reference_samples" / f"step-{step:07d}"
     generated_dir = sample_dir / "generated"
     generated_dir.mkdir(parents=True, exist_ok=True)
     base.save(generated_dir / "no-style.png")
-    for index, image in enumerate(styled, start=1):
-        image.save(generated_dir / f"style-cross-attention-TestSample{index}.png")
     size = (width, height)
-    sheet = _make_sheet(
-        prepared["paths"], base, None, styled, size,
-        current_label="STYLE CROSS-ATTENTION",
-    )
-    sheet_path = sample_dir / "detail-style-fixed-reference.png"
-    sheet.save(sheet_path, compress_level=4)
-    rms = _pixel_rms_from_baseline(base, styled)
+    sheets = {}
+    metrics = {}
+    for strength in strengths:
+        label = f"{strength:g}x"
+        styled = decoded[f"styled_{label}"]
+        for index, image in enumerate(styled, start=1):
+            image.save(
+                generated_dir
+                / f"style-cross-attention-{label}-TestSample{index}.png"
+            )
+        sheet = _make_sheet(
+            prepared["paths"], base, None, styled, size,
+            current_label=f"STYLE CROSS-ATTENTION {label}",
+        )
+        sheet_path = sample_dir / f"detail-style-fixed-reference-{label}.png"
+        sheet.save(sheet_path, compress_level=4)
+        rms = _pixel_rms_from_baseline(base, styled)
+        sheets[label] = str(sheet_path)
+        metrics[label] = {
+            "mean_pixel_rms_from_baseline": float(np.mean(rms)),
+            "pixel_rms_from_baseline": rms,
+        }
+    primary_label = "1x" if "1x" in sheets else f"{strengths[0]:g}x"
     summary = {
         "step": int(step),
-        "sheet": str(sheet_path),
+        "sheet": sheets[primary_label],
+        "sheets": sheets,
+        "strengths": strengths,
         "references": 7,
         "prompt": str(cfg["prompt"]),
         "negative_prompt": str(cfg["negative_prompt"]),
         "text_cfg": text_cfg,
-        "style_strength": 1.0,
         "steps": int(cfg["steps"]),
         "seed": int(cfg["seed"]),
-        "mean_pixel_rms_from_baseline": float(np.mean(rms)),
-        "pixel_rms_from_baseline": rms,
+        "metrics": metrics,
+        "mean_pixel_rms_from_baseline": metrics[primary_label][
+            "mean_pixel_rms_from_baseline"
+        ],
     }
     write_json(sample_dir / "summary.json", summary)
-    del references, style_tokens, base_latents, styled_latents, decoded
+    del references, style_tokens, base_latents, styled_latents_by_strength, decoded
     gc.collect()
     if device.startswith("cuda"):
         torch.cuda.empty_cache()
     return summary
+
+
+def _fixed_sample_complete(
+    summary_path: Path, strengths: list[float]
+) -> bool:
+    if not summary_path.exists():
+        return False
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    if [float(value) for value in summary.get("strengths", [])] != strengths:
+        return False
+    sheets = summary.get("sheets", {})
+    expected = {f"{value:g}x" for value in strengths}
+    return set(sheets) == expected and all(
+        Path(path).exists() for path in sheets.values()
+    )
 
 
 def train_detail_style_cross_attention(
@@ -797,6 +850,10 @@ def train_detail_style_cross_attention(
     state_every = int(training.get("state_every", checkpoint_every))
     sample_every = int(training.get("sample_every", 500))
     fixed_sample_every = int(training.get("fixed_sample_every", 1000))
+    fixed_sample_strengths = [
+        float(value)
+        for value in training.get("fixed_sample_strengths", [1.0, 1.5, 2.0])
+    ]
     teacher_every_after = int(training.get("teacher_every_after_bootstrap", 2))
     teacher_bootstrap_end = int(training.get("teacher_every_step_until", 500))
     prefetched = train_loader.prefetch(
@@ -835,7 +892,9 @@ def train_detail_style_cross_attention(
             fixed_prepared is not None
             and start_step > 0
             and start_step % fixed_sample_every == 0
-            and not resumed_fixed_summary.exists()
+            and not _fixed_sample_complete(
+                resumed_fixed_summary, fixed_sample_strengths
+            )
         ):
             fixed = _generate_fixed_reference_sample(
                 fixed_prepared, config, destination, anima, reader, adapter,
@@ -849,12 +908,15 @@ def train_detail_style_cross_attention(
             if wandb_run is not None:
                 import wandb
                 wandb_run.log({
-                    "val/functional/fixed_reference": wandb.Image(
-                        fixed["sheet"], caption=f"fixed references step {start_step}"
-                    ),
-                    "val/functional/fixed_reference_mean_pixel_rms": fixed[
-                        "mean_pixel_rms_from_baseline"
+                    "val/functional/fixed_reference": [
+                        wandb.Image(path, caption=f"fixed {label} step {start_step}")
+                        for label, path in fixed["sheets"].items()
                     ],
+                    **{
+                        f"val/functional/fixed_reference_pixel_rms/{label}":
+                        values["mean_pixel_rms_from_baseline"]
+                        for label, values in fixed["metrics"].items()
+                    },
                 }, step=start_step)
         for step in range(start_step + 1, steps + 1):
             step_started = time.perf_counter()
@@ -1006,12 +1068,15 @@ def train_detail_style_cross_attention(
                 if wandb_run is not None:
                     import wandb
                     wandb_run.log({
-                        "val/functional/fixed_reference": wandb.Image(
-                            fixed["sheet"], caption=f"fixed references step {step}"
-                        ),
-                        "val/functional/fixed_reference_mean_pixel_rms": fixed[
-                            "mean_pixel_rms_from_baseline"
+                        "val/functional/fixed_reference": [
+                            wandb.Image(path, caption=f"fixed {label} step {step}")
+                            for label, path in fixed["sheets"].items()
                         ],
+                        **{
+                            f"val/functional/fixed_reference_pixel_rms/{label}":
+                            values["mean_pixel_rms_from_baseline"]
+                            for label, values in fixed["metrics"].items()
+                        },
                     }, step=step)
             completed = step
     finally:
@@ -1066,6 +1131,10 @@ def backfill_detail_style_fixed_samples(
     training = dict(cfg["training"])
     device = str(training.get("device", "cuda"))
     every = int(training.get("fixed_sample_every", 1000))
+    strengths = [
+        float(value)
+        for value in training.get("fixed_sample_strengths", [1.0, 1.5, 2.0])
+    ]
     if every <= 0:
         raise ValueError("fixed_sample_every must be positive for backfill")
     output = destination / str(cfg["output_directory"])
@@ -1097,7 +1166,7 @@ def backfill_detail_style_fixed_samples(
             output / "external_reference_samples"
             / f"step-{step:07d}" / "summary.json"
         )
-        if summary_path.exists():
+        if _fixed_sample_complete(summary_path, strengths):
             reused.append(step)
             continue
         state = torch.load(checkpoint, map_location="cpu", weights_only=False)
