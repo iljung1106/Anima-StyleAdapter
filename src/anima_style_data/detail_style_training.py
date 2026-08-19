@@ -18,6 +18,7 @@ import torch.nn.functional as F
 from .detail_style_cross_attention import (
     DetailPreservingTypedSlotReader,
     FreshKVStyleCrossAttention,
+    SharedBaseKVStyleCrossAttention,
 )
 from .detail_style_teacher_context import NativeArtistContextCache
 from .data_mixture import ConstantRatioBatchMixer
@@ -46,11 +47,46 @@ from .query_style_tokenizer import (
 from .same_q_style_adapter import attach_same_q_style_adapter
 from .style_tokenizer import _flow_metrics, _mean_metrics
 from .style_transfer import (
-    _learning_rate_multiplier,
     _optimize_frozen_anima,
     _resolve_anima_model,
     _sample_flow_timesteps,
 )
+
+
+def _build_style_adapter(cfg: dict[str, Any]) -> FreshKVStyleCrossAttention:
+    adapter_cfg = dict(cfg["adapter"])
+    architecture = str(adapter_cfg.pop("architecture", "fresh_per_block"))
+    if architecture == "shared_base_lora":
+        return SharedBaseKVStyleCrossAttention(**adapter_cfg)
+    if architecture == "fresh_per_block":
+        return FreshKVStyleCrossAttention(**adapter_cfg)
+    raise ValueError(f"Unsupported style adapter architecture: {architecture}")
+
+
+def _delayed_learning_rate_multiplier(
+    step: int,
+    total_steps: int,
+    warmup_steps: int,
+    decay_start_step: int,
+    minimum_ratio: float,
+) -> float:
+    """Warm up, hold peak LR through alignment, then cosine decay."""
+
+    if not 0.0 <= minimum_ratio <= 1.0:
+        raise ValueError("minimum_lr_ratio must be between 0 and 1")
+    total_steps = max(1, int(total_steps))
+    warmup_steps = max(0, min(int(warmup_steps), total_steps))
+    decay_start_step = max(warmup_steps, min(int(decay_start_step), total_steps))
+    if warmup_steps and step <= warmup_steps:
+        return max(1, int(step)) / warmup_steps
+    if step <= decay_start_step:
+        return 1.0
+    progress = min(
+        1.0,
+        max(0.0, (int(step) - decay_start_step) / max(1, total_steps - decay_start_step)),
+    )
+    cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+    return minimum_ratio + (1.0 - minimum_ratio) * cosine
 
 
 def _loader_config(
@@ -807,7 +843,7 @@ def train_detail_style_cross_attention(
         fuse_attention_projections=bool(training.get("fuse_attention_projections", True)),
     )
     reader = DetailPreservingTypedSlotReader(**dict(cfg["model"])).to(device)
-    adapter = FreshKVStyleCrossAttention(**dict(cfg["adapter"])).to(device)
+    adapter = _build_style_adapter(cfg).to(device)
     attach_same_q_style_adapter(anima, adapter)
 
     output = destination / str(cfg["output_directory"])
@@ -821,6 +857,14 @@ def train_detail_style_cross_attention(
         reader.load_state_dict(resume["reader"], strict=True)
         adapter.load_state_dict(resume["adapter"], strict=True)
         start_step = int(resume["step"])
+    elif isinstance(adapter, SharedBaseKVStyleCrossAttention):
+        write_json(output / "style_strength.json", {
+            "mode": "fixed_global_with_relative_block_profile",
+            "global_gain": adapter.global_gain,
+            "alpha": adapter.alpha.detach().float().cpu().tolist(),
+            "medoid_blocks": list(adapter.medoid_blocks),
+            "block_to_base": adapter.block_to_base.detach().cpu().tolist(),
+        })
     else:
         calibration = _calibrate_alpha(
             anima, reader, adapter, bank, contexts, teacher_loader, device,
@@ -830,11 +874,44 @@ def train_detail_style_cross_attention(
 
     reader_parameters = [value for value in reader.parameters() if value.requires_grad]
     kv_parameters = adapter.kv_parameters()
+    optimizer_groups: list[dict[str, Any]] = [
+        {
+            "params": reader_parameters,
+            "lr": float(training.get("learning_rate", 1e-4)),
+            "name": "reader",
+        }
+    ]
+    if isinstance(adapter, SharedBaseKVStyleCrossAttention):
+        optimizer_groups.extend([
+            {
+                "params": adapter.shared_parameters(),
+                "lr": float(training.get("shared_kv_learning_rate", 5e-5)),
+                "name": "shared_kv",
+            },
+            {
+                "params": adapter.delta_parameters(),
+                "lr": float(training.get("block_delta_learning_rate", 1e-4)),
+                "name": "block_delta",
+            },
+            {
+                "params": adapter.mixing_parameters(),
+                "lr": float(training.get("base_mix_learning_rate", 2e-5)),
+                "name": "base_mix",
+                "weight_decay": 0.0,
+            },
+        ])
+    else:
+        optimizer_groups.append({
+            "params": kv_parameters,
+            "lr": float(training.get("kv_learning_rate", 5e-5)),
+            "name": "style_kv",
+        })
+    base_group_lrs = {
+        str(group["name"]): float(group["lr"])
+        for group in optimizer_groups
+    }
     optimizer = torch.optim.AdamW(
-        [
-            {"params": reader_parameters, "lr": float(training.get("learning_rate", 1e-4)), "name": "reader"},
-            {"params": kv_parameters, "lr": float(training.get("kv_learning_rate", 5e-5)), "name": "style_kv"},
-        ],
+        optimizer_groups,
         betas=tuple(training.get("betas", [0.9, 0.95])),
         eps=float(training.get("adam_eps", 1e-8)),
         weight_decay=float(training.get("weight_decay", 0.01)),
@@ -852,7 +929,9 @@ def train_detail_style_cross_attention(
     kv_count = sum(value.numel() for value in kv_parameters)
     print(
         f"detail-style model reader={reader_count/1e6:.2f}M "
-        f"fresh_kv={kv_count/1e6:.2f}M alpha_fixed={adapter.alpha.tolist()}",
+        f"style_adapter={kv_count/1e6:.2f}M "
+        f"architecture={cfg['adapter'].get('architecture', 'fresh_per_block')} "
+        f"alpha_fixed={adapter.alpha.tolist()}",
         flush=True,
     )
     wandb_run = None
@@ -867,13 +946,12 @@ def train_detail_style_cross_attention(
             config={
                 "detail_preserving_style_cross_attention": cfg,
                 "reader_parameters": reader_count,
-                "fresh_kv_parameters": kv_count,
+                "style_adapter_parameters": kv_count,
             },
         )
 
-    base_lr = float(training.get("learning_rate", 1e-4))
-    kv_lr = float(training.get("kv_learning_rate", 5e-5))
     warmup = int(training.get("warmup_steps", 500))
+    decay_start = int(training.get("lr_decay_start_step", steps))
     minimum_ratio = float(training.get("minimum_lr_ratio", 0.1))
     log_every = int(training.get("log_every", 10))
     validation_every = int(training.get("validation_every", 250))
@@ -951,9 +1029,11 @@ def train_detail_style_cross_attention(
                 }, step=start_step)
         for step in range(start_step + 1, steps + 1):
             step_started = time.perf_counter()
-            lr_scale = _learning_rate_multiplier(step, steps, warmup, minimum_ratio)
-            optimizer.param_groups[0]["lr"] = base_lr * lr_scale
-            optimizer.param_groups[1]["lr"] = kv_lr * lr_scale
+            lr_scale = _delayed_learning_rate_multiplier(
+                step, steps, warmup, decay_start, minimum_ratio
+            )
+            for group in optimizer.param_groups:
+                group["lr"] = base_group_lrs[str(group["name"])] * lr_scale
             optimizer.zero_grad(set_to_none=True)
             metric_rows: list[dict[str, torch.Tensor]] = []
             for micro in range(accumulation):
@@ -1011,11 +1091,13 @@ def train_detail_style_cross_attention(
                 }
                 averaged.update({
                     "grad_norm": float(grad_norm),
-                    "reader_lr": optimizer.param_groups[0]["lr"],
-                    "kv_lr": optimizer.param_groups[1]["lr"],
                     "step_s": time.perf_counter() - step_started,
                     "images_per_s": train_loader.batch_size * accumulation /
                     max(time.perf_counter() - step_started, 1e-6),
+                })
+                averaged.update({
+                    f"{group['name']}_lr": float(group["lr"])
+                    for group in optimizer.param_groups
                 })
                 averaged.update(adapter.runtime_stats())
                 print(
@@ -1033,7 +1115,7 @@ def train_detail_style_cross_attention(
                             namespace = "train/teacher"
                         elif key in {"step_s", "images_per_s"}:
                             namespace = "system/perf"
-                        elif key.startswith(("style_", "grad_", "reader_lr", "kv_lr")):
+                        elif key.startswith(("style_", "grad_")) or key.endswith("_lr"):
                             namespace = "model/activation"
                         elif "artist" in key or "functional" in key:
                             namespace = "train/artist"
@@ -1121,7 +1203,7 @@ def train_detail_style_cross_attention(
         "steps": completed,
         "requested_steps": steps,
         "reader_parameters": reader_count,
-        "fresh_kv_parameters": kv_count,
+        "style_adapter_parameters": kv_count,
         "elapsed_s": time.perf_counter() - started,
         "final_validation": history[-1] if history else None,
     }
@@ -1194,7 +1276,7 @@ def backfill_detail_style_fixed_samples(
         fuse_attention_projections=bool(training.get("fuse_attention_projections", True)),
     )
     reader = DetailPreservingTypedSlotReader(**dict(cfg["model"])).to(device).eval()
-    adapter = FreshKVStyleCrossAttention(**dict(cfg["adapter"])).to(device).eval()
+    adapter = _build_style_adapter(cfg).to(device).eval()
     attach_same_q_style_adapter(anima, adapter)
     prepared = load_dual_query_external_sample(config, destination)
 

@@ -68,6 +68,21 @@ cluster 쌍의 평균 외부 유사도는 `0.303`이다. 전체 내부 평균은
 원본 전체 행렬과 block별 teacher RMS/상대 gain은 원격 산출물
 `diagnostics/detail_style_block_similarity_v1/summary.json`에 보존한다.
 
+### 확정 구현
+
+- 네 full-rank base는 `L3/L12/L18/L26`의 frozen Anima native K/V를 복사해
+  시작한다.
+- 각 block은 네 base에 대한 작은 softmax mixing logit과 K/V별 rank-64
+  delta를 가진다. 할당된 base의 초기 logit은 4이고 나머지는 0이며, delta
+  up 행렬만 zero-init한다.
+- 동일 style context에 대한 네 base K/V 투영은 forward당 한 번만 계산해
+  28개 block이 재사용한다.
+- post-attention global gain은 1로 고정한다. 상대 block profile은 중앙값이
+  1이 되게 정규화하고 어느 block도 끄지 않는다. 기존 alpha calibration은
+  이 구조에서 실행하지 않는다.
+- optimizer group은 reader `1e-4`, shared base `5e-5`, block delta `1e-4`,
+  base mixing `2e-5`로 분리한다.
+
 ## Metric-gated curriculum과 LR
 
 초기에는 exact-self와 dense centered residual teacher로 방향과 절대 크기를 함께
@@ -85,6 +100,10 @@ target 포함률은 고정 step에서 자동으로 내리지 않는다. target-e
 낮춘다. 악화 시 현재 확률을 유지한다. LR은 warmup 뒤 이 전체 정렬/annealing
 구간에서 plateau를 유지하고, target 포함률이 0인 본학습이 안정된 뒤에만 cosine
 decay를 시작한다. 새 LoRA delta group을 여는 경우 해당 group만 짧게 re-warmup한다.
+
+현재 20k 실행은 500-step warmup 뒤 step 12,000까지 peak LR을 유지하고,
+12,000--20,000에서만 cosine decay해 0.1배 floor에 도달한다. 따라서 target이
+완전히 제외되는 step 6,000 뒤에도 6,000 step 동안 peak LR로 학습한다.
 
 ## MegaStyle-1.4M 상시 혼합
 

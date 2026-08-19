@@ -738,3 +738,236 @@ class FreshKVStyleCrossAttention(nn.Module):
             "style_alpha_max": float(self.alpha.max()),
             "style_alpha_active_blocks": float(self.alpha.ne(0).sum()),
         }
+
+
+class SharedBaseKVStyleCrossAttention(FreshKVStyleCrossAttention):
+    """Four native K/V bases plus a low-rank block-specific residual.
+
+    The shared full-rank projections are evaluated once per active style
+    context.  Each Anima block softly selects the four bases and adds its own
+    rank-limited delta before the native K/V normalization.  Native Q/O and
+    the separate text/style softmax remain implemented by the parent class.
+    """
+
+    def __init__(
+        self,
+        *,
+        context_dim: int = 1024,
+        blocks: int = 28,
+        shared_bases: int = 4,
+        medoid_blocks: list[int] | tuple[int, ...] = (3, 12, 18, 26),
+        block_to_base: list[int] | tuple[int, ...] = (
+            0, 0, 0, 0, 0, 0, 0, 0,
+            1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+            2, 2,
+            3, 3, 3, 3, 3, 3, 3, 3,
+        ),
+        delta_rank: int = 64,
+        delta_scale: float = 1.0,
+        mix_logit_scale: float = 4.0,
+        global_gain: float = 1.0,
+        relative_block_gain: list[float] | tuple[float, ...] | None = None,
+    ) -> None:
+        if shared_bases <= 0 or delta_rank <= 0:
+            raise ValueError("shared_bases and delta_rank must be positive")
+        if len(medoid_blocks) != shared_bases:
+            raise ValueError("medoid_blocks must contain one block per shared base")
+        if len(block_to_base) != blocks:
+            raise ValueError("block_to_base must contain one assignment per block")
+        if min(block_to_base) < 0 or max(block_to_base) >= shared_bases:
+            raise ValueError("block_to_base contains an invalid base index")
+        gains = [1.0] * blocks if relative_block_gain is None else list(relative_block_gain)
+        if len(gains) != blocks or any(value <= 0 for value in gains):
+            raise ValueError("relative_block_gain must be positive for every block")
+        if global_gain <= 0:
+            raise ValueError("global_gain must be positive")
+
+        super().__init__(context_dim=context_dim, blocks=blocks, initial_alpha=1.0)
+        self.shared_bases = int(shared_bases)
+        self.delta_rank = int(delta_rank)
+        self.delta_scale = float(delta_scale)
+        self.global_gain = float(global_gain)
+        self.medoid_blocks = tuple(int(value) for value in medoid_blocks)
+        self.register_buffer(
+            "block_to_base",
+            torch.tensor(block_to_base, dtype=torch.long),
+            persistent=True,
+        )
+        self.register_buffer(
+            "relative_block_gain",
+            torch.tensor(gains, dtype=torch.float32),
+            persistent=True,
+        )
+        self.alpha.copy_(self.relative_block_gain * self.global_gain)
+        logits = torch.zeros(blocks, shared_bases, dtype=torch.float32)
+        logits[torch.arange(blocks), self.block_to_base.cpu()] = float(mix_logit_scale)
+        self.base_mix_logits = nn.Parameter(logits)
+        self.base_k = nn.ModuleList()
+        self.base_v = nn.ModuleList()
+        self.delta_k_down = nn.ModuleList()
+        self.delta_k_up = nn.ModuleList()
+        self.delta_v_down = nn.ModuleList()
+        self.delta_v_up = nn.ModuleList()
+        self._base_projection_cache: tuple[list[torch.Tensor], list[torch.Tensor]] | None = None
+
+    @staticmethod
+    def _native_projection_weights(
+        cross_attention: nn.Module,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        output_dim = int(cross_attention.n_heads) * int(cross_attention.head_dim)
+        if hasattr(cross_attention, "kv_proj"):
+            key, value = cross_attention.kv_proj.weight.unflatten(
+                0, (2, output_dim)
+            ).unbind(0)
+            return key, value
+        return cross_attention.k_proj.weight, cross_attention.v_proj.weight
+
+    def initialize_from_anima(self, anima: nn.Module) -> None:
+        if self._initialized:
+            return
+        if len(anima.blocks) != self.blocks:
+            raise ValueError(f"Expected {self.blocks} Anima blocks, got {len(anima.blocks)}")
+        if any(index < 0 or index >= self.blocks for index in self.medoid_blocks):
+            raise ValueError("medoid_blocks contains an invalid Anima block")
+
+        output_dim: int | None = None
+        for block_index in self.medoid_blocks:
+            cross = anima.blocks[block_index].cross_attn
+            key_weight, value_weight = self._native_projection_weights(cross)
+            current_output_dim = int(cross.n_heads) * int(cross.head_dim)
+            if key_weight.shape != (current_output_dim, self.context_dim):
+                raise ValueError(
+                    "Native Anima K/V dimensions do not match the style context: "
+                    f"{tuple(key_weight.shape)} versus (*,{self.context_dim})"
+                )
+            output_dim = current_output_dim if output_dim is None else output_dim
+            if current_output_dim != output_dim:
+                raise ValueError("All shared-base blocks must use the same K/V width")
+            key = nn.Linear(
+                self.context_dim, output_dim, bias=False,
+                device=key_weight.device, dtype=key_weight.dtype,
+            )
+            value = nn.Linear(
+                self.context_dim, output_dim, bias=False,
+                device=value_weight.device, dtype=value_weight.dtype,
+            )
+            with torch.no_grad():
+                key.weight.copy_(key_weight)
+                value.weight.copy_(value_weight)
+            self.base_k.append(key)
+            self.base_v.append(value)
+
+        assert output_dim is not None
+        native = anima.blocks[0].cross_attn.output_proj.weight
+        for _ in range(self.blocks):
+            modules = []
+            for input_dim, result_dim, zero in (
+                (self.context_dim, self.delta_rank, False),
+                (self.delta_rank, output_dim, True),
+                (self.context_dim, self.delta_rank, False),
+                (self.delta_rank, output_dim, True),
+            ):
+                module = nn.Linear(
+                    input_dim, result_dim, bias=False,
+                    device=native.device, dtype=native.dtype,
+                )
+                if zero:
+                    nn.init.zeros_(module.weight)
+                else:
+                    nn.init.xavier_uniform_(module.weight)
+                modules.append(module)
+            k_down, k_up, v_down, v_up = modules
+            self.delta_k_down.append(k_down)
+            self.delta_k_up.append(k_up)
+            self.delta_v_down.append(v_down)
+            self.delta_v_up.append(v_up)
+        self._initialized = True
+
+    def shared_parameters(self) -> list[nn.Parameter]:
+        return list(self.base_k.parameters()) + list(self.base_v.parameters())
+
+    def delta_parameters(self) -> list[nn.Parameter]:
+        return (
+            list(self.delta_k_down.parameters())
+            + list(self.delta_k_up.parameters())
+            + list(self.delta_v_down.parameters())
+            + list(self.delta_v_up.parameters())
+        )
+
+    def mixing_parameters(self) -> list[nn.Parameter]:
+        return [self.base_mix_logits]
+
+    def kv_parameters(self) -> list[nn.Parameter]:
+        return self.shared_parameters() + self.delta_parameters() + self.mixing_parameters()
+
+    def set_style_context(
+        self,
+        tokens: torch.Tensor,
+        *,
+        enabled: torch.Tensor | None = None,
+        strength: float = 1.0,
+    ) -> None:
+        self._base_projection_cache = None
+        super().set_style_context(tokens, enabled=enabled, strength=strength)
+
+    set_style_tokens = set_style_context
+
+    def clear_style_tokens(self) -> None:
+        self._base_projection_cache = None
+        super().clear_style_tokens()
+
+    def _base_projections(self) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
+        if self._style_context is None:
+            raise RuntimeError("No active style context")
+        if self._base_projection_cache is None:
+            self._base_projection_cache = (
+                [module(self._style_context) for module in self.base_k],
+                [module(self._style_context) for module in self.base_v],
+            )
+        return self._base_projection_cache
+
+    def _style_kv(
+        self, index: int, cross_attention: nn.Module
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self._style_context is None:
+            raise RuntimeError("No active style context")
+        base_keys, base_values = self._base_projections()
+        weights = self.base_mix_logits[index].float().softmax(dim=0)
+        key = sum(
+            weight.to(value.dtype) * value
+            for weight, value in zip(weights, base_keys, strict=True)
+        )
+        value = sum(
+            weight.to(item.dtype) * item
+            for weight, item in zip(weights, base_values, strict=True)
+        )
+        key = key + self.delta_scale * self.delta_k_up[index](
+            self.delta_k_down[index](self._style_context)
+        )
+        value = value + self.delta_scale * self.delta_v_up[index](
+            self.delta_v_down[index](self._style_context)
+        )
+        key = rearrange(
+            key, "b s (h d) -> b s h d",
+            h=cross_attention.n_heads, d=cross_attention.head_dim,
+        )
+        value = rearrange(
+            value, "b s (h d) -> b s h d",
+            h=cross_attention.n_heads, d=cross_attention.head_dim,
+        )
+        return cross_attention.k_norm(key), cross_attention.v_norm(value)
+
+    def runtime_stats(self) -> dict[str, float]:
+        result = super().runtime_stats()
+        probabilities = self.base_mix_logits.detach().float().softmax(dim=-1)
+        entropy = -(probabilities * probabilities.clamp_min(1e-8).log()).sum(dim=-1)
+        result.update({
+            "style_base_mix_entropy": float(entropy.mean()),
+            "style_base_mix_assigned_probability": float(
+                probabilities[
+                    torch.arange(self.blocks, device=probabilities.device),
+                    self.block_to_base,
+                ].mean()
+            ),
+        })
+        return result

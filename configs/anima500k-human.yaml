@@ -3820,7 +3820,7 @@ real_artist_teacher:
 # Detail-preserving typed-slot, separate-softmax Style Cross-Attention v1.
 # Contract: docs/detail_preserving_style_cross_attention_plan.md
 detail_preserving_style_cross_attention:
-  output_directory: detail_preserving_style_cross_attention_v1_10k_retry1
+  output_directory: detail_preserving_style_cross_attention_shared_kv_v2_20k
   seed: 20260819
   train_split: train
   validation_split: validation
@@ -3883,9 +3883,26 @@ detail_preserving_style_cross_attention:
     slot_type_counts: [16, 8, 4]
     strict_v1: true
   adapter:
+    architecture: shared_base_lora
     context_dim: 1024
     blocks: 28
-    initial_alpha: 1.0
+    shared_bases: 4
+    medoid_blocks: [3, 12, 18, 26]
+    block_to_base: [0, 0, 0, 0, 0, 0, 0, 0,
+                    1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+                    2, 2,
+                    3, 3, 3, 3, 3, 3, 3, 3]
+    delta_rank: 64
+    delta_scale: 1.0
+    mix_logit_scale: 4.0
+    # No alpha calibration and no weak-block suppression.  Global strength is
+    # one; this fixed profile only preserves measured inter-block scale.
+    global_gain: 1.0
+    relative_block_gain: [0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5,
+                          0.5, 0.513159, 1.262426, 1.656704, 1.659147, 1.786944,
+                          1.558835, 1.786944, 1.106528, 1.232676, 1.510143, 1.550927,
+                          1.137174, 1.786944, 1.506362, 1.649759, 0.726383, 0.730984,
+                          0.848965, 0.893472]
   block_similarity:
     output_directory: diagnostics/detail_style_block_similarity_v1
     device: cuda
@@ -3922,13 +3939,18 @@ detail_preserving_style_cross_attention:
       - synthetic_teacher_additional_1500x6/dual_query_reference_tokens_v8_step10000
   training:
     device: cuda
-    steps: 10000
+    steps: 20000
     learning_rate: 0.0001
-    kv_learning_rate: 0.00005
+    shared_kv_learning_rate: 0.00005
+    block_delta_learning_rate: 0.0001
+    base_mix_learning_rate: 0.00002
     betas: [0.9, 0.95]
     adam_eps: 0.00000001
     weight_decay: 0.01
     warmup_steps: 500
+    # The peak rate remains intact throughout self-reference alignment and the
+    # first 6k fully held-out steps; cosine decay begins only at step 12k.
+    lr_decay_start_step: 12000
     minimum_lr_ratio: 0.10
     max_grad_norm: 1.0
     gradient_accumulation_steps: 4
@@ -3958,7 +3980,7 @@ detail_preserving_style_cross_attention:
         max_references: 4
         reference_count_weights: [0.50, 0.35, 0.0, 0.15]
       - name: heldout_1_2_4_8
-        end_step: 10000
+        end_step: 20000
         min_references: 1
         max_references: 8
         reference_count_weights: [0.45, 0.30, 0.0, 0.17, 0.0, 0.0, 0.0, 0.08]
@@ -4020,7 +4042,7 @@ detail_preserving_style_cross_attention:
       common_output_denominator: teacher_centered_rms
       common_output_threshold_start: 0.85
       common_output_threshold_end: 0.60
-      common_output_threshold_end_step: 10000
+      common_output_threshold_end_step: 20000
       centered_energy_start_step: 500
       centered_energy_ramp_end_step: 1500
       centered_energy_ratio_start: 0.30
@@ -4043,8 +4065,8 @@ detail_preserving_style_cross_attention:
     wandb:
       enabled: true
       project: anima-style-adapter
-      name: detail-preserving-style-cross-attention-v1-10k-teacher-rms
-      id: detail-preserving-style-cross-attention-v1-10k-teacher-rms
+      name: detail-style-shared-kv-v2-20k-megastyle15
+      id: detail-style-shared-kv-v2-20k-megastyle15
   sampling:
     width: 768
     height: 768

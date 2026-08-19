@@ -10,8 +10,12 @@ from torch import nn  # noqa: E402
 from anima_style_data.detail_style_cross_attention import (  # noqa: E402
     DetailPreservingTypedSlotReader,
     FreshKVStyleCrossAttention,
+    SharedBaseKVStyleCrossAttention,
 )
-from anima_style_data.detail_style_training import _audit_student_prompts  # noqa: E402
+from anima_style_data.detail_style_training import (  # noqa: E402
+    _audit_student_prompts,
+    _delayed_learning_rate_multiplier,
+)
 
 
 class _CountingLinear(nn.Linear):
@@ -208,6 +212,66 @@ def test_same_q_internal_teacher_produces_live_gradient_and_calibrates_alpha():
     assert metrics["internal_teacher_cosine"].isfinite()
     assert len(calibration["alpha"]) == 2
     assert all(0 <= value <= 2.0 for value in calibration["alpha"])
+
+
+def test_shared_native_bases_are_cached_and_block_deltas_train():
+    torch.manual_seed(113)
+    anima = _Anima().requires_grad_(False)
+    adapter = SharedBaseKVStyleCrossAttention(
+        context_dim=6,
+        blocks=2,
+        shared_bases=2,
+        medoid_blocks=(0, 1),
+        block_to_base=(0, 1),
+        delta_rank=3,
+        global_gain=1.0,
+        relative_block_gain=(0.75, 1.25),
+    )
+    adapter.initialize_from_anima(anima)
+
+    torch.testing.assert_close(
+        adapter.base_k[0].weight, anima.blocks[0].cross_attn.k_proj.weight
+    )
+    torch.testing.assert_close(
+        adapter.base_v[1].weight, anima.blocks[1].cross_attn.v_proj.weight
+    )
+    assert all(torch.count_nonzero(module.weight) == 0 for module in adapter.delta_k_up)
+    assert all(torch.count_nonzero(module.weight) == 0 for module in adapter.delta_v_up)
+    torch.testing.assert_close(adapter.alpha, torch.tensor([0.75, 1.25]))
+
+    calls = [0, 0, 0, 0]
+    hooks = []
+    for index, module in enumerate([*adapter.base_k, *adapter.base_v]):
+        hooks.append(module.register_forward_hook(
+            lambda _module, _inputs, _output, index=index: calls.__setitem__(
+                index, calls[index] + 1
+            )
+        ))
+    style = torch.randn(2, 3, 6)
+    adapter.set_style_context(style)
+    outputs = []
+    for index, block in enumerate(anima.blocks):
+        outputs.append(adapter.merged_cross_attention(
+            index, torch.randn(2, 5, 8), torch.randn(2, 4, 6),
+            block.cross_attn, None,
+        ))
+    sum(output.square().mean() for output in outputs).backward()
+    for hook in hooks:
+        hook.remove()
+
+    assert calls == [1, 1, 1, 1]
+    assert adapter.base_k[0].weight.grad is not None
+    assert adapter.delta_k_up[0].weight.grad is not None
+    assert adapter.delta_v_up[1].weight.grad is not None
+    assert adapter.base_mix_logits.grad is not None
+    assert all(block.cross_attn.k_proj.weight.grad is None for block in anima.blocks)
+
+
+def test_delayed_lr_holds_peak_until_requested_decay_step():
+    assert _delayed_learning_rate_multiplier(250, 20_000, 500, 12_000, 0.1) == 0.5
+    assert _delayed_learning_rate_multiplier(6_000, 20_000, 500, 12_000, 0.1) == 1.0
+    assert _delayed_learning_rate_multiplier(12_000, 20_000, 500, 12_000, 0.1) == 1.0
+    assert _delayed_learning_rate_multiplier(20_000, 20_000, 500, 12_000, 0.1) == pytest.approx(0.1)
 
 
 def test_student_prompt_audit_uses_tag_boundaries_not_substrings():
