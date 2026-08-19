@@ -3993,6 +3993,7 @@ detail_preserving_style_cross_attention:
     sample_every: 500
     fixed_sample_every: 1000
     fixed_sample_strengths: [1.0, 1.5, 2.0]
+    fixed_sample_backfill_steps: [8500]
     resume: true
     wandb:
       enabled: true

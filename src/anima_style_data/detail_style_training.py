@@ -1140,10 +1140,19 @@ def backfill_detail_style_fixed_samples(
     output = destination / str(cfg["output_directory"])
     checkpoint_dir = output / "checkpoints"
     checkpoints = sorted(checkpoint_dir.glob("step-*.pt"))
-    checkpoints = [
-        path for path in checkpoints
-        if int(path.stem.removeprefix("step-")) % every == 0
-    ]
+    requested_steps = {
+        int(value) for value in training.get("fixed_sample_backfill_steps", [])
+    }
+    if requested_steps:
+        checkpoints = [
+            path for path in checkpoints
+            if int(path.stem.removeprefix("step-")) in requested_steps
+        ]
+    else:
+        checkpoints = [
+            path for path in checkpoints
+            if int(path.stem.removeprefix("step-")) % every == 0
+        ]
     if not checkpoints:
         raise FileNotFoundError(f"No {every}-step checkpoints in {checkpoint_dir}")
 
