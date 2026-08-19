@@ -174,25 +174,19 @@ def _select_styles(
     # content-controlled validation split.
     remaining = selected_content_counts.copy()
     validation: set[int] = set()
-    validation_order = sorted(
-        selected_indices,
-        key=lambda index: (
-            -sum(selected_content_counts[value] > 1 for value in styles[index]["contents"]),
-            tie_breakers[index],
-        ),
-    )
-    for index in validation_order:
-        if len(validation) >= validation_styles:
-            break
-        if all(remaining[content] >= 2 for content in styles[index]["contents"]):
-            validation.add(index)
-            for content in styles[index]["contents"]:
-                remaining[content] -= 1
-    if len(validation) != validation_styles:
-        raise RuntimeError(
-            f"Could only form {len(validation)}/{validation_styles} content-overlap "
-            "validation styles"
+    validation_candidates = set(selected_indices)
+    while len(validation) < validation_styles:
+        index = min(
+            validation_candidates,
+            key=lambda value: (
+                -sum(remaining[content] >= 2 for content in styles[value]["contents"]),
+                tie_breakers[value],
+            ),
         )
+        validation_candidates.remove(index)
+        validation.add(index)
+        for content in styles[index]["contents"]:
+            remaining[content] -= 1
 
     records = []
     for style_rank, index in enumerate(selected_indices):
