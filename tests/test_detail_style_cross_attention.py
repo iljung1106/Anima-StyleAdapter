@@ -14,6 +14,7 @@ from anima_style_data.detail_style_cross_attention import (  # noqa: E402
 )
 from anima_style_data.detail_style_training import (  # noqa: E402
     _audit_student_prompts,
+    _compose_separate_text_style_guidance,
     _delayed_learning_rate_multiplier,
     _minimal_native_teacher_objective,
 )
@@ -355,6 +356,23 @@ def test_delayed_lr_holds_peak_until_requested_decay_step():
     assert _delayed_learning_rate_multiplier(6_000, 20_000, 500, 12_000, 0.1) == 1.0
     assert _delayed_learning_rate_multiplier(12_000, 20_000, 500, 12_000, 0.1) == 1.0
     assert _delayed_learning_rate_multiplier(20_000, 20_000, 500, 12_000, 0.1) == pytest.approx(0.1)
+
+
+def test_separate_style_guidance_is_not_scaled_by_text_cfg():
+    negative = torch.tensor([1.0, 2.0])
+    positive = torch.tensor([3.0, 5.0])
+    styled = torch.tensor([4.0, 9.0])
+
+    result = _compose_separate_text_style_guidance(
+        negative,
+        positive,
+        styled,
+        text_cfg=4.0,
+        style_strength=1.5,
+    )
+
+    expected = negative + 4.0 * (positive - negative) + 1.5 * (styled - positive)
+    assert torch.equal(result, expected)
 
 
 def test_minimal_teacher_projection_prevents_zero_output_without_total_rms_fix():

@@ -748,10 +748,6 @@ def _generate_fixed_reference_sample(
             batch, 1, height // 8, width // 8,
             device=device, dtype=torch.bfloat16,
         )
-        if style is None:
-            adapter.clear_style_tokens()
-        else:
-            adapter.set_style_context(style, strength=strength)
         with torch.autocast(
             device_type=torch.device(device).type,
             dtype=torch.bfloat16,
@@ -759,19 +755,34 @@ def _generate_fixed_reference_sample(
         ):
             for index in range(len(sigmas) - 1):
                 timestep = sigmas[index].expand(batch)
-                if style is not None:
-                    adapter.set_timesteps(timestep)
-                unconditioned = anima(
+
+                adapter.clear_style_tokens()
+                negative_null = anima(
                     x, timestep, context=negative_batch,
                     padding_mask=padding_mask, target_input_ids=None,
                 ).float()
-                conditioned = anima(
+                positive_null = anima(
                     x, timestep, context=text_batch,
                     padding_mask=padding_mask, target_input_ids=None,
                 ).float()
-                velocity = unconditioned + text_cfg * (
-                    conditioned - unconditioned
-                )
+                if style is None:
+                    velocity = negative_null + text_cfg * (
+                        positive_null - negative_null
+                    )
+                else:
+                    adapter.set_style_context(style)
+                    adapter.set_timesteps(timestep)
+                    positive_style = anima(
+                        x, timestep, context=text_batch,
+                        padding_mask=padding_mask, target_input_ids=None,
+                    ).float()
+                    velocity = _compose_separate_text_style_guidance(
+                        negative_null,
+                        positive_null,
+                        positive_style,
+                        text_cfg=text_cfg,
+                        style_strength=strength,
+                    )
                 x = (
                     x.float()
                     + velocity * (sigmas[index + 1] - sigmas[index]).float()
@@ -877,6 +888,27 @@ def _fixed_sample_complete(
     expected = {f"{value:g}x" for value in strengths}
     return set(sheets) == expected and all(
         Path(path).exists() for path in sheets.values()
+    )
+
+
+def _compose_separate_text_style_guidance(
+    negative_null: torch.Tensor,
+    positive_null: torch.Tensor,
+    positive_style: torch.Tensor,
+    *,
+    text_cfg: float,
+    style_strength: float,
+) -> torch.Tensor:
+    """Combine text and style guidance without applying text CFG to style.
+
+    The style branch is defined relative to the same positive-text trajectory,
+    so ``style_strength=1`` has the same meaning as val/functional/panel.
+    """
+
+    return (
+        negative_null
+        + float(text_cfg) * (positive_null - negative_null)
+        + float(style_strength) * (positive_style - positive_null)
     )
 
 
