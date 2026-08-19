@@ -485,6 +485,12 @@ def _calibrate_alpha(
     device: str,
     batches: int,
     training: dict[str, Any],
+    *,
+    reset_alpha: bool = True,
+    inject_style: bool = False,
+    apply_alpha: bool = True,
+    recommended_lower_multiplier: float = 1.5,
+    recommended_upper_multiplier: float = 1.5,
 ) -> dict[str, Any]:
     bin_edges = tuple(
         float(value)
@@ -493,7 +499,12 @@ def _calibrate_alpha(
             (0.0, 0.325, 0.625, 0.86, 1.000001),
         )
     )
-    adapter.begin_alpha_calibration(timestep_bin_edges=bin_edges)
+    adapter.begin_alpha_calibration(
+        timestep_bin_edges=bin_edges,
+        reset_alpha=reset_alpha,
+        inject_style=inject_style,
+    )
+    reader_was_training = reader.training
     reader.eval()
     content_count = int(bank.tensors["noisy_inputs"].shape[0])
     timestep_count = int(bank.tensors["noisy_inputs"].shape[1])
@@ -549,8 +560,11 @@ def _calibrate_alpha(
         maximum=float(training.get("alpha_calibration_maximum", 2.0)),
         relative_block_gain=relative,
         global_gain=float(getattr(adapter, "global_gain", 1.0)),
+        apply_alpha=apply_alpha,
+        recommended_lower_multiplier=recommended_lower_multiplier,
+        recommended_upper_multiplier=recommended_upper_multiplier,
     )
-    reader.train()
+    reader.train(reader_was_training)
     return result
 
 
@@ -1243,6 +1257,122 @@ def train_detail_style_cross_attention(
     }
     write_json(output / "summary.json", result)
     return result
+
+
+@torch.no_grad()
+def profile_detail_style_block_timestep_strength(
+    config: dict[str, Any], destination: Path
+) -> dict[str, Any]:
+    """Measure clean-path native and adapter effects for every block/timestep bin."""
+
+    cfg = copy.deepcopy(config["detail_preserving_style_cross_attention"])
+    training = dict(cfg["training"])
+    profile = dict(cfg.get("strength_profile", {}))
+    device = str(profile.get("device", training.get("device", "cuda")))
+    seed = int(profile.get("seed", cfg.get("seed", 20260819)))
+    torch.manual_seed(seed)
+
+    bank_key = str(cfg["teacher"].get("bank_config_key", "dual_domain_native_teacher"))
+    bank = NativeCenteredTeacherBank.load(
+        config, destination, config_key=bank_key
+    )
+    contexts = NativeArtistContextCache(
+        destination / str(cfg["teacher"]["context_cache"]),
+        capacity=int(cfg["teacher"].get("context_lru_shards", 8)),
+    )
+    synthetic_roots = [
+        destination / str(value) for value in cfg["teacher"]["reference_caches"]
+    ]
+    loader = CachedTeacherReferenceLoader(
+        synthetic_roots,
+        split="train",
+        style_ids=list(bank.summary["train_style_ids"]),
+        batch_size=int(profile.get("batch_size", 4)),
+        references=int(profile.get("references", 4)),
+        seed=seed ^ 0xB10C7A9,
+        token_lru_shards=int(cfg["teacher"].get("reference_lru_shards", 8)),
+        strict_style_ids=False,
+    )
+
+    anima = _resolve_anima_model(config, destination, device).requires_grad_(False).eval()
+    _optimize_frozen_anima(
+        anima,
+        low_precision_rmsnorm=bool(training.get("low_precision_rmsnorm", True)),
+        fuse_attention_projections=bool(training.get("fuse_attention_projections", True)),
+    )
+    reader = DetailPreservingTypedSlotReader(**dict(cfg["model"])).to(device).eval()
+    adapter = _build_style_adapter(cfg).to(device).eval()
+    attach_same_q_style_adapter(anima, adapter)
+
+    training_output = destination / str(cfg["output_directory"])
+    checkpoint_value = str(
+        profile.get("checkpoint", "checkpoints/step-0001000.pt")
+    )
+    checkpoint = Path(checkpoint_value)
+    if not checkpoint.is_absolute():
+        checkpoint = training_output / checkpoint
+    if not checkpoint.exists():
+        raise FileNotFoundError(checkpoint)
+    state = torch.load(checkpoint, map_location="cpu", weights_only=False)
+    reader.load_state_dict(state["reader"], strict=True)
+    adapter.load_state_dict(state["adapter"], strict=True)
+    checkpoint_step = int(state.get("step", 0))
+    del state
+
+    profile_training = dict(training)
+    profile_training["alpha_calibration_timestep_bin_edges"] = profile.get(
+        "timestep_bin_edges",
+        training.get(
+            "alpha_calibration_timestep_bin_edges",
+            [0.0, 0.325, 0.625, 0.86, 1.000001],
+        ),
+    )
+    result = _calibrate_alpha(
+        anima,
+        reader,
+        adapter,
+        bank,
+        contexts,
+        loader,
+        device,
+        int(profile.get("probe_batches", 128)),
+        profile_training,
+        reset_alpha=False,
+        inject_style=False,
+        apply_alpha=False,
+        recommended_lower_multiplier=float(
+            profile.get("recommended_lower_multiplier", 1.5)
+        ),
+        recommended_upper_multiplier=float(
+            profile.get("recommended_upper_multiplier", 1.5)
+        ),
+    )
+    result.update({
+        "checkpoint": str(checkpoint),
+        "checkpoint_step": checkpoint_step,
+        "probe_batches": int(profile.get("probe_batches", 128)),
+        "batch_size": loader.batch_size,
+        "references": int(profile.get("references", 4)),
+        "clean_frozen_anima_path": True,
+    })
+    output = destination / str(
+        profile.get(
+            "output_directory",
+            "diagnostics/detail_style_block_timestep_strength_v1",
+        )
+    )
+    output.mkdir(parents=True, exist_ok=True)
+    write_json(output / "profile.json", result)
+    summary = {
+        "output": str(output / "profile.json"),
+        "checkpoint_step": checkpoint_step,
+        "probe_batches": result["probe_batches"],
+        "batch_size": result["batch_size"],
+        "timestep_bins": len(result["block_timestep_profiles"]),
+        "blocks": adapter.blocks,
+    }
+    write_json(output / "summary.json", summary)
+    return summary
 
 
 def smoke_test_detail_style_cross_attention(

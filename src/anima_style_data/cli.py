@@ -117,6 +117,10 @@ def build_parser() -> argparse.ArgumentParser:
             "Backfill fixed TestSample1-7 panels from detail-style checkpoints",
         ),
         (
+            "detail-style-strength-profile",
+            "Measure clean-path block-by-timestep native/style residual distributions",
+        ),
+        (
             "detail-style-smoke",
             "Run two real detail-preserving Style Cross-Attention steps",
         ),
@@ -391,6 +395,7 @@ def main() -> None:
         "detail-style-train",
         "detail-style-block-similarity",
         "detail-style-fixed-samples",
+        "detail-style-strength-profile",
         "detail-style-smoke",
     }:
         from .detail_style_teacher_context import (
@@ -398,6 +403,7 @@ def main() -> None:
         )
         from .detail_style_training import (
             backfill_detail_style_fixed_samples,
+            profile_detail_style_block_timestep_strength,
             smoke_test_detail_style_cross_attention,
             train_detail_style_cross_attention,
         )
@@ -410,6 +416,9 @@ def main() -> None:
             "detail-style-train": train_detail_style_cross_attention,
             "detail-style-block-similarity": analyze_anima_block_similarity,
             "detail-style-fixed-samples": backfill_detail_style_fixed_samples,
+            "detail-style-strength-profile": (
+                profile_detail_style_block_timestep_strength
+            ),
             "detail-style-smoke": smoke_test_detail_style_cross_attention,
         }[args.command]
         _run(stage, config, destination)

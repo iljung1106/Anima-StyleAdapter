@@ -404,15 +404,26 @@ class FreshKVStyleCrossAttention(nn.Module):
         self._style_strength = 1.0
         self._teacher_context: torch.Tensor | None = None
         self._pending_internal: dict[
-            int, tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+            int,
+            tuple[
+                torch.Tensor,
+                torch.Tensor,
+                torch.Tensor,
+                torch.Tensor | None,
+            ],
         ] = {}
         self._internal_terms: list[tuple[int, dict[str, torch.Tensor]]] = []
         self._calibration = False
         self._calibration_bin_edges: tuple[float, ...] = (0.0, 1.000001)
         self._calibration_bin_index: int | None = None
+        self._calibration_inject_style = False
         self._calibration_teacher: list[list[list[torch.Tensor]]] = []
         self._calibration_student: list[list[list[torch.Tensor]]] = []
+        self._calibration_raw_residual: list[list[list[torch.Tensor]]] = []
         self._calibration_raw_attention: list[list[list[torch.Tensor]]] = []
+        self._calibration_cosine: list[list[list[torch.Tensor]]] = []
+        self._calibration_aligned_rms: list[list[list[torch.Tensor]]] = []
+        self._calibration_orthogonal_rms: list[list[list[torch.Tensor]]] = []
         self._runtime_ratios: list[torch.Tensor | None] = [None] * blocks
         self._initialized = False
 
@@ -484,6 +495,8 @@ class FreshKVStyleCrossAttention(nn.Module):
         self,
         *,
         timestep_bin_edges: tuple[float, ...] = (0.0, 1.000001),
+        reset_alpha: bool = True,
+        inject_style: bool = False,
     ) -> None:
         edges = tuple(float(value) for value in timestep_bin_edges)
         if len(edges) < 2 or any(
@@ -494,6 +507,7 @@ class FreshKVStyleCrossAttention(nn.Module):
         self._calibration = True
         self._calibration_bin_edges = edges
         self._calibration_bin_index = None
+        self._calibration_inject_style = bool(inject_style)
         bins = len(edges) - 1
         self._calibration_teacher = [
             [[] for _ in range(bins)] for _ in range(self.blocks)
@@ -501,13 +515,27 @@ class FreshKVStyleCrossAttention(nn.Module):
         self._calibration_student = [
             [[] for _ in range(bins)] for _ in range(self.blocks)
         ]
+        self._calibration_raw_residual = [
+            [[] for _ in range(bins)] for _ in range(self.blocks)
+        ]
         self._calibration_raw_attention = [
             [[] for _ in range(bins)] for _ in range(self.blocks)
         ]
-        # Calibration measures the raw alpha=1 branch.  The resulting absolute
-        # teacher/raw ratio is combined with only the normalized *relative*
-        # block profile and the independent global strength afterwards.
-        self.alpha.fill_(1.0)
+        self._calibration_cosine = [
+            [[] for _ in range(bins)] for _ in range(self.blocks)
+        ]
+        self._calibration_aligned_rms = [
+            [[] for _ in range(bins)] for _ in range(self.blocks)
+        ]
+        self._calibration_orthogonal_rms = [
+            [[] for _ in range(bins)] for _ in range(self.blocks)
+        ]
+        # Measure hypothetical style effects on the clean frozen-Anima path.
+        # Injecting alpha=1 into early blocks would corrupt the queries used to
+        # measure every later block.  ``inject_style`` exists only for explicit
+        # diagnostics of that old behaviour.
+        if reset_alpha:
+            self.alpha.fill_(1.0)
 
     def set_alpha_calibration_timestep(self, timestep: float) -> None:
         if not self._calibration:
@@ -525,6 +553,9 @@ class FreshKVStyleCrossAttention(nn.Module):
         maximum: float = 2.0,
         relative_block_gain: torch.Tensor | None = None,
         global_gain: float = 1.0,
+        apply_alpha: bool = True,
+        recommended_lower_multiplier: float = 1.5,
+        recommended_upper_multiplier: float = 1.5,
     ) -> dict[str, Any]:
         if not self._calibration:
             raise RuntimeError("Alpha calibration was not started")
@@ -536,26 +567,57 @@ class FreshKVStyleCrossAttention(nn.Module):
             (bins, self.blocks), float("nan"), device=self.alpha.device
         )
         student_by_bin = torch.full_like(teacher_by_bin, float("nan"))
+        raw_residual_by_bin = torch.full_like(teacher_by_bin, float("nan"))
         raw_attention_by_bin = torch.full_like(teacher_by_bin, float("nan"))
         per_bin_ratio = torch.full_like(teacher_by_bin, float("nan"))
+        cell_values: list[list[dict[str, torch.Tensor] | None]] = [
+            [None for _ in range(self.blocks)] for _ in range(bins)
+        ]
         base_alpha = torch.empty_like(self.alpha.float())
         for block in range(self.blocks):
             ratios = []
             for bin_index in range(bins):
                 teacher_values = self._calibration_teacher[block][bin_index]
                 student_values = self._calibration_student[block][bin_index]
+                raw_residual_values = self._calibration_raw_residual[block][bin_index]
                 attention_values = self._calibration_raw_attention[block][bin_index]
-                if not teacher_values or not student_values or not attention_values:
+                cosine_values = self._calibration_cosine[block][bin_index]
+                aligned_values = self._calibration_aligned_rms[block][bin_index]
+                orthogonal_values = self._calibration_orthogonal_rms[block][bin_index]
+                if (
+                    not teacher_values
+                    or not student_values
+                    or not raw_residual_values
+                    or not attention_values
+                ):
                     continue
-                teacher = torch.stack(teacher_values).median().float()
-                student = torch.stack(student_values).median().float()
-                attention = torch.stack(attention_values).median().float()
-                ratio = teacher / student.clamp_min(1e-8)
+                teacher_samples = torch.cat(teacher_values).float()
+                student_samples = torch.cat(student_values).float()
+                raw_residual_samples = torch.cat(raw_residual_values).float()
+                attention_samples = torch.cat(attention_values).float()
+                cosine_samples = torch.cat(cosine_values).float()
+                aligned_samples = torch.cat(aligned_values).float()
+                orthogonal_samples = torch.cat(orthogonal_values).float()
+                teacher = teacher_samples.median()
+                student = student_samples.median()
+                raw_residual = raw_residual_samples.median()
+                attention = attention_samples.median()
+                ratio = teacher / raw_residual.clamp_min(1e-8)
                 teacher_by_bin[bin_index, block] = teacher
                 student_by_bin[bin_index, block] = student
+                raw_residual_by_bin[bin_index, block] = raw_residual
                 raw_attention_by_bin[bin_index, block] = attention
                 per_bin_ratio[bin_index, block] = ratio
                 ratios.append(ratio)
+                cell_values[bin_index][block] = {
+                    "native": teacher_samples,
+                    "effective": student_samples,
+                    "raw_residual": raw_residual_samples,
+                    "raw_attention": attention_samples,
+                    "cosine": cosine_samples,
+                    "aligned_rms": aligned_samples,
+                    "orthogonal_rms": orthogonal_samples,
+                }
             if not ratios:
                 raise RuntimeError(
                     f"Alpha calibration did not observe Anima block {block}"
@@ -574,7 +636,8 @@ class FreshKVStyleCrossAttention(nn.Module):
         alpha = (
             base_alpha * relative * float(global_gain)
         ).clamp(min=float(minimum), max=float(maximum))
-        self.alpha.copy_(alpha.to(self.alpha))
+        if apply_alpha:
+            self.alpha.copy_(alpha.to(self.alpha))
         self._calibration = False
         self._calibration_bin_index = None
 
@@ -584,12 +647,66 @@ class FreshKVStyleCrossAttention(nn.Module):
                 for row in values.detach().cpu()
             ]
 
+        profiles = []
+        for bin_index, (left, right) in enumerate(
+            zip(
+                self._calibration_bin_edges[:-1],
+                self._calibration_bin_edges[1:],
+                strict=True,
+            )
+        ):
+            blocks = []
+            for block, values in enumerate(cell_values[bin_index]):
+                if values is None:
+                    continue
+
+                def distribution(name: str) -> dict[str, float]:
+                    samples = values[name]
+                    return {
+                        "mean": float(samples.mean()),
+                        "median": float(samples.median()),
+                        "p25": float(samples.quantile(0.25)),
+                        "p75": float(samples.quantile(0.75)),
+                        "p95": float(samples.quantile(0.95)),
+                        "maximum": float(samples.max()),
+                    }
+
+                native = distribution("native")
+                blocks.append({
+                    "block": block,
+                    "samples": int(values["native"].numel()),
+                    "native_residual_rms": native,
+                    "effective_style_residual_rms": distribution("effective"),
+                    "raw_style_residual_rms": distribution("raw_residual"),
+                    "raw_style_attention_rms": distribution("raw_attention"),
+                    "student_teacher_cosine": distribution("cosine"),
+                    "teacher_aligned_style_rms": distribution("aligned_rms"),
+                    "orthogonal_style_rms": distribution("orthogonal_rms"),
+                    "recommended_lower": (
+                        float(recommended_lower_multiplier) * native["median"]
+                    ),
+                    "recommended_upper": (
+                        float(recommended_upper_multiplier) * native["p95"]
+                    ),
+                })
+            profiles.append({
+                "bin": bin_index,
+                "timestep_min": left,
+                "timestep_max": right,
+                "blocks": blocks,
+            })
+
         result = {
             "timestep_bin_edges": list(self._calibration_bin_edges),
             "native_artist_residual_rms_by_timestep_bin": serializable(
                 teacher_by_bin
             ),
-            "raw_style_residual_rms_by_timestep_bin": serializable(student_by_bin),
+            "effective_style_residual_rms_by_timestep_bin": serializable(
+                student_by_bin
+            ),
+            "raw_style_residual_rms_by_timestep_bin": serializable(
+                raw_residual_by_bin
+            ),
             "raw_style_attention_rms_by_timestep_bin": serializable(
                 raw_attention_by_bin
             ),
@@ -600,10 +717,18 @@ class FreshKVStyleCrossAttention(nn.Module):
             "minimum_alpha": float(minimum),
             "maximum_alpha": float(maximum),
             "alpha": alpha.detach().cpu().tolist(),
+            "alpha_applied": bool(apply_alpha),
+            "recommended_lower_multiplier": float(recommended_lower_multiplier),
+            "recommended_upper_multiplier": float(recommended_upper_multiplier),
+            "block_timestep_profiles": profiles,
         }
         self._calibration_teacher = []
         self._calibration_student = []
+        self._calibration_raw_residual = []
         self._calibration_raw_attention = []
+        self._calibration_cosine = []
+        self._calibration_aligned_rms = []
+        self._calibration_orthogonal_rms = []
         return result
 
     def _style_kv(
@@ -683,7 +808,12 @@ class FreshKVStyleCrossAttention(nn.Module):
         alpha = self.alpha[block_index].to(style_attended.dtype) * float(
             self._style_strength
         )
-        merged = text_attended + alpha * style_attended
+        effective_style_attended = alpha * style_attended
+        merged = text_attended + (
+            effective_style_attended
+            if not self._calibration or self._calibration_inject_style
+            else torch.zeros_like(effective_style_attended)
+        )
         text_rms = text_attended.detach().float().square().mean().sqrt().clamp_min(1e-8)
         self._runtime_ratios[block_index] = (
             (alpha * style_attended.detach()).float().square().mean().sqrt() / text_rms
@@ -702,10 +832,15 @@ class FreshKVStyleCrossAttention(nn.Module):
                 cross_attention, teacher_attended - text_attended
             )
             student_delta = self._native_output_weight(
-                cross_attention, alpha * style_attended
+                cross_attention, effective_style_attended
+            )
+            raw_delta = (
+                self._native_output_weight(cross_attention, style_attended)
+                if self._calibration
+                else None
             )
             self._pending_internal[block_index] = (
-                student_delta, teacher_delta, style_attended
+                student_delta, teacher_delta, style_attended, raw_delta
             )
         return cross_attention.output_dropout(cross_attention.output_proj(merged))
 
@@ -718,13 +853,15 @@ class FreshKVStyleCrossAttention(nn.Module):
         pair = self._pending_internal.pop(block_index, None)
         if pair is None:
             return
-        student, teacher, raw_style_attention = pair
+        student, teacher, raw_style_attention, raw_style_residual = pair
         frames, height, width = spatial_shape
         gate = gate_cross.expand(-1, frames, height, width, -1).reshape(
             student.shape[0], -1, student.shape[-1]
         )
         student = student * gate
         teacher = teacher * gate
+        if raw_style_residual is not None:
+            raw_style_residual = raw_style_residual * gate
         if student.shape[0] > 1:
             student = student - student.mean(dim=0, keepdim=True)
             teacher = teacher - teacher.mean(dim=0, keepdim=True)
@@ -738,14 +875,45 @@ class FreshKVStyleCrossAttention(nn.Module):
             raw_attention_rms = raw_style_attention.detach().float().square().mean(
                 dim=dimensions
             ).sqrt()
+            assert raw_style_residual is not None
+            raw_residual_rms = raw_style_residual.detach().float().square().mean(
+                dim=dimensions
+            ).sqrt()
+            student_flat = student.detach().float().flatten(1)
+            teacher_flat = teacher.detach().float().flatten(1)
+            teacher_energy = teacher_flat.square().sum(dim=1).clamp_min(1e-8)
+            projection_coefficient = (
+                (student_flat * teacher_flat).sum(dim=1) / teacher_energy
+            )
+            cosine = F.cosine_similarity(
+                student_flat, teacher_flat, dim=1, eps=1e-8
+            )
+            aligned_rms = projection_coefficient.clamp_min(0) * teacher_rms
+            projected = teacher * projection_coefficient.reshape(-1, 1, 1)
+            orthogonal_rms = (
+                (student.detach().float() - projected).square()
+                .mean(dim=dimensions).sqrt()
+            )
             self._calibration_teacher[block_index][bin_index].append(
-                teacher_rms.median().detach()
+                teacher_rms.detach()
             )
             self._calibration_student[block_index][bin_index].append(
-                student_rms.median().detach()
+                student_rms.detach()
+            )
+            self._calibration_raw_residual[block_index][bin_index].append(
+                raw_residual_rms.detach()
             )
             self._calibration_raw_attention[block_index][bin_index].append(
-                raw_attention_rms.median().detach()
+                raw_attention_rms.detach()
+            )
+            self._calibration_cosine[block_index][bin_index].append(
+                cosine.detach()
+            )
+            self._calibration_aligned_rms[block_index][bin_index].append(
+                aligned_rms.detach()
+            )
+            self._calibration_orthogonal_rms[block_index][bin_index].append(
+                orthogonal_rms.detach()
             )
         scale = teacher_rms.clamp_min(1e-4)
         broadcast = scale.reshape(-1, 1, 1)

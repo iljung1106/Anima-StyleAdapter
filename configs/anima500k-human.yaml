@@ -3914,6 +3914,16 @@ detail_preserving_style_cross_attention:
                           1.558835, 1.786944, 1.106528, 1.232676, 1.510143, 1.550927,
                           1.137174, 1.786944, 1.506362, 1.649759, 0.726383, 0.730984,
                           0.848965, 0.893472]
+  strength_profile:
+    output_directory: diagnostics/detail_style_block_timestep_strength_v1
+    checkpoint: checkpoints/step-0001000.pt
+    device: cuda
+    probe_batches: 128
+    batch_size: 4
+    references: 4
+    timestep_bin_edges: [0.0, 0.325, 0.625, 0.86, 1.000001]
+    recommended_lower_multiplier: 1.5
+    recommended_upper_multiplier: 1.5
   block_similarity:
     output_directory: diagnostics/detail_style_block_similarity_v1
     device: cuda

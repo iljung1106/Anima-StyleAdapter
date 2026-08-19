@@ -187,14 +187,18 @@ def test_same_q_internal_teacher_produces_live_gradient_and_calibrates_alpha():
     adapter.alpha[0] = 0
 
     for block_index, block in enumerate(anima.blocks):
+        hidden = torch.randn(3, 5, 8)
+        text = torch.randn(3, 4, 6)
+        expected_clean_path = block.cross_attn(hidden, None, text)
         block.cross_attn.qkv_calls = 0
-        adapter.merged_cross_attention(
+        actual_clean_path = adapter.merged_cross_attention(
             block_index,
-            torch.randn(3, 5, 8),
-            torch.randn(3, 4, 6),
+            hidden,
+            text,
             block.cross_attn,
             None,
         )
+        torch.testing.assert_close(actual_clean_path, expected_clean_path)
         adapter.record_gated_internal_teacher(
             block_index,
             torch.ones(3, 1, 1, 1, 8),
@@ -220,6 +224,8 @@ def test_same_q_internal_teacher_produces_live_gradient_and_calibrates_alpha():
         value is not None
         for value in calibration["raw_style_attention_rms_by_timestep_bin"][1]
     )
+    assert len(calibration["block_timestep_profiles"]) == 2
+    assert calibration["block_timestep_profiles"][1]["blocks"][0]["samples"] == 3
 
 
 def test_shared_native_bases_are_cached_and_block_deltas_train():
