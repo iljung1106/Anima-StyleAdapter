@@ -1055,3 +1055,69 @@ def smoke_test_detail_style_cross_attention(
     })
     cfg["training"].setdefault("wandb", {})["enabled"] = False
     return train_detail_style_cross_attention(smoke, destination, steps_override=2)
+
+
+def backfill_detail_style_fixed_samples(
+    config: dict[str, Any], destination: Path
+) -> dict[str, Any]:
+    """Render missing fixed TestSample panels from periodic checkpoints."""
+
+    cfg = copy.deepcopy(config["detail_preserving_style_cross_attention"])
+    training = dict(cfg["training"])
+    device = str(training.get("device", "cuda"))
+    every = int(training.get("fixed_sample_every", 1000))
+    if every <= 0:
+        raise ValueError("fixed_sample_every must be positive for backfill")
+    output = destination / str(cfg["output_directory"])
+    checkpoint_dir = output / "checkpoints"
+    checkpoints = sorted(checkpoint_dir.glob("step-*.pt"))
+    checkpoints = [
+        path for path in checkpoints
+        if int(path.stem.removeprefix("step-")) % every == 0
+    ]
+    if not checkpoints:
+        raise FileNotFoundError(f"No {every}-step checkpoints in {checkpoint_dir}")
+
+    anima = _resolve_anima_model(config, destination, device).requires_grad_(False).eval()
+    _optimize_frozen_anima(
+        anima,
+        low_precision_rmsnorm=bool(training.get("low_precision_rmsnorm", True)),
+        fuse_attention_projections=bool(training.get("fuse_attention_projections", True)),
+    )
+    reader = DetailPreservingTypedSlotReader(**dict(cfg["model"])).to(device).eval()
+    adapter = FreshKVStyleCrossAttention(**dict(cfg["adapter"])).to(device).eval()
+    attach_same_q_style_adapter(anima, adapter)
+    prepared = load_dual_query_external_sample(config, destination)
+
+    generated = []
+    reused = []
+    for checkpoint in checkpoints:
+        step = int(checkpoint.stem.removeprefix("step-"))
+        summary_path = (
+            output / "external_reference_samples"
+            / f"step-{step:07d}" / "summary.json"
+        )
+        if summary_path.exists():
+            reused.append(step)
+            continue
+        state = torch.load(checkpoint, map_location="cpu", weights_only=False)
+        reader.load_state_dict(state["reader"], strict=True)
+        adapter.load_state_dict(state["adapter"], strict=True)
+        del state
+        result = _generate_fixed_reference_sample(
+            prepared, config, destination, anima, reader, adapter,
+            output, device, step,
+        )
+        generated.append({"step": step, "sheet": result["sheet"]})
+        print(
+            f"detail-style fixed-reference backfill step={step} "
+            f"sheet={result['sheet']}",
+            flush=True,
+        )
+    summary = {
+        "checkpoint_count": len(checkpoints),
+        "generated": generated,
+        "reused_steps": reused,
+    }
+    write_json(output / "external_reference_samples" / "backfill_summary.json", summary)
+    return summary

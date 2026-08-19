@@ -108,6 +108,10 @@ def build_parser() -> argparse.ArgumentParser:
             "Train detail-preserving typed-slot Style Cross-Attention",
         ),
         (
+            "detail-style-fixed-samples",
+            "Backfill fixed TestSample1-7 panels from detail-style checkpoints",
+        ),
+        (
             "detail-style-smoke",
             "Run two real detail-preserving Style Cross-Attention steps",
         ),
@@ -366,12 +370,14 @@ def main() -> None:
     elif args.command in {
         "detail-style-teacher-context-cache",
         "detail-style-train",
+        "detail-style-fixed-samples",
         "detail-style-smoke",
     }:
         from .detail_style_teacher_context import (
             cache_detail_style_teacher_contexts,
         )
         from .detail_style_training import (
+            backfill_detail_style_fixed_samples,
             smoke_test_detail_style_cross_attention,
             train_detail_style_cross_attention,
         )
@@ -381,6 +387,7 @@ def main() -> None:
                 cache_detail_style_teacher_contexts
             ),
             "detail-style-train": train_detail_style_cross_attention,
+            "detail-style-fixed-samples": backfill_detail_style_fixed_samples,
             "detail-style-smoke": smoke_test_detail_style_cross_attention,
         }[args.command]
         _run(stage, config, destination)
