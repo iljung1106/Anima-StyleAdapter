@@ -14,7 +14,6 @@ from typing import Any
 import numpy as np
 import torch
 import torch.nn.functional as F
-from torch.utils.checkpoint import checkpoint as activation_checkpoint
 
 from .artist_effect_losses import (
     centered_functional_artist_loss,
@@ -65,46 +64,6 @@ def _build_style_adapter(cfg: dict[str, Any]) -> FreshKVStyleCrossAttention:
     if architecture == "fresh_per_block":
         return FreshKVStyleCrossAttention(**adapter_cfg)
     raise ValueError(f"Unsupported style adapter architecture: {architecture}")
-
-
-def _checkpointed_style_prediction(
-    anima: torch.nn.Module,
-    adapter: FreshKVStyleCrossAttention,
-    style_tokens: torch.Tensor,
-    noisy: torch.Tensor,
-    timesteps: torch.Tensor,
-    context: torch.Tensor,
-    padding: torch.Tensor,
-) -> torch.Tensor:
-    """Run an auxiliary trainable style view without retaining DiT activations.
-
-    The primary flow graph is still alive when the heldout artist view is
-    evaluated.  Checkpointing only this auxiliary Anima pass avoids holding two
-    full DiT activation graphs at once while leaving the normal training path
-    and its throughput unchanged.
-    """
-
-    def forward(tokens: torch.Tensor, noisy_input: torch.Tensor) -> torch.Tensor:
-        adapter.set_style_context(tokens)
-        adapter.set_timesteps(timesteps)
-        try:
-            return anima(
-                noisy_input.unsqueeze(2),
-                timesteps.to(noisy_input.dtype),
-                context=context,
-                padding_mask=padding,
-                target_input_ids=None,
-            ).squeeze(2).float()
-        finally:
-            adapter.clear_style_tokens()
-
-    return activation_checkpoint(
-        forward,
-        style_tokens,
-        noisy,
-        use_reentrant=False,
-        preserve_rng_state=False,
-    )
 
 
 def _delayed_learning_rate_multiplier(
@@ -359,6 +318,7 @@ def _flow_step(
     mode: str,
     train_auxiliaries: bool,
     measure_base: bool,
+    backward_scale: float | None = None,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     latents = batch["latents"].to(device, dtype=torch.bfloat16, non_blocking=True)
     context = batch["conditioning"].to(
@@ -482,6 +442,7 @@ def _flow_step(
                 padding_mask=padding, target_input_ids=None,
             ).squeeze(2).float()
 
+    deferred_artist_effect = None
     if need_prototype or need_artist_effect:
         target_references = batch["cached_target_tokens"].to(
             device, dtype=torch.bfloat16, non_blocking=True
@@ -544,11 +505,10 @@ def _flow_step(
 
         if need_artist_effect:
             assert base_prediction is not None
-            # Exact-target style is a detached functional teacher.  Only one
-            # extra Anima graph (the heldout-reference student) is retained.
-            # This keeps the objective practical at batch four while forcing
-            # target-excluded references to reproduce the repeatable artist
-            # component rather than target-specific details.
+            # Exact-target style is a detached functional teacher.  If the
+            # primary path is not already the heldout view, defer that
+            # trainable Anima pass until after the primary graph is backwarded.
+            # Two simultaneous batch-four DiT graphs exceed an H100 80GB.
             if main_is_target:
                 target_prediction = prediction.detach()
             else:
@@ -569,62 +529,41 @@ def _flow_step(
                         adapter.clear_style_tokens()
             if main_is_heldout:
                 heldout_prediction = prediction
+                artist_effect, artist_effect_metrics = (
+                    centered_functional_artist_loss(
+                        target_prediction.detach() - base_prediction,
+                        heldout_prediction - base_prediction,
+                        style_ids,
+                        temperature=float(
+                            training.get("artist_effect_temperature", 0.10)
+                        ),
+                        pool_scales=tuple(
+                            int(value) for value in training.get(
+                                "artist_effect_pool_scales", [2, 4]
+                            )
+                        ),
+                        repeatability_weight=float(training.get(
+                            "artist_effect_repeatability_weight", 0.25
+                        )),
+                    )
+                )
+                total = total + artist_effect_weight * artist_effect
+                metrics.update(artist_effect_metrics)
+                metrics.update({
+                    "functional_artist_weight": flow_loss.new_tensor(
+                        artist_effect_weight
+                    ),
+                    "functional_artist_weighted_loss": (
+                        artist_effect_weight * artist_effect.detach()
+                    ),
+                })
             else:
-                with torch.autocast(
-                    device_type=torch.device(device).type,
-                    dtype=torch.bfloat16,
-                    enabled=torch.device(device).type == "cuda",
-                ):
-                    if bool(training.get(
-                        "artist_effect_checkpoint_student", True
-                    )):
-                        heldout_prediction = _checkpointed_style_prediction(
-                            anima,
-                            adapter,
-                            heldout_view_tokens,
-                            noisy,
-                            timesteps,
-                            context,
-                            padding,
-                        )
-                    else:
-                        adapter.set_style_context(heldout_view_tokens)
-                        adapter.set_timesteps(timesteps)
-                        try:
-                            heldout_prediction = anima(
-                                noisy.unsqueeze(2),
-                                timesteps.to(latents.dtype),
-                                context=context,
-                                padding_mask=padding,
-                                target_input_ids=None,
-                            ).squeeze(2).float()
-                        finally:
-                            adapter.clear_style_tokens()
-            artist_effect, artist_effect_metrics = centered_functional_artist_loss(
-                target_prediction.detach() - base_prediction,
-                heldout_prediction - base_prediction,
-                style_ids,
-                temperature=float(
-                    training.get("artist_effect_temperature", 0.10)
-                ),
-                pool_scales=tuple(
-                    int(value)
-                    for value in training.get("artist_effect_pool_scales", [2, 4])
-                ),
-                repeatability_weight=float(
-                    training.get("artist_effect_repeatability_weight", 0.25)
-                ),
-            )
-            total = total + artist_effect_weight * artist_effect
-            metrics.update(artist_effect_metrics)
-            metrics.update({
-                "functional_artist_weight": flow_loss.new_tensor(
-                    artist_effect_weight
-                ),
-                "functional_artist_weighted_loss": (
-                    artist_effect_weight * artist_effect.detach()
-                ),
-            })
+                deferred_artist_effect = (
+                    target_prediction.detach(),
+                    heldout_references,
+                    heldout_mask,
+                    style_ids,
+                )
     if need_wrong:
         wrong_references, wrong_mask = _reference_inputs(batch, device, "wrong_artist")
         # The wrong-reference branch is a comparator, not a target that should be
@@ -668,7 +607,65 @@ def _flow_step(
     if measure_base:
         assert base_prediction is not None
         metrics.update(_flow_metrics(prediction.detach(), base_prediction, target))
-    metrics["loss"] = total.detach()
+
+    reported_loss = total.detach()
+    if deferred_artist_effect is not None:
+        target_prediction, heldout_references, heldout_mask, style_ids = (
+            deferred_artist_effect
+        )
+        if backward_scale is not None:
+            (total * float(backward_scale)).backward()
+            total = flow_loss.new_zeros(())
+        # Recompute the inexpensive reader view after the primary backward.
+        # This also ensures no reader graph from the prototype objective is
+        # accidentally reused after its saved tensors have been released.
+        with torch.autocast(
+            device_type=torch.device(device).type,
+            dtype=torch.bfloat16,
+            enabled=torch.device(device).type == "cuda",
+        ):
+            heldout_view_tokens = reader(
+                heldout_references, heldout_mask
+            ).tokens
+            adapter.set_style_context(heldout_view_tokens)
+            adapter.set_timesteps(timesteps)
+            try:
+                heldout_prediction = anima(
+                    noisy.unsqueeze(2), timesteps.to(latents.dtype),
+                    context=context, padding_mask=padding,
+                    target_input_ids=None,
+                ).squeeze(2).float()
+            finally:
+                adapter.clear_style_tokens()
+        assert base_prediction is not None
+        artist_effect, artist_effect_metrics = centered_functional_artist_loss(
+            target_prediction - base_prediction,
+            heldout_prediction - base_prediction,
+            style_ids,
+            temperature=float(
+                training.get("artist_effect_temperature", 0.10)
+            ),
+            pool_scales=tuple(
+                int(value)
+                for value in training.get("artist_effect_pool_scales", [2, 4])
+            ),
+            repeatability_weight=float(
+                training.get("artist_effect_repeatability_weight", 0.25)
+            ),
+        )
+        weighted_artist_effect = artist_effect_weight * artist_effect
+        total = total + weighted_artist_effect
+        reported_loss = reported_loss + weighted_artist_effect.detach()
+        metrics.update(artist_effect_metrics)
+        metrics.update({
+            "functional_artist_weight": flow_loss.new_tensor(
+                artist_effect_weight
+            ),
+            "functional_artist_weighted_loss": (
+                weighted_artist_effect.detach()
+            ),
+        })
+    metrics["loss"] = reported_loss
     return total, metrics
 
 
@@ -1556,6 +1553,7 @@ def train_detail_style_cross_attention(
                     generator=generator, step=step, mode="curriculum",
                     train_auxiliaries=True,
                     measure_base=(step % log_every == 0 and micro == accumulation - 1),
+                    backward_scale=1.0 / accumulation,
                 )
                 (loss / accumulation).backward()
                 metric_rows.append(metrics)
