@@ -196,6 +196,19 @@ def _ramp(step: int, start: int, end: int, maximum: float) -> float:
     return float(maximum) * min(1.0, (step - start + 1) / max(1, end - start + 1))
 
 
+def _mean_scalar_rows(rows: list[dict[str, float]]) -> dict[str, float]:
+    """Average homogeneous scalar metric rows without flow-specific fields."""
+
+    if not rows:
+        return {}
+    keys = set().union(*(row.keys() for row in rows))
+    return {
+        key: sum(row[key] for row in rows if key in row)
+        / sum(key in row for row in rows)
+        for key in keys
+    }
+
+
 def _minimal_native_teacher_objective(
     student_delta: torch.Tensor,
     teacher_delta: torch.Tensor,
@@ -962,8 +975,8 @@ def _evaluate_artist_effect_consistency(
                 key: float(value) for key, value in effect_metrics.items()
             })
 
-    result = _mean_metrics(effect_rows)
-    result.update(_mean_metrics(prototype_rows))
+    result = _mean_scalar_rows(effect_rows)
+    result.update(_mean_scalar_rows(prototype_rows))
     result.update({
         "artists_per_probe": float(loader.batch_size),
         "random_retrieval_top1": 1.0 / max(1, loader.batch_size),
