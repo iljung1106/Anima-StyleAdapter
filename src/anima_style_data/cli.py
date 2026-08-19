@@ -57,6 +57,7 @@ def build_parser() -> argparse.ArgumentParser:
         ("deepghs", "Download eligible candidates from the indexed Danbooru2024 mirror"),
         ("anima500k-download", "Download human shards from anima-style-embedding-500k"),
         ("anima500k-extract", "Extract full human images and build a manifest"),
+        ("megastyle-download", "Download Tencent MegaStyle-1.4M Parquet shards"),
         ("dedup", "Decode, hash, remove near-duplicates, and make final manifest"),
         ("tag", "Run the WD EVA02 tagger into resumable Parquet shards"),
         ("caption", "Build ordered Anima and content caption shards"),
@@ -106,6 +107,10 @@ def build_parser() -> argparse.ArgumentParser:
         (
             "detail-style-train",
             "Train detail-preserving typed-slot Style Cross-Attention",
+        ),
+        (
+            "detail-style-block-similarity",
+            "Cluster Anima blocks for four shared Style K/V bases",
         ),
         (
             "detail-style-fixed-samples",
@@ -257,6 +262,10 @@ def main() -> None:
         _run(download_anima500k_human, config, destination)
     elif args.command == "anima500k-extract":
         _run(extract_anima500k_human, config, destination)
+    elif args.command == "megastyle-download":
+        from .megastyle import download_megastyle
+
+        _run(download_megastyle, config, destination)
     elif args.command == "dedup":
         _run(deduplicate, config, destination)
     elif args.command == "tag":
@@ -370,6 +379,7 @@ def main() -> None:
     elif args.command in {
         "detail-style-teacher-context-cache",
         "detail-style-train",
+        "detail-style-block-similarity",
         "detail-style-fixed-samples",
         "detail-style-smoke",
     }:
@@ -381,12 +391,14 @@ def main() -> None:
             smoke_test_detail_style_cross_attention,
             train_detail_style_cross_attention,
         )
+        from .block_similarity import analyze_anima_block_similarity
 
         stage = {
             "detail-style-teacher-context-cache": (
                 cache_detail_style_teacher_contexts
             ),
             "detail-style-train": train_detail_style_cross_attention,
+            "detail-style-block-similarity": analyze_anima_block_similarity,
             "detail-style-fixed-samples": backfill_detail_style_fixed_samples,
             "detail-style-smoke": smoke_test_detail_style_cross_attention,
         }[args.command]

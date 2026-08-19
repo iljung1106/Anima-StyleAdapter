@@ -8,6 +8,12 @@ anima500k:
   download_workers: 16
   extract_workers: 8
 
+megastyle:
+  repo_id: tencent/MegaStyle-1.4M
+  revision: 5625ac67efa1210e19bf138c0644b16aeaed252a
+  source_directory: ../megastyle-1.4m/source
+  download_workers: 16
+
 # Kept for the common pipeline configuration contract. Selection is already
 # encoded in the source dataset; 50 candidates are retained before dedup.
 metadata: {}
@@ -3846,6 +3852,22 @@ detail_preserving_style_cross_attention:
       short: 0.0
       empty: 0.0
     validation_quality_probability: 0.0
+  # MegaStyle caches are intentionally separate from the artist-labelled
+  # Anima corpus. Once prepared, exactly three of every 20 train microbatches
+  # come from this loader in every curriculum phase.
+  data_mixture:
+    enabled: true
+    primary_name: anima
+    auxiliary_name: megastyle
+    auxiliary_fraction: 0.15
+    loader:
+      style_cache: ../megastyle-1.4m/style_features_l18_l24_siglip_l24
+      text_cache: ../megastyle-1.4m/anima_text_cache_post_llm_multimode_v1
+      latent_cache: ../megastyle-1.4m/anima_latent_cache_qwen_2d
+      resampler_token_cache: ../megastyle-1.4m/dual_query_reference_tokens_v8_step10000
+      artist_balanced: true
+      ram_resident_tokens: false
+      token_lru_shards: 8
   model:
     dim: 1024
     spatial_tokens: 64
@@ -3864,6 +3886,20 @@ detail_preserving_style_cross_attention:
     context_dim: 1024
     blocks: 28
     initial_alpha: 1.0
+  block_similarity:
+    output_directory: diagnostics/detail_style_block_similarity_v1
+    device: cuda
+    clusters: 4
+    probe_batches: 32
+    artists_per_batch: 4
+    token_samples: 16
+    projection_dim: 256
+    seed: 20260819
+    effect_cka_weight: 0.35
+    query_cka_weight: 0.25
+    key_subspace_weight: 0.15
+    value_subspace_weight: 0.15
+    effect_rms_weight: 0.10
   teacher:
     bank_config_key: dual_domain_native_teacher
     context_cache: native_artist_post_llm_context_5000_v1

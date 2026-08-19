@@ -20,6 +20,7 @@ from .detail_style_cross_attention import (
     FreshKVStyleCrossAttention,
 )
 from .detail_style_teacher_context import NativeArtistContextCache
+from .data_mixture import ConstantRatioBatchMixer
 from .dual_query_external_samples import load_dual_query_external_sample
 from .dual_query_style_tokenizer import CachedTeacherReferenceLoader
 from .dual_query_style_training import (
@@ -98,6 +99,30 @@ def _audit_student_prompts(loader: MultiPromptDualQueryCachedStyleLoader) -> Non
             break
     if violations:
         raise RuntimeError(f"Artist leakage in student text cache: {violations}")
+
+
+def _training_loader(
+    destination: Path,
+    cfg: dict[str, Any],
+    train_cfg: dict[str, Any],
+) -> tuple[MultiPromptDualQueryCachedStyleLoader, Any]:
+    """Build the primary loader and optional constant-ratio external mixer."""
+
+    primary = MultiPromptDualQueryCachedStyleLoader(destination, train_cfg)
+    mixture = dict(cfg.get("data_mixture", {}))
+    if not bool(mixture.get("enabled", False)):
+        return primary, primary
+    auxiliary_cfg = dict(train_cfg)
+    auxiliary_cfg.update(dict(mixture["loader"]))
+    auxiliary = MultiPromptDualQueryCachedStyleLoader(destination, auxiliary_cfg)
+    mixed = ConstantRatioBatchMixer(
+        primary,
+        auxiliary,
+        auxiliary_fraction=float(mixture.get("auxiliary_fraction", 0.15)),
+        primary_name=str(mixture.get("primary_name", "anima")),
+        auxiliary_name=str(mixture.get("auxiliary_name", "megastyle")),
+    )
+    return primary, mixed
 
 
 def _reconstruction_loss(
@@ -212,6 +237,9 @@ def _flow_step(
         ),
         "style_enabled_fraction": enabled.float().mean(),
         "timestep_mean": timesteps.detach().mean(),
+        "megastyle_batch": flow_loss.new_tensor(
+            float(str(batch.get("data_domain", "anima")) == "megastyle")
+        ),
     }
     if train_auxiliaries:
         reconstruction, reconstruction_metrics = _reconstruction_loss(
@@ -745,9 +773,12 @@ def train_detail_style_cross_attention(
     validation_cfg = _loader_config(
         config, cfg, split=str(cfg.get("validation_split", "validation"))
     )
-    train_loader = MultiPromptDualQueryCachedStyleLoader(destination, train_cfg)
+    sample_train_loader, train_loader = _training_loader(
+        destination, cfg, train_cfg
+    )
     validation_loader = MultiPromptDualQueryCachedStyleLoader(destination, validation_cfg)
-    _audit_student_prompts(train_loader)
+    for loader in getattr(train_loader, "loaders", (train_loader,)):
+        _audit_student_prompts(loader)
     _audit_student_prompts(validation_loader)
 
     bank_key = str(cfg["teacher"].get("bank_config_key", "dual_domain_native_teacher"))
@@ -864,8 +895,8 @@ def train_detail_style_cross_attention(
     )
     sample_seed = int(cfg.get("sampling", {}).get("seed", seed ^ 0x5A17))
     sample_requests = [
-        ("train", train_loader, episode, sample_seed + index * 10_007)
-        for index, episode in enumerate(_select_sample_episodes(train_loader, 4))
+        ("train", sample_train_loader, episode, sample_seed + index * 10_007)
+        for index, episode in enumerate(_select_sample_episodes(sample_train_loader, 4))
     ] + [
         ("validation", validation_loader, episode, sample_seed + (index + 4) * 10_007)
         for index, episode in enumerate(_select_sample_episodes(validation_loader, 4))
