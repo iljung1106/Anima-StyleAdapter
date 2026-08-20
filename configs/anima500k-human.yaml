@@ -3830,7 +3830,7 @@ real_artist_teacher:
 # Detail-preserving typed-slot, separate-softmax Style Cross-Attention v1.
 # Contract: docs/detail_preserving_style_cross_attention_plan.md
 detail_preserving_style_cross_attention:
-  output_directory: detail_preserving_style_cross_attention_common_mag_v10_20k
+  output_directory: detail_preserving_style_cross_attention_native_mag_gain2_v11_20k
   seed: 20260819
   train_split: train
   validation_split: validation
@@ -3917,7 +3917,9 @@ detail_preserving_style_cross_attention:
     # Absolute strength is calibrated independently for every block and
     # timestep bin. global_gain is the only post-calibration strength control;
     # the old static relative_block_gain profile is deliberately disabled.
-    global_gain: 1.0
+    # Diagnostic v11: retain the calibrated block/timestep profile while
+    # doubling its absolute strength through one reversible global control.
+    global_gain: 2.0
   strength_profile:
     output_directory: diagnostics/detail_style_block_timestep_strength_v1
     checkpoint: checkpoints/step-0001000.pt
@@ -4058,17 +4060,21 @@ detail_preserving_style_cross_attention:
     # after the style branch has learned a usable direction.
     common_output_start_step: 250
     common_output_full_step: 1000
-    common_output_weight: 0.04
+    # Deliberately strong diagnostic: 30x the v10 common-output weight.
+    common_output_weight: 1.20
     common_output_threshold_start_step: 250
     common_output_threshold_end_step: 2000
     common_output_threshold_start: 0.90
     common_output_threshold_end: 0.65
-    # Preserve absolute artist-specific energy only along the centered
-    # exact-target teacher direction. Orthogonal texture noise cannot satisfy
-    # this band, and its weak upper side prevents the earlier texture blow-up.
-    artist_magnitude_start_step: 250
-    artist_magnitude_full_step: 1000
-    artist_magnitude_weight: 0.05
+    # Preserve absolute artist-specific energy only along the immutable
+    # NativeCenteredTeacherBank direction. Exact-target remains a repeatability
+    # teacher, but no longer defines the absolute artist magnitude.
+    artist_magnitude_teacher: native_centered_bank
+    artist_magnitude_start_step: 1
+    artist_magnitude_full_step: 250
+    # 15x the v10 artist-magnitude weight (0.05 -> 0.75). With the native bank
+    # selected, this is applied to its positive projection floor.
+    artist_magnitude_weight: 0.75
     artist_magnitude_lower_start_step: 250
     artist_magnitude_lower_end_step: 2000
     artist_magnitude_lower_start: 0.35
@@ -4104,10 +4110,12 @@ detail_preserving_style_cross_attention:
       residual_weight: 0.20
       native_teacher_huber_beta: 0.10
       native_teacher_scale_floor: 0.0001
-      projection_weight: 0.15
+      # Native-centered artist magnitude. This is also resolved from the
+      # top-level artist_magnitude_weight to keep a single source of truth.
+      projection_weight: 0.75
       projection_floor_start_step: 1
-      projection_floor_end_step: 1000
-      projection_floor_start: 0.25
+      projection_floor_end_step: 250
+      projection_floor_start: 0.50
       projection_floor_end: 1.0
       orthogonal_weight: 0.05
       orthogonal_ratio_maximum: 0.50
@@ -4126,8 +4134,8 @@ detail_preserving_style_cross_attention:
     wandb:
       enabled: true
       project: anima-style-adapter
-      name: detail-style-common-mag-v10-20k-anima-only
-      id: detail-style-common-mag-v10-20k-anima-only
+      name: detail-style-native-mag-gain2-v11-20k-anima-only
+      id: detail-style-native-mag-gain2-v11-20k-anima-only
   sampling:
     width: 768
     height: 768

@@ -214,6 +214,14 @@ def _weighted_artist_effect_objective(
     *,
     step: int,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    magnitude_teacher = str(
+        training.get("artist_magnitude_teacher", "exact_target")
+    )
+    if magnitude_teacher not in {"exact_target", "native_centered_bank"}:
+        raise ValueError(
+            "artist_magnitude_teacher must be exact_target or "
+            "native_centered_bank"
+        )
     pool_scales = tuple(
         int(value)
         for value in training.get("artist_effect_pool_scales", [2, 4])
@@ -268,11 +276,15 @@ def _weighted_artist_effect_objective(
         int(training.get("common_output_full_step", 1_000)),
         float(training.get("common_output_weight", 0.0)),
     )
-    magnitude_weight = _ramp(
-        step,
-        int(training.get("artist_magnitude_start_step", 250)),
-        int(training.get("artist_magnitude_full_step", 1_000)),
-        float(training.get("artist_magnitude_weight", 0.0)),
+    magnitude_weight = (
+        _ramp(
+            step,
+            int(training.get("artist_magnitude_start_step", 250)),
+            int(training.get("artist_magnitude_full_step", 1_000)),
+            float(training.get("artist_magnitude_weight", 0.0)),
+        )
+        if magnitude_teacher == "exact_target"
+        else 0.0
     )
     weighted_effect = effect_weight * effect
     weighted_common = common_weight * common_loss
@@ -299,6 +311,9 @@ def _weighted_artist_effect_objective(
         ),
         "functional_artist_magnitude_weight": effect.new_tensor(
             magnitude_weight
+        ),
+        "functional_artist_magnitude_uses_native_teacher": effect.new_tensor(
+            float(magnitude_teacher == "native_centered_bank")
         ),
         "functional_artist_magnitude_weighted_loss": (
             weighted_magnitude.detach()
@@ -519,6 +534,8 @@ def _minimal_native_teacher_objective(
         "native_teacher_projection_floor": residual.new_tensor(projection_floor),
         "native_teacher_projection_floor_loss": projection.detach(),
         "native_teacher_projection_weighted_loss": weighted_projection.detach(),
+        "native_artist_magnitude_weight": residual.new_tensor(projection_weight),
+        "native_artist_magnitude_weighted_loss": weighted_projection.detach(),
         "native_teacher_projection_coefficient": coefficient.detach().mean(),
         "native_teacher_projection_positive_fraction": (
             coefficient.detach() > 0
@@ -534,6 +551,23 @@ def _minimal_native_teacher_objective(
         ).mean(),
         "native_teacher_minimal_loss": total.detach(),
     }
+
+
+def _native_teacher_objective_config(training: dict[str, Any]) -> dict[str, Any]:
+    """Resolve the immutable native-bank magnitude objective for a teacher step."""
+
+    objective = dict(training)
+    objective.update(dict(training.get("teacher_objective", {})))
+    if str(training.get("artist_magnitude_teacher", "exact_target")) == (
+        "native_centered_bank"
+    ):
+        objective["projection_weight"] = float(
+            training.get(
+                "artist_magnitude_weight",
+                objective.get("projection_weight", 0.15),
+            )
+        )
+    return objective
 
 
 def _rho_min(step: int) -> float:
@@ -953,8 +987,7 @@ def _teacher_step(
         finally:
             adapter.clear_style_tokens()
     student = prediction - base
-    objective_cfg = dict(training)
-    objective_cfg.update(dict(training.get("teacher_objective", {})))
+    objective_cfg = _native_teacher_objective_config(training)
     final_loss, metrics = _minimal_native_teacher_objective(
         student, teacher, objective_cfg, step=step
     )

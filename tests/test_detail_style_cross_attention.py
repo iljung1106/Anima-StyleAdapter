@@ -19,6 +19,7 @@ from anima_style_data.detail_style_training import (  # noqa: E402
     _delayed_learning_rate_multiplier,
     _effect_stage_metrics,
     _minimal_native_teacher_objective,
+    _native_teacher_objective_config,
 )
 
 
@@ -452,6 +453,19 @@ def test_minimal_teacher_projection_prevents_zero_output_without_total_rms_fix()
     assert float(collapsed_metrics["native_teacher_projection_floor_loss"]) == pytest.approx(1.0)
     assert float(aligned_metrics["native_teacher_projection_coefficient"]) == pytest.approx(1.0)
     assert float(aligned_loss) < float(collapsed_loss)
+
+
+def test_native_bank_owns_artist_magnitude_weight():
+    training = {
+        "artist_magnitude_teacher": "native_centered_bank",
+        "artist_magnitude_weight": 0.75,
+        "teacher_objective": {"projection_weight": 0.15},
+    }
+
+    resolved = _native_teacher_objective_config(training)
+
+    assert resolved["projection_weight"] == pytest.approx(0.75)
+    assert training["teacher_objective"]["projection_weight"] == pytest.approx(0.15)
 
 
 def test_student_prompt_audit_uses_tag_boundaries_not_substrings():
