@@ -822,9 +822,14 @@ def _same_q_block_forward(
         w=width,
     )
     x = x + gate_self * result
+    adapter = block.__dict__["_style_controller"]()
+    record_stage = getattr(adapter, "record_diagnostic_stage", None)
+    if record_stage is not None:
+        record_stage(
+            block.__dict__["_same_q_style_block_index"], "post_self_hidden", x
+        )
 
     normalized = block.layer_norm_cross_attn(x) * (1 + scale_cross) + shift_cross
-    adapter = block.__dict__["_style_controller"]()
     set_gate_context = getattr(adapter, "set_block_gate_context", None)
     if set_gate_context is not None:
         set_gate_context(
@@ -851,7 +856,6 @@ def _same_q_block_forward(
         )
     # Native timestep-conditioned gate_cross controls the complete merged path.
     x = x + gate_cross * result
-    record_stage = getattr(adapter, "record_diagnostic_stage", None)
     if record_stage is not None:
         record_stage(
             block.__dict__["_same_q_style_block_index"], "post_cross_hidden", x

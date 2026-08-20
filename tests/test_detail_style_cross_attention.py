@@ -253,6 +253,7 @@ def test_attenuation_metrics_remove_common_output_and_pair_stage_captures():
     assert metrics["common_output_ratio"] == pytest.approx(0.8320503)
 
     recorder = _StyleAttenuationRecorder()
+    recorder(0, "post_self_hidden", torch.zeros_like(student))
     recorder(0, "post_cross_hidden", torch.zeros_like(student))
     recorder(0, "post_mlp_hidden", torch.zeros_like(student))
     recorder.record_output_stage("final_layer_norm", torch.ones_like(student))
@@ -263,13 +264,15 @@ def test_attenuation_metrics_remove_common_output_and_pair_stage_captures():
     recorder(0, "post_o_teacher", teacher)
     recorder(0, "post_gate_style", student)
     recorder(0, "post_gate_teacher", teacher)
+    recorder(0, "post_self_hidden", student)
     recorder(0, "post_cross_hidden", student)
     recorder(0, "post_mlp_hidden", student)
     recorder.record_output_stage("final_layer_norm", torch.ones_like(student) + student)
     captured = recorder.finish()[0]
 
     assert set(captured) == {
-        "pre_o", "post_o", "post_gate", "post_cross_hidden", "post_mlp_hidden"
+        "pre_o", "post_o", "post_gate", "post_self_hidden",
+        "post_cross_hidden", "post_mlp_hidden"
     }
     assert captured["post_gate"]["teacher_projection"] == pytest.approx(2.0)
     assert recorder.output_metrics["final_layer_norm"]["effect_to_base_rms"] > 0

@@ -384,7 +384,9 @@ class _StyleAttenuationRecorder:
         "post_o_teacher": "post_o_style",
         "post_gate_teacher": "post_gate_style",
     }
-    _HIDDEN_STAGES = {"post_cross_hidden", "post_mlp_hidden"}
+    _HIDDEN_STAGES = {
+        "post_self_hidden", "post_cross_hidden", "post_mlp_hidden"
+    }
 
     def __init__(self) -> None:
         self.mode = "base"
@@ -2316,11 +2318,31 @@ def diagnose_detail_style_attenuation(
                 reduced["post_mlp_hidden"]["centered_rms"]
                 / max(reduced["post_cross_hidden"]["centered_rms"], 1e-8)
             )
+        if {"post_self_hidden", "post_cross_hidden"} <= reduced.keys():
+            attenuation["cross_relative_effect_retention"] = (
+                reduced["post_cross_hidden"]["effect_to_base_rms"]
+                / max(reduced["post_self_hidden"]["effect_to_base_rms"], 1e-8)
+            )
+        if {"post_cross_hidden", "post_mlp_hidden"} <= reduced.keys():
+            attenuation["mlp_relative_effect_retention"] = (
+                reduced["post_mlp_hidden"]["effect_to_base_rms"]
+                / max(reduced["post_cross_hidden"]["effect_to_base_rms"], 1e-8)
+            )
         block_summary.append({
             "block": block_index,
             "stages": reduced,
             "attenuation": attenuation,
         })
+    for block_index in range(1, len(block_summary)):
+        current = block_summary[block_index]
+        previous = block_summary[block_index - 1]
+        current["attenuation"]["self_relative_effect_retention"] = (
+            current["stages"]["post_self_hidden"]["effect_to_base_rms"]
+            / max(
+                previous["stages"]["post_mlp_hidden"]["effect_to_base_rms"],
+                1e-8,
+            )
+        )
 
     bin_summary = []
     for bin_index, stages in bin_stage_rows.items():
