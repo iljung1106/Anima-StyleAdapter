@@ -1475,6 +1475,10 @@ class FreshKVStyleCrossAttention(nn.Module):
         cosine = F.cosine_similarity(
             student.flatten(1), teacher.flatten(1), dim=1, eps=1e-8
         )
+        teacher_energy = teacher.flatten(1).square().sum(dim=1).clamp_min(1e-8)
+        projection_coefficient = (
+            student.flatten(1) * teacher.flatten(1)
+        ).sum(dim=1) / teacher_energy
         valid = teacher_row_rms >= native_scale.detach() * 0.10
         self._post_gate_distillation_terms.append(
             (
@@ -1482,6 +1486,7 @@ class FreshKVStyleCrossAttention(nn.Module):
                 {
                     "huber": huber,
                     "cosine": cosine,
+                    "projection_coefficient": projection_coefficient,
                     "teacher_rms": teacher_row_rms,
                     "student_rms": student_row_rms,
                     "native_scale": native_scale.expand_as(teacher_row_rms),
@@ -1493,12 +1498,29 @@ class FreshKVStyleCrossAttention(nn.Module):
     def post_gate_teacher_loss(
         self,
         *,
-        cosine_weight: float = 0.15,
+        direction_weight: float = 1.0,
+        magnitude_weight: float = 0.0,
+        huber_weight: float = 0.0,
+        magnitude_lower: float = 0.50,
+        magnitude_upper: float = 1.25,
+        cosine_weight: float | None = None,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-        """Match selected post-gate native artist effects without cross-step state."""
+        """Align post-gate direction first, then its teacher-axis magnitude.
 
-        if not 0.0 <= float(cosine_weight) <= 1.0:
-            raise ValueError("cosine_weight must be in [0, 1]")
+        Direction is measured on normalized artist-centered rows, so the
+        calibrated alpha affects the real forward strength without suppressing
+        the direction-learning signal.  Magnitude is a separate projection
+        band and can stay disabled during the bootstrap stage.
+        """
+
+        if cosine_weight is not None:
+            # Compatibility for diagnostics created before the direction and
+            # magnitude objectives were separated.
+            direction_weight = float(cosine_weight)
+        if min(direction_weight, magnitude_weight, huber_weight) < 0:
+            raise ValueError("Post-gate loss weights must be non-negative")
+        if magnitude_lower < 0 or magnitude_upper < magnitude_lower:
+            raise ValueError("Invalid post-gate magnitude band")
         if not self._post_gate_distillation_terms:
             reference = self.alpha.float().sum() * 0.0
             return reference, {}
@@ -1510,12 +1532,31 @@ class FreshKVStyleCrossAttention(nn.Module):
             denominator = weights.sum().clamp_min(1.0)
             huber = (values["huber"] * weights).sum() / denominator
             direction = ((1.0 - values["cosine"]) * weights).sum() / denominator
-            loss = huber + float(cosine_weight) * direction
+            coefficient = values["projection_coefficient"]
+            magnitude_lower_loss = (
+                F.relu(float(magnitude_lower) - coefficient).square() * weights
+            ).sum() / denominator
+            magnitude_upper_loss = (
+                F.relu(coefficient - float(magnitude_upper)).square() * weights
+            ).sum() / denominator
+            magnitude = magnitude_lower_loss + 0.25 * magnitude_upper_loss
+            loss = (
+                float(direction_weight) * direction
+                + float(magnitude_weight) * magnitude
+                + float(huber_weight) * huber
+            )
             block_losses.append(loss)
             prefix = f"post_gate_teacher_block_{block_index}"
             metrics.update({
                 f"{prefix}_loss": loss.detach(),
                 f"{prefix}_huber": huber.detach(),
+                f"{prefix}_direction_loss": direction.detach(),
+                f"{prefix}_magnitude_loss": magnitude.detach(),
+                f"{prefix}_magnitude_lower_loss": magnitude_lower_loss.detach(),
+                f"{prefix}_magnitude_upper_loss": magnitude_upper_loss.detach(),
+                f"{prefix}_projection_coefficient": (
+                    coefficient.detach() * weights
+                ).sum() / denominator,
                 f"{prefix}_cosine": (
                     values["cosine"].detach() * weights
                 ).sum() / denominator,
@@ -1536,6 +1577,21 @@ class FreshKVStyleCrossAttention(nn.Module):
         metrics.update({
             "post_gate_teacher_loss": total.detach(),
             "post_gate_teacher_blocks": total.new_tensor(len(block_losses)),
+            "post_gate_teacher_direction_weight": total.new_tensor(
+                float(direction_weight)
+            ),
+            "post_gate_teacher_magnitude_weight": total.new_tensor(
+                float(magnitude_weight)
+            ),
+            "post_gate_teacher_huber_weight": total.new_tensor(
+                float(huber_weight)
+            ),
+            "post_gate_teacher_magnitude_lower": total.new_tensor(
+                float(magnitude_lower)
+            ),
+            "post_gate_teacher_magnitude_upper": total.new_tensor(
+                float(magnitude_upper)
+            ),
         })
         return total, metrics
 

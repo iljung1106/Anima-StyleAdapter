@@ -3830,7 +3830,7 @@ real_artist_teacher:
 # Detail-preserving typed-slot, separate-softmax Style Cross-Attention v1.
 # Contract: docs/detail_preserving_style_cross_attention_plan.md
 detail_preserving_style_cross_attention:
-  output_directory: detail_preserving_style_cross_attention_early_self_postgate_v16_20k
+  output_directory: detail_preserving_style_cross_attention_direction_first_v17_20k
   seed: 20260819
   train_split: train
   validation_split: validation
@@ -4036,17 +4036,17 @@ detail_preserving_style_cross_attention:
     reconstruction_weight: 0.01
     reconstruction_final_weight: 0.01
     reconstruction_hold_steps: 20000
-    # Correct-vs-wrong cyclic ranking starts as soon as the branch has a
-    # measurable output, reaches full strength at step 750, and remains on.
+    # Legacy main-flow ranking is disabled below. The controlled frozen
+    # teacher-direction ranking is configured beside the post-gate objective.
     functional_start_step: 250
     functional_full_step: 750
     functional_every: 1
     functional_margin: 0.01
-    # Make correct-reference flow ranking materially visible. The correct path
-    # receives the full gradient; a sequential wrong-reference pass receives
-    # only 10% of it so it cannot dominate by deliberately damaging negatives.
-    functional_weight: 0.25
-    functional_wrong_gradient_scale: 0.10
+    # v17 ranks correct vs cyclic-wrong frozen artist directions in the
+    # controlled teacher batch. Disable noisy main-flow ranking and its extra
+    # wrong-reference backward path.
+    functional_weight: 0.0
+    functional_wrong_gradient_scale: 0.0
     functional_wrong_gradient_every: 1
     # Compare detached exact-target and trainable heldout-reference effects at
     # identical noisy latent/text/timestep conditions.  The batch artist mean
@@ -4064,21 +4064,25 @@ detail_preserving_style_cross_attention:
     # Estimate the common residual directly under a controlled same-content /
     # timestep native-teacher probe. Normalize only by the frozen native effect
     # scale; no cross-step EMA or student-derived denominator is used.
-    common_output_start_step: 1000
-    common_output_full_step: 3000
-    common_output_weight: 0.04
+    common_output_start_step: 250
+    common_output_full_step: 750
+    common_output_weight: 0.10
     common_output_teacher: native_centered
     common_output_native_ratio_threshold: 0.60
+    artist_energy_native_ratio_floor: 0.50
+    artist_energy_weight: 1.0
     # Apply the same frozen-native-normalized common-effect constraint to
     # ordinary human training artists. Four artists share one main-batch
     # x_t/timestep/content probe, so their mean residual is functionally valid.
     # This pass is sequential after the main backward to bound peak VRAM.
-    main_common_output_start_step: 1000
-    main_common_output_full_step: 3000
+    main_common_output_start_step: 250
+    main_common_output_full_step: 750
     main_common_output_every: 4
     main_common_output_batch_rows: 4
-    main_common_output_weight: 0.04
+    main_common_output_weight: 0.10
     main_common_output_native_ratio_threshold: 0.60
+    main_artist_energy_native_ratio_floor: 0.50
+    main_artist_energy_weight: 1.0
     common_output_threshold_start_step: 1000
     common_output_threshold_end_step: 4000
     common_output_threshold_start: 0.90
@@ -4125,7 +4129,18 @@ detail_preserving_style_cross_attention:
       start_step: 1
       full_step: 500
       weight: 0.10
-      cosine_weight: 0.15
+      direction_weight: 1.0
+      magnitude_weight: 0.25
+      huber_weight: 0.0
+      magnitude_lower: 0.50
+      magnitude_upper: 1.25
+    # Same controlled Student effects are ranked against matching and
+    # cyclic-shifted frozen artist directions. Only Student correct-direction
+    # scores receive gradients; wrong artists are never trained to deteriorate.
+    teacher_direction_ranking_start_step: 1
+    teacher_direction_ranking_full_step: 250
+    teacher_direction_ranking_weight: 0.10
+    teacher_direction_ranking_margin: 0.10
     # Cover the complete 4-content x 8-timestep teacher grid once. Each of the
     # 28 blocks receives four independent alpha values which are linearly
     # interpolated at runtime. Native median is the aligned lower target and
@@ -4138,7 +4153,12 @@ detail_preserving_style_cross_attention:
     # forward: the aligned projection floor must retain a radial gradient.
     fixed_output_quantile: null
     teacher_objective:
-      residual_weight: 0.20
+      # Full-resolution native residual regression dominated v16 while its
+      # direction stayed near random. Keep one quarter of that term and add
+      # pooled 2x2/4x4 residual targets for repeatable low-frequency effects.
+      residual_weight: 0.05
+      low_frequency_residual_pool_scales: [2, 4]
+      low_frequency_residual_weight: 0.10
       native_teacher_huber_beta: 0.10
       native_teacher_scale_floor: 0.0001
       # Native-centered artist magnitude. This is also resolved from the
@@ -4152,6 +4172,55 @@ detail_preserving_style_cross_attention:
       projection_upper_weight: 0.25
       orthogonal_weight: 0.05
       orthogonal_ratio_maximum: 0.50
+    # Do not lower target inclusion or teacher density merely because a step
+    # boundary was crossed. Each transition needs two consecutive validation
+    # windows satisfying every criterion below.
+    performance_curriculum:
+      enabled: true
+      stages:
+        - name: direction_bootstrap_exact_self
+          min_references: 1
+          max_references: 1
+          reference_count_weights: [1.0]
+          target_only: true
+          target_probability: 1.0
+          teacher_every: 1
+          post_gate_magnitude_enabled: false
+          advance:
+            minimum_step: 500
+            post_gate_cosine: 0.20
+            native_projection: 0.40
+            correct_wrong_advantage: 0.0
+            common_output_ratio: 0.70
+            centered_rms_ratio_minimum: 0.50
+            centered_rms_ratio_maximum: 1.50
+            consecutive_validations: 2
+        - name: aligned_target_mix_1_2_4
+          min_references: 1
+          max_references: 4
+          reference_count_weights: [0.50, 0.35, 0.0, 0.15]
+          target_only: false
+          target_probability: 0.65
+          teacher_every: 1
+          post_gate_magnitude_enabled: true
+          advance:
+            minimum_step: 1000
+            post_gate_cosine: 0.25
+            native_projection: 0.50
+            correct_wrong_advantage: 0.01
+            common_output_ratio: 0.65
+            centered_rms_ratio_minimum: 0.70
+            centered_rms_ratio_maximum: 1.30
+            heldout_paired_improvement: 0.0
+            consecutive_validations: 2
+        - name: aligned_heldout_1_2_4_8
+          min_references: 1
+          max_references: 8
+          reference_count_weights: [0.45, 0.30, 0.0, 0.17, 0.0, 0.0, 0.0, 0.08]
+          target_only: false
+          target_probability: 0.0
+          teacher_every: 2
+          post_gate_magnitude_enabled: true
     prefetch_workers: 2
     prefetch_batches: 6
     log_every: 10
@@ -4167,8 +4236,8 @@ detail_preserving_style_cross_attention:
     wandb:
       enabled: true
       project: anima-style-adapter
-      name: detail-style-early-self-postgate-v16-20k-anima-only
-      id: detail-style-early-self-postgate-v16-20k-anima-only
+      name: detail-style-direction-first-v17-20k-anima-only
+      id: detail-style-direction-first-v17-20k-anima-only
   sampling:
     width: 768
     height: 768

@@ -734,3 +734,93 @@ correct-vs-wrong, centered artist retrieval을 함께 사용한다.
 
 이 조건을 통과한 뒤에만 Resampler 일부 joint fine-tuning이나 cross-slot mixer
 2층, block별 alpha 학습을 후속 실험으로 검토한다.
+
+## 17. v17 방향 우선 재정렬 실험
+
+v16의 2,500-step 검증에서는 artist-centered 출력 RMS가 native teacher와 거의
+같아졌지만 held-out flow direction cosine은 약 `0.035`, 선택 block의 post-gate
+cosine 중앙값은 약 `0.008`에 머물렀다. 따라서 v17은 출력량을 더 강제하지 않고
+**올바른 작가 방향을 먼저 학습한 뒤 크기를 여는 것**을 목표로 한다. Shared
+K/V base + block별 low-rank delta 구조와 frozen Anima/Resampler는 이번 비교에서
+바꾸지 않는다.
+
+### 17.1 Post-gate 방향과 크기 분리
+
+선택 block의 `gate_cross x O(style attention)`과 native artist-tag teacher를
+artist-centered한 뒤 다음 두 항을 별도로 계산한다.
+
+```math
+L_{pg-dir}=1-cos(center(S_b), center(T_b))
+```
+
+```math
+c_b = <S_b,T_b> / ||T_b||^2
+```
+
+`L_pg-dir`은 정규화된 출력에서 계산하여 작은 calibrated alpha가 방향 gradient를
+약화하지 않게 한다. Post-gate magnitude band는 방향 bootstrap 단계에서는 끄고,
+성능 기준을 통과한 다음에만 `c_b`가 설정 범위에 들어오도록 활성화한다. 기존의
+고차원 post-gate Huber 회귀는 기본값에서 끈다.
+
+### 17.2 Final residual 목표 단순화
+
+Native centered final-velocity residual의 full-resolution Huber weight는 `0.20`에서
+`0.05`로 1/4 축소한다. 대신 latent spatial grid를 average-pooling한 `2x2`와
+`4x4` 저주파 residual을 각각 teacher RMS로 정규화해 평균한 보조 목표를 둔다.
+세부 노이즈를 복제하는 대신 반복 가능한 저주파 작가 효과를 보존하는 것이 목적이다.
+
+### 17.3 Teacher-direction cyclic ranking
+
+일반 flow MSE 기반 correct-vs-wrong ranking을 주 ranking으로 사용하지 않는다.
+Controlled teacher batch의 동일한 `x_t`, timestep, content, Student Q에서 student
+artist effect와 native teacher effect를 center하고 cyclic-shifted teacher를 hard
+negative로 사용한다.
+
+```math
+L_{rank}=relu(m - cos(S_i,T_i) + cos(S_i,T_{i+1}))
+```
+
+Wrong 경로를 일부러 망가뜨리는 별도 목표 없이 correct 방향만 움직인다. 기존
+flow ranking은 v17 기본 설정에서 비활성화한다.
+
+### 17.4 결합 common-output / artist-energy 제약
+
+Controlled batch의 student effect를 `S_i=C+D_i`, `C=mean_i(S_i)`로 분해한다.
+Frozen native teacher scale만 분모로 사용하여 공통 성분 상한과 artist-centered
+성분 하한을 한 번에 계산한다.
+
+```math
+L_{joint}=relu(||C||/s_T-r_C)^2
+          + w_D relu(r_D-RMS_i(D_i)/s_T)^2
+```
+
+Common 성분만 처벌해 zero-output으로 도망가지 못하도록 두 항은 항상 함께
+활성화한다. Teacher controlled batch와 일반 human main batch의 same-Q probe에
+같은 정의를 사용한다.
+
+### 17.5 성능 기반 curriculum
+
+Reference 수, target 포함률과 teacher 주기는 절대 step만으로 전환하지 않는다.
+Loader는 최대 8개 held-out reference를 효율적으로 prefetch하고, 현재 stage가
+허용한 reference 수만 mask한다. 검증 때 다음 지표를 평가해 연속 두 번 통과했을
+때만 다음 stage로 전환하며 stage와 연속 통과 횟수는 training state에 저장한다.
+
+- 선택 block post-gate cosine 중앙값
+- native final projection coefficient
+- heldout correct-vs-wrong advantage
+- validation common-output ratio
+- artist-centered student/native RMS 비율
+- 후속 stage에서는 heldout paired improvement
+
+Stage 0은 exact-self 1-reference와 매-step controlled teacher를 유지하고 post-gate
+magnitude를 끈다. 첫 기준을 통과하면 1/2/4-reference와 target probability `0.65`,
+post-gate magnitude를 연다. 더 엄격한 heldout 기준을 통과한 뒤에만 1/2/4/8
+reference, target probability `0`, teacher 매 2-step 단계로 넘어간다. 기준을
+통과하지 못하면 학습 step이 늘어도 자동으로 난도를 높이지 않는다.
+
+### 17.6 v17 선택 기준
+
+`val/functional/panel`의 서로 다른 prompt/seed 다양성은 성공 근거로 사용하지
+않는다. 같은 prompt/seed의 fixed-reference에서 common effect와 artist-centered
+effect를 분리하고, direction/ranking 검증과 함께 판단한다. Global strength 증가는
+방향 정렬을 통과한 뒤의 inference 조절로만 사용한다.

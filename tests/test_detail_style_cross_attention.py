@@ -23,6 +23,8 @@ from anima_style_data.detail_style_training import (  # noqa: E402
     _minimal_native_teacher_objective,
     _native_effect_scales_for_timesteps,
     _native_teacher_objective_config,
+    _teacher_direction_ranking_loss,
+    _update_performance_curriculum,
     _wrong_flow_ranking_loss,
 )
 
@@ -60,6 +62,24 @@ def test_native_scale_common_output_penalty_uses_current_controlled_batch():
     )
     assert float(centered_loss) == pytest.approx(0.0)
     assert centered_metrics["native_teacher_common_output_ratio"] == pytest.approx(0.0)
+
+
+def test_joint_common_output_penalty_rejects_zero_artist_energy():
+    penalty = NativeScaleCommonOutputPenalty()
+    native = torch.tensor([1.0, -1.0, 1.0, -1.0]).reshape(4, 1, 1, 1)
+    collapsed = torch.zeros_like(native, requires_grad=True)
+
+    loss, metrics = penalty.objective(
+        collapsed,
+        native,
+        ratio_threshold=0.6,
+        artist_energy_floor=0.5,
+    )
+    loss.backward()
+
+    assert float(metrics["native_teacher_common_output_common_loss"]) == 0.0
+    assert float(metrics["native_teacher_artist_energy_loss"]) == pytest.approx(0.25)
+    assert collapsed.grad is not None and collapsed.grad.abs().sum() > 0
 
 
 def test_native_effect_scale_profile_interpolates_frozen_median_rms():
@@ -353,6 +373,40 @@ def test_post_gate_teacher_distillation_only_records_selected_block():
     assert style.grad is not None and style.grad.norm() > 0
 
 
+def test_post_gate_direction_and_magnitude_are_independent():
+    adapter = FreshKVStyleCrossAttention(
+        context_dim=4, blocks=1, initial_alpha=0.2
+    )
+    teacher = torch.tensor([
+        [[1.0, 0.0, 0.0, 0.0]],
+        [[-1.0, 0.0, 0.0, 0.0]],
+        [[0.0, 1.0, 0.0, 0.0]],
+        [[0.0, -1.0, 0.0, 0.0]],
+    ])
+    student = 0.25 * teacher
+    adapter._record_post_gate_distillation(0, student, teacher)
+
+    direction_only, direction_metrics = adapter.post_gate_teacher_loss(
+        direction_weight=1.0,
+        magnitude_weight=0.0,
+    )
+    adapter._record_post_gate_distillation(0, student, teacher)
+    with_magnitude, magnitude_metrics = adapter.post_gate_teacher_loss(
+        direction_weight=1.0,
+        magnitude_weight=1.0,
+        magnitude_lower=0.5,
+    )
+
+    assert float(direction_only) == pytest.approx(0.0, abs=1e-7)
+    assert float(with_magnitude) > float(direction_only)
+    assert float(
+        direction_metrics["post_gate_teacher_block_0_projection_coefficient"]
+    ) == pytest.approx(0.25)
+    assert float(
+        magnitude_metrics["post_gate_teacher_block_0_magnitude_lower_loss"]
+    ) == pytest.approx(0.0625)
+
+
 def test_attenuation_metrics_remove_common_output_and_pair_stage_captures():
     teacher = torch.tensor([[[-1.0, 0.0]], [[1.0, 0.0]]])
     common = torch.tensor([[[0.0, 3.0]]])
@@ -604,6 +658,102 @@ def test_minimal_teacher_projection_has_a_weak_upper_bound():
         pytest.approx(0.25)
     )
     assert float(excessive_loss) > float(aligned_loss)
+
+
+def test_low_frequency_native_residual_uses_two_pool_scales():
+    torch.manual_seed(129)
+    teacher = torch.randn(4, 3, 8, 8)
+    config = {
+        "residual_weight": 0.0,
+        "low_frequency_residual_pool_scales": [2, 4],
+        "low_frequency_residual_weight": 1.0,
+        "projection_weight": 0.0,
+        "orthogonal_weight": 0.0,
+    }
+
+    aligned, aligned_metrics = _minimal_native_teacher_objective(
+        teacher.clone(), teacher, config, step=1
+    )
+    collapsed, collapsed_metrics = _minimal_native_teacher_objective(
+        torch.zeros_like(teacher), teacher, config, step=1
+    )
+
+    assert float(aligned_metrics["native_teacher_low_frequency_residual_loss"]) == (
+        pytest.approx(0.0, abs=1e-7)
+    )
+    assert float(collapsed_metrics["native_teacher_low_frequency_residual_loss"]) > 0
+    assert float(collapsed) > float(aligned)
+
+
+def test_teacher_direction_ranking_uses_cyclic_frozen_negatives():
+    teacher = torch.eye(4).reshape(4, 1, 2, 2)
+    student = teacher.clone().requires_grad_(True)
+
+    loss, metrics = _teacher_direction_ranking_loss(
+        student, teacher, margin=0.1
+    )
+    loss.backward()
+
+    assert float(metrics["teacher_direction_accuracy"]) == pytest.approx(1.0)
+    assert float(metrics["teacher_direction_advantage"]) > 0.5
+    assert float(loss) == pytest.approx(0.0, abs=1e-7)
+
+
+def test_performance_curriculum_requires_consecutive_validation_windows():
+    training = {
+        "performance_curriculum": {
+            "enabled": True,
+            "stages": [
+                {
+                    "name": "bootstrap",
+                    "min_references": 1,
+                    "max_references": 1,
+                    "reference_count_weights": [1.0],
+                    "target_probability": 1.0,
+                    "advance": {
+                        "minimum_step": 100,
+                        "post_gate_cosine": 0.2,
+                        "native_projection": 0.4,
+                        "correct_wrong_advantage": 0.0,
+                        "common_output_ratio": 0.7,
+                        "centered_rms_ratio_minimum": 0.5,
+                        "centered_rms_ratio_maximum": 1.5,
+                        "consecutive_validations": 2,
+                    },
+                },
+                {
+                    "name": "mixed",
+                    "min_references": 1,
+                    "max_references": 2,
+                    "reference_count_weights": [0.5, 0.5],
+                    "target_probability": 0.5,
+                },
+            ],
+        }
+    }
+    state = {"enabled": True, "stage_index": 0, "consecutive_passes": 0}
+    validation = {
+        "heldout": {"paired_flow_improvement": 0.02},
+        "wrong_artist": {"paired_flow_improvement": 0.0},
+        "artist_effect": {
+            "functional_artist_common_output_ratio": 0.6,
+            "functional_artist_centered_student_rms": 1.0,
+            "functional_artist_centered_teacher_rms": 1.0,
+        },
+    }
+    teacher_rows = [{
+        "post_gate_teacher_block_21_cosine": 0.3,
+        "native_teacher_projection_coefficient": 0.5,
+    }]
+
+    first, changed = _update_performance_curriculum(
+        training, state, validation, teacher_rows, step=100
+    )
+    assert not changed and first["consecutive_passes"] == 1
+    second, changed = _update_performance_curriculum(
+        training, state, validation, teacher_rows, step=200
+    )
+    assert changed and second["stage_index"] == 1
 
 
 def test_student_prompt_audit_uses_tag_boundaries_not_substrings():
