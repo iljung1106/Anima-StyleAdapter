@@ -34,6 +34,15 @@ class DetailStyleOutput:
     reconstruction_target: torch.Tensor | None
 
 
+def _leave_one_out_artist_center(values: torch.Tensor) -> torch.Tensor:
+    """Remove the other artists' mean without shrinking a batch-four target."""
+
+    if values.ndim < 2 or values.shape[0] < 2:
+        raise ValueError("Artist centering requires at least two batch rows")
+    rows = values.shape[0]
+    return (values * rows - values.sum(dim=0, keepdim=True)) / (rows - 1)
+
+
 def _sincos_2d(side: int, dim: int) -> torch.Tensor:
     if dim % 4:
         raise ValueError("2D sin/cos width must be divisible by four")
@@ -509,6 +518,8 @@ class FreshKVStyleCrossAttention(nn.Module):
             torch.Tensor, torch.Tensor, torch.Tensor
         ] | None = None
         self._teacher_context: torch.Tensor | None = None
+        self._teacher_block_indices: frozenset[int] | None = None
+        self._post_gate_distillation_enabled = False
         self._pending_internal: dict[
             int,
             tuple[
@@ -522,6 +533,9 @@ class FreshKVStyleCrossAttention(nn.Module):
             int, tuple[torch.Tensor, tuple[int, int, int]]
         ] = {}
         self._internal_terms: list[tuple[int, dict[str, torch.Tensor]]] = []
+        self._post_gate_distillation_terms: list[
+            tuple[int, dict[str, torch.Tensor]]
+        ] = []
         self._calibration = False
         self._calibration_bin_edges: tuple[float, ...] = (0.0, 1.000001)
         self._calibration_bin_index: int | None = None
@@ -594,8 +608,31 @@ class FreshKVStyleCrossAttention(nn.Module):
 
     set_style_tokens = set_style_context
 
-    def set_teacher_context(self, context: torch.Tensor | None) -> None:
+    def set_teacher_context(
+        self,
+        context: torch.Tensor | None,
+        *,
+        block_indices: tuple[int, ...] | list[int] | None = None,
+        post_gate_distillation: bool = False,
+    ) -> None:
+        if context is not None and (
+            context.ndim != 3 or context.shape[-1] != self.context_dim
+        ):
+            raise ValueError("teacher context must be [batch,tokens,context_dim]")
+        selected = None
+        if block_indices is not None:
+            selected = frozenset(int(index) for index in block_indices)
+            if not selected or min(selected) < 0 or max(selected) >= self.blocks:
+                raise ValueError("teacher block indices must select valid Anima blocks")
         self._teacher_context = context
+        self._teacher_block_indices = selected
+        self._post_gate_distillation_enabled = bool(post_gate_distillation)
+
+    def _teacher_enabled_for_block(self, block_index: int) -> bool:
+        return self._teacher_context is not None and (
+            self._teacher_block_indices is None
+            or int(block_index) in self._teacher_block_indices
+        )
 
     def set_diagnostic_recorder(
         self,
@@ -783,6 +820,8 @@ class FreshKVStyleCrossAttention(nn.Module):
         self._style_enabled = None
         self._style_strength = 1.0
         self._teacher_context = None
+        self._teacher_block_indices = None
+        self._post_gate_distillation_enabled = False
         self._timesteps = None
         self._timestep_interpolation = None
         self._pending_internal.clear()
@@ -791,6 +830,7 @@ class FreshKVStyleCrossAttention(nn.Module):
     def reset_internal_teacher(self) -> None:
         self._pending_internal.clear()
         self._internal_terms.clear()
+        self._post_gate_distillation_terms.clear()
 
     def begin_alpha_calibration(
         self,
@@ -1220,7 +1260,8 @@ class FreshKVStyleCrossAttention(nn.Module):
             self._runtime_fixed_actuals[block_index] = actual_rms.detach().float().mean()
             self._runtime_fixed_scales[block_index] = scale.detach().float().mean()
 
-            if self._teacher_context is not None:
+            if self._teacher_enabled_for_block(block_index):
+                assert self._teacher_context is not None
                 teacher_key, teacher_value = self._native_context_kv(
                     cross_attention, self._teacher_context
                 )
@@ -1261,7 +1302,8 @@ class FreshKVStyleCrossAttention(nn.Module):
             (alpha * style_attended.detach()).float().square().mean().sqrt() / text_rms
         )
 
-        if self._teacher_context is not None:
+        if self._teacher_enabled_for_block(block_index):
+            assert self._teacher_context is not None
             teacher_key, teacher_value = self._native_context_kv(
                 cross_attention, self._teacher_context
             )
@@ -1309,6 +1351,9 @@ class FreshKVStyleCrossAttention(nn.Module):
         teacher = teacher * gate
         self.record_diagnostic_stage(block_index, "post_gate_style", student)
         self.record_diagnostic_stage(block_index, "post_gate_teacher", teacher)
+        if self._post_gate_distillation_enabled:
+            self._record_post_gate_distillation(block_index, student, teacher)
+            return
         if student.shape[0] > 1:
             student = student - student.mean(dim=0, keepdim=True)
             teacher = teacher - teacher.mean(dim=0, keepdim=True)
@@ -1405,6 +1450,94 @@ class FreshKVStyleCrossAttention(nn.Module):
                 },
             )
         )
+
+    def _record_post_gate_distillation(
+        self,
+        block_index: int,
+        student: torch.Tensor,
+        teacher: torch.Tensor,
+    ) -> None:
+        """Record an instantaneous artist-specific post-gate comparison."""
+
+        student = _leave_one_out_artist_center(student.float())
+        teacher = _leave_one_out_artist_center(teacher.detach().float())
+        dimensions = tuple(range(1, teacher.ndim))
+        teacher_row_rms = teacher.square().mean(dim=dimensions).sqrt()
+        student_row_rms = student.square().mean(dim=dimensions).sqrt()
+        native_scale = teacher.square().mean().sqrt().clamp_min(1e-4)
+        normalized_delta = (student - teacher) / native_scale
+        huber = F.smooth_l1_loss(
+            normalized_delta,
+            torch.zeros_like(normalized_delta),
+            beta=0.10,
+            reduction="none",
+        ).mean(dim=dimensions)
+        cosine = F.cosine_similarity(
+            student.flatten(1), teacher.flatten(1), dim=1, eps=1e-8
+        )
+        valid = teacher_row_rms >= native_scale.detach() * 0.10
+        self._post_gate_distillation_terms.append(
+            (
+                int(block_index),
+                {
+                    "huber": huber,
+                    "cosine": cosine,
+                    "teacher_rms": teacher_row_rms,
+                    "student_rms": student_row_rms,
+                    "native_scale": native_scale.expand_as(teacher_row_rms),
+                    "valid": valid,
+                },
+            )
+        )
+
+    def post_gate_teacher_loss(
+        self,
+        *,
+        cosine_weight: float = 0.15,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        """Match selected post-gate native artist effects without cross-step state."""
+
+        if not 0.0 <= float(cosine_weight) <= 1.0:
+            raise ValueError("cosine_weight must be in [0, 1]")
+        if not self._post_gate_distillation_terms:
+            reference = self.alpha.float().sum() * 0.0
+            return reference, {}
+        block_losses: list[torch.Tensor] = []
+        metrics: dict[str, torch.Tensor] = {}
+        for block_index, values in self._post_gate_distillation_terms:
+            valid = values["valid"]
+            weights = valid.to(values["huber"].dtype)
+            denominator = weights.sum().clamp_min(1.0)
+            huber = (values["huber"] * weights).sum() / denominator
+            direction = ((1.0 - values["cosine"]) * weights).sum() / denominator
+            loss = huber + float(cosine_weight) * direction
+            block_losses.append(loss)
+            prefix = f"post_gate_teacher_block_{block_index}"
+            metrics.update({
+                f"{prefix}_loss": loss.detach(),
+                f"{prefix}_huber": huber.detach(),
+                f"{prefix}_cosine": (
+                    values["cosine"].detach() * weights
+                ).sum() / denominator,
+                f"{prefix}_teacher_rms": (
+                    values["teacher_rms"].detach() * weights
+                ).sum() / denominator,
+                f"{prefix}_student_rms": (
+                    values["student_rms"].detach() * weights
+                ).sum() / denominator,
+                f"{prefix}_native_scale": values["native_scale"].detach().mean(),
+                f"{prefix}_valid_fraction": valid.detach().float().mean(),
+            })
+        self._post_gate_distillation_terms.clear()
+        if not block_losses:
+            reference = self.alpha.float().sum() * 0.0
+            return reference, metrics
+        total = torch.stack(block_losses).mean()
+        metrics.update({
+            "post_gate_teacher_loss": total.detach(),
+            "post_gate_teacher_blocks": total.new_tensor(len(block_losses)),
+        })
+        return total, metrics
 
     def internal_teacher_loss(
         self,

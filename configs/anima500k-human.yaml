@@ -4109,6 +4109,20 @@ detail_preserving_style_cross_attention:
     teacher_references: 4
     teacher_every_step_until: 500
     teacher_every_after_bootstrap: 2
+    # Optional local native-artist distillation. All rows share x_t, timestep,
+    # and content; the tagged native context and style branch use the same
+    # Student Q. Selected zero-based block outputs are compared after native O
+    # and gate_cross. Leave-one-out artist centering removes common output
+    # without the batch-four 3/4 magnitude shrink. There is deliberately no
+    # EMA or other cross-step state. Keep disabled until its isolated metrics
+    # and weight have been reviewed.
+    post_gate_teacher_distillation:
+      enabled: false
+      block_indices: [11, 12, 13, 14, 15, 21, 22, 23]
+      start_step: 1
+      full_step: 500
+      weight: 0.10
+      cosine_weight: 0.15
     # Cover the complete 4-content x 8-timestep teacher grid once. Each of the
     # 28 blocks receives four independent alpha values which are linearly
     # interpolated at runtime. Native median is the aligned lower target and

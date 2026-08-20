@@ -1256,6 +1256,25 @@ def _teacher_step(
     timestep = tensors["timesteps"][timestep_index].to(
         device=device, dtype=torch.bfloat16
     )
+    post_gate_cfg = dict(training.get("post_gate_teacher_distillation", {}))
+    post_gate_weight = _ramp(
+        step,
+        int(post_gate_cfg.get("start_step", 1)),
+        int(post_gate_cfg.get("full_step", 500)),
+        float(post_gate_cfg.get("weight", 0.10)),
+    )
+    post_gate_active = bool(post_gate_cfg.get("enabled", False)) and (
+        post_gate_weight > 0
+    )
+    if post_gate_active and len(set(style_ids)) != rows:
+        raise ValueError(
+            "Post-gate teacher distillation requires distinct artists per row"
+        )
+    tagged = None
+    if post_gate_active:
+        tagged = contexts.get(style_ids, content_index).to(
+            device=device, dtype=torch.bfloat16, non_blocking=True
+        )
 
     with torch.autocast(
         device_type=torch.device(device).type,
@@ -1263,7 +1282,20 @@ def _teacher_step(
         enabled=torch.device(device).type == "cuda",
     ):
         style = reader(references, mask).tokens
+        adapter.reset_internal_teacher()
         adapter.set_style_context(style)
+        if post_gate_active:
+            assert tagged is not None
+            adapter.set_teacher_context(
+                tagged,
+                block_indices=tuple(
+                    int(index)
+                    for index in post_gate_cfg.get(
+                        "block_indices", (11, 12, 13, 14, 15, 21, 22, 23)
+                    )
+                ),
+                post_gate_distillation=True,
+            )
         adapter.set_timesteps(timestep.expand(rows))
         padding = torch.zeros(
             rows, 1, noisy.shape[-2], noisy.shape[-1],
@@ -1283,6 +1315,21 @@ def _teacher_step(
     final_loss, metrics = _minimal_native_teacher_objective(
         student, teacher, objective_cfg, step=step
     )
+    if post_gate_active:
+        post_gate_loss, post_gate_metrics = adapter.post_gate_teacher_loss(
+            cosine_weight=float(post_gate_cfg.get("cosine_weight", 0.15))
+        )
+        if not post_gate_metrics:
+            raise RuntimeError(
+                "Post-gate teacher distillation captured no selected blocks"
+            )
+        weighted_post_gate = post_gate_weight * post_gate_loss
+        final_loss = final_loss + weighted_post_gate
+        metrics.update(post_gate_metrics)
+        metrics.update({
+            "post_gate_teacher_weight": final_loss.new_tensor(post_gate_weight),
+            "post_gate_teacher_weighted_loss": weighted_post_gate.detach(),
+        })
     if common_output_penalty is not None:
         common_loss, common_metrics = common_output_penalty.objective(
             student,
@@ -1323,6 +1370,7 @@ def _teacher_step(
         "teacher_timestep": timestep.detach().float(),
         "teacher_total_loss": total.detach(),
         "teacher_student_view_rms": student.detach().square().mean().sqrt(),
+        "post_gate_teacher_enabled": total.new_tensor(float(post_gate_active)),
     })
     return total, metrics
 

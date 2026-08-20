@@ -11,6 +11,7 @@ from anima_style_data.detail_style_cross_attention import (  # noqa: E402
     DetailPreservingTypedSlotReader,
     FreshKVStyleCrossAttention,
     SharedBaseKVStyleCrossAttention,
+    _leave_one_out_artist_center,
 )
 from anima_style_data.detail_style_training import (  # noqa: E402
     NativeScaleCommonOutputPenalty,
@@ -84,6 +85,14 @@ def test_wrong_flow_ranking_only_pushes_the_wrong_path():
     assert correct.grad is None
     assert wrong.grad is not None and float(wrong.grad) > 0
     assert metrics["advantage"] < 0
+
+
+def test_leave_one_out_artist_center_preserves_batch_four_contrast_scale():
+    values = torch.arange(1.0, 5.0).reshape(4, 1, 1)
+    centered = _leave_one_out_artist_center(values)
+    expected = torch.tensor([-2.0, -2.0 / 3.0, 2.0 / 3.0, 2.0]).reshape(4, 1, 1)
+    torch.testing.assert_close(centered, expected)
+    torch.testing.assert_close(centered.mean(dim=0), torch.zeros(1, 1))
 
 
 class _CountingLinear(nn.Linear):
@@ -303,6 +312,45 @@ def test_same_q_internal_teacher_produces_live_gradient_and_calibrates_alpha():
         assert effective / raw == pytest.approx(0.2, rel=1e-5)
     assert len(calibration["block_timestep_profiles"]) == 2
     assert calibration["block_timestep_profiles"][1]["blocks"][0]["samples"] == 3
+
+
+def test_post_gate_teacher_distillation_only_records_selected_block():
+    torch.manual_seed(110)
+    anima = _Anima(blocks=2).requires_grad_(False)
+    adapter = FreshKVStyleCrossAttention(
+        context_dim=6, blocks=2, initial_alpha=0.2
+    )
+    adapter.initialize_from_anima(anima)
+    style = torch.randn(4, 3, 6, requires_grad=True)
+    adapter.set_style_context(style)
+    adapter.set_teacher_context(
+        torch.randn(4, 4, 6),
+        block_indices=(1,),
+        post_gate_distillation=True,
+    )
+
+    for block_index, block in enumerate(anima.blocks):
+        adapter.merged_cross_attention(
+            block_index,
+            torch.randn(4, 5, 8),
+            torch.randn(4, 4, 6),
+            block.cross_attn,
+            None,
+        )
+        adapter.record_gated_internal_teacher(
+            block_index,
+            torch.ones(4, 1, 1, 1, 8),
+            (1, 1, 5),
+        )
+
+    loss, metrics = adapter.post_gate_teacher_loss(cosine_weight=0.15)
+    loss.backward()
+
+    assert torch.isfinite(loss)
+    assert metrics["post_gate_teacher_blocks"] == 1
+    assert "post_gate_teacher_block_1_loss" in metrics
+    assert "post_gate_teacher_block_0_loss" not in metrics
+    assert style.grad is not None and style.grad.norm() > 0
 
 
 def test_attenuation_metrics_remove_common_output_and_pair_stage_captures():
