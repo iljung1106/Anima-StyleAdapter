@@ -4238,6 +4238,15 @@ detail_preserving_style_cross_attention:
       project: anima-style-adapter
       name: detail-style-direction-first-v17-20k-anima-only
       id: detail-style-direction-first-v17-20k-anima-only
+  gradient_diagnostics:
+    checkpoint_step: 1500
+    teacher_batch_step: 1500
+    batch_size: 4
+    content_index: 0
+    timestep_index: 3
+    gradient_samples_per_group: 131072
+    candidate_absolute_direction_weight: 0.10
+    output_file: gradient_diagnostics_step_1500.json
   sampling:
     width: 768
     height: 768

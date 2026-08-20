@@ -27,6 +27,11 @@ from anima_style_data.detail_style_training import (  # noqa: E402
     _update_performance_curriculum,
     _wrong_flow_ranking_loss,
 )
+from anima_style_data.detail_style_gradient_diagnostics import (  # noqa: E402
+    _cosine_matrices,
+    _gradient_sample_plan,
+    _measure_gradient_sketches,
+)
 
 
 def test_native_scale_common_output_penalty_uses_current_controlled_batch():
@@ -62,6 +67,28 @@ def test_native_scale_common_output_penalty_uses_current_controlled_batch():
     )
     assert float(centered_loss) == pytest.approx(0.0)
     assert centered_metrics["native_teacher_common_output_ratio"] == pytest.approx(0.0)
+
+
+def test_gradient_diagnostic_reports_known_conflict_and_orthogonality():
+    parameter = torch.nn.Parameter(torch.tensor([1.0, 2.0]))
+    parameters, plans = _gradient_sample_plan(
+        {"reader": [parameter]}, samples_per_group=2, seed=17
+    )
+    sketches, statistics = _measure_gradient_sketches(
+        {
+            "aligned": parameter.sum(),
+            "orthogonal": parameter[0] - parameter[1],
+            "opposed": -parameter.sum(),
+        },
+        parameters,
+        plans,
+    )
+    matrices = _cosine_matrices(sketches, plans)
+
+    assert matrices["reader"]["aligned"]["orthogonal"] == pytest.approx(0.0)
+    assert matrices["reader"]["aligned"]["opposed"] == pytest.approx(-1.0)
+    assert matrices["all_trainable"]["aligned"]["opposed"] == pytest.approx(-1.0)
+    assert statistics["aligned"]["reader_exact_norm"] == pytest.approx(2**0.5)
 
 
 def test_joint_common_output_penalty_rejects_zero_artist_energy():

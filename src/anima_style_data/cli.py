@@ -125,6 +125,10 @@ def build_parser() -> argparse.ArgumentParser:
             "Trace style residual attenuation from attention to final velocity",
         ),
         (
+            "detail-style-gradient-diagnostics",
+            "Measure controlled-batch loss gradient cosines from a checkpoint",
+        ),
+        (
             "detail-style-smoke",
             "Run two real detail-preserving Style Cross-Attention steps",
         ),
@@ -401,6 +405,7 @@ def main() -> None:
         "detail-style-fixed-samples",
         "detail-style-strength-profile",
         "detail-style-attenuation",
+        "detail-style-gradient-diagnostics",
         "detail-style-smoke",
     }:
         from .detail_style_teacher_context import (
@@ -414,6 +419,9 @@ def main() -> None:
             train_detail_style_cross_attention,
         )
         from .block_similarity import analyze_anima_block_similarity
+        from .detail_style_gradient_diagnostics import (
+            run_detail_style_gradient_diagnostics,
+        )
 
         stage = {
             "detail-style-teacher-context-cache": (
@@ -426,6 +434,9 @@ def main() -> None:
                 profile_detail_style_block_timestep_strength
             ),
             "detail-style-attenuation": diagnose_detail_style_attenuation,
+            "detail-style-gradient-diagnostics": (
+                run_detail_style_gradient_diagnostics
+            ),
             "detail-style-smoke": smoke_test_detail_style_cross_attention,
         }[args.command]
         _run(stage, config, destination)
