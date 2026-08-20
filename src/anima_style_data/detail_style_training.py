@@ -2564,6 +2564,19 @@ def train_detail_style_cross_attention(
         adapter.restore_timestep_strength_state()
         start_step = int(resume["step"])
     else:
+        reader_checkpoint = cfg.get("reader_checkpoint")
+        if reader_checkpoint:
+            reader_state = torch.load(
+                destination / str(reader_checkpoint),
+                map_location="cpu",
+                weights_only=False,
+            )
+            reader.load_state_dict(reader_state["reader"], strict=True)
+            print(
+                f"loaded pretrained detail-style Reader from {reader_checkpoint} "
+                f"step={int(reader_state.get('step', 0))}",
+                flush=True,
+            )
         calibration = _calibrate_alpha(
             anima, reader, adapter, bank, contexts, teacher_loader, device,
             int(training.get("alpha_calibration_batches", 4)),

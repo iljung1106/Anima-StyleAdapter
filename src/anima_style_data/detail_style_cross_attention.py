@@ -32,6 +32,8 @@ class DetailStyleOutput:
     per_reference_tokens: torch.Tensor
     reconstruction: torch.Tensor | None
     reconstruction_target: torch.Tensor | None
+    pooled_reconstruction: torch.Tensor | None = None
+    pooled_reconstruction_target: torch.Tensor | None = None
 
 
 def _leave_one_out_artist_center(values: torch.Tensor) -> torch.Tensor:
@@ -437,22 +439,37 @@ class DetailPreservingTypedSlotReader(nn.Module):
 
         reconstruction = None
         reconstruction_target = None
+        pooled_reconstruction = None
+        pooled_reconstruction_target = None
         if reconstruct:
-            queries = self.reconstruction_queries.to(encoded.dtype)[None].expand(
-                encoded.shape[0], -1, -1
-            )
-            reconstruction, _ = self.reconstruction_attention(
-                queries,
-                self.reconstruction_norm(encoded),
-                self.reconstruction_norm(encoded),
-            )
-            reconstruction = self.reconstruction_output(reconstruction)
+            def decode(values: torch.Tensor) -> torch.Tensor:
+                queries = self.reconstruction_queries.to(values.dtype)[None].expand(
+                    values.shape[0], -1, -1
+                )
+                normalized = self.reconstruction_norm(values)
+                decoded, _ = self.reconstruction_attention(
+                    queries, normalized, normalized
+                )
+                return self.reconstruction_output(decoded)
+
+            reconstruction = decode(encoded)
             reconstruction_target = targets.detach()
+            full_targets = targets.new_zeros(
+                *references.shape[:2], self.cached_tokens, self.dim
+            )
+            full_targets[reference_mask] = targets
+            counts = reference_mask.sum(dim=1).clamp_min(1).to(targets.dtype)
+            pooled_reconstruction_target = (
+                full_targets.sum(dim=1) / counts[:, None, None]
+            ).detach()
+            pooled_reconstruction = decode(tokens)
         return DetailStyleOutput(
             tokens=tokens,
             per_reference_tokens=per_reference,
             reconstruction=reconstruction,
             reconstruction_target=reconstruction_target,
+            pooled_reconstruction=pooled_reconstruction,
+            pooled_reconstruction_target=pooled_reconstruction_target,
         )
 
 

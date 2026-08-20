@@ -856,3 +856,30 @@ block별 post-gate 목표는 공통 Reader에서 충돌했다. v18은 다음처�
 
 Main flow와 reconstruction은 기존대로 유지한다. 기존 main-batch artist-effect,
 prototype, common/magnitude 보조 항은 v18에서 꺼 중복 gradient를 제거한다.
+
+## 19. v19 Reader 정보보존 선행학습
+
+v18은 1,500스텝까지 final centered cosine과 known-artist InfoNCE가 상승했지만,
+같은 prompt/seed의 미지 fixed reference 출력은 오히려 서로 비슷해졌다. 실제
+gradient 진단에서는 controlled teacher 합계가 main flow보다 약 `2.6x` 컸으며,
+특히 InfoNCE가 Reader의 가장 큰 gradient였다. 반면 무작위 초기화된 86M Reader의
+reconstruction gradient는 그보다 훨씬 작았다. 또한 기존 decoder는 각 reference의
+`84 -> 28 -> 84`만 지도하고 reference set-attention과 cross-slot mixer는 지도하지
+않았다.
+
+따라서 v19은 Anima를 로드하기 전에 Reader만 다음 두 목표로 4,000스텝
+선행학습한다.
+
+- 각 reference의 정규화된 84개 Dual-query token을 해당 28개 canonical token에서
+  복원한다.
+- 같은 작가의 네 reference를 set-attention/mixer로 합친 최종 28개 token에서,
+  네 입력의 평균 84-token을 복원한다. 이 항이 multi-reference 경로까지 직접
+  학습한다.
+
+본학습은 새 adapter와 함께 처음부터 시작하되 선행학습 Reader를 불러온다. Reader
+LR은 `2e-5`, reconstruction weight는 전 구간 `0.05`로 유지해 정보보존을 잊지
+않게 한다. Known-artist InfoNCE는 `0.05`로 낮추고, 관측된 공통 출력 붕괴를 직접
+억제하는 16-artist common-output 항은 `0.15`로 높인다. 나머지 v18 final-centered
+teacher, 저주파 residual, 성능 기반 curriculum은 유지한다. 선택 기준은 fixed
+reference 간 차이, pooled reconstruction validation, final centered cosine과
+common-output ratio를 함께 사용한다.

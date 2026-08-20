@@ -236,6 +236,9 @@ def test_reader_is_reference_order_invariant_and_reconstructs_every_valid_view()
     assert output.reconstruction is not None
     assert output.reconstruction_target is not None
     assert output.reconstruction.shape == (5, 12, 32)
+    assert output.pooled_reconstruction is not None
+    assert output.pooled_reconstruction_target is not None
+    assert output.pooled_reconstruction.shape == (2, 12, 32)
     torch.testing.assert_close(output.tokens, permuted.tokens, atol=3e-6, rtol=3e-5)
 
     loss = output.tokens.square().mean() + F.smooth_l1_loss(

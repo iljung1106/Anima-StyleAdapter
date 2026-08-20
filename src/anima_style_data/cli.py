@@ -109,6 +109,10 @@ def build_parser() -> argparse.ArgumentParser:
             "Train detail-preserving typed-slot Style Cross-Attention",
         ),
         (
+            "detail-style-reader-pretrain",
+            "Pretrain the typed-slot Reader with per-reference and pooled reconstruction",
+        ),
+        (
             "detail-style-block-similarity",
             "Cluster Anima blocks for four shared Style K/V bases",
         ),
@@ -401,6 +405,7 @@ def main() -> None:
     elif args.command in {
         "detail-style-teacher-context-cache",
         "detail-style-train",
+        "detail-style-reader-pretrain",
         "detail-style-block-similarity",
         "detail-style-fixed-samples",
         "detail-style-strength-profile",
@@ -422,12 +427,16 @@ def main() -> None:
         from .detail_style_gradient_diagnostics import (
             run_detail_style_gradient_diagnostics,
         )
+        from .detail_style_reader_pretraining import (
+            pretrain_detail_style_reader,
+        )
 
         stage = {
             "detail-style-teacher-context-cache": (
                 cache_detail_style_teacher_contexts
             ),
             "detail-style-train": train_detail_style_cross_attention,
+            "detail-style-reader-pretrain": pretrain_detail_style_reader,
             "detail-style-block-similarity": analyze_anima_block_similarity,
             "detail-style-fixed-samples": backfill_detail_style_fixed_samples,
             "detail-style-strength-profile": (
