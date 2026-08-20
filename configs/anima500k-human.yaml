@@ -3830,7 +3830,7 @@ real_artist_teacher:
 # Detail-preserving typed-slot, separate-softmax Style Cross-Attention v1.
 # Contract: docs/detail_preserving_style_cross_attention_plan.md
 detail_preserving_style_cross_attention:
-  output_directory: detail_preserving_style_cross_attention_native_band_v12_20k
+  output_directory: detail_preserving_style_cross_attention_native_common_ema_v13_20k
   seed: 20260819
   train_split: train
   validation_split: validation
@@ -4055,14 +4055,16 @@ detail_preserving_style_cross_attention:
     artist_effect_temperature: 0.10
     artist_effect_pool_scales: [2, 4]
     artist_effect_repeatability_weight: 0.25
-    # Penalize the raw heldout-reference residual shared by every artist. The
-    # threshold respects the finite batch-four floor (~0.5) and tightens only
-    # after the style branch has learned a usable direction.
+    # Estimate the common residual under controlled same-content/timestep
+    # native-teacher probes. Normalize only by the frozen native effect scale;
+    # a shrinking student can no longer shrink its own denominator. A separate
+    # EMA per content/timestep cell stabilizes the batch-four artist sample.
     common_output_start_step: 250
     common_output_full_step: 1000
-    # Restore the pre-ablation weight until the batch-four estimator is
-    # replaced by a controlled same-content/timestep common-effect objective.
     common_output_weight: 0.04
+    common_output_teacher: native_centered_ema
+    common_output_ema_decay: 0.90
+    common_output_native_ratio_threshold: 0.20
     common_output_threshold_start_step: 250
     common_output_threshold_end_step: 2000
     common_output_threshold_start: 0.90
@@ -4137,8 +4139,8 @@ detail_preserving_style_cross_attention:
     wandb:
       enabled: true
       project: anima-style-adapter
-      name: detail-style-native-band-v12-20k-anima-only
-      id: detail-style-native-band-v12-20k-anima-only
+      name: detail-style-native-common-ema-v13-20k-anima-only
+      id: detail-style-native-common-ema-v13-20k-anima-only
   sampling:
     width: 768
     height: 768

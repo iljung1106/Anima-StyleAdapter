@@ -13,6 +13,7 @@ from anima_style_data.detail_style_cross_attention import (  # noqa: E402
     SharedBaseKVStyleCrossAttention,
 )
 from anima_style_data.detail_style_training import (  # noqa: E402
+    NativeScaleCommonOutputEMA,
     _StyleAttenuationRecorder,
     _audit_student_prompts,
     _compose_separate_text_style_guidance,
@@ -21,6 +22,41 @@ from anima_style_data.detail_style_training import (  # noqa: E402
     _minimal_native_teacher_objective,
     _native_teacher_objective_config,
 )
+
+
+def test_native_scale_common_output_ema_is_stable_and_trainable():
+    estimator = NativeScaleCommonOutputEMA(decay=0.5)
+    native = torch.ones(4, 1, 1, 2, 2)
+    first = torch.full_like(native, 2.0, requires_grad=True)
+    first_loss, first_metrics = estimator.objective(
+        first, native, key=3, ratio_threshold=0.2
+    )
+    assert first_metrics[
+        "native_teacher_common_output_ema_ratio"
+    ] == pytest.approx(2.0)
+    assert float(first_loss.detach()) == pytest.approx(3.24)
+
+    second = torch.zeros_like(native, requires_grad=True)
+    second_loss, second_metrics = estimator.objective(
+        second, native, key=3, ratio_threshold=0.2
+    )
+    assert second_metrics[
+        "native_teacher_common_output_batch_ratio"
+    ] == pytest.approx(0.0)
+    assert second_metrics[
+        "native_teacher_common_output_ema_ratio"
+    ] == pytest.approx(1.0)
+    second_loss.backward()
+    assert second.grad is not None
+    assert second.grad.abs().sum() > 0
+
+    restored = NativeScaleCommonOutputEMA(decay=0.5)
+    restored.load_state_dict(estimator.state_dict())
+    assert restored.updates == {3: 2}
+    assert torch.equal(restored.values[3], estimator.values[3].cpu())
+    assert torch.equal(
+        restored.native_scales[3], estimator.native_scales[3].cpu()
+    )
 
 
 class _CountingLinear(nn.Linear):

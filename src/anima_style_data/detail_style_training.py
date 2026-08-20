@@ -206,6 +206,129 @@ def _scheduled_value(
     return float(initial) + progress * (float(final) - float(initial))
 
 
+class NativeScaleCommonOutputEMA:
+    """Stable common-effect estimator normalized by a frozen native scale.
+
+    Each native-teacher content/timestep cell owns an EMA of the batch-four
+    student mean residual.  The forward value uses that EMA, while the
+    straight-through term keeps the current student residual trainable.  The
+    native teacher is detached and is the only denominator, so shrinking the
+    student cannot weaken its own penalty.
+    """
+
+    def __init__(self, decay: float = 0.90) -> None:
+        if not 0.0 <= decay < 1.0:
+            raise ValueError("common-output EMA decay must be in [0, 1)")
+        self.decay = float(decay)
+        self.values: dict[int, torch.Tensor] = {}
+        self.native_scales: dict[int, torch.Tensor] = {}
+        self.updates: dict[int, int] = {}
+
+    def objective(
+        self,
+        student: torch.Tensor,
+        native_teacher: torch.Tensor,
+        *,
+        key: int,
+        ratio_threshold: float,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        student_float = student.float()
+        native_float = native_teacher.detach().float()
+        batch_common = student_float.mean(dim=0)
+        previous = self.values.get(int(key))
+        if previous is None:
+            smoothed_detached = batch_common.detach()
+            updates = 1
+        else:
+            previous = previous.to(
+                device=batch_common.device, dtype=batch_common.dtype,
+                non_blocking=True,
+            )
+            smoothed_detached = (
+                self.decay * previous
+                + (1.0 - self.decay) * batch_common.detach()
+            )
+            updates = self.updates[int(key)] + 1
+        self.values[int(key)] = smoothed_detached
+        self.updates[int(key)] = updates
+
+        # Forward: stable EMA. Backward: identity gradient to the current
+        # batch mean, avoiding the vanishing (1-decay) gradient of a literal
+        # differentiable EMA and the disconnected gradient of a detached EMA.
+        smoothed_common = (
+            smoothed_detached + batch_common - batch_common.detach()
+        )
+        reduce_dims = tuple(range(1, native_float.ndim))
+        native_row_rms = native_float.square().mean(dim=reduce_dims).sqrt()
+        native_scale_batch = native_row_rms.median().clamp_min(1e-8)
+        previous_scale = self.native_scales.get(int(key))
+        if previous_scale is None:
+            native_scale = native_scale_batch
+        else:
+            native_scale = (
+                self.decay * previous_scale.to(
+                    device=native_scale_batch.device,
+                    dtype=native_scale_batch.dtype,
+                    non_blocking=True,
+                )
+                + (1.0 - self.decay) * native_scale_batch
+            )
+        native_scale = native_scale.detach().clamp_min(1e-8)
+        self.native_scales[int(key)] = native_scale
+        batch_rms = batch_common.square().mean().sqrt()
+        ema_rms = smoothed_common.square().mean().sqrt()
+        ratio = ema_rms / native_scale
+        loss = F.relu(ratio - float(ratio_threshold)).square()
+        return loss, {
+            "native_teacher_common_output_batch_ratio": (
+                batch_rms.detach() / native_scale
+            ),
+            "native_teacher_common_output_ema_ratio": ratio.detach(),
+            "native_teacher_common_output_batch_rms": batch_rms.detach(),
+            "native_teacher_common_output_ema_rms": ema_rms.detach(),
+            "native_teacher_common_output_scale": native_scale.detach(),
+            "native_teacher_common_output_scale_batch": native_scale_batch.detach(),
+            "native_teacher_common_output_updates": loss.new_tensor(updates),
+            "native_teacher_common_output_loss": loss.detach(),
+        }
+
+    def state_dict(self) -> dict[str, Any]:
+        return {
+            "decay": self.decay,
+            "values": {
+                str(key): value.detach().cpu()
+                for key, value in self.values.items()
+            },
+            "native_scales": {
+                str(key): value.detach().cpu()
+                for key, value in self.native_scales.items()
+            },
+            "updates": {
+                str(key): int(value) for key, value in self.updates.items()
+            },
+        }
+
+    def load_state_dict(self, state: dict[str, Any]) -> None:
+        saved_decay = float(state.get("decay", self.decay))
+        if not math.isclose(saved_decay, self.decay, rel_tol=0.0, abs_tol=1e-12):
+            raise ValueError(
+                "common-output EMA decay differs from the saved training state: "
+                f"configured={self.decay} saved={saved_decay}"
+            )
+        self.values = {
+            int(key): value.detach().float()
+            for key, value in dict(state.get("values", {})).items()
+        }
+        self.native_scales = {
+            int(key): value.detach().float()
+            for key, value in dict(state.get("native_scales", {})).items()
+        }
+        self.updates = {
+            int(key): int(value)
+            for key, value in dict(state.get("updates", {})).items()
+        }
+
+
 def _weighted_artist_effect_objective(
     teacher_delta: torch.Tensor,
     student_delta: torch.Tensor,
@@ -270,11 +393,22 @@ def _weighted_artist_effect_objective(
         int(training.get("artist_effect_full_step", 1_000)),
         float(training.get("artist_effect_weight", 0.0)),
     )
-    common_weight = _ramp(
-        step,
-        int(training.get("common_output_start_step", 250)),
-        int(training.get("common_output_full_step", 1_000)),
-        float(training.get("common_output_weight", 0.0)),
+    common_output_teacher = str(
+        training.get("common_output_teacher", "student_batch")
+    )
+    if common_output_teacher not in {"student_batch", "native_centered_ema"}:
+        raise ValueError(
+            "common_output_teacher must be student_batch or native_centered_ema"
+        )
+    common_weight = (
+        _ramp(
+            step,
+            int(training.get("common_output_start_step", 250)),
+            int(training.get("common_output_full_step", 1_000)),
+            float(training.get("common_output_weight", 0.0)),
+        )
+        if common_output_teacher == "student_batch"
+        else 0.0
     )
     magnitude_weight = (
         _ramp(
@@ -302,6 +436,9 @@ def _weighted_artist_effect_objective(
         ),
         "functional_artist_common_output_weighted_loss": (
             weighted_common.detach()
+        ),
+        "functional_artist_common_output_uses_native_ema": effect.new_tensor(
+            float(common_output_teacher == "native_centered_ema")
         ),
         "functional_artist_magnitude_lower": effect.new_tensor(
             magnitude_lower
@@ -949,6 +1086,7 @@ def _teacher_step(
     device: str,
     training: dict[str, Any],
     timestep_weighting: dict[str, torch.Tensor] | None,
+    common_output_ema: NativeScaleCommonOutputEMA | None,
     *,
     step: int,
     probe_index: int,
@@ -1007,6 +1145,37 @@ def _teacher_step(
     final_loss, metrics = _minimal_native_teacher_objective(
         student, teacher, objective_cfg, step=step
     )
+    if common_output_ema is not None:
+        common_loss, common_metrics = common_output_ema.objective(
+            student,
+            teacher,
+            key=content_index * timestep_count + timestep_index,
+            ratio_threshold=float(
+                training.get("common_output_native_ratio_threshold", 0.20)
+            ),
+        )
+        common_weight = _ramp(
+            step,
+            int(training.get("common_output_start_step", 250)),
+            int(training.get("common_output_full_step", 1_000)),
+            float(training.get("common_output_weight", 0.0)),
+        )
+        weighted_common = common_weight * common_loss
+        final_loss = final_loss + weighted_common
+        metrics.update(common_metrics)
+        metrics.update({
+            "native_teacher_common_output_ratio_threshold": (
+                final_loss.new_tensor(
+                    float(training.get("common_output_native_ratio_threshold", 0.20))
+                )
+            ),
+            "native_teacher_common_output_weight": final_loss.new_tensor(
+                common_weight
+            ),
+            "native_teacher_common_output_weighted_loss": (
+                weighted_common.detach()
+            ),
+        })
     timestep_weight = _native_effect_weights_for_timesteps(
         timestep.float().reshape(1), timestep_weighting
     )[0]
@@ -1123,6 +1292,7 @@ def _save_state(
     adapter: FreshKVStyleCrossAttention,
     optimizer: torch.optim.Optimizer,
     cfg: dict[str, Any],
+    common_output_ema: NativeScaleCommonOutputEMA | None = None,
 ) -> None:
     temporary = path.with_suffix(path.suffix + ".tmp")
     torch.save({
@@ -1130,6 +1300,11 @@ def _save_state(
         "reader": {key: value.detach().cpu() for key, value in reader.state_dict().items()},
         "adapter": {key: value.detach().cpu() for key, value in adapter.state_dict().items()},
         "optimizer": optimizer.state_dict(),
+        "common_output_ema": (
+            common_output_ema.state_dict()
+            if common_output_ema is not None
+            else None
+        ),
         "config": cfg,
         "python_rng": random.getstate(),
         "numpy_rng": np.random.get_state(),
@@ -1590,6 +1765,14 @@ def train_detail_style_cross_attention(
         strict_style_ids=False,
     )
     timestep_weighting = _build_native_effect_timestep_weighting(bank, training)
+    common_output_ema = None
+    if (
+        str(training.get("common_output_teacher", "student_batch"))
+        == "native_centered_ema"
+    ):
+        common_output_ema = NativeScaleCommonOutputEMA(
+            decay=float(training.get("common_output_ema_decay", 0.90))
+        )
 
     anima = _resolve_anima_model(config, destination, device).requires_grad_(False).eval()
     _optimize_frozen_anima(
@@ -1689,6 +1872,11 @@ def train_detail_style_cross_attention(
     )
     if resume is not None:
         optimizer.load_state_dict(resume["optimizer"])
+        if (
+            common_output_ema is not None
+            and resume.get("common_output_ema") is not None
+        ):
+            common_output_ema.load_state_dict(resume["common_output_ema"])
         random.setstate(resume["python_rng"])
         np.random.set_state(resume["numpy_rng"])
         torch.set_rng_state(resume["torch_rng"])
@@ -1826,7 +2014,8 @@ def train_detail_style_cross_attention(
                 teacher_loss, teacher_metrics = _teacher_step(
                     anima, reader, adapter, bank, contexts,
                     teacher_loader.load_step(teacher_update), device, training,
-                    timestep_weighting, step=step, probe_index=teacher_update,
+                    timestep_weighting, common_output_ema,
+                    step=step, probe_index=teacher_update,
                 )
                 teacher_loss.backward()
                 metric_rows[-1].update(teacher_metrics)
@@ -1932,11 +2121,13 @@ def train_detail_style_cross_attention(
                 _save_state(
                     state_path, step=step, reader=reader, adapter=adapter,
                     optimizer=optimizer, cfg=cfg,
+                    common_output_ema=common_output_ema,
                 )
             if step % checkpoint_every == 0 or step == steps:
                 _save_state(
                     checkpoint_dir / f"step-{step:07d}.pt", step=step,
                     reader=reader, adapter=adapter, optimizer=optimizer, cfg=cfg,
+                    common_output_ema=common_output_ema,
                 )
             if sample_every > 0 and (step % sample_every == 0 or step == steps):
                 sample_records, vae = _sample_query_style_tokenizer(
