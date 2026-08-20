@@ -3525,7 +3525,7 @@ def smoke_test_detail_style_cross_attention(
 ) -> dict[str, Any]:
     smoke = copy.deepcopy(config)
     cfg = smoke["detail_preserving_style_cross_attention"]
-    cfg["output_directory"] = str(cfg["output_directory"]) + "_smoke"
+    cfg["output_directory"] = str(cfg["output_directory"]) + "_smoke16"
     cfg.setdefault("data_mixture", {})["enabled"] = False
     cfg["loader"]["batch_size"] = 2
     cfg["training"].update({
@@ -3537,7 +3537,8 @@ def smoke_test_detail_style_cross_attention(
         "sample_every": 0,
         "resume": False,
         "alpha_calibration_batches": 1,
-        "teacher_batch_rows": 2,
+        "teacher_batch_rows": 16,
+        "teacher_microbatch_rows": 4,
         "functional_start_step": 1,
         "functional_every": 1,
         "artist_effect_start_step": 1,
