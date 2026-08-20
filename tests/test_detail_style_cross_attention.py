@@ -16,13 +16,16 @@ from anima_style_data.detail_style_cross_attention import (  # noqa: E402
 from anima_style_data.detail_style_training import (  # noqa: E402
     NativeScaleCommonOutputPenalty,
     _StyleAttenuationRecorder,
+    _all_artist_teacher_infonce,
     _audit_student_prompts,
+    _backward_adapter_only,
     _compose_separate_text_style_guidance,
     _delayed_learning_rate_multiplier,
     _effect_stage_metrics,
     _minimal_native_teacher_objective,
     _native_effect_scales_for_timesteps,
     _native_teacher_objective_config,
+    _soft_common_output_objective,
     _teacher_direction_ranking_loss,
     _update_performance_curriculum,
     _wrong_flow_ranking_loss,
@@ -617,19 +620,19 @@ def test_separate_style_guidance_is_not_scaled_by_text_cfg():
     assert torch.equal(result, expected)
 
 
-def test_minimal_teacher_projection_prevents_zero_output_without_total_rms_fix():
+def test_centered_direction_and_magnitude_prevent_zero_output():
     torch.manual_seed(127)
     teacher = torch.randn(4, 3, 5)
     collapsed = torch.zeros_like(teacher, requires_grad=True)
     config = {
         "residual_weight": 0.20,
-        "projection_weight": 0.15,
-        "projection_floor_start": 0.25,
-        "projection_floor_end": 1.0,
-        "projection_floor_start_step": 1,
-        "projection_floor_end_step": 1000,
-        "orthogonal_weight": 0.05,
-        "orthogonal_ratio_maximum": 0.50,
+        "low_frequency_residual_weight": 0.0,
+        "direction_weight": 1.0,
+        "magnitude_weight": 0.10,
+        "magnitude_floor_start": 1.0,
+        "magnitude_floor_end": 1.0,
+        "magnitude_floor_start_step": 1,
+        "magnitude_floor_end_step": 1000,
     }
     collapsed_loss, collapsed_metrics = _minimal_native_teacher_objective(
         collapsed, teacher, config, step=1000
@@ -642,35 +645,35 @@ def test_minimal_teacher_projection_prevents_zero_output_without_total_rms_fix()
     assert collapsed.grad is not None
     assert torch.count_nonzero(collapsed.grad) > 0
     assert float(collapsed_metrics["native_teacher_projection_coefficient"]) == pytest.approx(0.0)
-    assert float(collapsed_metrics["native_teacher_projection_floor_loss"]) == pytest.approx(1.0)
+    assert float(collapsed_metrics["native_teacher_magnitude_lower_loss"]) == pytest.approx(1.0)
     assert float(aligned_metrics["native_teacher_projection_coefficient"]) == pytest.approx(1.0)
     assert float(aligned_loss) < float(collapsed_loss)
 
 
-def test_native_bank_owns_artist_magnitude_weight():
+def test_nested_teacher_objective_overrides_legacy_top_level_values():
     training = {
-        "artist_magnitude_teacher": "native_centered_bank",
-        "artist_magnitude_weight": 0.75,
-        "teacher_objective": {"projection_weight": 0.15},
+        "magnitude_weight": 0.75,
+        "teacher_objective": {"magnitude_weight": 0.15},
     }
 
     resolved = _native_teacher_objective_config(training)
 
-    assert resolved["projection_weight"] == pytest.approx(0.75)
-    assert training["teacher_objective"]["projection_weight"] == pytest.approx(0.15)
+    assert resolved["magnitude_weight"] == pytest.approx(0.15)
+    assert training["magnitude_weight"] == pytest.approx(0.75)
 
 
-def test_minimal_teacher_projection_has_a_weak_upper_bound():
+def test_centered_teacher_magnitude_has_a_weak_upper_bound():
     torch.manual_seed(128)
     teacher = torch.randn(4, 3, 5)
     config = {
         "residual_weight": 0.0,
-        "projection_weight": 1.0,
-        "projection_floor_start": 0.7,
-        "projection_floor_end": 0.7,
-        "projection_upper": 1.5,
-        "projection_upper_weight": 0.25,
-        "orthogonal_weight": 0.0,
+        "low_frequency_residual_weight": 0.0,
+        "direction_weight": 0.0,
+        "magnitude_weight": 1.0,
+        "magnitude_floor_start": 0.7,
+        "magnitude_floor_end": 0.7,
+        "magnitude_upper": 1.5,
+        "magnitude_upper_weight": 0.25,
     }
 
     aligned_loss, aligned_metrics = _minimal_native_teacher_objective(
@@ -681,21 +684,21 @@ def test_minimal_teacher_projection_has_a_weak_upper_bound():
     )
 
     assert float(aligned_loss) == pytest.approx(0.0, abs=1e-7)
-    assert float(excessive_metrics["native_teacher_projection_upper_loss"]) == (
+    assert float(excessive_metrics["native_teacher_magnitude_upper_loss"]) == (
         pytest.approx(0.25)
     )
     assert float(excessive_loss) > float(aligned_loss)
 
 
-def test_low_frequency_native_residual_uses_two_pool_scales():
+def test_low_frequency_native_residual_uses_single_two_x_pool():
     torch.manual_seed(129)
     teacher = torch.randn(4, 3, 8, 8)
     config = {
         "residual_weight": 0.0,
-        "low_frequency_residual_pool_scales": [2, 4],
+        "low_frequency_residual_pool_scales": [2],
         "low_frequency_residual_weight": 1.0,
-        "projection_weight": 0.0,
-        "orthogonal_weight": 0.0,
+        "direction_weight": 0.0,
+        "magnitude_weight": 0.0,
     }
 
     aligned, aligned_metrics = _minimal_native_teacher_objective(
@@ -726,6 +729,45 @@ def test_teacher_direction_ranking_uses_cyclic_frozen_negatives():
     assert float(loss) == pytest.approx(0.0, abs=1e-7)
 
 
+def test_all_artist_infonce_uses_every_wrong_teacher():
+    teacher = torch.eye(4).reshape(4, 1, 2, 2)
+    student = teacher[:2].clone().requires_grad_(True)
+    labels = torch.tensor([0, 1])
+
+    loss, metrics = _all_artist_teacher_infonce(
+        student, teacher[:2], teacher, labels, temperature=0.1
+    )
+    loss.backward()
+
+    assert student.grad is not None
+    assert float(metrics["teacher_infonce_accuracy"]) == pytest.approx(1.0)
+    assert float(metrics["teacher_infonce_cosine_gap"]) > 0.9
+
+
+def test_soft_common_output_keeps_gradient_at_threshold():
+    mean = torch.full((1, 2, 2), 0.6, requires_grad=True)
+    loss, metrics = _soft_common_output_objective(
+        mean, torch.tensor(1.0), ratio_threshold=0.6, softness=0.05
+    )
+    loss.backward()
+
+    assert float(loss) > 0
+    assert mean.grad is not None and torch.count_nonzero(mean.grad) > 0
+    assert float(metrics["native_teacher_common_output_ratio"]) == pytest.approx(0.6)
+
+
+def test_adapter_only_backward_does_not_touch_reader_leaf():
+    reader = nn.Parameter(torch.tensor(2.0))
+    adapter = nn.Parameter(torch.tensor(3.0))
+    shared = reader * adapter
+    _backward_adapter_only(shared.square(), [adapter], retain_graph=True)
+
+    assert reader.grad is None
+    assert adapter.grad is not None
+    shared.backward()
+    assert reader.grad is not None
+
+
 def test_performance_curriculum_requires_consecutive_validation_windows():
     training = {
         "performance_curriculum": {
@@ -739,12 +781,9 @@ def test_performance_curriculum_requires_consecutive_validation_windows():
                     "target_probability": 1.0,
                     "advance": {
                         "minimum_step": 100,
-                        "post_gate_cosine": 0.2,
+                        "final_centered_cosine": 0.2,
                         "native_projection": 0.4,
-                        "correct_wrong_advantage": 0.0,
                         "common_output_ratio": 0.7,
-                        "centered_rms_ratio_minimum": 0.5,
-                        "centered_rms_ratio_maximum": 1.5,
                         "consecutive_validations": 2,
                     },
                 },
@@ -769,8 +808,10 @@ def test_performance_curriculum_requires_consecutive_validation_windows():
         },
     }
     teacher_rows = [{
-        "post_gate_teacher_block_21_cosine": 0.3,
+        "native_teacher_cosine": 0.3,
         "native_teacher_projection_coefficient": 0.5,
+        "native_teacher_common_output_ratio": 0.6,
+        "teacher_infonce_accuracy": 0.75,
     }]
 
     first, changed = _update_performance_curriculum(

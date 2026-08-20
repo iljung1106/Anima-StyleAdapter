@@ -824,3 +824,35 @@ reference, target probability `0`, teacher 매 2-step 단계로 넘어간다. �
 않는다. 같은 prompt/seed의 fixed-reference에서 common effect와 artist-centered
 effect를 분리하고, direction/ranking 검증과 함께 판단한다. Global strength 증가는
 방향 정렬을 통과한 뒤의 inference 조절로만 사용한다.
+
+## 18. v18 16-artist centered objective
+
+v17 1,500-step gradient 진단에서 controlled Teacher gradient가 main flow보다
+`8.6--8.8x` 컸고, projection band와 orthogonal cap의 cosine은 `-0.55`였다.
+또한 cyclic/common hinge는 쉬운 batch-4에서 gradient가 정확히 0이 되었고,
+block별 post-gate 목표는 공통 Reader에서 충돌했다. v18은 다음처럼 단순화한다.
+
+- 동일 `x_t`, timestep, content, Student Q를 공유하는 16명 controlled batch를
+  4명 microbatch로 처리한다. Student residual은 final artist mean으로 center한다.
+- Final centered residual에 `1-cos(S_i,T_i)`를 직접 적용하고, 양의 native
+  projection에는 약한 magnitude band만 둔다. 기존 projection/artist-energy/
+  orthogonal 세 항은 제거한다.
+- Cyclic negative 하나 대신 16명 native teacher 전체를 negative로 쓰는 InfoNCE를
+  적용한다. Frozen teacher만 bank로 사용하므로 다른 student graph를 보존하지 않는다.
+- Common-output은 16명 전체 student mean과 frozen native scale로 계산한다. Hard
+  hinge 대신 softplus를 사용하고, 첫 no-grad pass로 얻은 mean의 정확한 gradient를
+  두 번째 microbatch pass에 선형 surrogate로 전달한다.
+- Residual 회귀는 `2x` low-frequency를 주 보조 항으로 쓰고 full-resolution은
+  약하게 유지하며 `4x` 항은 제거한다.
+- Controlled 증류 합계에는 단일 `teacher_global_weight=0.1`을 적용한다. Post-gate
+  증류는 adapter K/V, block delta, base mixing에만 역전파하고 Reader에는 전달하지
+  않는다.
+- Validation의 `self` 경로는 이름만 유지하되 실제 active performance stage와 같은
+  reference 수와 target 포함률을 사용한다. 고정 exact-self는
+  `exact_self_probe`로 별도 기록한다.
+- Curriculum 전환은 post-gate cosine을 사용하지 않는다. Final centered cosine,
+  positive native projection, 16-artist common-output ratio가 연속 3회 기준을 통과할
+  때만 다음 stage로 이동한다. Post-gate cosine은 진단용으로만 계속 기록한다.
+
+Main flow와 reconstruction은 기존대로 유지한다. 기존 main-batch artist-effect,
+prototype, common/magnitude 보조 항은 v18에서 꺼 중복 gradient를 제거한다.
