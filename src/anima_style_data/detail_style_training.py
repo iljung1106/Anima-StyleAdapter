@@ -207,20 +207,21 @@ def _scheduled_value(
 
 
 class NativeScaleCommonOutputEMA:
-    """Stable common-effect estimator normalized by a frozen native scale.
+    """Stable common-effect energy normalized by a frozen native scale.
 
-    Each native-teacher content/timestep cell owns an EMA of the batch-four
-    student mean residual.  The forward value uses that EMA, while the
-    straight-through term keeps the current student residual trainable.  The
-    native teacher is detached and is the only denominator, so shrinking the
-    student cannot weaken its own penalty.
+    Each probe cell owns an EMA of the scalar energy of the batch-four student
+    mean residual.  Averaging the high-dimensional residual vector itself can
+    hide a rotating common failure mode through cancellation.  The forward
+    value uses the scalar EMA, while a straight-through term keeps the current
+    batch common residual trainable.  The native scale is detached and is the
+    only denominator, so shrinking the student cannot weaken its own penalty.
     """
 
     def __init__(self, decay: float = 0.90) -> None:
         if not 0.0 <= decay < 1.0:
             raise ValueError("common-output EMA decay must be in [0, 1)")
         self.decay = float(decay)
-        self.values: dict[int, torch.Tensor] = {}
+        self.energies: dict[int, torch.Tensor] = {}
         self.native_scales: dict[int, torch.Tensor] = {}
         self.updates: dict[int, int] = {}
 
@@ -232,35 +233,54 @@ class NativeScaleCommonOutputEMA:
         key: int,
         ratio_threshold: float,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-        student_float = student.float()
         native_float = native_teacher.detach().float()
+        reduce_dims = tuple(range(1, native_float.ndim))
+        native_row_rms = native_float.square().mean(dim=reduce_dims).sqrt()
+        native_scale = native_row_rms.median().clamp_min(1e-8)
+        return self.objective_from_scale(
+            student,
+            native_scale,
+            key=key,
+            ratio_threshold=ratio_threshold,
+        )
+
+    def objective_from_scale(
+        self,
+        student: torch.Tensor,
+        native_scale: torch.Tensor,
+        *,
+        key: int,
+        ratio_threshold: float,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        """Penalize common energy using an immutable scalar native scale."""
+
+        student_float = student.float()
         batch_common = student_float.mean(dim=0)
-        previous = self.values.get(int(key))
+        batch_energy = batch_common.square().mean()
+        previous = self.energies.get(int(key))
         if previous is None:
-            smoothed_detached = batch_common.detach()
+            smoothed_energy_detached = batch_energy.detach()
             updates = 1
         else:
             previous = previous.to(
-                device=batch_common.device, dtype=batch_common.dtype,
+                device=batch_energy.device, dtype=batch_energy.dtype,
                 non_blocking=True,
             )
-            smoothed_detached = (
+            smoothed_energy_detached = (
                 self.decay * previous
-                + (1.0 - self.decay) * batch_common.detach()
+                + (1.0 - self.decay) * batch_energy.detach()
             )
             updates = self.updates[int(key)] + 1
-        self.values[int(key)] = smoothed_detached
+        self.energies[int(key)] = smoothed_energy_detached
         self.updates[int(key)] = updates
 
-        # Forward: stable EMA. Backward: identity gradient to the current
-        # batch mean, avoiding the vanishing (1-decay) gradient of a literal
-        # differentiable EMA and the disconnected gradient of a detached EMA.
-        smoothed_common = (
-            smoothed_detached + batch_common - batch_common.detach()
+        # Forward: stable scalar-energy EMA. Backward: identity gradient to
+        # the current batch energy, which in turn follows the current common
+        # residual direction rather than a stale averaged vector direction.
+        smoothed_energy = (
+            smoothed_energy_detached + batch_energy - batch_energy.detach()
         )
-        reduce_dims = tuple(range(1, native_float.ndim))
-        native_row_rms = native_float.square().mean(dim=reduce_dims).sqrt()
-        native_scale_batch = native_row_rms.median().clamp_min(1e-8)
+        native_scale_batch = native_scale.detach().float().clamp_min(1e-8)
         previous_scale = self.native_scales.get(int(key))
         if previous_scale is None:
             native_scale = native_scale_batch
@@ -275,8 +295,8 @@ class NativeScaleCommonOutputEMA:
             )
         native_scale = native_scale.detach().clamp_min(1e-8)
         self.native_scales[int(key)] = native_scale
-        batch_rms = batch_common.square().mean().sqrt()
-        ema_rms = smoothed_common.square().mean().sqrt()
+        batch_rms = batch_energy.sqrt()
+        ema_rms = smoothed_energy.clamp_min(1e-16).sqrt()
         ratio = ema_rms / native_scale
         loss = F.relu(ratio - float(ratio_threshold)).square()
         return loss, {
@@ -295,9 +315,9 @@ class NativeScaleCommonOutputEMA:
     def state_dict(self) -> dict[str, Any]:
         return {
             "decay": self.decay,
-            "values": {
+            "energies": {
                 str(key): value.detach().cpu()
-                for key, value in self.values.items()
+                for key, value in self.energies.items()
             },
             "native_scales": {
                 str(key): value.detach().cpu()
@@ -315,9 +335,9 @@ class NativeScaleCommonOutputEMA:
                 "common-output EMA decay differs from the saved training state: "
                 f"configured={self.decay} saved={saved_decay}"
             )
-        self.values = {
+        self.energies = {
             int(key): value.detach().float()
-            for key, value in dict(state.get("values", {})).items()
+            for key, value in dict(state.get("energies", {})).items()
         }
         self.native_scales = {
             int(key): value.detach().float()
@@ -743,8 +763,13 @@ def _flow_step(
     mode: str,
     train_auxiliaries: bool,
     measure_base: bool,
+    capture_auxiliary_probe: bool = False,
     backward_scale: float | None = None,
-) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+) -> tuple[
+    torch.Tensor,
+    dict[str, torch.Tensor],
+    dict[str, torch.Tensor] | None,
+]:
     latents = batch["latents"].to(device, dtype=torch.bfloat16, non_blocking=True)
     context = batch["conditioning"].to(
         device, dtype=torch.bfloat16, non_blocking=True
@@ -869,7 +894,7 @@ def _flow_step(
         and prediction.shape[0] >= 2
     )
     base_prediction = None
-    if measure_base or need_wrong or need_artist_effect:
+    if measure_base or need_wrong or need_artist_effect or capture_auxiliary_probe:
         with torch.no_grad(), torch.autocast(
             device_type=torch.device(device).type,
             dtype=torch.bfloat16,
@@ -1072,8 +1097,219 @@ def _flow_step(
         total = total + weighted_artist_effect
         reported_loss = reported_loss + weighted_artist_effect.detach()
         metrics.update(artist_effect_metrics)
+    auxiliary_probe = None
+    if capture_auxiliary_probe:
+        assert base_prediction is not None
+        auxiliary_probe = {
+            "noisy": noisy.detach(),
+            "timesteps": timesteps.detach(),
+            "context": context.detach(),
+            "padding": padding.detach(),
+            "target": target.detach(),
+            "base_prediction": base_prediction.detach(),
+            "correct_prediction": prediction.detach(),
+        }
     metrics["loss"] = reported_loss
-    return total, metrics
+    return total, metrics, auxiliary_probe
+
+
+def _native_effect_scales_for_timesteps(
+    timesteps: torch.Tensor,
+    weighting: dict[str, torch.Tensor] | None,
+) -> torch.Tensor:
+    """Interpolate the frozen native centered-effect median RMS profile."""
+
+    if weighting is None or "median_rms" not in weighting:
+        raise ValueError(
+            "Main common-output supervision requires native timestep RMS statistics"
+        )
+    grid = weighting["timesteps"].to(timesteps.device).float()
+    values = weighting["median_rms"].to(timesteps.device).float()
+    order = grid.argsort()
+    grid = grid[order]
+    values = values[order]
+    query = timesteps.float().clamp(grid[0], grid[-1])
+    if len(grid) == 1:
+        return values[0].expand_as(query)
+    upper = torch.searchsorted(grid, query).clamp(1, len(grid) - 1)
+    lower = upper - 1
+    left = grid[lower]
+    right = grid[upper]
+    fraction = (query - left) / (right - left).clamp_min(1e-8)
+    return values[lower] + fraction * (values[upper] - values[lower])
+
+
+def _wrong_flow_ranking_loss(
+    correct_prediction: torch.Tensor,
+    wrong_prediction: torch.Tensor,
+    base_prediction: torch.Tensor,
+    target: torch.Tensor,
+    *,
+    margin: float,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Rank a trainable wrong path below a detached correct comparator."""
+
+    dimensions = tuple(range(1, wrong_prediction.ndim))
+    base_error = (
+        (base_prediction.detach().float() - target.float())
+        .square().mean(dim=dimensions).clamp_min(1e-8)
+    )
+    correct_error = (
+        (correct_prediction.detach().float() - target.float())
+        .square().mean(dim=dimensions)
+    )
+    wrong_error = (
+        (wrong_prediction.float() - target.float()).square().mean(dim=dimensions)
+    )
+    correct_improvement = (base_error - correct_error) / base_error
+    wrong_improvement = (base_error - wrong_error) / base_error
+    advantage = correct_improvement - wrong_improvement
+    ranking = F.relu(float(margin) - advantage).mean()
+    return ranking, {
+        "correct_improvement": correct_improvement.detach().mean(),
+        "wrong_improvement": wrong_improvement.detach().mean(),
+        "advantage": advantage.detach().mean(),
+    }
+
+
+def _wrong_reference_gradient_step(
+    anima: torch.nn.Module,
+    reader: DetailPreservingTypedSlotReader,
+    adapter: FreshKVStyleCrossAttention,
+    batch: dict[str, Any],
+    probe: dict[str, torch.Tensor],
+    device: str,
+    training: dict[str, Any],
+    *,
+    step: int,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Give the cyclic wrong-reference comparator a weak, sequential gradient."""
+
+    wrong_references, wrong_mask = _reference_inputs(batch, device, "wrong_artist")
+    with torch.autocast(
+        device_type=torch.device(device).type,
+        dtype=torch.bfloat16,
+        enabled=torch.device(device).type == "cuda",
+    ):
+        wrong_tokens = reader(wrong_references, wrong_mask).tokens
+        adapter.set_style_context(wrong_tokens)
+        adapter.set_timesteps(probe["timesteps"])
+        try:
+            wrong_prediction = anima(
+                probe["noisy"].unsqueeze(2),
+                probe["timesteps"].to(probe["noisy"].dtype),
+                context=probe["context"],
+                padding_mask=probe["padding"],
+                target_input_ids=None,
+            ).squeeze(2).float()
+        finally:
+            adapter.clear_style_tokens()
+
+    ranking, ranking_metrics = _wrong_flow_ranking_loss(
+        probe["correct_prediction"],
+        wrong_prediction,
+        probe["base_prediction"],
+        probe["target"],
+        margin=float(training.get("functional_margin", 0.01)),
+    )
+    full_weight = _ramp(
+        step,
+        int(training.get("functional_start_step", 250)),
+        int(training.get("functional_full_step", 750)),
+        float(training.get("functional_weight", 0.10)),
+    )
+    gradient_scale = float(training.get("functional_wrong_gradient_scale", 0.10))
+    weighted = full_weight * gradient_scale * ranking
+    return weighted, {
+        "functional_wrong_gradient_ranking_loss": ranking.detach(),
+        "functional_wrong_gradient_scale": ranking.new_tensor(gradient_scale),
+        "functional_wrong_gradient_weight": ranking.new_tensor(
+            full_weight * gradient_scale
+        ),
+        "functional_wrong_gradient_weighted_loss": weighted.detach(),
+        "functional_wrong_gradient_flow_improvement": (
+            ranking_metrics["wrong_improvement"]
+        ),
+        "functional_wrong_gradient_advantage": ranking_metrics["advantage"],
+    }
+
+
+def _main_common_output_step(
+    anima: torch.nn.Module,
+    reader: DetailPreservingTypedSlotReader,
+    adapter: FreshKVStyleCrossAttention,
+    estimator: NativeScaleCommonOutputEMA,
+    batch: dict[str, Any],
+    probe: dict[str, torch.Tensor],
+    device: str,
+    training: dict[str, Any],
+    timestep_weighting: dict[str, torch.Tensor] | None,
+    *,
+    step: int,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Penalize common artist output on a controlled normal-train probe."""
+
+    references, mask = _reference_inputs(batch, device, "heldout")
+    rows = min(
+        int(training.get("main_common_output_batch_rows", 4)),
+        references.shape[0],
+    )
+    references, mask = references[:rows], mask[:rows]
+    timestep = probe["timesteps"][0:1]
+    with torch.autocast(
+        device_type=torch.device(device).type,
+        dtype=torch.bfloat16,
+        enabled=torch.device(device).type == "cuda",
+    ):
+        style = reader(references, mask).tokens
+        adapter.set_style_context(style)
+        adapter.set_timesteps(timestep.expand(rows))
+        try:
+            prediction = anima(
+                probe["noisy"][0:1].expand(rows, -1, -1, -1).unsqueeze(2),
+                timestep.to(probe["noisy"].dtype).expand(rows),
+                context=probe["context"][0:1].expand(rows, -1, -1),
+                padding_mask=probe["padding"][0:1].expand(rows, -1, -1, -1),
+                target_input_ids=None,
+            ).squeeze(2).float()
+        finally:
+            adapter.clear_style_tokens()
+    student = prediction - probe["base_prediction"][0:1].float()
+    native_scale = _native_effect_scales_for_timesteps(
+        timestep.float(), timestep_weighting
+    )[0]
+    grid = timestep_weighting["timesteps"].to(timestep.device).float()
+    timestep_key = int((grid - timestep.float()[0]).abs().argmin())
+    common_loss, raw_metrics = estimator.objective_from_scale(
+        student,
+        native_scale,
+        key=timestep_key,
+        ratio_threshold=float(
+            training.get("main_common_output_native_ratio_threshold", 0.20)
+        ),
+    )
+    weight = _ramp(
+        step,
+        int(training.get("main_common_output_start_step", 250)),
+        int(training.get("main_common_output_full_step", 1_000)),
+        float(training.get("main_common_output_weight", 0.04)),
+    )
+    timestep_weight = _native_effect_weights_for_timesteps(
+        timestep.float(), timestep_weighting
+    )[0]
+    weighted = weight * timestep_weight * common_loss
+    metrics = {
+        key.replace("native_teacher_common_output", "main_common_output"): value
+        for key, value in raw_metrics.items()
+    }
+    metrics.update({
+        "main_common_output_weight": weighted.new_tensor(weight),
+        "main_common_output_timestep_weight": timestep_weight.detach(),
+        "main_common_output_weighted_loss": weighted.detach(),
+        "main_common_output_artist_rows": weighted.new_tensor(rows),
+        "main_common_output_timestep": timestep.detach().float()[0],
+    })
+    return weighted, metrics
 
 
 def _teacher_step(
@@ -1293,6 +1529,7 @@ def _save_state(
     optimizer: torch.optim.Optimizer,
     cfg: dict[str, Any],
     common_output_ema: NativeScaleCommonOutputEMA | None = None,
+    main_common_output_ema: NativeScaleCommonOutputEMA | None = None,
 ) -> None:
     temporary = path.with_suffix(path.suffix + ".tmp")
     torch.save({
@@ -1303,6 +1540,11 @@ def _save_state(
         "common_output_ema": (
             common_output_ema.state_dict()
             if common_output_ema is not None
+            else None
+        ),
+        "main_common_output_ema": (
+            main_common_output_ema.state_dict()
+            if main_common_output_ema is not None
             else None
         ),
         "config": cfg,
@@ -1333,7 +1575,7 @@ def _evaluate(
     adapter.eval()
     rows = []
     for index in range(batches):
-        _, metrics = _flow_step(
+        _, metrics, _ = _flow_step(
             anima, reader, adapter, loader.load_step(index), device, training,
             timestep_weighting,
             generator=torch.Generator(device=device).manual_seed(seed + index * 97),
@@ -1773,6 +2015,11 @@ def train_detail_style_cross_attention(
         common_output_ema = NativeScaleCommonOutputEMA(
             decay=float(training.get("common_output_ema_decay", 0.90))
         )
+    main_common_output_ema = None
+    if float(training.get("main_common_output_weight", 0.0)) > 0:
+        main_common_output_ema = NativeScaleCommonOutputEMA(
+            decay=float(training.get("common_output_ema_decay", 0.90))
+        )
 
     anima = _resolve_anima_model(config, destination, device).requires_grad_(False).eval()
     _optimize_frozen_anima(
@@ -1877,6 +2124,13 @@ def train_detail_style_cross_attention(
             and resume.get("common_output_ema") is not None
         ):
             common_output_ema.load_state_dict(resume["common_output_ema"])
+        if (
+            main_common_output_ema is not None
+            and resume.get("main_common_output_ema") is not None
+        ):
+            main_common_output_ema.load_state_dict(
+                resume["main_common_output_ema"]
+            )
         random.setstate(resume["python_rng"])
         np.random.set_state(resume["numpy_rng"])
         torch.set_rng_state(resume["torch_rng"])
@@ -1994,21 +2248,58 @@ def train_detail_style_cross_attention(
                 group["lr"] = base_group_lrs[str(group["name"])] * lr_scale
             optimizer.zero_grad(set_to_none=True)
             metric_rows: list[dict[str, torch.Tensor]] = []
+            main_common_due = bool(
+                main_common_output_ema is not None
+                and step >= int(training.get("main_common_output_start_step", 250))
+                and step % int(training.get("main_common_output_every", 4)) == 0
+            )
+            wrong_gradient_due = bool(
+                float(training.get("functional_wrong_gradient_scale", 0.0)) > 0
+                and step >= int(training.get("functional_start_step", 250))
+                and step % int(training.get("functional_wrong_gradient_every", 1)) == 0
+            )
+            auxiliary_probe = None
+            auxiliary_batch = None
             for micro in range(accumulation):
                 batch = next(prefetched)
                 generator = torch.Generator(device=device).manual_seed(
                     seed + step * 100_003 + micro
                 )
-                loss, metrics = _flow_step(
+                loss, metrics, captured_probe = _flow_step(
                     anima, reader, adapter, batch, device, training,
                     timestep_weighting,
                     generator=generator, step=step, mode="curriculum",
                     train_auxiliaries=True,
                     measure_base=(step % log_every == 0 and micro == accumulation - 1),
+                    capture_auxiliary_probe=(
+                        (main_common_due or wrong_gradient_due)
+                        and micro == accumulation - 1
+                    ),
                     backward_scale=1.0 / accumulation,
                 )
                 (loss / accumulation).backward()
                 metric_rows.append(metrics)
+                if captured_probe is not None:
+                    auxiliary_probe = captured_probe
+                    auxiliary_batch = batch
+            if wrong_gradient_due:
+                assert auxiliary_probe is not None and auxiliary_batch is not None
+                wrong_loss, wrong_metrics = _wrong_reference_gradient_step(
+                    anima, reader, adapter, auxiliary_batch, auxiliary_probe,
+                    device, training, step=step,
+                )
+                wrong_loss.backward()
+                metric_rows[-1].update(wrong_metrics)
+            if main_common_due:
+                assert main_common_output_ema is not None
+                assert auxiliary_probe is not None and auxiliary_batch is not None
+                main_common_loss, main_common_metrics = _main_common_output_step(
+                    anima, reader, adapter, main_common_output_ema,
+                    auxiliary_batch, auxiliary_probe, device, training,
+                    timestep_weighting, step=step,
+                )
+                main_common_loss.backward()
+                metric_rows[-1].update(main_common_metrics)
             teacher_due = step <= teacher_bootstrap_end or step % teacher_every_after == 0
             if teacher_due:
                 teacher_loss, teacher_metrics = _teacher_step(
@@ -2077,7 +2368,11 @@ def train_detail_style_cross_attention(
                             namespace = "system/perf"
                         elif key.startswith(("style_", "grad_")) or key.endswith("_lr"):
                             namespace = "model/activation"
-                        elif "artist" in key or "functional" in key:
+                        elif (
+                            "artist" in key
+                            or "functional" in key
+                            or "common_output" in key
+                        ):
                             namespace = "train/artist"
                         else:
                             namespace = "train/flow"
@@ -2122,12 +2417,14 @@ def train_detail_style_cross_attention(
                     state_path, step=step, reader=reader, adapter=adapter,
                     optimizer=optimizer, cfg=cfg,
                     common_output_ema=common_output_ema,
+                    main_common_output_ema=main_common_output_ema,
                 )
             if step % checkpoint_every == 0 or step == steps:
                 _save_state(
                     checkpoint_dir / f"step-{step:07d}.pt", step=step,
                     reader=reader, adapter=adapter, optimizer=optimizer, cfg=cfg,
                     common_output_ema=common_output_ema,
+                    main_common_output_ema=main_common_output_ema,
                 )
             if sample_every > 0 and (step % sample_every == 0 or step == steps):
                 sample_records, vae = _sample_query_style_tokenizer(

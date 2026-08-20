@@ -20,11 +20,13 @@ from anima_style_data.detail_style_training import (  # noqa: E402
     _delayed_learning_rate_multiplier,
     _effect_stage_metrics,
     _minimal_native_teacher_objective,
+    _native_effect_scales_for_timesteps,
     _native_teacher_objective_config,
+    _wrong_flow_ranking_loss,
 )
 
 
-def test_native_scale_common_output_ema_is_stable_and_trainable():
+def test_native_scale_common_output_ema_tracks_energy_without_vector_cancellation():
     estimator = NativeScaleCommonOutputEMA(decay=0.5)
     native = torch.ones(4, 1, 1, 2, 2)
     first = torch.full_like(native, 2.0, requires_grad=True)
@@ -36,16 +38,18 @@ def test_native_scale_common_output_ema_is_stable_and_trainable():
     ] == pytest.approx(2.0)
     assert float(first_loss.detach()) == pytest.approx(3.24)
 
-    second = torch.zeros_like(native, requires_grad=True)
+    # Reversing the common direction would cancel a vector EMA at decay=0.5.
+    # Scalar energy EMA must keep reporting the full shared-output magnitude.
+    second = torch.full_like(native, -2.0, requires_grad=True)
     second_loss, second_metrics = estimator.objective(
         second, native, key=3, ratio_threshold=0.2
     )
     assert second_metrics[
         "native_teacher_common_output_batch_ratio"
-    ] == pytest.approx(0.0)
+    ] == pytest.approx(2.0)
     assert second_metrics[
         "native_teacher_common_output_ema_ratio"
-    ] == pytest.approx(1.0)
+    ] == pytest.approx(2.0)
     second_loss.backward()
     assert second.grad is not None
     assert second.grad.abs().sum() > 0
@@ -53,10 +57,35 @@ def test_native_scale_common_output_ema_is_stable_and_trainable():
     restored = NativeScaleCommonOutputEMA(decay=0.5)
     restored.load_state_dict(estimator.state_dict())
     assert restored.updates == {3: 2}
-    assert torch.equal(restored.values[3], estimator.values[3].cpu())
+    assert torch.equal(restored.energies[3], estimator.energies[3].cpu())
     assert torch.equal(
         restored.native_scales[3], estimator.native_scales[3].cpu()
     )
+
+
+def test_native_effect_scale_profile_interpolates_frozen_median_rms():
+    weighting = {
+        "timesteps": torch.tensor([0.0, 0.5, 1.0]),
+        "median_rms": torch.tensor([1.0, 2.0, 4.0]),
+    }
+    result = _native_effect_scales_for_timesteps(
+        torch.tensor([0.25, 0.75]), weighting
+    )
+    assert torch.allclose(result, torch.tensor([1.5, 3.0]))
+
+
+def test_wrong_flow_ranking_only_pushes_the_wrong_path():
+    base = torch.zeros(1, 1, 1, 1)
+    target = torch.ones_like(base)
+    correct = torch.full_like(base, 0.8, requires_grad=True)
+    wrong = torch.full_like(base, 0.9, requires_grad=True)
+    loss, metrics = _wrong_flow_ranking_loss(
+        correct, wrong, base, target, margin=0.01
+    )
+    loss.backward()
+    assert correct.grad is None
+    assert wrong.grad is not None and float(wrong.grad) > 0
+    assert metrics["advantage"] < 0
 
 
 class _CountingLinear(nn.Linear):

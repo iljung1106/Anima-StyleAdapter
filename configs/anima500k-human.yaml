@@ -3830,7 +3830,7 @@ real_artist_teacher:
 # Detail-preserving typed-slot, separate-softmax Style Cross-Attention v1.
 # Contract: docs/detail_preserving_style_cross_attention_plan.md
 detail_preserving_style_cross_attention:
-  output_directory: detail_preserving_style_cross_attention_native_common_ema_v13_20k
+  output_directory: detail_preserving_style_cross_attention_scalar_main_common_v14_20k
   seed: 20260819
   train_split: train
   validation_split: validation
@@ -4039,9 +4039,12 @@ detail_preserving_style_cross_attention:
     functional_full_step: 750
     functional_every: 1
     functional_margin: 0.01
-    # Flow-error ranking remains useful, but is weaker now that actual
-    # cross-reference artist effects receive direct supervision.
-    functional_weight: 0.05
+    # Make correct-reference flow ranking materially visible. The correct path
+    # receives the full gradient; a sequential wrong-reference pass receives
+    # only 10% of it so it cannot dominate by deliberately damaging negatives.
+    functional_weight: 0.25
+    functional_wrong_gradient_scale: 0.10
+    functional_wrong_gradient_every: 1
     # Compare detached exact-target and trainable heldout-reference effects at
     # identical noisy latent/text/timestep conditions.  The batch artist mean
     # is removed before low/mid-frequency contrastive matching.
@@ -4065,6 +4068,16 @@ detail_preserving_style_cross_attention:
     common_output_teacher: native_centered_ema
     common_output_ema_decay: 0.90
     common_output_native_ratio_threshold: 0.20
+    # Apply the same frozen-native-normalized common-effect constraint to
+    # ordinary human training artists. Four artists share one main-batch
+    # x_t/timestep/content probe, so their mean residual is functionally valid.
+    # This pass is sequential after the main backward to bound peak VRAM.
+    main_common_output_start_step: 250
+    main_common_output_full_step: 1000
+    main_common_output_every: 4
+    main_common_output_batch_rows: 4
+    main_common_output_weight: 0.04
+    main_common_output_native_ratio_threshold: 0.20
     common_output_threshold_start_step: 250
     common_output_threshold_end_step: 2000
     common_output_threshold_start: 0.90
@@ -4139,8 +4152,8 @@ detail_preserving_style_cross_attention:
     wandb:
       enabled: true
       project: anima-style-adapter
-      name: detail-style-native-common-ema-v13-20k-anima-only
-      id: detail-style-native-common-ema-v13-20k-anima-only
+      name: detail-style-scalar-main-common-v14-20k-anima-only
+      id: detail-style-scalar-main-common-v14-20k-anima-only
   sampling:
     width: 768
     height: 768
