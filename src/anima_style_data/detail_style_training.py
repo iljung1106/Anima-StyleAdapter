@@ -513,7 +513,17 @@ def _minimal_native_teacher_objective(
             / max(1, floor_end_step - floor_start_step),
         )
         projection_floor = floor_start + progress * (floor_end - floor_start)
-    projection = F.relu(projection_floor - coefficient).square().mean()
+    projection_lower = F.relu(projection_floor - coefficient).square().mean()
+    projection_upper = float(training.get("projection_upper", 1.50))
+    if projection_upper < projection_floor:
+        raise ValueError("projection_upper must not be below the projection floor")
+    projection_upper_loss = F.relu(
+        coefficient - projection_upper
+    ).square().mean()
+    projection_upper_weight = float(
+        training.get("projection_upper_weight", 0.25)
+    )
+    projection = projection_lower + projection_upper_weight * projection_upper_loss
     orthogonal_maximum = float(training.get("orthogonal_ratio_maximum", 0.50))
     orthogonal_loss = F.relu(
         orthogonal_ratio - orthogonal_maximum
@@ -532,7 +542,13 @@ def _minimal_native_teacher_objective(
         "native_teacher_residual_loss": residual.detach(),
         "native_teacher_residual_weighted_loss": weighted_residual.detach(),
         "native_teacher_projection_floor": residual.new_tensor(projection_floor),
-        "native_teacher_projection_floor_loss": projection.detach(),
+        "native_teacher_projection_floor_loss": projection_lower.detach(),
+        "native_teacher_projection_upper": residual.new_tensor(projection_upper),
+        "native_teacher_projection_upper_loss": projection_upper_loss.detach(),
+        "native_teacher_projection_upper_weight": residual.new_tensor(
+            projection_upper_weight
+        ),
+        "native_teacher_projection_band_loss": projection.detach(),
         "native_teacher_projection_weighted_loss": weighted_projection.detach(),
         "native_artist_magnitude_weight": residual.new_tensor(projection_weight),
         "native_artist_magnitude_weighted_loss": weighted_projection.detach(),

@@ -468,6 +468,33 @@ def test_native_bank_owns_artist_magnitude_weight():
     assert training["teacher_objective"]["projection_weight"] == pytest.approx(0.15)
 
 
+def test_minimal_teacher_projection_has_a_weak_upper_bound():
+    torch.manual_seed(128)
+    teacher = torch.randn(4, 3, 5)
+    config = {
+        "residual_weight": 0.0,
+        "projection_weight": 1.0,
+        "projection_floor_start": 0.7,
+        "projection_floor_end": 0.7,
+        "projection_upper": 1.5,
+        "projection_upper_weight": 0.25,
+        "orthogonal_weight": 0.0,
+    }
+
+    aligned_loss, aligned_metrics = _minimal_native_teacher_objective(
+        teacher.clone(), teacher, config, step=1
+    )
+    excessive_loss, excessive_metrics = _minimal_native_teacher_objective(
+        2.0 * teacher, teacher, config, step=1
+    )
+
+    assert float(aligned_loss) == pytest.approx(0.0, abs=1e-7)
+    assert float(excessive_metrics["native_teacher_projection_upper_loss"]) == (
+        pytest.approx(0.25)
+    )
+    assert float(excessive_loss) > float(aligned_loss)
+
+
 def test_student_prompt_audit_uses_tag_boundaries_not_substrings():
     clean = SimpleNamespace(text_by_key={
         (1, 0): {
