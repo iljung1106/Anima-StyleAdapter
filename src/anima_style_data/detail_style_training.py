@@ -391,6 +391,16 @@ class _StyleAttenuationRecorder:
         self.base_hidden: dict[tuple[int, str], torch.Tensor] = {}
         self.pending: dict[tuple[int, str], torch.Tensor] = {}
         self.metrics: dict[int, dict[str, dict[str, float]]] = {}
+        self.output_base: dict[str, torch.Tensor] = {}
+        self.output_metrics: dict[str, dict[str, float]] = {}
+
+    @staticmethod
+    def _effect_to_base_rms(effect: torch.Tensor, base: torch.Tensor) -> float:
+        dimensions = tuple(range(1, effect.ndim))
+        return float(
+            effect.detach().float().square().mean(dim=dimensions).sqrt().mean()
+            / base.detach().float().square().mean(dim=dimensions).sqrt().mean().clamp_min(1e-8)
+        )
 
     def __call__(self, block_index: int, stage: str, value: torch.Tensor) -> None:
         key = (int(block_index), str(stage))
@@ -410,15 +420,27 @@ class _StyleAttenuationRecorder:
             return
         if stage in self._HIDDEN_STAGES:
             base = self.base_hidden.pop(key)
-            self.metrics.setdefault(int(block_index), {})[stage] = (
-                _effect_stage_metrics(value.detach() - base)
-            )
+            effect = value.detach() - base
+            metrics = _effect_stage_metrics(effect)
+            metrics["effect_to_base_rms"] = self._effect_to_base_rms(effect, base)
+            self.metrics.setdefault(int(block_index), {})[stage] = metrics
+
+    def record_output_stage(self, stage: str, value: torch.Tensor) -> None:
+        if self.mode == "base":
+            self.output_base[str(stage)] = value.detach()
+            return
+        base = self.output_base.pop(str(stage))
+        effect = value.detach() - base
+        metrics = _effect_stage_metrics(effect)
+        metrics["effect_to_base_rms"] = self._effect_to_base_rms(effect, base)
+        self.output_metrics[str(stage)] = metrics
 
     def finish(self) -> dict[int, dict[str, dict[str, float]]]:
-        if self.pending or self.base_hidden:
+        if self.pending or self.base_hidden or self.output_base:
             raise RuntimeError(
                 "Incomplete attenuation capture: "
-                f"pending={len(self.pending)} base={len(self.base_hidden)}"
+                f"pending={len(self.pending)} base={len(self.base_hidden)} "
+                f"output={len(self.output_base)}"
             )
         return self.metrics
 
@@ -2119,6 +2141,34 @@ def diagnose_detail_style_attenuation(
     final_bin_rows: dict[int, list[dict[str, float]]] = {
         index: [] for index in range(len(edges) - 1)
     }
+    output_stage_rows: dict[str, list[dict[str, float]]] = {}
+    bin_output_stage_rows: dict[int, dict[str, list[dict[str, float]]]] = {
+        index: {} for index in range(len(edges) - 1)
+    }
+    active_recorder: list[_StyleAttenuationRecorder | None] = [None]
+
+    def record_output_stage(stage: str, value: torch.Tensor) -> None:
+        if active_recorder[0] is not None:
+            active_recorder[0].record_output_stage(stage, value)
+
+    final_handles = [
+        anima.final_layer.register_forward_pre_hook(
+            lambda _module, args: record_output_stage("final_input", args[0])
+        ),
+        anima.final_layer.layer_norm.register_forward_hook(
+            lambda _module, _args, output: record_output_stage(
+                "final_layer_norm", output
+            )
+        ),
+        anima.final_layer.linear.register_forward_pre_hook(
+            lambda _module, args: record_output_stage("final_adaln", args[0])
+        ),
+        anima.final_layer.linear.register_forward_hook(
+            lambda _module, _args, output: record_output_stage(
+                "final_linear", output
+            )
+        ),
+    ]
 
     for probe_index in range(probe_batches):
         batch = loader.load_step(probe_index)
@@ -2162,6 +2212,7 @@ def diagnose_detail_style_attenuation(
             device=device, dtype=noisy.dtype,
         )
         recorder = _StyleAttenuationRecorder()
+        active_recorder[0] = recorder
         adapter.set_diagnostic_recorder(recorder)
         with torch.autocast(
             "cuda", dtype=torch.bfloat16, enabled=device.startswith("cuda")
@@ -2193,6 +2244,7 @@ def diagnose_detail_style_attenuation(
             finally:
                 adapter.clear_style_tokens()
                 adapter.set_diagnostic_recorder(None)
+                active_recorder[0] = None
         # ``record_gated_internal_teacher`` retains its differentiable terms
         # until the objective is consumed.  The diagnostic uses only the
         # reduced recorder statistics, so consume and release them per probe.
@@ -2203,6 +2255,9 @@ def diagnose_detail_style_attenuation(
             for stage, metrics in stages.items():
                 block_stage_rows[block_index].setdefault(stage, []).append(metrics)
                 bin_stage_rows[bin_index].setdefault(stage, []).append(metrics)
+        for stage, metrics in recorder.output_metrics.items():
+            output_stage_rows.setdefault(stage, []).append(metrics)
+            bin_output_stage_rows[bin_index].setdefault(stage, []).append(metrics)
 
         final_teacher = tensors["centered_teacher"][
             artist_indices, content_index, timestep_index
@@ -2228,6 +2283,9 @@ def diagnose_detail_style_attenuation(
             f"projection={final_metrics['teacher_projection']:.5f}",
             flush=True,
         )
+
+    for handle in final_handles:
+        handle.remove()
 
     block_summary: list[dict[str, Any]] = []
     for block_index, stages in block_stage_rows.items():
@@ -2272,6 +2330,10 @@ def diagnose_detail_style_attenuation(
             "stages": {
                 stage: _mean_scalar_rows(rows) for stage, rows in stages.items()
             },
+            "final_layer_stages": {
+                stage: _mean_scalar_rows(rows)
+                for stage, rows in bin_output_stage_rows[bin_index].items()
+            },
             "final_velocity": _mean_scalar_rows(final_bin_rows[bin_index]),
         })
     result = {
@@ -2281,6 +2343,10 @@ def diagnose_detail_style_attenuation(
         "batch_size": loader.batch_size,
         "references": int(diagnostic.get("references", 4)),
         "timestep_bin_edges": list(edges),
+        "final_layer_stages": {
+            stage: _mean_scalar_rows(rows)
+            for stage, rows in output_stage_rows.items()
+        },
         "final_velocity": _mean_scalar_rows(final_rows),
         "blocks": block_summary,
         "timestep_bins": bin_summary,

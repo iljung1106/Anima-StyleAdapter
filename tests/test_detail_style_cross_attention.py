@@ -255,6 +255,7 @@ def test_attenuation_metrics_remove_common_output_and_pair_stage_captures():
     recorder = _StyleAttenuationRecorder()
     recorder(0, "post_cross_hidden", torch.zeros_like(student))
     recorder(0, "post_mlp_hidden", torch.zeros_like(student))
+    recorder.record_output_stage("final_layer_norm", torch.ones_like(student))
     recorder.mode = "style"
     recorder(0, "pre_o_style", student)
     recorder(0, "pre_o_teacher", teacher)
@@ -264,12 +265,14 @@ def test_attenuation_metrics_remove_common_output_and_pair_stage_captures():
     recorder(0, "post_gate_teacher", teacher)
     recorder(0, "post_cross_hidden", student)
     recorder(0, "post_mlp_hidden", student)
+    recorder.record_output_stage("final_layer_norm", torch.ones_like(student) + student)
     captured = recorder.finish()[0]
 
     assert set(captured) == {
         "pre_o", "post_o", "post_gate", "post_cross_hidden", "post_mlp_hidden"
     }
     assert captured["post_gate"]["teacher_projection"] == pytest.approx(2.0)
+    assert recorder.output_metrics["final_layer_norm"]["effect_to_base_rms"] > 0
 
 
 def test_timestep_strength_profile_interpolates_per_block_and_keeps_bounds():
