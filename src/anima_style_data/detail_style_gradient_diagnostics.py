@@ -25,15 +25,18 @@ from .detail_style_cross_attention import (
 )
 from .detail_style_teacher_context import NativeArtistContextCache
 from .detail_style_training import (
+    _all_artist_teacher_infonce,
     _active_performance_stage,
     _build_native_effect_timestep_weighting,
     _build_style_adapter,
     _flow_step,
     _initial_performance_curriculum_state,
     _loader_config,
+    _native_effect_weights_for_timesteps,
+    _native_teacher_objective_config,
     _reconstruction_loss,
     _scheduled_value,
-    _teacher_direction_ranking_loss,
+    _soft_common_output_objective,
     _training_loader,
 )
 from .io import write_json
@@ -265,6 +268,7 @@ def _controlled_losses(
     device: str,
     training: dict[str, Any],
     diagnostic: dict[str, Any],
+    timestep_weighting: dict[str, torch.Tensor] | None,
     *,
     step: int,
 ) -> tuple[dict[str, torch.Tensor], dict[str, Any]]:
@@ -331,41 +335,40 @@ def _controlled_losses(
             adapter.clear_style_tokens()
     student = prediction - base
     dimensions = tuple(range(1, teacher.ndim))
-    teacher_rms = teacher.square().mean(dim=dimensions).sqrt().clamp_min(1e-4)
+    student_center = student.mean(dim=0, keepdim=True)
+    teacher_center = teacher.mean(dim=0, keepdim=True)
+    centered_student = student - student_center
+    centered_teacher = teacher - teacher_center
+    objective = _native_teacher_objective_config(training)
+    scale_floor = float(objective.get("native_teacher_scale_floor", 1e-4))
+    teacher_power = centered_teacher.square().mean(dim=dimensions).clamp_min(
+        scale_floor**2
+    )
+    teacher_rms = teacher_power.sqrt()
     scale_view = teacher_rms.reshape(-1, *([1] * (teacher.ndim - 1)))
-    beta = float(training["teacher_objective"].get("native_teacher_huber_beta", 0.1))
+    beta = float(objective.get("native_teacher_huber_beta", 0.1))
     full_residual = F.smooth_l1_loss(
-        (student - teacher) / scale_view,
-        torch.zeros_like(student),
+        (centered_student - centered_teacher) / scale_view,
+        torch.zeros_like(centered_student),
         beta=beta,
     )
 
-    teacher_power = teacher.square().mean(dim=dimensions).clamp_min(1e-8)
-    coefficient = (student * teacher).mean(dim=dimensions) / teacher_power
-    coefficient_view = coefficient.reshape(-1, *([1] * (student.ndim - 1)))
-    orthogonal = student - coefficient_view * teacher
-    orthogonal_ratio_squared = orthogonal.square().mean(dim=dimensions) / teacher_power
-    objective = dict(training["teacher_objective"])
-    projection_floor = _scheduled_value(
+    coefficient = (
+        centered_student * centered_teacher
+    ).mean(dim=dimensions) / teacher_power
+    magnitude_floor = _scheduled_value(
         step,
-        int(objective.get("projection_floor_start_step", 1)),
-        int(objective.get("projection_floor_end_step", 1000)),
-        float(objective.get("projection_floor_start", 0.30)),
-        float(objective.get("projection_floor_end", 0.70)),
+        int(objective.get("magnitude_floor_start_step", 1)),
+        int(objective.get("magnitude_floor_end_step", 1000)),
+        float(objective.get("magnitude_floor_start", 0.30)),
+        float(objective.get("magnitude_floor_end", 0.70)),
     )
-    projection_upper = float(objective.get("projection_upper", 1.50))
-    projection = (
-        F.relu(projection_floor - coefficient).square().mean()
-        + float(objective.get("projection_upper_weight", 0.25))
-        * F.relu(coefficient - projection_upper).square().mean()
+    magnitude_upper = float(objective.get("magnitude_upper", 1.50))
+    magnitude_band = (
+        F.relu(magnitude_floor - coefficient).square().mean()
+        + float(objective.get("magnitude_upper_weight", 0.25))
+        * F.relu(coefficient - magnitude_upper).square().mean()
     )
-    orthogonal_loss = F.relu(
-        orthogonal_ratio_squared
-        - float(objective.get("orthogonal_ratio_maximum", 0.50)) ** 2
-    ).square().mean()
-
-    centered_student = student - student.mean(dim=0, keepdim=True)
-    centered_teacher = teacher - teacher.mean(dim=0, keepdim=True)
     absolute_direction = (
         1.0
         - F.cosine_similarity(
@@ -373,28 +376,25 @@ def _controlled_losses(
             dim=1, eps=1e-8,
         )
     ).mean()
-    ranking, ranking_metrics = _teacher_direction_ranking_loss(
-        student,
-        teacher,
-        margin=float(training.get("teacher_direction_ranking_margin", 0.10)),
+    labels = torch.arange(rows, device=device, dtype=torch.long)
+    infonce, infonce_metrics = _all_artist_teacher_infonce(
+        centered_student,
+        centered_teacher,
+        centered_teacher,
+        labels,
+        temperature=float(training.get("teacher_infonce_temperature", 0.10)),
     )
 
-    native_scale = teacher.square().mean(dim=dimensions).sqrt().median().clamp_min(1e-8)
-    common = student.mean(dim=0)
-    common_ratio = common.square().mean().sqrt() / native_scale
-    common_loss = F.relu(
-        common_ratio - float(training.get("common_output_native_ratio_threshold", 0.60))
-    ).square()
-    teacher_centered_power = centered_teacher.square().mean(
-        dim=dimensions
-    ).clamp_min(1e-8)
-    artist_projection = (
-        centered_student * centered_teacher
-    ).mean(dim=dimensions) / teacher_centered_power
-    artist_energy_loss = F.relu(
-        float(training.get("artist_energy_native_ratio_floor", 0.50))
-        - artist_projection
-    ).square().mean()
+    native_scale = teacher_rms.median().clamp_min(1e-8)
+    common_loss, common_metrics = _soft_common_output_objective(
+        student_center,
+        native_scale,
+        ratio_threshold=float(
+            training.get("teacher_common_output_ratio_threshold", 0.60)
+        ),
+        softness=float(training.get("teacher_common_output_softness", 0.05)),
+    )
+    common_ratio = common_metrics["native_teacher_common_output_ratio"]
 
     low_frequency_losses = {}
     scales = [
@@ -402,8 +402,8 @@ def _controlled_losses(
         for value in objective.get("low_frequency_residual_pool_scales", [2, 4])
     ]
     for pool_scale in scales:
-        pooled_student = F.avg_pool2d(student, pool_scale, pool_scale)
-        pooled_teacher = F.avg_pool2d(teacher, pool_scale, pool_scale)
+        pooled_student = F.avg_pool2d(centered_student, pool_scale, pool_scale)
+        pooled_teacher = F.avg_pool2d(centered_teacher, pool_scale, pool_scale)
         pooled_dimensions = tuple(range(1, pooled_teacher.ndim))
         pooled_scale = pooled_teacher.square().mean(
             dim=pooled_dimensions
@@ -420,31 +420,31 @@ def _controlled_losses(
     reconstruction, reconstruction_metrics = _reconstruction_loss(
         output.reconstruction, output.reconstruction_target
     )
+    global_weight = float(training.get("teacher_global_weight", 0.10))
+    timestep_weight = _native_effect_weights_for_timesteps(
+        timestep.float().reshape(1), timestep_weighting
+    )[0]
+    outer = global_weight * timestep_weight
     losses: dict[str, torch.Tensor] = {
-        "final_full_residual": float(objective.get("residual_weight", 0.05))
-        * full_residual,
-        "final_projection_band": float(objective.get("projection_weight", 0.15))
-        * projection,
-        "final_orthogonal_cap": float(objective.get("orthogonal_weight", 0.05))
-        * orthogonal_loss,
-        "teacher_cyclic_ranking": float(
-            training.get("teacher_direction_ranking_weight", 0.10)
-        ) * ranking,
-        "common_suppression": float(training.get("common_output_weight", 0.10))
+        "final_full_residual": outer
+        * float(objective.get("residual_weight", 0.025)) * full_residual,
+        "final_absolute_direction": outer
+        * float(objective.get("direction_weight", 0.10)) * absolute_direction,
+        "final_magnitude_band": outer
+        * float(objective.get("magnitude_weight", 0.10)) * magnitude_band,
+        "all_artist_infonce": outer
+        * float(training.get("teacher_infonce_weight", 0.10)) * infonce,
+        "common_suppression": outer
+        * float(training.get("teacher_common_output_weight", 0.10))
         * common_loss,
-        "artist_energy_floor": float(training.get("common_output_weight", 0.10))
-        * float(training.get("artist_energy_weight", 1.0))
-        * artist_energy_loss,
-        "candidate_final_absolute_direction": float(
-            diagnostic.get("candidate_absolute_direction_weight", 0.10)
-        ) * absolute_direction,
         "candidate_reconstruction": float(training.get("reconstruction_weight", 0.01))
         * reconstruction,
     }
     low_frequency_weight = float(objective.get("low_frequency_residual_weight", 0.10))
     for pool_scale, value in low_frequency_losses.items():
         losses[f"final_low_frequency_{pool_scale}x"] = (
-            low_frequency_weight / max(1, len(low_frequency_losses)) * value
+            outer * low_frequency_weight / max(1, len(low_frequency_losses))
+            * value
         )
 
     post_gate_losses = []
@@ -459,7 +459,7 @@ def _controlled_losses(
             (1.0 - values["cosine"]) * weights
         ).sum() / weights.sum().clamp_min(1.0)
         weighted = (
-            float(post_gate_cfg.get("weight", 0.10))
+            outer * float(post_gate_cfg.get("weight", 0.10))
             * float(post_gate_cfg.get("direction_weight", 1.0))
             / len(terms)
             * direction
@@ -469,11 +469,10 @@ def _controlled_losses(
 
     active_names = [
         "final_full_residual",
-        "final_projection_band",
-        "final_orthogonal_cap",
-        "teacher_cyclic_ranking",
+        "final_absolute_direction",
+        "final_magnitude_band",
+        "all_artist_infonce",
         "common_suppression",
-        "artist_energy_floor",
         *[f"final_low_frequency_{value}x" for value in scales],
         *[f"postgate_block_{value}_direction" for value in block_indices],
     ]
@@ -490,13 +489,17 @@ def _controlled_losses(
         "native_projection": float(coefficient.detach().mean()),
         "native_cosine": float(
             F.cosine_similarity(
-                student.detach().flatten(1), teacher.flatten(1), dim=1, eps=1e-8
+                centered_student.detach().flatten(1),
+                centered_teacher.flatten(1), dim=1, eps=1e-8
             ).mean()
         ),
         "absolute_centered_cosine": float(1.0 - absolute_direction.detach()),
-        "cyclic_advantage": float(ranking_metrics["teacher_direction_advantage"]),
+        "infonce_accuracy": float(infonce_metrics["teacher_infonce_accuracy"]),
+        "infonce_cosine_gap": float(infonce_metrics["teacher_infonce_cosine_gap"]),
         "common_ratio": float(common_ratio.detach()),
-        "artist_projection": float(artist_projection.detach().mean()),
+        "artist_projection": float(coefficient.detach().mean()),
+        "teacher_global_weight": global_weight,
+        "teacher_timestep_weight": float(timestep_weight.detach()),
         "reconstruction_cosine_loss": float(
             reconstruction_metrics["reconstruction_cosine_loss"]
         ),
@@ -573,6 +576,7 @@ def run_detail_style_gradient_diagnostics(
         device,
         training,
         diagnostic,
+        timestep_weighting,
         step=checkpoint_step,
     )
     loss_values = {
