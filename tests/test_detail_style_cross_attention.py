@@ -13,7 +13,7 @@ from anima_style_data.detail_style_cross_attention import (  # noqa: E402
     SharedBaseKVStyleCrossAttention,
 )
 from anima_style_data.detail_style_training import (  # noqa: E402
-    NativeScaleCommonOutputEMA,
+    NativeScaleCommonOutputPenalty,
     _StyleAttenuationRecorder,
     _audit_student_prompts,
     _compose_separate_text_style_guidance,
@@ -26,41 +26,39 @@ from anima_style_data.detail_style_training import (  # noqa: E402
 )
 
 
-def test_native_scale_common_output_ema_tracks_energy_without_vector_cancellation():
-    estimator = NativeScaleCommonOutputEMA(decay=0.5)
+def test_native_scale_common_output_penalty_uses_current_controlled_batch():
+    penalty = NativeScaleCommonOutputPenalty()
     native = torch.ones(4, 1, 1, 2, 2)
     first = torch.full_like(native, 2.0, requires_grad=True)
-    first_loss, first_metrics = estimator.objective(
-        first, native, key=3, ratio_threshold=0.2
+    first_loss, first_metrics = penalty.objective(
+        first, native, ratio_threshold=0.2
     )
     assert first_metrics[
-        "native_teacher_common_output_ema_ratio"
+        "native_teacher_common_output_ratio"
     ] == pytest.approx(2.0)
     assert float(first_loss.detach()) == pytest.approx(3.24)
 
-    # Reversing the common direction would cancel a vector EMA at decay=0.5.
-    # Scalar energy EMA must keep reporting the full shared-output magnitude.
+    # No history is carried between controlled probes.
     second = torch.full_like(native, -2.0, requires_grad=True)
-    second_loss, second_metrics = estimator.objective(
-        second, native, key=3, ratio_threshold=0.2
+    second_loss, second_metrics = penalty.objective(
+        second, native, ratio_threshold=0.2
     )
     assert second_metrics[
         "native_teacher_common_output_batch_ratio"
     ] == pytest.approx(2.0)
     assert second_metrics[
-        "native_teacher_common_output_ema_ratio"
+        "native_teacher_common_output_ratio"
     ] == pytest.approx(2.0)
     second_loss.backward()
     assert second.grad is not None
     assert second.grad.abs().sum() > 0
 
-    restored = NativeScaleCommonOutputEMA(decay=0.5)
-    restored.load_state_dict(estimator.state_dict())
-    assert restored.updates == {3: 2}
-    assert torch.equal(restored.energies[3], estimator.energies[3].cpu())
-    assert torch.equal(
-        restored.native_scales[3], estimator.native_scales[3].cpu()
+    centered = torch.cat((native[:2], -native[2:]), dim=0)
+    centered_loss, centered_metrics = penalty.objective(
+        centered, native, ratio_threshold=0.2
     )
+    assert float(centered_loss) == pytest.approx(0.0)
+    assert centered_metrics["native_teacher_common_output_ratio"] == pytest.approx(0.0)
 
 
 def test_native_effect_scale_profile_interpolates_frozen_median_rms():

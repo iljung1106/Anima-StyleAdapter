@@ -3830,7 +3830,7 @@ real_artist_teacher:
 # Detail-preserving typed-slot, separate-softmax Style Cross-Attention v1.
 # Contract: docs/detail_preserving_style_cross_attention_plan.md
 detail_preserving_style_cross_attention:
-  output_directory: detail_preserving_style_cross_attention_scalar_main_common_v14_20k
+  output_directory: detail_preserving_style_cross_attention_instant_main_common_v15_20k
   seed: 20260819
   train_split: train
   validation_split: validation
@@ -4058,15 +4058,13 @@ detail_preserving_style_cross_attention:
     artist_effect_temperature: 0.10
     artist_effect_pool_scales: [2, 4]
     artist_effect_repeatability_weight: 0.25
-    # Estimate the common residual under controlled same-content/timestep
-    # native-teacher probes. Normalize only by the frozen native effect scale;
-    # a shrinking student can no longer shrink its own denominator. A separate
-    # EMA per content/timestep cell stabilizes the batch-four artist sample.
+    # Estimate the common residual directly under a controlled same-content /
+    # timestep native-teacher probe. Normalize only by the frozen native effect
+    # scale; no cross-step EMA or student-derived denominator is used.
     common_output_start_step: 250
     common_output_full_step: 1000
     common_output_weight: 0.04
-    common_output_teacher: native_centered_ema
-    common_output_ema_decay: 0.90
+    common_output_teacher: native_centered
     common_output_native_ratio_threshold: 0.20
     # Apply the same frozen-native-normalized common-effect constraint to
     # ordinary human training artists. Four artists share one main-batch
@@ -4152,8 +4150,8 @@ detail_preserving_style_cross_attention:
     wandb:
       enabled: true
       project: anima-style-adapter
-      name: detail-style-scalar-main-common-v14-20k-anima-only
-      id: detail-style-scalar-main-common-v14-20k-anima-only
+      name: detail-style-instant-main-common-v15-20k-anima-only
+      id: detail-style-instant-main-common-v15-20k-anima-only
   sampling:
     width: 768
     height: 768
