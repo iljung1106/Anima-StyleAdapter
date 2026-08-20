@@ -3928,6 +3928,15 @@ detail_preserving_style_cross_attention:
     timestep_bin_edges: [0.0, 0.325, 0.625, 0.86, 1.000001]
     recommended_lower_multiplier: 1.0
     recommended_upper_multiplier: 1.5
+  attenuation_diagnostic:
+    output_directory: diagnostics/detail_style_attenuation_v10_step500
+    checkpoint: checkpoints/step-0000500.pt
+    device: cuda
+    # Four contents x eight cached timesteps covers the complete teacher grid.
+    probe_batches: 32
+    batch_size: 4
+    references: 4
+    timestep_bin_edges: [0.0, 0.325, 0.625, 0.86, 1.000001]
   block_similarity:
     output_directory: diagnostics/detail_style_block_similarity_v1
     device: cuda

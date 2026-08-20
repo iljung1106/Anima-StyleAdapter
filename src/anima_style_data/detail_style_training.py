@@ -321,6 +321,108 @@ def _mean_scalar_rows(rows: list[dict[str, float]]) -> dict[str, float]:
     }
 
 
+@torch.no_grad()
+def _effect_stage_metrics(
+    student: torch.Tensor,
+    teacher: torch.Tensor | None = None,
+) -> dict[str, float]:
+    """Summarize an artist-conditioned residual without retaining activations."""
+
+    student = student.detach().float()
+    dimensions = tuple(range(1, student.ndim))
+    row_rms = student.square().mean(dim=dimensions).sqrt()
+    common = student.mean(dim=0, keepdim=True)
+    centered = student - common
+    centered_rms = centered.square().mean(dim=dimensions).sqrt()
+    result = {
+        "rms": float(row_rms.mean()),
+        "centered_rms": float(centered_rms.mean()),
+        "common_rms": float(common.square().mean().sqrt()),
+        "common_output_ratio": float(
+            common.square().mean().sqrt() / row_rms.mean().clamp_min(1e-8)
+        ),
+    }
+    if teacher is None:
+        return result
+    teacher = teacher.detach().float()
+    if teacher.shape != student.shape:
+        raise ValueError("Student and teacher stages must have matching shapes")
+    teacher = teacher - teacher.mean(dim=0, keepdim=True)
+    teacher_rms = teacher.square().mean(dim=dimensions).sqrt()
+    student_flat = centered.flatten(1)
+    teacher_flat = teacher.flatten(1)
+    teacher_energy = teacher_flat.square().sum(dim=1).clamp_min(1e-8)
+    coefficient = (student_flat * teacher_flat).sum(dim=1) / teacher_energy
+    projection = coefficient.reshape(-1, *([1] * (student.ndim - 1))) * teacher
+    orthogonal_rms = (
+        (centered - projection).square().mean(dim=dimensions).sqrt()
+    )
+    result.update({
+        "teacher_rms": float(teacher_rms.mean()),
+        "student_to_teacher_rms": float(
+            (centered_rms / teacher_rms.clamp_min(1e-8)).mean()
+        ),
+        "teacher_projection": float(coefficient.mean()),
+        "teacher_projection_positive_fraction": float(
+            (coefficient > 0).float().mean()
+        ),
+        "teacher_direction_cosine": float(
+            F.cosine_similarity(student_flat, teacher_flat, dim=1, eps=1e-8).mean()
+        ),
+        "orthogonal_to_teacher_rms": float(
+            (orthogonal_rms / teacher_rms.clamp_min(1e-8)).mean()
+        ),
+    })
+    return result
+
+
+class _StyleAttenuationRecorder:
+    """Pair base/style block stages and immediately reduce them to scalars."""
+
+    _PAIRED_STAGES = {
+        "pre_o_teacher": "pre_o_style",
+        "post_o_teacher": "post_o_style",
+        "post_gate_teacher": "post_gate_style",
+    }
+    _HIDDEN_STAGES = {"post_cross_hidden", "post_mlp_hidden"}
+
+    def __init__(self) -> None:
+        self.mode = "base"
+        self.base_hidden: dict[tuple[int, str], torch.Tensor] = {}
+        self.pending: dict[tuple[int, str], torch.Tensor] = {}
+        self.metrics: dict[int, dict[str, dict[str, float]]] = {}
+
+    def __call__(self, block_index: int, stage: str, value: torch.Tensor) -> None:
+        key = (int(block_index), str(stage))
+        if self.mode == "base":
+            if stage in self._HIDDEN_STAGES:
+                self.base_hidden[key] = value.detach()
+            return
+        if stage.endswith("_style"):
+            self.pending[key] = value.detach()
+            return
+        if stage in self._PAIRED_STAGES:
+            style_stage = self._PAIRED_STAGES[stage]
+            student = self.pending.pop((int(block_index), style_stage))
+            self.metrics.setdefault(int(block_index), {})[style_stage.removesuffix("_style")] = (
+                _effect_stage_metrics(student, value)
+            )
+            return
+        if stage in self._HIDDEN_STAGES:
+            base = self.base_hidden.pop(key)
+            self.metrics.setdefault(int(block_index), {})[stage] = (
+                _effect_stage_metrics(value.detach() - base)
+            )
+
+    def finish(self) -> dict[int, dict[str, dict[str, float]]]:
+        if self.pending or self.base_hidden:
+            raise RuntimeError(
+                "Incomplete attenuation capture: "
+                f"pending={len(self.pending)} base={len(self.base_hidden)}"
+            )
+        return self.metrics
+
+
 def _minimal_native_teacher_objective(
     student_delta: torch.Tensor,
     teacher_delta: torch.Tensor,
@@ -1932,6 +2034,270 @@ def profile_detail_style_block_timestep_strength(
         "batch_size": result["batch_size"],
         "timestep_bins": len(result["block_timestep_profiles"]),
         "blocks": adapter.blocks,
+    }
+    write_json(output / "summary.json", summary)
+    return summary
+
+
+@torch.no_grad()
+def diagnose_detail_style_attenuation(
+    config: dict[str, Any], destination: Path
+) -> dict[str, Any]:
+    """Locate style-effect attenuation from attention space to final velocity."""
+
+    cfg = copy.deepcopy(config["detail_preserving_style_cross_attention"])
+    training = dict(cfg["training"])
+    diagnostic = dict(cfg.get("attenuation_diagnostic", {}))
+    device = str(diagnostic.get("device", training.get("device", "cuda")))
+    seed = int(diagnostic.get("seed", cfg.get("seed", 20260819)))
+    torch.manual_seed(seed)
+
+    bank_key = str(cfg["teacher"].get("bank_config_key", "dual_domain_native_teacher"))
+    bank = NativeCenteredTeacherBank.load(config, destination, config_key=bank_key)
+    contexts = NativeArtistContextCache(
+        destination / str(cfg["teacher"]["context_cache"]),
+        capacity=int(cfg["teacher"].get("context_lru_shards", 8)),
+    )
+    loader = CachedTeacherReferenceLoader(
+        [destination / str(value) for value in cfg["teacher"]["reference_caches"]],
+        split="train",
+        style_ids=list(bank.summary["train_style_ids"]),
+        batch_size=int(diagnostic.get("batch_size", 4)),
+        references=int(diagnostic.get("references", 4)),
+        seed=seed ^ 0xA77E0A7E,
+        token_lru_shards=int(cfg["teacher"].get("reference_lru_shards", 8)),
+        strict_style_ids=False,
+    )
+
+    anima = _resolve_anima_model(config, destination, device).requires_grad_(False).eval()
+    _optimize_frozen_anima(
+        anima,
+        low_precision_rmsnorm=bool(training.get("low_precision_rmsnorm", True)),
+        fuse_attention_projections=bool(training.get("fuse_attention_projections", True)),
+    )
+    reader = DetailPreservingTypedSlotReader(**dict(cfg["model"])).to(device).eval()
+    adapter = _build_style_adapter(cfg).to(device).eval()
+    attach_same_q_style_adapter(anima, adapter)
+
+    training_output = destination / str(cfg["output_directory"])
+    checkpoint_value = str(
+        diagnostic.get("checkpoint", "checkpoints/step-0000500.pt")
+    )
+    checkpoint = Path(checkpoint_value)
+    if not checkpoint.is_absolute():
+        checkpoint = training_output / checkpoint
+    if not checkpoint.exists():
+        raise FileNotFoundError(checkpoint)
+    state = torch.load(checkpoint, map_location="cpu", weights_only=False)
+    reader.load_state_dict(state["reader"], strict=True)
+    adapter.load_state_dict(state["adapter"], strict=True)
+    adapter.restore_timestep_strength_state()
+    checkpoint_step = int(state.get("step", 0))
+    del state
+
+    tensors = bank.tensors
+    content_count = int(tensors["noisy_inputs"].shape[0])
+    timestep_count = int(tensors["noisy_inputs"].shape[1])
+    probe_batches = int(diagnostic.get("probe_batches", content_count * timestep_count))
+    edges = tuple(
+        float(value)
+        for value in diagnostic.get(
+            "timestep_bin_edges",
+            training.get(
+                "alpha_calibration_timestep_bin_edges",
+                [0.0, 0.325, 0.625, 0.86, 1.000001],
+            ),
+        )
+    )
+    block_stage_rows: dict[int, dict[str, list[dict[str, float]]]] = {
+        block: {} for block in range(adapter.blocks)
+    }
+    bin_stage_rows: dict[int, dict[str, list[dict[str, float]]]] = {
+        index: {} for index in range(len(edges) - 1)
+    }
+    final_rows: list[dict[str, float]] = []
+    final_bin_rows: dict[int, list[dict[str, float]]] = {
+        index: [] for index in range(len(edges) - 1)
+    }
+
+    for probe_index in range(probe_batches):
+        batch = loader.load_step(probe_index)
+        references, mask = _reference_inputs(batch, device, "heldout")
+        rows = references.shape[0]
+        style_ids = [str(item.style_id) for item in batch["episodes"]]
+        artist_indices = torch.tensor(
+            [bank.artist_to_index[value] for value in style_ids], dtype=torch.long
+        )
+        timestep_index = probe_index % timestep_count
+        content_index = (probe_index // timestep_count) % content_count
+        timestep = tensors["timesteps"][timestep_index].to(
+            device=device, dtype=torch.bfloat16
+        )
+        timestep_value = float(timestep.float())
+        bin_index = max(
+            0,
+            min(
+                len(edges) - 2,
+                next(
+                    (
+                        index
+                        for index in range(len(edges) - 1)
+                        if edges[index] <= timestep_value < edges[index + 1]
+                    ),
+                    len(edges) - 2,
+                ),
+            ),
+        )
+        noisy = tensors["noisy_inputs"][content_index, timestep_index].to(
+            device=device, dtype=torch.bfloat16
+        )
+        context = tensors["base_context"][content_index : content_index + 1].to(
+            device=device, dtype=torch.bfloat16
+        )
+        tagged = contexts.get(style_ids, content_index).to(
+            device=device, dtype=torch.bfloat16, non_blocking=True
+        )
+        padding = torch.zeros(
+            rows, 1, noisy.shape[-2], noisy.shape[-1],
+            device=device, dtype=noisy.dtype,
+        )
+        recorder = _StyleAttenuationRecorder()
+        adapter.set_diagnostic_recorder(recorder)
+        with torch.autocast(
+            "cuda", dtype=torch.bfloat16, enabled=device.startswith("cuda")
+        ):
+            adapter.clear_style_tokens()
+            recorder.mode = "base"
+            base_prediction = anima(
+                noisy.expand(rows, -1, -1, -1).unsqueeze(2),
+                timestep.expand(rows),
+                context=context.expand(rows, -1, -1),
+                padding_mask=padding,
+                target_input_ids=None,
+            ).squeeze(2).float()
+
+            style = reader(references, mask).tokens
+            recorder.mode = "style"
+            adapter.reset_internal_teacher()
+            adapter.set_style_context(style)
+            adapter.set_teacher_context(tagged)
+            adapter.set_timesteps(timestep.expand(rows))
+            try:
+                style_prediction = anima(
+                    noisy.expand(rows, -1, -1, -1).unsqueeze(2),
+                    timestep.expand(rows),
+                    context=context.expand(rows, -1, -1),
+                    padding_mask=padding,
+                    target_input_ids=None,
+                ).squeeze(2).float()
+            finally:
+                adapter.clear_style_tokens()
+                adapter.set_diagnostic_recorder(None)
+        # ``record_gated_internal_teacher`` retains its differentiable terms
+        # until the objective is consumed.  The diagnostic uses only the
+        # reduced recorder statistics, so consume and release them per probe.
+        adapter.internal_teacher_loss(rho_min=0.0)
+
+        captured = recorder.finish()
+        for block_index, stages in captured.items():
+            for stage, metrics in stages.items():
+                block_stage_rows[block_index].setdefault(stage, []).append(metrics)
+                bin_stage_rows[bin_index].setdefault(stage, []).append(metrics)
+
+        final_teacher = tensors["centered_teacher"][
+            artist_indices, content_index, timestep_index
+        ].to(device=device, dtype=torch.float32, non_blocking=True)
+        final_metrics = _effect_stage_metrics(
+            style_prediction - base_prediction, final_teacher
+        )
+        dimensions = tuple(range(1, base_prediction.ndim))
+        final_metrics.update({
+            "output_to_base_rms": float(
+                (style_prediction - base_prediction).square()
+                .mean(dim=dimensions).sqrt().mean()
+                / base_prediction.square().mean(dim=dimensions).sqrt().mean().clamp_min(1e-8)
+            ),
+            "timestep": timestep_value,
+        })
+        final_rows.append(final_metrics)
+        final_bin_rows[bin_index].append(final_metrics)
+        print(
+            f"attenuation probe={probe_index + 1}/{probe_batches} "
+            f"content={content_index} timestep={timestep_value:.4f} "
+            f"final_ratio={final_metrics['output_to_base_rms']:.5f} "
+            f"projection={final_metrics['teacher_projection']:.5f}",
+            flush=True,
+        )
+
+    block_summary: list[dict[str, Any]] = []
+    for block_index, stages in block_stage_rows.items():
+        reduced = {
+            stage: _mean_scalar_rows(rows) for stage, rows in stages.items()
+        }
+        attenuation = {}
+        if {"pre_o", "post_o"} <= reduced.keys():
+            attenuation["o_rms_retention"] = (
+                reduced["post_o"]["centered_rms"]
+                / max(reduced["pre_o"]["centered_rms"], 1e-8)
+            )
+            attenuation["o_projection_change"] = (
+                reduced["post_o"]["teacher_projection"]
+                - reduced["pre_o"]["teacher_projection"]
+            )
+        if {"post_o", "post_gate"} <= reduced.keys():
+            attenuation["gate_rms_retention"] = (
+                reduced["post_gate"]["centered_rms"]
+                / max(reduced["post_o"]["centered_rms"], 1e-8)
+            )
+            attenuation["gate_projection_change"] = (
+                reduced["post_gate"]["teacher_projection"]
+                - reduced["post_o"]["teacher_projection"]
+            )
+        if {"post_cross_hidden", "post_mlp_hidden"} <= reduced.keys():
+            attenuation["mlp_cumulative_rms_retention"] = (
+                reduced["post_mlp_hidden"]["centered_rms"]
+                / max(reduced["post_cross_hidden"]["centered_rms"], 1e-8)
+            )
+        block_summary.append({
+            "block": block_index,
+            "stages": reduced,
+            "attenuation": attenuation,
+        })
+
+    bin_summary = []
+    for bin_index, stages in bin_stage_rows.items():
+        bin_summary.append({
+            "bin": bin_index,
+            "range": [edges[bin_index], edges[bin_index + 1]],
+            "stages": {
+                stage: _mean_scalar_rows(rows) for stage, rows in stages.items()
+            },
+            "final_velocity": _mean_scalar_rows(final_bin_rows[bin_index]),
+        })
+    result = {
+        "checkpoint": str(checkpoint),
+        "checkpoint_step": checkpoint_step,
+        "probe_batches": probe_batches,
+        "batch_size": loader.batch_size,
+        "references": int(diagnostic.get("references", 4)),
+        "timestep_bin_edges": list(edges),
+        "final_velocity": _mean_scalar_rows(final_rows),
+        "blocks": block_summary,
+        "timestep_bins": bin_summary,
+    }
+    output = destination / str(
+        diagnostic.get(
+            "output_directory",
+            "diagnostics/detail_style_attenuation_v10_step500",
+        )
+    )
+    output.mkdir(parents=True, exist_ok=True)
+    write_json(output / "attenuation.json", result)
+    summary = {
+        "output": str(output / "attenuation.json"),
+        "checkpoint_step": checkpoint_step,
+        "probe_batches": probe_batches,
+        "final_velocity": result["final_velocity"],
     }
     write_json(output / "summary.json", summary)
     return summary

@@ -12,6 +12,7 @@ from __future__ import annotations
 import math
 from bisect import bisect_right
 from dataclasses import dataclass
+from collections.abc import Callable
 from typing import Any
 
 import torch
@@ -538,6 +539,9 @@ class FreshKVStyleCrossAttention(nn.Module):
         self._runtime_fixed_targets: list[torch.Tensor | None] = [None] * blocks
         self._runtime_fixed_actuals: list[torch.Tensor | None] = [None] * blocks
         self._runtime_fixed_scales: list[torch.Tensor | None] = [None] * blocks
+        self._diagnostic_recorder: (
+            Callable[[int, str, torch.Tensor], None] | None
+        ) = None
         self._initialized = False
 
     def initialize_from_anima(self, anima: nn.Module) -> None:
@@ -592,6 +596,20 @@ class FreshKVStyleCrossAttention(nn.Module):
 
     def set_teacher_context(self, context: torch.Tensor | None) -> None:
         self._teacher_context = context
+
+    def set_diagnostic_recorder(
+        self,
+        recorder: Callable[[int, str, torch.Tensor], None] | None,
+    ) -> None:
+        """Attach a transient stage recorder without changing model state."""
+
+        self._diagnostic_recorder = recorder
+
+    def record_diagnostic_stage(
+        self, block_index: int, stage: str, value: torch.Tensor
+    ) -> None:
+        if self._diagnostic_recorder is not None:
+            self._diagnostic_recorder(int(block_index), str(stage), value)
 
     def set_timesteps(self, timesteps: torch.Tensor | float) -> None:
         value = torch.as_tensor(timesteps, dtype=torch.float32, device=self.alpha.device)
@@ -1230,6 +1248,9 @@ class FreshKVStyleCrossAttention(nn.Module):
         )
         effective_style_attended = alpha * style_attended
         self._runtime_alphas[block_index] = alpha.detach().float().mean()
+        self.record_diagnostic_stage(
+            block_index, "pre_o_style", effective_style_attended
+        )
         merged = text_attended + (
             effective_style_attended
             if not self._calibration or self._calibration_inject_style
@@ -1249,11 +1270,21 @@ class FreshKVStyleCrossAttention(nn.Module):
             teacher_attended = _run_attention(
                 cross_attention, query, teacher_key, teacher_value, attn_params
             )
+            teacher_attention_delta = teacher_attended - text_attended
             teacher_delta = self._native_output_weight(
-                cross_attention, teacher_attended - text_attended
+                cross_attention, teacher_attention_delta
             )
             student_delta = self._native_output_weight(
                 cross_attention, effective_style_attended
+            )
+            self.record_diagnostic_stage(
+                block_index, "pre_o_teacher", teacher_attention_delta
+            )
+            self.record_diagnostic_stage(
+                block_index, "post_o_style", student_delta
+            )
+            self.record_diagnostic_stage(
+                block_index, "post_o_teacher", teacher_delta
             )
             self._pending_internal[block_index] = (
                 student_delta, teacher_delta, style_attended, alpha.detach().float()
@@ -1276,6 +1307,8 @@ class FreshKVStyleCrossAttention(nn.Module):
         )
         student = student * gate
         teacher = teacher * gate
+        self.record_diagnostic_stage(block_index, "post_gate_style", student)
+        self.record_diagnostic_stage(block_index, "post_gate_teacher", teacher)
         if student.shape[0] > 1:
             student = student - student.mean(dim=0, keepdim=True)
             teacher = teacher - teacher.mean(dim=0, keepdim=True)

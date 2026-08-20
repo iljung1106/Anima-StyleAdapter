@@ -851,8 +851,18 @@ def _same_q_block_forward(
         )
     # Native timestep-conditioned gate_cross controls the complete merged path.
     x = x + gate_cross * result
+    record_stage = getattr(adapter, "record_diagnostic_stage", None)
+    if record_stage is not None:
+        record_stage(
+            block.__dict__["_same_q_style_block_index"], "post_cross_hidden", x
+        )
     normalized = block.layer_norm_mlp(x) * (1 + scale_mlp) + shift_mlp
-    return x + gate_mlp * block.mlp(normalized)
+    x = x + gate_mlp * block.mlp(normalized)
+    if record_stage is not None:
+        record_stage(
+            block.__dict__["_same_q_style_block_index"], "post_mlp_hidden", x
+        )
+    return x
 
 
 def attach_same_q_style_adapter(

@@ -13,9 +13,11 @@ from anima_style_data.detail_style_cross_attention import (  # noqa: E402
     SharedBaseKVStyleCrossAttention,
 )
 from anima_style_data.detail_style_training import (  # noqa: E402
+    _StyleAttenuationRecorder,
     _audit_student_prompts,
     _compose_separate_text_style_guidance,
     _delayed_learning_rate_multiplier,
+    _effect_stage_metrics,
     _minimal_native_teacher_objective,
 )
 
@@ -237,6 +239,37 @@ def test_same_q_internal_teacher_produces_live_gradient_and_calibrates_alpha():
         assert effective / raw == pytest.approx(0.2, rel=1e-5)
     assert len(calibration["block_timestep_profiles"]) == 2
     assert calibration["block_timestep_profiles"][1]["blocks"][0]["samples"] == 3
+
+
+def test_attenuation_metrics_remove_common_output_and_pair_stage_captures():
+    teacher = torch.tensor([[[-1.0, 0.0]], [[1.0, 0.0]]])
+    common = torch.tensor([[[0.0, 3.0]]])
+    student = 2.0 * teacher + common
+    metrics = _effect_stage_metrics(student, teacher)
+
+    assert metrics["teacher_projection"] == pytest.approx(2.0)
+    assert metrics["teacher_direction_cosine"] == pytest.approx(1.0)
+    assert metrics["student_to_teacher_rms"] == pytest.approx(2.0)
+    assert metrics["common_output_ratio"] == pytest.approx(0.8320503)
+
+    recorder = _StyleAttenuationRecorder()
+    recorder(0, "post_cross_hidden", torch.zeros_like(student))
+    recorder(0, "post_mlp_hidden", torch.zeros_like(student))
+    recorder.mode = "style"
+    recorder(0, "pre_o_style", student)
+    recorder(0, "pre_o_teacher", teacher)
+    recorder(0, "post_o_style", student)
+    recorder(0, "post_o_teacher", teacher)
+    recorder(0, "post_gate_style", student)
+    recorder(0, "post_gate_teacher", teacher)
+    recorder(0, "post_cross_hidden", student)
+    recorder(0, "post_mlp_hidden", student)
+    captured = recorder.finish()[0]
+
+    assert set(captured) == {
+        "pre_o", "post_o", "post_gate", "post_cross_hidden", "post_mlp_hidden"
+    }
+    assert captured["post_gate"]["teacher_projection"] == pytest.approx(2.0)
 
 
 def test_timestep_strength_profile_interpolates_per_block_and_keeps_bounds():

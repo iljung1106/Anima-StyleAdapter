@@ -121,6 +121,10 @@ def build_parser() -> argparse.ArgumentParser:
             "Measure clean-path block-by-timestep native/style residual distributions",
         ),
         (
+            "detail-style-attenuation",
+            "Trace style residual attenuation from attention to final velocity",
+        ),
+        (
             "detail-style-smoke",
             "Run two real detail-preserving Style Cross-Attention steps",
         ),
@@ -396,6 +400,7 @@ def main() -> None:
         "detail-style-block-similarity",
         "detail-style-fixed-samples",
         "detail-style-strength-profile",
+        "detail-style-attenuation",
         "detail-style-smoke",
     }:
         from .detail_style_teacher_context import (
@@ -403,6 +408,7 @@ def main() -> None:
         )
         from .detail_style_training import (
             backfill_detail_style_fixed_samples,
+            diagnose_detail_style_attenuation,
             profile_detail_style_block_timestep_strength,
             smoke_test_detail_style_cross_attention,
             train_detail_style_cross_attention,
@@ -419,6 +425,7 @@ def main() -> None:
             "detail-style-strength-profile": (
                 profile_detail_style_block_timestep_strength
             ),
+            "detail-style-attenuation": diagnose_detail_style_attenuation,
             "detail-style-smoke": smoke_test_detail_style_cross_attention,
         }[args.command]
         _run(stage, config, destination)
