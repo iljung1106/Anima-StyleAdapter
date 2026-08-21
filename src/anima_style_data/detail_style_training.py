@@ -3742,6 +3742,8 @@ def train_detail_style_cross_attention(
                     f"detail-style step={step}/{steps} loss={averaged['loss']:.5f} "
                     f"flow={averaged['flow_loss']:.5f} grad={averaged['grad_norm']:.4f} "
                     f"teacher={teacher_label} "
+                    f"reader_grad={averaged.get('reader_gradient_rms', 0.0):.3e} "
+                    f"null_grad={averaged.get('null_context_gradient_rms', 0.0):.3e} "
                     f"step_s={averaged['step_s']:.3f}", flush=True,
                 )
                 if wandb_run is not None:
@@ -3753,7 +3755,10 @@ def train_detail_style_cross_attention(
                             namespace = "train/teacher"
                         elif key in {"step_s", "images_per_s"}:
                             namespace = "system/perf"
-                        elif key.startswith(("style_", "grad_")) or key.endswith("_lr"):
+                        elif (
+                            key.startswith(("style_", "grad_"))
+                            or key.endswith(("_lr", "_gradient_rms"))
+                        ):
                             namespace = "model/activation"
                         elif (
                             "artist" in key
