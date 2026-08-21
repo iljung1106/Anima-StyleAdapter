@@ -2054,9 +2054,11 @@ def _controlled_artist_bootstrap_step(
                 "controlled_artist_skipped": reference.new_tensor(1.0),
             }
         first_references = heldout_references[eligible]
-        first_mask = first_view_mask[eligible]
+        # _split_reference_views already returns masks compacted to eligible
+        # rows; indexing them again with the original batch mask is invalid.
+        first_mask = first_view_mask
         second_references = heldout_references[eligible]
-        second_mask = second_view_mask[eligible]
+        second_mask = second_view_mask
         style_ids = [
             style_ids[int(index)]
             for index in eligible_indices.detach().cpu().tolist()
