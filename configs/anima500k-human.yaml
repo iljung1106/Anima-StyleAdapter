@@ -1195,7 +1195,7 @@ dual_domain_style_distillation:
     discrete_flow_shift: 3.0
     prefetch_workers: 2
     prefetch_batches: 6
-    resume: true
+    resume: false
     pilot_enabled: true
     reference_schedule:
       - name: target_excluded_1_4
@@ -4329,7 +4329,7 @@ detail_preserving_style_cross_attention:
     fixed_sample_every: 500
     fixed_sample_strengths: [1.0]
     fixed_sample_backfill_steps: []
-    resume: false
+    resume: true
     wandb:
       enabled: true
       project: anima-style-adapter
