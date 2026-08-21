@@ -883,3 +883,30 @@ LR은 `2e-5`, reconstruction weight는 전 구간 `0.05`로 유지해 정보보�
 teacher, 저주파 residual, 성능 기반 curriculum은 유지한다. 선택 기준은 fixed
 reference 간 차이, pooled reconstruction validation, final centered cosine과
 common-output ratio를 함께 사용한다.
+
+## 20. v19 2k performance-gate correction
+
+Reader 선행학습을 적용한 본학습은 2,000스텝에서 exact-self paired
+improvement `+0.00655`, final centered cosine `0.334`, 16-artist InfoNCE
+accuracy `0.602`, common-output ratio `0.541`을 달성했다. 반면 native-axis
+projection coefficient는 magnitude floor ramp가 완료된 후에도 `0.227`에서
+정체했다. 출력의 centered RMS는 native의 `0.927`배이므로 이는 출력
+에너지 부족이 아니라, lossy reference에서 고차원 native residual 축을
+완전히 회귀하도록 요구한 기준이 과도한 문제였다.
+
+따라서 exact-self stage의 목표는 절대 native effect의 40% 회귀가 아니라,
+학습 가능한 방향성과 작가 분리가 안정적으로 확립되었는지로 한다.
+
+- Stage 0은 최소 2,000스텝 이후 final cosine `>=0.30`, native projection
+  `>=0.20`, common-output ratio `<=0.62`를 2회 연속 통과하면 종료한다.
+- Stage 1은 target-included 1/2/4-reference를 충분히 보도록 최소
+  4,000스텝까지 유지한다. 그 뒤 final cosine `>=0.30`, projection
+  `>=0.20`, common-output `<=0.65`를 3회 연속 통과하면 완전히
+  target-excluded 1/2/4/8-reference stage로 이동한다.
+- Magnitude/direction/InfoNCE 가중치는 변경하지 않는다. 1,500→2,000
+  구간에서 final cosine과 InfoNCE가 계속 상승했고, 샘플 효과 RMS도
+  축소되지 않았기 때문이다.
+
+2,000스텝 checkpoint와 optimizer/RNG state를 그대로 resume하며, 전환
+후에는 heldout paired improvement, correct-vs-wrong advantage, fixed-reference
+작가 간 차이를 주요 선택 기준으로 본다.

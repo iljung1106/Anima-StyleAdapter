@@ -4238,11 +4238,16 @@ detail_preserving_style_cross_attention:
           teacher_every: 1
           post_gate_magnitude_enabled: false
           advance:
-            minimum_step: 500
-            final_centered_cosine: 0.20
-            native_projection: 0.40
-            common_output_ratio: 0.70
-            consecutive_validations: 3
+            # v19 reached a stable exact-self improvement and separated all
+            # 16 teacher artists by step 2k, while the positive native-axis
+            # coefficient plateaued near 0.22. Requiring 0.40 kept training
+            # on target-only references after the bootstrap task was already
+            # solved and delayed the heldout-reference objective indefinitely.
+            minimum_step: 2000
+            final_centered_cosine: 0.30
+            native_projection: 0.20
+            common_output_ratio: 0.62
+            consecutive_validations: 2
         - name: aligned_target_mix_1_2_4
           min_references: 1
           max_references: 4
@@ -4252,9 +4257,13 @@ detail_preserving_style_cross_attention:
           teacher_every: 1
           post_gate_magnitude_enabled: true
           advance:
-            minimum_step: 1000
+            # Keep this mixed target/reference phase for roughly 2k updates
+            # after the expected stage-0 transition. Direction must survive
+            # lossy cross-reference inputs; it need not grow to an unattained
+            # target-only coefficient before fully heldout training begins.
+            minimum_step: 4000
             final_centered_cosine: 0.30
-            native_projection: 0.50
+            native_projection: 0.20
             common_output_ratio: 0.65
             consecutive_validations: 3
         - name: aligned_heldout_1_2_4_8
