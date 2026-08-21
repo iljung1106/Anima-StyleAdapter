@@ -1330,7 +1330,11 @@ class FreshKVStyleCrossAttention(nn.Module):
         null_attended = _run_attention(
             cross_attention, query, null_key, null_value, attn_params
         )
-        artist_attended = style_attended - null_attended
+        # Preserve the exact forward decomposition while preventing the common
+        # path's gradient from cancelling when common_gain == artist_gain.
+        # Centered final-artist losses train the reference path; the final
+        # common loss trains the learned null path directly.
+        artist_attended = style_attended - null_attended.detach()
         common_gain, artist_gain = self._component_gains()
         artist_component = artist_gain.to(
             device=artist_attended.device, dtype=artist_attended.dtype

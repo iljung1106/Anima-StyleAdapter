@@ -764,10 +764,10 @@ def test_shared_xavier_bases_are_cached_and_block_deltas_train():
     assert adapter.log_common_gain.grad.abs() > 0
     assert adapter.log_artist_gain.grad.abs() > 0
     assert adapter.null_style_context.grad is not None
-    # With common_gain == artist_gain the summed forward is algebraically the
-    # raw reference path. The dedicated native common/artist bootstrap—not the
-    # unsplit main output—supplies the null-context gradient.
-    assert adapter.null_style_context.grad.norm() == 0
+    # The forward still recomposes the raw reference path at equal gains, but
+    # stop-gradient on the artist subtraction prevents the common path from
+    # becoming untrainable through exact algebraic cancellation.
+    assert adapter.null_style_context.grad.norm() > 0
     assert all(block.cross_attn.k_proj.weight.grad is None for block in anima.blocks)
 
 
