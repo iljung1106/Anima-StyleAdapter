@@ -195,6 +195,21 @@ def _reference_batch(
     include_target = torch.rand(
         target_tokens.shape[0], device=device, generator=generator
     ) < float(curriculum["target_probability"])
+    if bool(training_cfg.get("empty_prompt_forces_target", False)):
+        prompt_modes = [str(value) for value in batch.get("prompt_modes", [])]
+        if prompt_modes:
+            empty = torch.tensor(
+                [value == "empty" for value in prompt_modes],
+                device=device,
+                dtype=torch.bool,
+            )
+            include_target = include_target | empty
+            # An empty text condition has no content instruction. Keep its
+            # contract unambiguous: one exact target reference, not a target
+            # hidden among unrelated heldout views.
+            for row in empty.nonzero(as_tuple=False).flatten().tolist():
+                mask[row].zero_()
+                mask[row, 0] = True
     references, mask = _replace_reference_with_target(
         references, mask, target_tokens, include_target
     )

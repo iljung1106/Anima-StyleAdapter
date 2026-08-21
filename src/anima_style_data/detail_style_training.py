@@ -1946,6 +1946,220 @@ def _main_common_output_step(
     return weighted, metrics
 
 
+def _centered_native_magnitude_band(
+    student_delta: torch.Tensor,
+    native_scale: torch.Tensor,
+    *,
+    lower: float,
+    upper: float,
+    upper_weight: float = 0.10,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Keep artist-specific final velocity energy away from the zero shortcut.
+
+    The batch must contain different artists evaluated with one shared probe.
+    Removing the artist mean before measuring RMS prevents an identical common
+    residual from satisfying the lower bound. Direction remains the job of the
+    flow, short teacher bootstrap, and cross-view contrastive objectives.
+    """
+
+    if student_delta.ndim < 2 or student_delta.shape[0] < 2:
+        raise ValueError("Centered magnitude needs at least two artist rows")
+    if lower < 0 or upper < lower or upper_weight < 0:
+        raise ValueError("Invalid centered native magnitude band")
+    student = student_delta.float()
+    centered = student - student.mean(dim=0, keepdim=True)
+    dimensions = tuple(range(1, centered.ndim))
+    row_rms = centered.square().mean(dim=dimensions).sqrt()
+    scale = native_scale.detach().float().clamp_min(1e-8)
+    ratio = row_rms / scale
+    lower_loss = F.relu(float(lower) - ratio).square().mean()
+    upper_loss = F.relu(ratio - float(upper)).square().mean()
+    loss = lower_loss + float(upper_weight) * upper_loss
+    return loss, {
+        "controlled_artist_centered_rms": row_rms.detach().mean(),
+        "controlled_artist_native_scale": scale.detach(),
+        "controlled_artist_magnitude_ratio": ratio.detach().mean(),
+        "controlled_artist_magnitude_lower": loss.new_tensor(float(lower)),
+        "controlled_artist_magnitude_upper": loss.new_tensor(float(upper)),
+        "controlled_artist_magnitude_lower_loss": lower_loss.detach(),
+        "controlled_artist_magnitude_upper_loss": upper_loss.detach(),
+        "controlled_artist_magnitude_loss": loss.detach(),
+    }
+
+
+def _controlled_artist_bootstrap_step(
+    anima: torch.nn.Module,
+    reader: DetailPreservingTypedSlotReader,
+    adapter: FreshKVStyleCrossAttention,
+    batch: dict[str, Any],
+    probe: dict[str, torch.Tensor],
+    device: str,
+    training: dict[str, Any],
+    timestep_weighting: dict[str, torch.Tensor] | None,
+    *,
+    step: int,
+) -> tuple[torch.Tensor | None, dict[str, torch.Tensor]]:
+    """Train nonzero, reference-repeatable effects on one controlled probe.
+
+    Through the exact-self phase the target image supplies the style view and
+    only the centered magnitude band is active. Afterwards two disjoint
+    heldout views from each artist receive the same noisy latent, timestep,
+    text context, and therefore the same frozen-Anima Q. This makes every
+    cross-artist negative in the functional InfoNCE genuinely comparable.
+    """
+
+    magnitude_weight = _ramp(
+        step,
+        int(training.get("controlled_magnitude_start_step", 1)),
+        int(training.get("controlled_magnitude_full_step", 500)),
+        float(training.get("controlled_magnitude_weight", 0.0)),
+    )
+    contrastive_weight = _ramp(
+        step,
+        int(training.get("controlled_contrastive_start_step", 251)),
+        int(training.get("controlled_contrastive_full_step", 500)),
+        float(training.get("controlled_contrastive_weight", 0.0)),
+    )
+    if max(magnitude_weight, contrastive_weight) <= 0:
+        return None, {}
+    if timestep_weighting is None:
+        raise ValueError("Controlled artist magnitude needs frozen native scales")
+
+    exact_end = int(training.get("controlled_exact_self_end_step", 250))
+    style_ids = [str(item.style_id) for item in batch["episodes"]]
+    first_references = None
+    first_mask = None
+    if step <= exact_end:
+        second_references = batch["cached_target_tokens"].to(
+            device, dtype=torch.bfloat16, non_blocking=True
+        )[:, None]
+        second_mask = torch.ones(
+            second_references.shape[:2], device=device, dtype=torch.bool
+        )
+        eligible_indices = torch.arange(
+            second_references.shape[0], device=device
+        )
+    else:
+        heldout_references, heldout_mask = _reference_inputs(
+            batch, device, "heldout"
+        )
+        eligible, first_view_mask, second_view_mask = _split_reference_views(
+            heldout_mask
+        )
+        eligible_indices = eligible.nonzero(as_tuple=False).flatten()
+        if eligible_indices.numel() < 2:
+            reference = probe["timesteps"].new_zeros(())
+            return None, {
+                "controlled_artist_eligible_fraction": reference,
+                "controlled_artist_skipped": reference.new_tensor(1.0),
+            }
+        first_references = heldout_references[eligible]
+        first_mask = first_view_mask[eligible]
+        second_references = heldout_references[eligible]
+        second_mask = second_view_mask[eligible]
+        style_ids = [
+            style_ids[int(index)]
+            for index in eligible_indices.detach().cpu().tolist()
+        ]
+
+    rows = int(eligible_indices.numel())
+    if rows < 2:
+        return None, {}
+    noisy = probe["noisy"][0:1]
+    base = probe["base_prediction"][0:1]
+    context = probe["context"][0:1]
+    timestep = probe["timesteps"][0:1]
+
+    first_delta = None
+    if contrastive_weight > 0 and first_references is not None:
+        with torch.no_grad():
+            first_delta = _controlled_teacher_forward(
+                anima, reader, adapter,
+                first_references, first_mask,
+                noisy, base, context, timestep, device,
+            ).detach()
+    second_delta = _controlled_teacher_forward(
+        anima, reader, adapter,
+        second_references, second_mask,
+        noisy, base, context, timestep, device,
+    )
+
+    lower = _scheduled_value(
+        step,
+        int(training.get("controlled_magnitude_lower_start_step", 1)),
+        int(training.get("controlled_magnitude_lower_end_step", 500)),
+        float(training.get("controlled_magnitude_lower_start", 0.25)),
+        float(training.get("controlled_magnitude_lower_end", 0.50)),
+    )
+    native_scale = _native_effect_scales_for_timesteps(
+        timestep.float(), timestep_weighting
+    )[0]
+    magnitude, metrics = _centered_native_magnitude_band(
+        second_delta,
+        native_scale,
+        lower=lower,
+        upper=float(training.get("controlled_magnitude_upper", 1.25)),
+        upper_weight=float(
+            training.get("controlled_magnitude_upper_weight", 0.10)
+        ),
+    )
+    total = magnitude_weight * magnitude
+    metrics.update({
+        "controlled_artist_magnitude_weight": magnitude.new_tensor(
+            magnitude_weight
+        ),
+        "controlled_artist_magnitude_weighted_loss": (
+            magnitude_weight * magnitude.detach()
+        ),
+        "controlled_artist_exact_self": magnitude.new_tensor(
+            float(step <= exact_end)
+        ),
+        "controlled_artist_eligible_fraction": magnitude.new_tensor(
+            rows / max(1, len(batch["episodes"]))
+        ),
+        "controlled_artist_skipped": magnitude.new_tensor(0.0),
+    })
+
+    if contrastive_weight > 0 and first_delta is not None:
+        contrastive, contrastive_metrics = centered_functional_artist_loss(
+            first_delta,
+            second_delta,
+            style_ids,
+            temperature=float(
+                training.get("controlled_contrastive_temperature", 0.10)
+            ),
+            pool_scales=tuple(
+                int(value)
+                for value in training.get(
+                    "controlled_contrastive_pool_scales", [2, 4]
+                )
+            ),
+            repeatability_weight=float(
+                training.get("controlled_repeatability_weight", 0.0)
+            ),
+        )
+        total = total + contrastive_weight * contrastive
+        metrics.update({
+            f"controlled_{key}": value
+            for key, value in contrastive_metrics.items()
+        })
+        metrics.update({
+            "controlled_artist_contrastive_weight": contrastive.new_tensor(
+                contrastive_weight
+            ),
+            "controlled_artist_contrastive_weighted_loss": (
+                contrastive_weight * contrastive.detach()
+            ),
+        })
+    else:
+        metrics.update({
+            "controlled_artist_contrastive_weight": magnitude.new_zeros(()),
+            "controlled_artist_contrastive_weighted_loss": magnitude.new_zeros(()),
+        })
+    metrics["controlled_artist_total_weighted_loss"] = total.detach()
+    return total, metrics
+
+
 def _controlled_teacher_forward(
     anima: torch.nn.Module,
     reader: DetailPreservingTypedSlotReader,
@@ -2891,7 +3105,9 @@ def train_detail_style_cross_attention(
                 f"step={int(reader_state.get('step', 0))}",
                 flush=True,
             )
-        if exact_self_flow_only:
+        if exact_self_flow_only or bool(
+            training.get("use_fixed_initial_alpha", False)
+        ):
             initial_alpha = float(training.get("fixed_initial_alpha", 0.10))
             if initial_alpha <= 0:
                 raise ValueError("fixed_initial_alpha must be positive")
@@ -2902,7 +3118,10 @@ def train_detail_style_cross_attention(
                 adapter.fixed_output_strength_enabled.fill_(False)
             adapter.restore_timestep_strength_state()
             write_json(output / "style_strength.json", {
-                "mode": "fixed_teacher_free",
+                "mode": (
+                    "fixed_teacher_free" if exact_self_flow_only
+                    else "fixed_auxiliary_bootstrap"
+                ),
                 "alpha": initial_alpha,
                 "global_gain": float(getattr(adapter, "global_gain", 1.0)),
                 "timestep_strength": False,
@@ -3149,6 +3368,26 @@ def train_detail_style_cross_attention(
                 and step >= int(training.get("functional_start_step", 250))
                 and step % int(training.get("functional_wrong_gradient_every", 1)) == 0
             )
+            controlled_artist_due = bool(
+                not exact_self_flow_only
+                and step % max(
+                    1, int(training.get("controlled_artist_every", 4))
+                ) == 0
+                and (
+                    _ramp(
+                        step,
+                        int(training.get("controlled_magnitude_start_step", 1)),
+                        int(training.get("controlled_magnitude_full_step", 500)),
+                        float(training.get("controlled_magnitude_weight", 0.0)),
+                    ) > 0
+                    or _ramp(
+                        step,
+                        int(training.get("controlled_contrastive_start_step", 251)),
+                        int(training.get("controlled_contrastive_full_step", 500)),
+                        float(training.get("controlled_contrastive_weight", 0.0)),
+                    ) > 0
+                )
+            )
             auxiliary_probe = None
             auxiliary_batch = None
             for micro in range(accumulation):
@@ -3164,7 +3403,11 @@ def train_detail_style_cross_attention(
                     train_auxiliaries=not exact_self_flow_only,
                     measure_base=(step % log_every == 0 and micro == accumulation - 1),
                     capture_auxiliary_probe=(
-                        (main_common_due or wrong_gradient_due)
+                        (
+                            main_common_due
+                            or wrong_gradient_due
+                            or controlled_artist_due
+                        )
                         and micro == accumulation - 1
                     ),
                     backward_scale=1.0 / accumulation,
@@ -3193,6 +3436,22 @@ def train_detail_style_cross_attention(
                 )
                 main_common_loss.backward()
                 metric_rows[-1].update(main_common_metrics)
+            if controlled_artist_due:
+                assert auxiliary_probe is not None and auxiliary_batch is not None
+                controlled_loss, controlled_metrics = (
+                    _controlled_artist_bootstrap_step(
+                        anima, reader, adapter,
+                        auxiliary_batch, auxiliary_probe,
+                        device, training, timestep_weighting,
+                        step=step,
+                    )
+                )
+                if controlled_loss is not None:
+                    controlled_loss.backward()
+                    metric_rows[-1]["loss"] = (
+                        metric_rows[-1]["loss"] + controlled_loss.detach()
+                    )
+                metric_rows[-1].update(controlled_metrics)
             stage_teacher_every = (
                 int(performance_stage.get("teacher_every", 1))
                 if performance_stage is not None
@@ -3202,6 +3461,7 @@ def train_detail_style_cross_attention(
             )
             teacher_due = (
                 not exact_self_flow_only
+                and step <= int(training.get("teacher_end_step", steps))
                 and step % max(1, stage_teacher_every) == 0
             )
             if teacher_due:

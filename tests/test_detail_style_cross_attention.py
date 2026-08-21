@@ -19,6 +19,7 @@ from anima_style_data.detail_style_training import (  # noqa: E402
     _all_artist_teacher_infonce,
     _audit_student_prompts,
     _backward_adapter_only,
+    _centered_native_magnitude_band,
     _compose_separate_text_style_guidance,
     _delayed_learning_rate_multiplier,
     _effect_stage_metrics,
@@ -139,6 +140,27 @@ def test_main_flow_total_magnitude_accepts_orthogonal_equal_rms():
     small_loss.backward()
     assert small.grad is not None
     assert float((small.grad * small.detach()).sum()) < 0
+
+
+def test_centered_native_magnitude_rejects_common_output_shortcut():
+    common = torch.ones(4, 1, 2, 2, requires_grad=True)
+    common_loss, common_metrics = _centered_native_magnitude_band(
+        common, torch.tensor(1.0), lower=0.5, upper=1.25
+    )
+    assert float(common_metrics["controlled_artist_magnitude_ratio"]) == pytest.approx(0.0)
+    assert float(common_loss) == pytest.approx(0.25)
+
+    distinct = torch.tensor([
+        [[[1.0, 1.0], [1.0, 1.0]]],
+        [[[-1.0, -1.0], [-1.0, -1.0]]],
+        [[[1.0, -1.0], [1.0, -1.0]]],
+        [[[-1.0, 1.0], [-1.0, 1.0]]],
+    ])
+    distinct_loss, distinct_metrics = _centered_native_magnitude_band(
+        distinct, torch.tensor(1.0), lower=0.5, upper=1.25
+    )
+    assert float(distinct_metrics["controlled_artist_magnitude_ratio"]) == pytest.approx(1.0)
+    assert float(distinct_loss) == pytest.approx(0.0)
 
 
 def test_native_scale_common_output_penalty_uses_current_controlled_batch():

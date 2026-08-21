@@ -3830,7 +3830,7 @@ real_artist_teacher:
 # Detail-preserving typed-slot, separate-softmax Style Cross-Attention v1.
 # Contract: docs/detail_preserving_style_cross_attention_plan.md
 detail_preserving_style_cross_attention:
-  output_directory: detail_preserving_style_cross_attention_v24_exact_self_flow_only_1k
+  output_directory: detail_preserving_style_cross_attention_v25_minimal_bootstrap_2k
   seed: 20260819
   train_split: train
   validation_split: validation
@@ -4011,11 +4011,13 @@ detail_preserving_style_cross_attention:
       - synthetic_teacher_additional_1500x6/dual_query_reference_tokens_v8_step10000
   training:
     device: cuda
-    steps: 1000
-    # Bypass every teacher and auxiliary objective. Frozen Anima sees exactly
-    # the target image's cached 84-token reference and supplies ordinary
-    # rectified-flow MSE as the sole optimization objective.
-    exact_self_flow_only: true
+    steps: 2000
+    # Minimal v25 objective: flow MSE, a 100-step synthetic all-block teacher,
+    # artist-centered final-effect magnitude, weak Reader reconstruction, and
+    # controlled cross-reference functional InfoNCE. No prototype, ranking,
+    # common-output, or raw target-residual magnitude objective is active.
+    exact_self_flow_only: false
+    use_fixed_initial_alpha: true
     fixed_initial_alpha: 0.10
     # Preserve the pretrained information bottleneck while allowing slow
     # task-specific adaptation. Adapter K/V groups retain their original LR.
@@ -4027,9 +4029,7 @@ detail_preserving_style_cross_attention:
     adam_eps: 0.00000001
     weight_decay: 0.01
     warmup_steps: 100
-    # The peak rate remains intact throughout self-reference alignment and the
-    # first 6k fully held-out steps; cosine decay begins only at step 12k.
-    lr_decay_start_step: 1000
+    lr_decay_start_step: 2000
     minimum_lr_ratio: 0.10
     max_grad_norm: 1.0
     gradient_accumulation_steps: 4
@@ -4049,40 +4049,36 @@ detail_preserving_style_cross_attention:
       statistics_chunk_artists: 16
     reference_schedule:
       - name: exact_single
-        end_step: 1000
+        end_step: 250
         min_references: 1
         max_references: 1
         reference_count_weights: [1.0]
-      - name: mixed_1_2_4
-        end_step: 4000
+      - name: target_included_1_2_4
+        end_step: 1000
         min_references: 1
         max_references: 4
-        reference_count_weights: [0.50, 0.35, 0.0, 0.15]
-      - name: heldout_1_2_4_8
-        end_step: 20000
+        reference_count_weights: [0.55, 0.30, 0.0, 0.15]
+      - name: target_anneal_1_2_4_8
+        end_step: 2000
         min_references: 1
         max_references: 8
         reference_count_weights: [0.45, 0.30, 0.0, 0.17, 0.0, 0.0, 0.0, 0.08]
     curriculum:
       gate_only_steps: 0
-      # Preserve the high-signal exact-self/content-leakage bootstrap twice as
-      # long, then remove target inclusion gradually instead of asking the
-      # lossy heldout path to replace it before native alignment is established.
-      self_reference_steps: 1000
-      target_mix_end_step: 4000
-      target_mix_end_probability: 0.65
-      target_anneal_end: 10000
+      self_reference_steps: 250
+      target_mix_end_step: 1000
+      target_mix_end_probability: 1.0
+      target_anneal_end: 2000
       target_mix_min_references: 1
       target_mix_max_references: 4
       target_anneal_min_references: 1
       target_anneal_max_references: 8
-    # The pretrained Reader checkpoint remains a controlled initialization,
-    # but reconstruction is no longer allowed to dominate the functional
-    # flow experiment. The frozen upstream Resampler already preserves its
-    # source features; this weak term only prevents catastrophic forgetting.
-    reconstruction_weight: 0.0
-    reconstruction_final_weight: 0.0
-    reconstruction_hold_steps: 1000
+    empty_prompt_forces_target: true
+    # Weakly preserve the random Reader's 84 -> 28 information path without
+    # turning reconstruction into the style objective.
+    reconstruction_weight: 0.03
+    reconstruction_final_weight: 0.03
+    reconstruction_hold_steps: 2000
     # v23 removes the failed v22 full-residual RMS bootstrap. The complete
     # target-minus-frozen residual contains content/noise/base-model error that
     # cannot be recovered from a lossy style reference; forcing its norm made
@@ -4095,6 +4091,26 @@ detail_preserving_style_cross_attention:
     main_flow_magnitude_target_ratio: 1.0
     main_flow_magnitude_huber_beta: 0.10
     main_flow_magnitude_scale_floor: 0.0001
+    # Every fourth optimizer step, different artists share one x_t, timestep,
+    # prompt and frozen-Anima Q. The centered RMS band is active from the
+    # beginning; disjoint-view functional InfoNCE starts once exact-self ends.
+    controlled_artist_every: 4
+    controlled_exact_self_end_step: 250
+    controlled_magnitude_start_step: 1
+    controlled_magnitude_full_step: 500
+    controlled_magnitude_weight: 0.10
+    controlled_magnitude_lower_start_step: 1
+    controlled_magnitude_lower_end_step: 500
+    controlled_magnitude_lower_start: 0.25
+    controlled_magnitude_lower_end: 0.50
+    controlled_magnitude_upper: 1.25
+    controlled_magnitude_upper_weight: 0.10
+    controlled_contrastive_start_step: 251
+    controlled_contrastive_full_step: 500
+    controlled_contrastive_weight: 0.05
+    controlled_contrastive_temperature: 0.10
+    controlled_contrastive_pool_scales: [2, 4]
+    controlled_repeatability_weight: 0.0
     # Legacy main-flow ranking is disabled below. The controlled frozen
     # teacher-direction ranking is configured beside the post-gate objective.
     functional_start_step: 250
@@ -4176,11 +4192,12 @@ detail_preserving_style_cross_attention:
     # Sixteen artists share the same x_t/timestep/content/Q. Frozen DiT
     # forwards are split into four-row microbatches; InfoNCE still sees all 15
     # wrong artists and common-output uses the exact sixteen-row mean.
-    teacher_batch_rows: 16
+    teacher_batch_rows: 4
     teacher_microbatch_rows: 4
     teacher_references: 4
-    teacher_every_step_until: 1000
+    teacher_every_step_until: 100
     teacher_every_after_bootstrap: 2
+    teacher_end_step: 100
     # Optional local native-artist distillation. All rows share x_t, timestep,
     # and content; the tagged native context and style branch use the same
     # Student Q. Selected zero-based block outputs are compared after native O
@@ -4189,13 +4206,14 @@ detail_preserving_style_cross_attention:
     # EMA or other cross-step state. The local teacher is dense throughout the
     # extended exact-self bootstrap, then follows teacher_every_after_bootstrap.
     post_gate_teacher_distillation:
-      enabled: false
-      block_indices: [11, 12, 13, 14, 15, 21, 22, 23]
+      enabled: true
+      block_indices: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13,
+                      14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27]
       start_step: 1
-      full_step: 500
+      full_step: 10
       # This remains relative to teacher_global_weight. Its gradient is
       # accumulated only into adapter K/V, block delta and base-mix leaves.
-      weight: 0.10
+      weight: 1.0
       direction_weight: 1.0
       magnitude_weight: 0.0
       huber_weight: 0.0
@@ -4221,13 +4239,13 @@ detail_preserving_style_cross_attention:
     fixed_output_quantile: null
     # One outer factor keeps the complete controlled-distillation gradient near
     # the main-flow gradient (v17 measured an 8.6--8.8x excess).
-    teacher_global_weight: 0.0
+    teacher_global_weight: 0.10
     # v18 gradient diagnostics found known-artist InfoNCE was the largest
     # Reader gradient. Balance it against reconstruction and place relatively
     # more pressure on the directly observed common-output failure.
-    teacher_infonce_weight: 0.05
+    teacher_infonce_weight: 0.0
     teacher_infonce_temperature: 0.10
-    teacher_common_output_weight: 0.15
+    teacher_common_output_weight: 0.0
     teacher_common_output_ratio_threshold: 0.60
     teacher_common_output_softness: 0.05
     teacher_objective:
@@ -4236,13 +4254,13 @@ detail_preserving_style_cross_attention:
       # Keep the new direction term on the same pre-global scale as the
       # removed 0.10--0.15 teacher components; otherwise cosine alone would
       # recreate the v17 gradient excess despite the outer 0.1 factor.
-      direction_weight: 0.10
-      residual_weight: 0.025
+      direction_weight: 0.0
+      residual_weight: 0.0
       low_frequency_residual_pool_scales: [2]
-      low_frequency_residual_weight: 0.10
+      low_frequency_residual_weight: 0.0
       native_teacher_huber_beta: 0.10
       native_teacher_scale_floor: 0.0001
-      magnitude_weight: 0.10
+      magnitude_weight: 0.0
       magnitude_floor_start_step: 1
       magnitude_floor_end_step: 1000
       magnitude_floor_start: 0.30
@@ -4315,8 +4333,8 @@ detail_preserving_style_cross_attention:
     wandb:
       enabled: true
       project: anima-style-adapter
-      name: detail-style-v24-exact-self-flow-only-1k
-      id: detail-style-v24-exact-self-flow-only-1k
+      name: detail-style-v25-minimal-bootstrap-2k
+      id: detail-style-v25-minimal-bootstrap-2k
   gradient_diagnostics:
     checkpoint_step: 1500
     teacher_batch_step: 1500
@@ -4327,9 +4345,10 @@ detail_preserving_style_cross_attention:
     candidate_absolute_direction_weight: 0.10
     output_file: gradient_diagnostics_step_1500_v19.json
   sampling:
-    # Periodic panel and the deterministic seven-image fixed suite both use
-    # each episode's target image itself as the sole style reference.
-    reference_mode: self
+    # Heldout panels expose whether the exact-self bootstrap generalizes as
+    # target inclusion is removed. Exact-self remains a numeric validation
+    # probe at every 250-step boundary.
+    reference_mode: heldout
     width: 768
     height: 768
     steps: 30

@@ -1056,3 +1056,28 @@ baseline을 새로 시작한다.
 효과가 생기지 않으면 teacher나 보조 loss가 아니라 Reader→K/V→Anima 주입 경로와
 고정 alpha가 병목이다. Exact-self가 성공하면 이후에만 같은 작가의 다른 reference로
 일반화하는 목적을 하나씩 추가한다.
+
+## 26. v25 최소 보조목표와 단계적 self 제거
+
+v24는 1,000스텝 동안 최종 delta를 줄여 flow 손상을 완화했지만, validation
+exact-self의 paired improvement는 `-0.0617`, 방향 cosine은 `0.0300`에 머물렀다.
+따라서 복잡한 과거 규제를 다시 켜지 않고 다음 네 보조 신호만 추가한다.
+
+- 1~100스텝에는 synthetic Anima reference에 한정해 28개 전 블록의
+  `gate_cross × O` 출력을 native artist-tag 출력 방향에 맞춘다. 블록 loss는 합이
+  아니라 평균이며, Reader에는 이 local teacher gradient를 주지 않는다.
+- 최종 Anima velocity residual의 크기 하한은 동일 `x_t`, timestep, prompt와 Q를
+  공유하는 controlled artist batch에서만 계산한다. Artist batch mean을 제거한 뒤
+  frozen native median scale의 `0.25 → 0.50` 범위로 하한을 올리므로 공통 출력은
+  이 loss를 만족할 수 없다. 상한은 `1.25`다.
+- Reader reconstruction은 전 구간 `0.03`으로 둔다.
+- 251스텝부터 같은 작가의 서로 겹치지 않는 두 heldout reference view를 같은
+  controlled probe에서 평가하고, batch의 모든 다른 작가를 negative로 쓰는
+  functional InfoNCE를 `0.05`까지 ramp한다. Token prototype은 사용하지 않는다.
+
+Reference curriculum은 `1~250: target 한 장만`, `251~1000: 1~4장 중 target 필수`,
+`1001~2000: target 포함률 1→0 선형 감소, 1~8장`이다. Empty prompt는 과거 계약대로
+항상 target 한 장만 reference로 사용한다. 표준 rectified-flow MSE가 주 loss이며,
+prototype, cyclic ranking, 별도 common-output, raw desired-residual magnitude loss는
+모두 끈다. Alpha는 v24와 동일하게 모든 블록 `0.10`, global gain `1.0`으로 시작해
+loss 구성과 reference curriculum만 비교한다.
