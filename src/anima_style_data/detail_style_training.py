@@ -851,7 +851,7 @@ def _minimal_native_teacher_objective(
     student_center: torch.Tensor | None = None,
     teacher_center: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-    """Align final artist-centered direction with one weak magnitude band."""
+    """Align only the final artist-centered direction and its RMS band."""
 
     if student_delta.shape != teacher_delta.shape or student_delta.shape[0] < 2:
         raise ValueError("Minimal teacher objective needs matching artist batches")
@@ -894,53 +894,6 @@ def _minimal_native_teacher_objective(
             raise ValueError("Native teacher row objective has an invalid shape")
         return (rows * row_weights).sum() / row_weights.sum().clamp_min(1e-8)
 
-    scale = teacher_rms.reshape(-1, *([1] * (student.ndim - 1)))
-    residual_rows = F.smooth_l1_loss(
-        (student - teacher) / scale,
-        torch.zeros_like(student),
-        beta=float(training.get("native_teacher_huber_beta", 0.10)),
-        reduction="none",
-    ).mean(dim=dimensions)
-    residual = weighted_mean(residual_rows)
-
-    low_frequency_scales = tuple(
-        int(value)
-        for value in training.get("low_frequency_residual_pool_scales", [2])
-    )
-    if any(value <= 1 for value in low_frequency_scales):
-        raise ValueError("Low-frequency residual pool scales must be greater than 1")
-    low_frequency_rows = []
-    if float(training.get("low_frequency_residual_weight", 0.0)) > 0:
-        if student.ndim != 4:
-            raise ValueError("Low-frequency residual expects BCHW velocity tensors")
-        for pool_scale in low_frequency_scales:
-            pooled_student = F.avg_pool2d(
-                student, kernel_size=pool_scale, stride=pool_scale
-            )
-            pooled_teacher = F.avg_pool2d(
-                teacher, kernel_size=pool_scale, stride=pool_scale
-            )
-            pooled_dimensions = tuple(range(1, pooled_teacher.ndim))
-            pooled_scale = pooled_teacher.square().mean(
-                dim=pooled_dimensions
-            ).sqrt().clamp_min(scale_floor)
-            pooled_scale = pooled_scale.reshape(
-                -1, *([1] * (pooled_teacher.ndim - 1))
-            )
-            low_frequency_rows.append(
-                weighted_mean(F.smooth_l1_loss(
-                    (pooled_student - pooled_teacher) / pooled_scale,
-                    torch.zeros_like(pooled_student),
-                    beta=float(training.get("native_teacher_huber_beta", 0.10)),
-                    reduction="none",
-                ).mean(dim=pooled_dimensions))
-            )
-    low_frequency_residual = (
-        torch.stack(low_frequency_rows).mean()
-        if low_frequency_rows
-        else residual.new_zeros(())
-    )
-
     coefficient = (student * teacher).mean(dim=dimensions) / teacher_power
     floor_start_step = int(training.get("magnitude_floor_start_step", 1))
     floor_end_step = int(training.get("magnitude_floor_end_step", 1_000))
@@ -955,15 +908,13 @@ def _minimal_native_teacher_objective(
             / max(1, floor_end_step - floor_start_step),
         )
         magnitude_floor = floor_start + progress * (floor_end - floor_start)
-    magnitude_lower_loss = weighted_mean(
-        F.relu(magnitude_floor - coefficient).square()
-    )
+    student_rms = (student.square().mean(dim=dimensions) + 1e-12).sqrt()
+    rms_ratio = student_rms / teacher_rms.clamp_min(scale_floor)
+    magnitude_lower_loss = weighted_mean(F.relu(magnitude_floor - rms_ratio).square())
     magnitude_upper = float(training.get("magnitude_upper", 1.50))
     if magnitude_upper < magnitude_floor:
         raise ValueError("magnitude_upper must not be below the magnitude floor")
-    magnitude_upper_loss = weighted_mean(
-        F.relu(coefficient - magnitude_upper).square()
-    )
+    magnitude_upper_loss = weighted_mean(F.relu(rms_ratio - magnitude_upper).square())
     magnitude_upper_weight = float(
         training.get("magnitude_upper_weight", 0.25)
     )
@@ -973,50 +924,30 @@ def _minimal_native_teacher_objective(
     )
     direction = weighted_mean(1.0 - cosine)
 
-    residual_weight = float(training.get("residual_weight", 0.025))
-    low_frequency_weight = float(
-        training.get("low_frequency_residual_weight", 0.10)
+    direction_weight = float(
+        training.get("artist_direction_weight", training.get("direction_weight", 1.0))
     )
-    direction_weight = float(training.get("direction_weight", 1.0))
     magnitude_weight = float(training.get("magnitude_weight", 0.10))
-    weighted_residual = residual_weight * residual
-    weighted_low_frequency = low_frequency_weight * low_frequency_residual
     weighted_direction = direction_weight * direction
     weighted_magnitude = magnitude_weight * magnitude
-    total = (
-        weighted_residual
-        + weighted_low_frequency
-        + weighted_direction
-        + weighted_magnitude
-    )
-    student_rms = student.square().mean(dim=dimensions).sqrt()
+    total = weighted_direction + weighted_magnitude
     return total, {
-        "native_teacher_residual_loss": residual.detach(),
-        "native_teacher_residual_weighted_loss": weighted_residual.detach(),
-        "native_teacher_low_frequency_residual_loss": (
-            low_frequency_residual.detach()
-        ),
-        "native_teacher_low_frequency_residual_weight": residual.new_tensor(
-            low_frequency_weight
-        ),
-        "native_teacher_low_frequency_residual_weighted_loss": (
-            weighted_low_frequency.detach()
-        ),
         "native_teacher_final_direction_loss": direction.detach(),
-        "native_teacher_final_direction_weight": residual.new_tensor(
+        "native_teacher_final_direction_weight": direction.new_tensor(
             direction_weight
         ),
         "native_teacher_final_direction_weighted_loss": weighted_direction.detach(),
-        "native_teacher_magnitude_floor": residual.new_tensor(magnitude_floor),
+        "native_teacher_magnitude_floor": direction.new_tensor(magnitude_floor),
         "native_teacher_magnitude_lower_loss": magnitude_lower_loss.detach(),
-        "native_teacher_magnitude_upper": residual.new_tensor(magnitude_upper),
+        "native_teacher_magnitude_upper": direction.new_tensor(magnitude_upper),
         "native_teacher_magnitude_upper_loss": magnitude_upper_loss.detach(),
-        "native_teacher_magnitude_upper_weight": residual.new_tensor(
+        "native_teacher_magnitude_upper_weight": direction.new_tensor(
             magnitude_upper_weight
         ),
         "native_teacher_magnitude_band_loss": magnitude.detach(),
-        "native_teacher_magnitude_weight": residual.new_tensor(magnitude_weight),
+        "native_teacher_magnitude_weight": direction.new_tensor(magnitude_weight),
         "native_teacher_magnitude_weighted_loss": weighted_magnitude.detach(),
+        "native_teacher_artist_rms_ratio": rms_ratio.detach().mean(),
         "native_teacher_projection_coefficient": coefficient.detach().mean(),
         "native_teacher_projection_positive_fraction": (
             coefficient.detach() > 0
@@ -1031,6 +962,76 @@ def _minimal_native_teacher_objective(
         "native_teacher_strength_weight_max": row_weights.detach().max(),
         "native_teacher_strength_weight_min": row_weights.detach().min(),
         "native_teacher_minimal_loss": total.detach(),
+    }
+
+
+def _common_native_teacher_objective(
+    student_common: torch.Tensor,
+    teacher_common: torch.Tensor,
+    training: dict[str, Any],
+    *,
+    step: int,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Align the final cross-artist common direction and a weak RMS band."""
+
+    if student_common.shape != teacher_common.shape or student_common.shape[0] != 1:
+        raise ValueError("Common teacher objective expects matching singleton means")
+    student = student_common.float()
+    teacher = teacher_common.detach().float()
+    dimensions = tuple(range(1, student.ndim))
+    scale_floor = float(training.get("native_teacher_scale_floor", 1e-4))
+    teacher_power = teacher.square().mean(dim=dimensions).clamp_min(scale_floor**2)
+    teacher_rms = teacher_power.sqrt()
+    student_rms = (student.square().mean(dim=dimensions) + 1e-12).sqrt()
+    rms_ratio = student_rms / teacher_rms
+    cosine = F.cosine_similarity(
+        student.flatten(1), teacher.flatten(1), dim=-1, eps=1e-8
+    ).mean()
+    direction = 1.0 - cosine
+
+    floor_start_step = int(training.get("magnitude_floor_start_step", 1))
+    floor_end_step = int(training.get("magnitude_floor_end_step", 1_000))
+    floor_start = float(training.get("magnitude_floor_start", 0.25))
+    floor_end = float(training.get("magnitude_floor_end", 0.70))
+    if step <= floor_start_step:
+        magnitude_floor = floor_start
+    else:
+        progress = min(
+            1.0,
+            (step - floor_start_step) / max(1, floor_end_step - floor_start_step),
+        )
+        magnitude_floor = floor_start + progress * (floor_end - floor_start)
+    magnitude_upper = float(training.get("magnitude_upper", 1.50))
+    magnitude_upper_weight = float(training.get("magnitude_upper_weight", 0.25))
+    lower = F.relu(magnitude_floor - rms_ratio).square().mean()
+    upper = F.relu(rms_ratio - magnitude_upper).square().mean()
+    magnitude = lower + magnitude_upper_weight * upper
+
+    direction_weight = float(training.get("common_direction_weight", 1.0))
+    magnitude_weight = float(training.get("magnitude_weight", 0.10))
+    weighted_direction = direction_weight * direction
+    weighted_magnitude = magnitude_weight * magnitude
+    coefficient = (student * teacher).mean(dim=dimensions) / teacher_power
+    total = weighted_direction + weighted_magnitude
+    return total, {
+        "native_teacher_common_direction_loss": direction.detach(),
+        "native_teacher_common_direction_weight": direction.new_tensor(
+            direction_weight
+        ),
+        "native_teacher_common_direction_weighted_loss": weighted_direction.detach(),
+        "native_teacher_common_magnitude_lower_loss": lower.detach(),
+        "native_teacher_common_magnitude_upper_loss": upper.detach(),
+        "native_teacher_common_magnitude_band_loss": magnitude.detach(),
+        "native_teacher_common_magnitude_weight": direction.new_tensor(
+            magnitude_weight
+        ),
+        "native_teacher_common_magnitude_weighted_loss": weighted_magnitude.detach(),
+        "native_teacher_common_rms_ratio": rms_ratio.detach().mean(),
+        "native_teacher_common_cosine": cosine.detach(),
+        "native_teacher_common_projection_coefficient": coefficient.detach().mean(),
+        "native_teacher_common_student_rms": student_rms.detach().mean(),
+        "native_teacher_common_target_rms": teacher_rms.detach().mean(),
+        "native_teacher_common_loss": total.detach(),
     }
 
 
@@ -1189,31 +1190,24 @@ def _native_bootstrap_status(
         "native_teacher_projection_coefficient": float(
             config.get("final_projection", 0.25)
         ),
-        "post_gate_teacher_cosine": float(
-            config.get("post_gate_cosine", 0.30)
-        ),
-        "post_gate_teacher_common_cosine": float(
+        "native_teacher_common_cosine": float(
             config.get("common_cosine", 0.30)
         ),
-        "post_gate_teacher_common_projection_coefficient": float(
+        "native_teacher_common_projection_coefficient": float(
             config.get("common_projection", 0.25)
         ),
+        "teacher_infonce_cosine_gap": float(config.get("infonce_gap", 0.02)),
     }
-    maximum_artist_leakage = float(
-        config.get("artist_common_leakage", 0.35)
-    )
     means = {
         key: float(np.mean([row[key] for row in rows if key in row]))
-        for key in (*required, "post_gate_teacher_artist_common_leakage")
+        for key in required
         if any(key in row for row in rows)
     }
     enough_steps = step >= int(config.get("minimum_steps", 500))
     passed = enough_steps and all(
         means.get(key, float("-inf")) >= threshold
         for key, threshold in required.items()
-    ) and means.get(
-        "post_gate_teacher_artist_common_leakage", float("inf")
-    ) <= maximum_artist_leakage
+    )
     consecutive = previous_consecutive + 1 if passed else 0
     required_consecutive = int(config.get("consecutive_validations", 3))
     complete = consecutive >= required_consecutive
@@ -2309,6 +2303,40 @@ def _controlled_teacher_forward(
     return prediction - base
 
 
+@torch.no_grad()
+def _native_final_teacher_forward(
+    anima: torch.nn.Module,
+    adapter: FreshKVStyleCrossAttention,
+    noisy: torch.Tensor,
+    base: torch.Tensor,
+    tagged_context: torch.Tensor,
+    timestep: torch.Tensor,
+    device: str,
+) -> torch.Tensor:
+    """Measure the native tagged final effect with the style path bypassed."""
+
+    rows = tagged_context.shape[0]
+    adapter.clear_style_tokens()
+    padding = torch.zeros(
+        rows, 1, noisy.shape[-2], noisy.shape[-1],
+        device=device, dtype=noisy.dtype,
+    )
+    with torch.autocast(
+        device_type=torch.device(device).type,
+        dtype=torch.bfloat16,
+        enabled=torch.device(device).type == "cuda",
+    ):
+        prediction = anima(
+            noisy.expand(rows, -1, -1, -1).unsqueeze(2),
+            timestep.expand(rows),
+            context=tagged_context,
+            padding_mask=padding,
+            target_input_ids=None,
+        ).squeeze(2).float()
+    adapter.clear_style_tokens()
+    return prediction - base
+
+
 def _teacher_step(
     anima: torch.nn.Module,
     reader: DetailPreservingTypedSlotReader,
@@ -2319,6 +2347,7 @@ def _teacher_step(
     device: str,
     training: dict[str, Any],
     timestep_weighting: dict[str, torch.Tensor] | None,
+    native_common_cache: dict[tuple[int, int], torch.Tensor],
     *,
     step: int,
     probe_index: int,
@@ -2354,12 +2383,12 @@ def _teacher_step(
     teacher = tensors["centered_teacher"][
         artist_indices, content_index, timestep_index
     ].to(device=device, dtype=torch.float32, non_blocking=True)
-    teacher_center = teacher.mean(dim=0, keepdim=True)
-    teacher_centered = teacher - teacher_center
-    teacher_dimensions = tuple(range(1, teacher.ndim))
-    native_scale = teacher_centered.square().mean(
-        dim=teacher_dimensions
-    ).sqrt().median().clamp_min(1e-8)
+    # The bank is centered over every cached artist, not over this sampled
+    # sixteen-row batch. Keep those artist targets intact. Recover the removed
+    # global native component once per content/timestep from one tagged native
+    # forward: raw_effect - globally_centered_effect = exact global mean.
+    teacher_centered = teacher
+    teacher_center = teacher.new_zeros((1, *teacher.shape[1:]))
     base_context = tensors["base_context"][content_index : content_index + 1].to(
         device=device, dtype=torch.bfloat16, non_blocking=True
     )
@@ -2381,12 +2410,21 @@ def _teacher_step(
             "block_indices", (11, 12, 13, 14, 15, 21, 22, 23)
         )
     )
-    tagged = (
-        contexts.get(style_ids, content_index).to(
-            device=device, dtype=torch.bfloat16, non_blocking=True
-        )
-        if post_gate_active else None
+    tagged = contexts.get(style_ids, content_index).to(
+        device=device, dtype=torch.bfloat16, non_blocking=True
     )
+    common_key = (content_index, timestep_index)
+    teacher_common = native_common_cache.get(common_key)
+    if teacher_common is None:
+        raw_teacher = _native_final_teacher_forward(
+            anima, adapter, noisy, base, tagged[:1], timestep, device
+        )
+        teacher_common = (raw_teacher - teacher[:1]).detach()
+        native_common_cache[common_key] = teacher_common
+    else:
+        teacher_common = teacher_common.to(
+            device=device, dtype=torch.float32, non_blocking=True
+        )
 
     # First pass obtains the exact sixteen-artist common effect without keeping
     # four frozen-DiT graphs alive. The second pass supplies all gradients.
@@ -2401,7 +2439,7 @@ def _teacher_step(
                     anima, reader, adapter,
                     references[offset:stop], mask[offset:stop],
                     noisy, base, base_context, timestep, device,
-                    tagged=(tagged[offset:stop] if tagged is not None else None),
+                    tagged=(tagged[offset:stop] if post_gate_active else None),
                     block_indices=block_indices,
                 ).detach()
             )
@@ -2410,25 +2448,22 @@ def _teacher_step(
             adapter.finish_post_gate_center_collection()
         )
     student_center = torch.cat(detached_students, dim=0).mean(dim=0, keepdim=True)
+    objective_cfg = _native_teacher_objective_config(training)
     common_proxy = student_center.detach().float().requires_grad_(True)
-    common_loss, common_metrics = _soft_common_output_objective(
+    common_loss, common_metrics = _common_native_teacher_objective(
         common_proxy,
-        native_scale,
-        ratio_threshold=float(
-            training.get("teacher_common_output_ratio_threshold", 0.60)
-        ),
-        softness=float(training.get("teacher_common_output_softness", 0.05)),
+        teacher_common,
+        objective_cfg,
+        step=step,
     )
     common_gradient = torch.autograd.grad(common_loss, common_proxy)[0].detach()
-    common_weight = float(training.get("teacher_common_output_weight", 0.10))
     infonce_weight = float(training.get("teacher_infonce_weight", 0.25))
     global_weight = float(training.get("teacher_global_weight", 0.10))
     timestep_weight = _native_effect_weights_for_timesteps(
         timestep.float().reshape(1), timestep_weighting
     )[0]
-    objective_cfg = _native_teacher_objective_config(training)
     metric_rows: list[dict[str, torch.Tensor]] = []
-    detached_total = common_loss.detach() * common_weight
+    detached_total = common_loss.detach()
     for offset in range(0, rows, microbatch_rows):
         stop = min(rows, offset + microbatch_rows)
         row_fraction = (stop - offset) / rows
@@ -2436,7 +2471,7 @@ def _teacher_step(
             anima, reader, adapter,
             references[offset:stop], mask[offset:stop],
             noisy, base, base_context, timestep, device,
-            tagged=(tagged[offset:stop] if tagged is not None else None),
+            tagged=(tagged[offset:stop] if post_gate_active else None),
             block_indices=block_indices,
         )
         teacher_rows = teacher[offset:stop]
@@ -2463,7 +2498,7 @@ def _teacher_step(
         ).sum() / rows
         main_loss = global_weight * timestep_weight * (
             row_fraction * (final_loss + infonce_weight * infonce_loss)
-            + common_weight * common_surrogate
+            + common_surrogate
         )
         post_gate_loss = None
         if post_gate_active:
@@ -2530,10 +2565,6 @@ def _teacher_step(
     }
     metrics.update(common_metrics)
     metrics.update({
-        "native_teacher_common_output_weight": timestep.new_tensor(common_weight),
-        "native_teacher_common_output_weighted_loss": (
-            common_weight * common_loss.detach()
-        ),
         "teacher_global_weight": timestep.new_tensor(global_weight),
         "teacher_timestep_weight": timestep_weight.detach(),
         "teacher_content_index": timestep.new_tensor(content_index),
@@ -3455,6 +3486,7 @@ def train_detail_style_cross_attention(
         training, resume
     )
     teacher_curriculum_rows: list[dict[str, float]] = []
+    native_common_cache: dict[tuple[int, int], torch.Tensor] = {}
     teacher_update = (
         int(performance_curriculum.get("teacher_update", 0))
         if bool(performance_curriculum.get("enabled", False))
@@ -3639,7 +3671,7 @@ def train_detail_style_cross_attention(
                 teacher_metrics = _teacher_step(
                     anima, reader, adapter, bank, contexts,
                     teacher_loader.load_step(domain_update), device, training,
-                    timestep_weighting,
+                    timestep_weighting, native_common_cache,
                     step=step, probe_index=teacher_update,
                     post_gate_magnitude_enabled=bool(
                         performance_stage.get(
@@ -3673,13 +3705,10 @@ def train_detail_style_cross_attention(
                     if (
                         key == "native_teacher_projection_coefficient"
                         or key == "native_teacher_cosine"
-                        or key == "native_teacher_common_output_ratio"
-                        or key == "post_gate_teacher_cosine"
-                        or key == "post_gate_teacher_projection_coefficient"
-                        or key == "post_gate_teacher_common_cosine"
-                        or key == "post_gate_teacher_common_projection_coefficient"
-                        or key == "post_gate_teacher_artist_common_leakage"
+                        or key == "native_teacher_common_cosine"
+                        or key == "native_teacher_common_projection_coefficient"
                         or key == "teacher_infonce_accuracy"
+                        or key == "teacher_infonce_cosine_gap"
                         or (
                             key.startswith("post_gate_teacher_block_")
                             and key.endswith("_cosine")

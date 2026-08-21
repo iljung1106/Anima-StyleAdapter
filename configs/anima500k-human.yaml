@@ -3830,7 +3830,7 @@ real_artist_teacher:
 # Detail-preserving typed-slot, separate-softmax Style Cross-Attention v1.
 # Contract: docs/detail_preserving_style_cross_attention_plan.md
 detail_preserving_style_cross_attention:
-  output_directory: detail_preserving_style_cross_attention_v26c_native_bootstrap
+  output_directory: detail_preserving_style_cross_attention_v27_final_component_bootstrap
   seed: 20260819
   train_split: train
   validation_split: validation
@@ -4020,19 +4020,18 @@ detail_preserving_style_cross_attention:
   training:
     device: cuda
     steps: 4000
-    # Separate v26 bootstrap: do not mix the ordinary flow objective until the
-    # open Reader and adapter reproduce native artist effects at both selected
-    # block outputs and final velocity. Windowed criteria stop this run early;
-    # failure to satisfy them by max_steps does not silently enter main flow.
+    # v27 uses only final functional effects: native common direction, centered
+    # artist direction, all-wrong InfoNCE, and a weak RMS band shared by the
+    # common/artist components. Per-block post-gate values remain available in
+    # code for diagnostics but are not an optimization target in this run.
     native_bootstrap:
       enabled: true
       minimum_steps: 750
       final_cosine: 0.35
       final_projection: 0.30
-      post_gate_cosine: 0.30
       common_cosine: 0.30
       common_projection: 0.25
-      artist_common_leakage: 0.35
+      infonce_gap: 0.02
       consecutive_validations: 3
     exact_self_flow_only: false
     use_fixed_initial_alpha: false
@@ -4100,8 +4099,8 @@ detail_preserving_style_cross_attention:
     empty_prompt_forces_target: true
     # Weakly preserve the random Reader's 84 -> 28 information path without
     # turning reconstruction into the style objective.
-    reconstruction_weight: 0.03
-    reconstruction_final_weight: 0.03
+    reconstruction_weight: 0.0
+    reconstruction_final_weight: 0.0
     reconstruction_hold_steps: 2000
     # v23 removes the failed v22 full-residual RMS bootstrap. The complete
     # target-minus-frozen residual contains content/noise/base-model error that
@@ -4222,33 +4221,11 @@ detail_preserving_style_cross_attention:
     teacher_every_step_until: 4000
     teacher_every_after_bootstrap: 1
     teacher_end_step: 4000
-    # Optional local native-artist distillation. All rows share x_t, timestep,
-    # and content; the tagged native context and style branch use the same
-    # Student Q. Selected zero-based block outputs are compared after native O
-    # and gate_cross. A no-grad pass gathers exact 16-artist block means across
-    # four microbatches; the gradient pass uses those frozen centers to give
-    # common and artist-residual branches separate native targets. There is no
-    # EMA or other cross-step state.
+    # Local block-output regression is intentionally disabled. Native tagged
+    # contexts are used only to recover the final global common effect removed
+    # by the pre-centered teacher cache.
     post_gate_teacher_distillation:
-      enabled: true
-      block_indices: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13,
-                      14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27]
-      start_step: 1
-      full_step: 50
-      # Native-RMS weighting keeps weak/noisy blocks from contributing equally
-      # to blocks where Anima's artist tag has a real effect. This loss is part
-      # of the ordinary backward graph, so it updates the Reader as well.
-      weight: 0.50
-      direction_weight: 1.0
-      magnitude_weight: 0.20
-      huber_weight: 0.05
-      magnitude_lower: 0.40
-      magnitude_upper: 1.50
-      native_strength_weighting: true
-      native_strength_weight_min: 0.25
-      native_strength_weight_max: 4.0
-      common_weight: 0.25
-      artist_common_leakage_weight: 0.10
+      enabled: false
     # Same controlled Student effects are ranked against matching and
     # cyclic-shifted frozen artist directions. Only Student correct-direction
     # scores receive gradients; wrong artists are never trained to deteriorate.
@@ -4267,35 +4244,28 @@ detail_preserving_style_cross_attention:
     # Alpha calibration is initialization only. Do not renormalize every
     # forward: the aligned projection floor must retain a radial gradient.
     fixed_output_quantile: null
-    # This bootstrap has no competing main-flow backward. The outer factor
-    # keeps final and 28-block teacher terms in a comparable optimizer range.
+    # This bootstrap has no competing main-flow or per-block teacher backward.
+    # The outer factor keeps the four final-component objectives in a stable
+    # optimizer range.
     teacher_global_weight: 0.50
-    # v18 gradient diagnostics found known-artist InfoNCE was the largest
-    # Reader gradient. Balance it against reconstruction and place relatively
-    # more pressure on the directly observed common-output failure.
+    # Every controlled row is contrasted against all other frozen artists.
     teacher_infonce_weight: 0.10
     teacher_infonce_temperature: 0.10
-    # The explicit common branch is aligned to the raw native artist-batch
-    # mean at post-gate outputs. Do not simultaneously suppress that valid
-    # native common direction with the legacy zero-common objective.
-    teacher_common_output_weight: 0.0
-    teacher_common_output_ratio_threshold: 0.20
-    teacher_common_output_softness: 0.05
+    # Legacy zero-common suppression is absent. One native tagged final forward
+    # per cached content/timestep recovers the global common component exactly:
+    # raw native effect minus the stored globally-centered artist effect.
     teacher_objective:
-      # Final centered direction is primary. Keep only one repeatable 2x
-      # low-frequency target and a weak full-resolution residual.
-      # Native-strength row weighting prevents weak artist/timestep examples
-      # from dominating a normalized direction objective.
-      direction_weight: 1.0
-      residual_weight: 0.10
-      low_frequency_residual_pool_scales: [2]
-      low_frequency_residual_weight: 0.25
-      native_teacher_huber_beta: 0.10
+      # The only reconstruction targets are the final common and centered
+      # artist directions. Absolute full/low-frequency residual regression is
+      # deliberately absent because the two attention paths are not locally
+      # identifiable and the visual reference is lossy.
+      artist_direction_weight: 1.0
+      common_direction_weight: 1.0
       native_teacher_scale_floor: 0.0001
       native_strength_weighting: true
       native_strength_weight_min: 0.25
       native_strength_weight_max: 4.0
-      magnitude_weight: 0.25
+      magnitude_weight: 0.10
       magnitude_floor_start_step: 1
       magnitude_floor_end_step: 750
       magnitude_floor_start: 0.25
@@ -4368,8 +4338,8 @@ detail_preserving_style_cross_attention:
     wandb:
       enabled: true
       project: anima-style-adapter
-      name: detail-style-v26c-native-bootstrap
-      id: detail-style-v26c-native-bootstrap
+      name: detail-style-v27-final-component-bootstrap
+      id: detail-style-v27-final-component-bootstrap
   gradient_diagnostics:
     checkpoint_step: 1500
     teacher_batch_step: 1500

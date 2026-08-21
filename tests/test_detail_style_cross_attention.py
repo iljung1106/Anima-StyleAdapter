@@ -20,6 +20,7 @@ from anima_style_data.detail_style_training import (  # noqa: E402
     _audit_student_prompts,
     _backward_adapter_only,
     _centered_native_magnitude_band,
+    _common_native_teacher_objective,
     _compose_separate_text_style_guidance,
     _delayed_learning_rate_multiplier,
     _effect_stage_metrics,
@@ -819,7 +820,9 @@ def test_centered_direction_and_magnitude_prevent_zero_output():
     assert collapsed.grad is not None
     assert torch.count_nonzero(collapsed.grad) > 0
     assert float(collapsed_metrics["native_teacher_projection_coefficient"]) == pytest.approx(0.0)
-    assert float(collapsed_metrics["native_teacher_magnitude_lower_loss"]) == pytest.approx(1.0)
+    assert float(collapsed_metrics["native_teacher_magnitude_lower_loss"]) == pytest.approx(
+        1.0, abs=1e-5
+    )
     assert float(aligned_metrics["native_teacher_projection_coefficient"]) == pytest.approx(1.0)
     assert float(aligned_loss) < float(collapsed_loss)
 
@@ -864,28 +867,31 @@ def test_centered_teacher_magnitude_has_a_weak_upper_bound():
     assert float(excessive_loss) > float(aligned_loss)
 
 
-def test_low_frequency_native_residual_uses_single_two_x_pool():
+def test_common_teacher_objective_aligns_direction_and_magnitude():
     torch.manual_seed(129)
-    teacher = torch.randn(4, 3, 8, 8)
+    teacher = torch.randn(1, 3, 8, 8)
     config = {
-        "residual_weight": 0.0,
-        "low_frequency_residual_pool_scales": [2],
-        "low_frequency_residual_weight": 1.0,
-        "direction_weight": 0.0,
-        "magnitude_weight": 0.0,
+        "common_direction_weight": 1.0,
+        "magnitude_weight": 0.1,
+        "magnitude_floor_start": 0.7,
+        "magnitude_floor_end": 0.7,
+        "magnitude_upper": 1.5,
     }
 
-    aligned, aligned_metrics = _minimal_native_teacher_objective(
-        teacher.clone(), teacher, config, step=1
+    aligned, aligned_metrics = _common_native_teacher_objective(
+        teacher.clone().requires_grad_(True), teacher, config, step=1
     )
-    collapsed, collapsed_metrics = _minimal_native_teacher_objective(
-        torch.zeros_like(teacher), teacher, config, step=1
+    collapsed_input = torch.zeros_like(teacher, requires_grad=True)
+    collapsed, collapsed_metrics = _common_native_teacher_objective(
+        collapsed_input, teacher, config, step=1
     )
+    collapsed.backward()
 
-    assert float(aligned_metrics["native_teacher_low_frequency_residual_loss"]) == (
-        pytest.approx(0.0, abs=1e-7)
-    )
-    assert float(collapsed_metrics["native_teacher_low_frequency_residual_loss"]) > 0
+    assert float(aligned_metrics["native_teacher_common_cosine"]) == pytest.approx(1.0)
+    assert float(aligned_metrics["native_teacher_common_rms_ratio"]) == pytest.approx(1.0)
+    assert float(collapsed_metrics["native_teacher_common_magnitude_lower_loss"]) > 0
+    assert collapsed_input.grad is not None
+    assert torch.count_nonzero(collapsed_input.grad) > 0
     assert float(collapsed) > float(aligned)
 
 
@@ -1003,19 +1009,17 @@ def test_native_bootstrap_requires_both_common_and_artist_alignment():
         "minimum_steps": 500,
         "final_cosine": 0.3,
         "final_projection": 0.25,
-        "post_gate_cosine": 0.3,
         "common_cosine": 0.3,
         "common_projection": 0.25,
-        "artist_common_leakage": 0.4,
+        "infonce_gap": 0.02,
         "consecutive_validations": 2,
     }
     rows = [{
         "native_teacher_cosine": 0.4,
         "native_teacher_projection_coefficient": 0.35,
-        "post_gate_teacher_cosine": 0.45,
-        "post_gate_teacher_common_cosine": 0.4,
-        "post_gate_teacher_common_projection_coefficient": 0.3,
-        "post_gate_teacher_artist_common_leakage": 0.2,
+        "native_teacher_common_cosine": 0.4,
+        "native_teacher_common_projection_coefficient": 0.3,
+        "teacher_infonce_cosine_gap": 0.05,
     }]
     first, consecutive, complete = _native_bootstrap_status(
         rows, config, step=500, previous_consecutive=0
