@@ -3830,7 +3830,7 @@ real_artist_teacher:
 # Detail-preserving typed-slot, separate-softmax Style Cross-Attention v1.
 # Contract: docs/detail_preserving_style_cross_attention_plan.md
 detail_preserving_style_cross_attention:
-  output_directory: detail_preserving_style_cross_attention_centered_v21_20k
+  output_directory: detail_preserving_style_cross_attention_centered_v21_synthetic_only_20k
   seed: 20260819
   train_split: train
   validation_split: validation
@@ -3996,6 +3996,7 @@ detail_preserving_style_cross_attention:
                     3, 3, 3, 3, 3, 3, 3, 3]
     block_delta_rank: 64
   teacher:
+    reference_domain_name: synthetic_anima_artist_tag
     bank_config_key: dual_domain_native_teacher
     context_cache: native_artist_post_llm_context_5000_v1
     context_cache_device: cuda
@@ -4311,8 +4312,8 @@ detail_preserving_style_cross_attention:
     wandb:
       enabled: true
       project: anima-style-adapter
-      name: detail-style-centered-v21-20k-main-flow-strength
-      id: detail-style-centered-v21-20k-main-flow-strength
+      name: detail-style-centered-v21-synthetic-only-20k
+      id: detail-style-centered-v21-synthetic-only-20k
   gradient_diagnostics:
     checkpoint_step: 1500
     teacher_batch_step: 1500

@@ -2659,7 +2659,11 @@ def train_detail_style_cross_attention(
     domain_cfgs = list(cfg["teacher"].get("reference_domains", []))
     if not domain_cfgs:
         domain_cfgs = [{
-            "name": "legacy",
+            "name": str(
+                cfg["teacher"].get(
+                    "reference_domain_name", "synthetic_anima_artist_tag"
+                )
+            ),
             "weight": 1,
             "reference_caches": list(cfg["teacher"]["reference_caches"]),
         }]
@@ -2695,7 +2699,8 @@ def train_detail_style_cross_attention(
     print(
         "detail-style teacher domains "
         + ", ".join(
-            f"{name}={len(loader.styles)} styles"
+            f"{name}={len(loader.styles)} styles roots="
+            f"{[str(root) for root in loader.token_roots]}"
             for name, loader in teacher_loaders
         )
         + f" schedule={teacher_domain_schedule}",

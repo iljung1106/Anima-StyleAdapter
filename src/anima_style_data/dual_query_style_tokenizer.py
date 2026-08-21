@@ -599,7 +599,10 @@ class CachedTeacherReferenceLoader:
             raise ValueError("At least one teacher token root is required")
         self.token_root = token_roots[0]
         self.token_roots = token_roots
-        root_label = ",".join(root.name for root in token_roots)
+        # Full paths make data provenance explicit. Several caches deliberately
+        # share the same leaf directory name, which previously made a
+        # synthetic-only teacher look indistinguishable from a Human cache.
+        root_label = ",".join(str(root) for root in token_roots)
         self.batch_size = int(batch_size)
         self.references = int(references)
         self.seed = int(seed)
