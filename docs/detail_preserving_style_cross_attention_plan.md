@@ -939,3 +939,42 @@ v20은 모델 구조와 Reader 선행학습은 유지하고 지도 범위를 바
 화풍이 육안으로 확인되고, pixel common component와 final controlled common-output이
 함께 감소하는 것이다. 이 기준을 만족하지 못하면 shared-K/V 용량보다 먼저
 teacher-to-human 전달 경로와 final functional objective를 다시 진단한다.
+
+## 22. v21 Synthetic-only teacher와 main-flow 출력 하한
+
+v20의 Human reference를 native `@artist` residual에 직접 정렬하는 가정은
+폐기한다. Anima의 작가 태그 효과는 약하고 실제 Human reference의 화풍과
+일치한다는 보장이 없으므로, 작가 태그 증류는 그 태그로 직접 생성한 Synthetic
+Anima reference에만 적용한다. v20의 Human:Synthetic `3:1` teacher domain,
+Human 기준 alpha calibration, main Human native-scale common auxiliary 및 강화된
+teacher weight는 모두 v19 값으로 복원한다.
+
+v21은 v19의 pretrained Reader를 재사용해 초기 정보 병목을 통제하되 이를 새
+스타일 지도 신호로 간주하지 않는다. 지속 reconstruction weight는 `0.05`에서
+`0.01`로 낮춰 forgetting 방지만 맡긴다. 이 초기값을 제거하면 출력 크기/LR
+실험과 무작위 86M Reader 재학습이 혼재하므로 이번 비교에서는 유지한다.
+
+핵심 실험 변수는 Human main flow의 약한 출력 shortcut이다. 같은 noisy latent,
+timestep, prompt에서 Adapter 출력과 frozen Anima 출력을 비교하고,
+`target_velocity - base_velocity` 방향으로 투영된 Adapter 최종 velocity 변화에만
+하한을 둔다. 전체 RMS만 키우는 것으로는 만족할 수 없으며, unrelated orthogonal
+성분은 main flow MSE에 그대로 불리하다. 투영 하한은 1~500스텝에
+`0.05 -> 0.20`으로 올리고 네 스텝마다 `0.50` 가중치로 적용한다. 과대 출력을
+막기 위해 desired residual RMS의 `0.75`를 약한 상한으로 둔다.
+
+- Exact-self stage: projection scale `1.0`
+- Target-mixed stage: projection scale `0.5`
+- Fully heldout stage: projection scale `0.25`
+
+학습률은 v19 대비 두 배로 올린다.
+
+- Reader `2e-5 -> 4e-5`
+- Shared K/V `5e-5 -> 1e-4`
+- Block delta `1e-4 -> 2e-4`
+- Base mixing `2e-5 -> 4e-5`
+
+Reader, adapter, optimizer는 모두 새 v21 run에서 처음부터 시작하되 Reader 가중치만
+기존 reconstruction checkpoint로 초기화한다. v19 checkpoint는 재사용하지 않는다.
+선택 기준은 projection loss 자체가 아니라 exact-self/heldout paired improvement,
+final style delta 크기, common-output, fixed-reference 1x 시각적 작가 차이와 이미지
+안정성을 함께 사용한다.

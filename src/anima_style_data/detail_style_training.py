@@ -1131,6 +1131,70 @@ def _rho_min(step: int) -> float:
     return 0.5 * min(1.0, (step - 250) / 750)
 
 
+def _main_flow_projection_floor_loss(
+    prediction: torch.Tensor,
+    base_prediction: torch.Tensor,
+    target: torch.Tensor,
+    *,
+    step: int,
+    training: dict[str, Any],
+    stage_scale: float = 1.0,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Keep the style branch from winning main flow by shrinking to zero.
+
+    The lower bound is applied only to the component of the final Anima
+    velocity change that points toward the actual flow residual.  Increasing
+    unrelated/orthogonal energy therefore cannot satisfy this objective.  A
+    weak total-energy ceiling prevents the early exact-self bootstrap from
+    destabilizing the frozen denoiser.
+    """
+
+    delta = prediction.float() - base_prediction.detach().float()
+    desired = target.float() - base_prediction.detach().float()
+    dimensions = tuple(range(1, delta.ndim))
+    scale_floor = float(training.get("main_flow_projection_scale_floor", 1e-4))
+    desired_power = desired.square().mean(dim=dimensions).clamp_min(
+        scale_floor**2
+    )
+    coefficient = (delta * desired).mean(dim=dimensions) / desired_power
+    delta_rms = delta.square().mean(dim=dimensions).clamp_min(
+        scale_floor**2
+    ).sqrt()
+    desired_rms = desired_power.sqrt()
+    rms_ratio = delta_rms / desired_rms
+
+    start_step = int(training.get("main_flow_projection_floor_start_step", 1))
+    end_step = int(training.get("main_flow_projection_floor_end_step", 500))
+    floor_start = float(training.get("main_flow_projection_floor_start", 0.05))
+    floor_end = float(training.get("main_flow_projection_floor_end", 0.20))
+    progress = min(
+        1.0,
+        max(0.0, (step - start_step) / max(1, end_step - start_step)),
+    )
+    floor = stage_scale * (
+        floor_start + progress * (floor_end - floor_start)
+    )
+    lower = F.relu(floor - coefficient).square().mean()
+    upper = float(training.get("main_flow_projection_rms_upper", 0.75))
+    upper_loss = F.relu(rms_ratio - upper).square().mean()
+    upper_weight = float(
+        training.get("main_flow_projection_upper_weight", 0.10)
+    )
+    loss = lower + upper_weight * upper_loss
+    return loss, {
+        "main_flow_projection_coefficient": coefficient.detach().mean(),
+        "main_flow_projection_positive_fraction": (
+            coefficient.detach() > 0
+        ).float().mean(),
+        "main_flow_projection_floor": loss.new_tensor(floor),
+        "main_flow_projection_lower_loss": lower.detach(),
+        "main_flow_projection_rms_ratio": rms_ratio.detach().mean(),
+        "main_flow_projection_rms_upper": loss.new_tensor(upper),
+        "main_flow_projection_upper_loss": upper_loss.detach(),
+        "main_flow_projection_loss": loss.detach(),
+    }
+
+
 def _flow_step(
     anima: torch.nn.Module,
     reader: DetailPreservingTypedSlotReader,
@@ -1283,8 +1347,28 @@ def _flow_step(
         and step % int(training.get("functional_every", 4)) == 0
         and prediction.shape[0] >= 2
     )
+    main_projection_weight = _ramp(
+        step,
+        int(training.get("main_flow_projection_start_step", 1)),
+        int(training.get("main_flow_projection_full_step", 500)),
+        float(training.get("main_flow_projection_weight", 0.0)),
+    )
+    main_projection_every = int(
+        training.get("main_flow_projection_every", 4)
+    )
+    need_main_projection = (
+        train_auxiliaries
+        and main_projection_weight > 0
+        and step % max(1, main_projection_every) == 0
+    )
     base_prediction = None
-    if measure_base or need_wrong or need_artist_effect or capture_auxiliary_probe:
+    if (
+        measure_base
+        or need_wrong
+        or need_artist_effect
+        or capture_auxiliary_probe
+        or need_main_projection
+    ):
         with torch.no_grad(), torch.autocast(
             device_type=torch.device(device).type,
             dtype=torch.bfloat16,
@@ -1295,6 +1379,37 @@ def _flow_step(
                 noisy.unsqueeze(2), timesteps.to(latents.dtype), context=context,
                 padding_mask=padding, target_input_ids=None,
             ).squeeze(2).float()
+
+    if need_main_projection:
+        assert base_prediction is not None
+        stage_scale = float(
+            performance_stage.get("main_flow_projection_scale", 1.0)
+            if performance_stage is not None else 1.0
+        )
+        projection_loss, projection_metrics = (
+            _main_flow_projection_floor_loss(
+                prediction,
+                base_prediction,
+                target,
+                step=step,
+                training=training,
+                stage_scale=stage_scale,
+            )
+        )
+        weighted_projection = main_projection_weight * projection_loss
+        total = total + weighted_projection
+        metrics.update(projection_metrics)
+        metrics.update({
+            "main_flow_projection_weight": flow_loss.new_tensor(
+                main_projection_weight
+            ),
+            "main_flow_projection_stage_scale": flow_loss.new_tensor(
+                stage_scale
+            ),
+            "main_flow_projection_weighted_loss": (
+                weighted_projection.detach()
+            ),
+        })
 
     deferred_artist_effect = None
     if need_prototype or need_artist_effect:
@@ -2628,8 +2743,9 @@ def train_detail_style_cross_attention(
                 flush=True,
             )
         calibration = _calibrate_alpha(
-            # Calibrate against the complete human domain. Synthetic batches
-            # remain an independent regularizer once optimizer updates start.
+            # Calibrate against the same synthetic-reference domain used by
+            # native artist-tag distillation. Human references never receive
+            # an artist-tag residual target.
             anima, reader, adapter, bank, contexts, teacher_loaders[0][1], device,
             int(training.get("alpha_calibration_batches", 4)),
             training,

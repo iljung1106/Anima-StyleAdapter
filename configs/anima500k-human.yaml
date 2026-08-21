@@ -3830,7 +3830,7 @@ real_artist_teacher:
 # Detail-preserving typed-slot, separate-softmax Style Cross-Attention v1.
 # Contract: docs/detail_preserving_style_cross_attention_plan.md
 detail_preserving_style_cross_attention:
-  output_directory: detail_preserving_style_cross_attention_centered_v20_20k
+  output_directory: detail_preserving_style_cross_attention_centered_v21_20k
   seed: 20260819
   train_split: train
   validation_split: validation
@@ -4006,29 +4006,15 @@ detail_preserving_style_cross_attention:
     reference_caches:
       - synthetic_teacher_500x16/dual_query_reference_tokens_v8_step10000
       - synthetic_teacher_additional_1500x6/dual_query_reference_tokens_v8_step10000
-    # Keep human and Anima-generated references as independent controlled
-    # teacher batches. Human coverage supplies every train artist; synthetic
-    # references remain a smaller regularizing domain rather than being mixed
-    # into the same four-reference set.
-    reference_domains:
-      - name: human
-        weight: 3
-        reference_caches:
-          - dual_query_reference_tokens_v8_step10000
-      - name: synthetic
-        weight: 1
-        reference_caches:
-          - synthetic_teacher_500x16/dual_query_reference_tokens_v8_step10000
-          - synthetic_teacher_additional_1500x6/dual_query_reference_tokens_v8_step10000
   training:
     device: cuda
     steps: 20000
     # Preserve the pretrained information bottleneck while allowing slow
     # task-specific adaptation. Adapter K/V groups retain their original LR.
-    learning_rate: 0.00002
-    shared_kv_learning_rate: 0.00005
-    block_delta_learning_rate: 0.0001
-    base_mix_learning_rate: 0.00002
+    learning_rate: 0.00004
+    shared_kv_learning_rate: 0.00010
+    block_delta_learning_rate: 0.00020
+    base_mix_learning_rate: 0.00004
     betas: [0.9, 0.95]
     adam_eps: 0.00000001
     weight_decay: 0.01
@@ -4082,9 +4068,28 @@ detail_preserving_style_cross_attention:
       target_mix_max_references: 4
       target_anneal_min_references: 1
       target_anneal_max_references: 8
-    reconstruction_weight: 0.05
-    reconstruction_final_weight: 0.05
+    # The pretrained Reader checkpoint remains a controlled initialization,
+    # but reconstruction is no longer allowed to dominate the functional
+    # flow experiment. The frozen upstream Resampler already preserves its
+    # source features; this weak term only prevents catastrophic forgetting.
+    reconstruction_weight: 0.01
+    reconstruction_final_weight: 0.01
     reconstruction_hold_steps: 20000
+    # Main human flow is the only human image-space teacher. Every fourth
+    # update, compare the final adapter velocity to frozen Anima on the same
+    # noisy latent. Enforce a lower bound only on the component aligned with
+    # the true target residual, so orthogonal noise cannot satisfy the floor.
+    main_flow_projection_start_step: 1
+    main_flow_projection_full_step: 500
+    main_flow_projection_every: 4
+    main_flow_projection_weight: 0.50
+    main_flow_projection_floor_start_step: 1
+    main_flow_projection_floor_end_step: 500
+    main_flow_projection_floor_start: 0.05
+    main_flow_projection_floor_end: 0.20
+    main_flow_projection_rms_upper: 0.75
+    main_flow_projection_upper_weight: 0.10
+    main_flow_projection_scale_floor: 0.0001
     # Legacy main-flow ranking is disabled below. The controlled frozen
     # teacher-direction ranking is configured beside the post-gate objective.
     functional_start_step: 250
@@ -4128,8 +4133,8 @@ detail_preserving_style_cross_attention:
     main_common_output_full_step: 750
     main_common_output_every: 4
     main_common_output_batch_rows: 4
-    main_common_output_weight: 0.02
-    main_common_output_native_ratio_threshold: 0.45
+    main_common_output_weight: 0.0
+    main_common_output_native_ratio_threshold: 0.60
     main_artist_energy_native_ratio_floor: 0.50
     main_artist_energy_weight: 1.0
     common_output_threshold_start_step: 1000
@@ -4213,10 +4218,10 @@ detail_preserving_style_cross_attention:
     # v18 gradient diagnostics found known-artist InfoNCE was the largest
     # Reader gradient. Balance it against reconstruction and place relatively
     # more pressure on the directly observed common-output failure.
-    teacher_infonce_weight: 0.10
+    teacher_infonce_weight: 0.05
     teacher_infonce_temperature: 0.10
-    teacher_common_output_weight: 0.20
-    teacher_common_output_ratio_threshold: 0.45
+    teacher_common_output_weight: 0.15
+    teacher_common_output_ratio_threshold: 0.60
     teacher_common_output_softness: 0.05
     teacher_objective:
       # Final centered direction is primary. Keep only one repeatable 2x
@@ -4250,6 +4255,7 @@ detail_preserving_style_cross_attention:
           target_only: true
           target_probability: 1.0
           teacher_every: 1
+          main_flow_projection_scale: 1.0
           post_gate_magnitude_enabled: false
           advance:
             # v19 reached a stable exact-self improvement and separated all
@@ -4269,6 +4275,7 @@ detail_preserving_style_cross_attention:
           target_only: false
           target_probability: 0.65
           teacher_every: 1
+          main_flow_projection_scale: 0.50
           post_gate_magnitude_enabled: true
           advance:
             # Keep this mixed target/reference phase for roughly 2k updates
@@ -4286,7 +4293,8 @@ detail_preserving_style_cross_attention:
           reference_count_weights: [0.45, 0.30, 0.0, 0.17, 0.0, 0.0, 0.0, 0.08]
           target_only: false
           target_probability: 0.0
-          teacher_every: 1
+          teacher_every: 2
+          main_flow_projection_scale: 0.25
           post_gate_magnitude_enabled: true
     prefetch_workers: 2
     prefetch_batches: 6
@@ -4303,8 +4311,8 @@ detail_preserving_style_cross_attention:
     wandb:
       enabled: true
       project: anima-style-adapter
-      name: detail-style-centered-v20-20k-all-artist-teacher
-      id: detail-style-centered-v20-20k-all-artist-teacher
+      name: detail-style-centered-v21-20k-main-flow-strength
+      id: detail-style-centered-v21-20k-main-flow-strength
   gradient_diagnostics:
     checkpoint_step: 1500
     teacher_batch_step: 1500

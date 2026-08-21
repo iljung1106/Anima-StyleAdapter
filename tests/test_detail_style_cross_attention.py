@@ -22,6 +22,7 @@ from anima_style_data.detail_style_training import (  # noqa: E402
     _compose_separate_text_style_guidance,
     _delayed_learning_rate_multiplier,
     _effect_stage_metrics,
+    _main_flow_projection_floor_loss,
     _minimal_native_teacher_objective,
     _native_effect_scales_for_timesteps,
     _native_teacher_objective_config,
@@ -54,6 +55,42 @@ def test_teacher_domain_schedule_rejects_invalid_updates():
         _teacher_domain_update((), 0)
     with pytest.raises(ValueError):
         _teacher_domain_update((0,), -1)
+
+
+def test_main_flow_projection_floor_rewards_only_aligned_output():
+    base = torch.zeros(2, 1, 1, 2)
+    target = torch.tensor([[[[1.0, 0.0]]], [[[1.0, 0.0]]]])
+    prediction = torch.zeros_like(target, requires_grad=True)
+    training = {
+        "main_flow_projection_floor_start_step": 1,
+        "main_flow_projection_floor_end_step": 500,
+        "main_flow_projection_floor_start": 0.05,
+        "main_flow_projection_floor_end": 0.20,
+        "main_flow_projection_rms_upper": 2.0,
+    }
+
+    loss, metrics = _main_flow_projection_floor_loss(
+        prediction, base, target, step=500, training=training
+    )
+    assert float(metrics["main_flow_projection_coefficient"]) == pytest.approx(0.0)
+    assert float(loss) == pytest.approx(0.04)
+    loss.backward()
+    assert prediction.grad is not None
+    assert float(prediction.grad[..., 0].mean()) < 0
+
+    aligned = 0.20 * target
+    aligned_loss, aligned_metrics = _main_flow_projection_floor_loss(
+        aligned, base, target, step=500, training=training
+    )
+    assert float(aligned_metrics["main_flow_projection_coefficient"]) == pytest.approx(0.20)
+    assert float(aligned_loss) == pytest.approx(0.0)
+
+    orthogonal = torch.tensor([[[[0.0, 0.20]]], [[[0.0, 0.20]]]])
+    orthogonal_loss, orthogonal_metrics = _main_flow_projection_floor_loss(
+        orthogonal, base, target, step=500, training=training
+    )
+    assert float(orthogonal_metrics["main_flow_projection_coefficient"]) == pytest.approx(0.0)
+    assert float(orthogonal_loss) == pytest.approx(0.04)
 
 
 def test_native_scale_common_output_penalty_uses_current_controlled_batch():
