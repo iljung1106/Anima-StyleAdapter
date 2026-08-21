@@ -686,6 +686,23 @@ def _pixels_to_image(value: torch.Tensor) -> Image.Image:
     return Image.fromarray(pixels)
 
 
+def _sampling_reference_inputs(
+    batch: dict[str, Any], device: str, reference_mode: str
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Select the exact target or ordinary heldout references for sampling."""
+
+    if reference_mode == "self":
+        references = batch["cached_target_tokens"][:1, None].to(
+            device, dtype=torch.bfloat16, non_blocking=True
+        )
+        return references, torch.ones(
+            references.shape[:2], device=device, dtype=torch.bool
+        )
+    if reference_mode == "heldout":
+        return _reference_inputs(batch, device, "heldout")
+    raise ValueError("sampling.reference_mode must be heldout or self")
+
+
 @torch.no_grad()
 def _sample_query_style_tokenizer_chunk(
     anima: nn.Module,
@@ -711,8 +728,11 @@ def _sample_query_style_tokenizer_chunk(
     ]).to(device, dtype=torch.bfloat16)
     positive_style = []
     sources_by_request: list[list[tuple[str, int]]] = []
+    reference_mode = str(sample_cfg.get("reference_mode", "heldout"))
     for batch in batches:
-        references, mask = _reference_inputs(batch, device, "heldout")
+        references, mask = _sampling_reference_inputs(
+            batch, device, reference_mode
+        )
         with torch.autocast(
             device_type=torch.device(device).type,
             dtype=torch.bfloat16,
@@ -720,13 +740,16 @@ def _sample_query_style_tokenizer_chunk(
         ):
             positive_style.append(tokenizer(references, mask).tokens[:1])
         episode = batch["episodes"][0]
-        sources_by_request.append(
-            [("target", int(episode.target_id))]
-            + [
-                (f"ref {index + 1}", int(image_id))
-                for index, image_id in enumerate(episode.reference_ids[:4])
-            ]
-        )
+        if reference_mode == "self":
+            sources_by_request.append([("target = reference", int(episode.target_id))])
+        else:
+            sources_by_request.append(
+                [("target", int(episode.target_id))]
+                + [
+                    (f"ref {index + 1}", int(image_id))
+                    for index, image_id in enumerate(episode.reference_ids[:4])
+                ]
+            )
     positive_style_context = torch.cat(positive_style)
     batch_size = len(requests)
     first_loader = requests[0][1]
@@ -846,7 +869,7 @@ def _sample_query_style_tokenizer_chunk(
             {"episodes": [batch["episodes"][0]]},
             base_generated=base_image,
             generated_label=(
-                f"Query StyleTokenizer CFG {style_cfg:g} (heldout) — "
+                f"Query StyleTokenizer CFG {style_cfg:g} ({reference_mode}) — "
                 f"{batch['episodes'][0].style_id}"
             ),
             sources=sources,

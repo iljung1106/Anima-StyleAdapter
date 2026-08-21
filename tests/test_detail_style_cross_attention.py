@@ -33,6 +33,9 @@ from anima_style_data.detail_style_training import (  # noqa: E402
     _update_performance_curriculum,
     _wrong_flow_ranking_loss,
 )
+from anima_style_data.query_style_tokenizer import (  # noqa: E402
+    _sampling_reference_inputs,
+)
 from anima_style_data.detail_style_gradient_diagnostics import (  # noqa: E402
     _cosine_matrices,
     _gradient_sample_plan,
@@ -56,6 +59,22 @@ def test_teacher_domain_schedule_rejects_invalid_updates():
         _teacher_domain_update((), 0)
     with pytest.raises(ValueError):
         _teacher_domain_update((0,), -1)
+
+
+def test_exact_self_sampling_uses_only_the_target_reference():
+    target = torch.randn(3, 84, 1024, dtype=torch.bfloat16)
+    references, mask = _sampling_reference_inputs(
+        {"cached_target_tokens": target}, "cpu", "self"
+    )
+
+    assert references.shape == (1, 1, 84, 1024)
+    assert mask.tolist() == [[True]]
+    torch.testing.assert_close(references[0, 0], target[0])
+
+    with pytest.raises(ValueError):
+        _sampling_reference_inputs(
+            {"cached_target_tokens": target}, "cpu", "unknown"
+        )
 
 
 def test_main_flow_projection_floor_rewards_only_aligned_output():

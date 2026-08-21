@@ -3830,7 +3830,7 @@ real_artist_teacher:
 # Detail-preserving typed-slot, separate-softmax Style Cross-Attention v1.
 # Contract: docs/detail_preserving_style_cross_attention_plan.md
 detail_preserving_style_cross_attention:
-  output_directory: detail_preserving_style_cross_attention_v23_repeatable_artist_20k
+  output_directory: detail_preserving_style_cross_attention_v24_exact_self_flow_only_1k
   seed: 20260819
   train_split: train
   validation_split: validation
@@ -3840,7 +3840,9 @@ detail_preserving_style_cross_attention:
   # v18 showed that joint flow/teacher training makes the random 86M Reader
   # classify known teacher artists before it learns to preserve reference
   # geometry. Pretrain both sides of its 84 -> 28 -> 84 bottleneck first.
-  reader_checkpoint: detail_style_reader_pretrain_v1/checkpoints/step-0004000.pt
+  # v24 is an intentionally clean capacity test. The 86M Reader, shared K/V,
+  # block deltas and slot mixer all start from their normal random initializers.
+  reader_checkpoint: null
   reader_pretraining:
     output_directory: detail_style_reader_pretrain_v1
     device: cuda
@@ -4009,20 +4011,25 @@ detail_preserving_style_cross_attention:
       - synthetic_teacher_additional_1500x6/dual_query_reference_tokens_v8_step10000
   training:
     device: cuda
-    steps: 20000
+    steps: 1000
+    # Bypass every teacher and auxiliary objective. Frozen Anima sees exactly
+    # the target image's cached 84-token reference and supplies ordinary
+    # rectified-flow MSE as the sole optimization objective.
+    exact_self_flow_only: true
+    fixed_initial_alpha: 0.10
     # Preserve the pretrained information bottleneck while allowing slow
     # task-specific adaptation. Adapter K/V groups retain their original LR.
-    learning_rate: 0.00004
+    learning_rate: 0.00010
     shared_kv_learning_rate: 0.00010
     block_delta_learning_rate: 0.00020
     base_mix_learning_rate: 0.00004
     betas: [0.9, 0.95]
     adam_eps: 0.00000001
     weight_decay: 0.01
-    warmup_steps: 500
+    warmup_steps: 100
     # The peak rate remains intact throughout self-reference alignment and the
     # first 6k fully held-out steps; cosine decay begins only at step 12k.
-    lr_decay_start_step: 12000
+    lr_decay_start_step: 1000
     minimum_lr_ratio: 0.10
     max_grad_norm: 1.0
     gradient_accumulation_steps: 4
@@ -4073,9 +4080,9 @@ detail_preserving_style_cross_attention:
     # but reconstruction is no longer allowed to dominate the functional
     # flow experiment. The frozen upstream Resampler already preserves its
     # source features; this weak term only prevents catastrophic forgetting.
-    reconstruction_weight: 0.03
-    reconstruction_final_weight: 0.03
-    reconstruction_hold_steps: 20000
+    reconstruction_weight: 0.0
+    reconstruction_final_weight: 0.0
+    reconstruction_hold_steps: 1000
     # v23 removes the failed v22 full-residual RMS bootstrap. The complete
     # target-minus-frozen residual contains content/noise/base-model error that
     # cannot be recovered from a lossy style reference; forcing its norm made
@@ -4108,7 +4115,7 @@ detail_preserving_style_cross_attention:
     artist_effect_start_step: 250
     artist_effect_full_step: 1000
     artist_effect_every: 2
-    artist_effect_weight: 0.15
+    artist_effect_weight: 0.0
     artist_effect_teacher_view: disjoint_heldout
     # The primary loss is backwarded before the auxiliary heldout-reference
     # Anima pass, so two batch-four DiT graphs never coexist on an H100 80GB.
@@ -4120,7 +4127,7 @@ detail_preserving_style_cross_attention:
     # scale; no cross-step EMA or student-derived denominator is used.
     common_output_start_step: 250
     common_output_full_step: 750
-    common_output_weight: 0.02
+    common_output_weight: 0.0
     common_output_teacher: student_batch
     common_output_native_ratio_threshold: 0.60
     artist_energy_native_ratio_floor: 0.50
@@ -4136,7 +4143,7 @@ detail_preserving_style_cross_attention:
     main_common_output_weight: 0.0
     main_common_output_native_ratio_threshold: 0.60
     main_artist_energy_native_ratio_floor: 0.50
-    main_artist_energy_weight: 1.0
+    main_artist_energy_weight: 0.0
     common_output_threshold_start_step: 1000
     common_output_threshold_end_step: 4000
     common_output_threshold_start: 0.90
@@ -4149,7 +4156,7 @@ detail_preserving_style_cross_attention:
     artist_magnitude_full_step: 1000
     # Keep this band weak: it preserves a repeatable effect without making
     # magnitude more important than its direction or the main flow objective.
-    artist_magnitude_weight: 0.05
+    artist_magnitude_weight: 0.0
     artist_magnitude_lower_start_step: 250
     artist_magnitude_lower_end_step: 2000
     artist_magnitude_lower_start: 0.35
@@ -4161,7 +4168,7 @@ detail_preserving_style_cross_attention:
     artist_prototype_start_step: 250
     artist_prototype_full_step: 1000
     artist_prototype_every: 2
-    artist_prototype_weight: 0.03
+    artist_prototype_weight: 0.0
     artist_prototype_temperature: 0.10
     artist_prototype_slot_type_counts: [16, 8, 4]
     artist_effect_validation_batches: 2
@@ -4182,7 +4189,7 @@ detail_preserving_style_cross_attention:
     # EMA or other cross-step state. The local teacher is dense throughout the
     # extended exact-self bootstrap, then follows teacher_every_after_bootstrap.
     post_gate_teacher_distillation:
-      enabled: true
+      enabled: false
       block_indices: [11, 12, 13, 14, 15, 21, 22, 23]
       start_step: 1
       full_step: 500
@@ -4214,7 +4221,7 @@ detail_preserving_style_cross_attention:
     fixed_output_quantile: null
     # One outer factor keeps the complete controlled-distillation gradient near
     # the main-flow gradient (v17 measured an 8.6--8.8x excess).
-    teacher_global_weight: 0.10
+    teacher_global_weight: 0.0
     # v18 gradient diagnostics found known-artist InfoNCE was the largest
     # Reader gradient. Balance it against reconstruction and place relatively
     # more pressure on the directly observed common-output failure.
@@ -4246,7 +4253,7 @@ detail_preserving_style_cross_attention:
     # boundary was crossed. Each transition needs three consecutive validation
     # windows satisfying every criterion below.
     performance_curriculum:
-      enabled: true
+      enabled: false
       stages:
         - name: direction_bootstrap_exact_self
           min_references: 1
@@ -4300,16 +4307,16 @@ detail_preserving_style_cross_attention:
     validation_batches: 8
     state_every: 250
     checkpoint_every: 500
-    sample_every: 500
-    fixed_sample_every: 1000
-    fixed_sample_strengths: [1.0, 1.5, 2.0]
-    fixed_sample_backfill_steps: [1500, 2250]
-    resume: true
+    sample_every: 250
+    fixed_sample_every: 500
+    fixed_sample_strengths: [1.0]
+    fixed_sample_backfill_steps: []
+    resume: false
     wandb:
       enabled: true
       project: anima-style-adapter
-      name: detail-style-v23-repeatable-artist-20k
-      id: detail-style-v23-repeatable-artist-20k
+      name: detail-style-v24-exact-self-flow-only-1k
+      id: detail-style-v24-exact-self-flow-only-1k
   gradient_diagnostics:
     checkpoint_step: 1500
     teacher_batch_step: 1500
@@ -4320,6 +4327,9 @@ detail_preserving_style_cross_attention:
     candidate_absolute_direction_weight: 0.10
     output_file: gradient_diagnostics_step_1500_v19.json
   sampling:
+    # Periodic panel and the deterministic seven-image fixed suite both use
+    # each episode's target image itself as the sole style reference.
+    reference_mode: self
     width: 768
     height: 768
     steps: 30

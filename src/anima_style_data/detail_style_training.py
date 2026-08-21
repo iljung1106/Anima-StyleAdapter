@@ -2749,6 +2749,7 @@ def train_detail_style_cross_attention(
 ) -> dict[str, Any]:
     cfg = copy.deepcopy(config["detail_preserving_style_cross_attention"])
     training = dict(cfg["training"])
+    exact_self_flow_only = bool(training.get("exact_self_flow_only", False))
     steps = int(steps_override or training["steps"])
     training["steps"] = steps
     device = str(training.get("device", "cuda"))
@@ -2775,65 +2776,83 @@ def train_detail_style_cross_attention(
         _audit_student_prompts(loader)
     _audit_student_prompts(validation_loader)
 
-    bank_key = str(cfg["teacher"].get("bank_config_key", "dual_domain_native_teacher"))
-    bank = NativeCenteredTeacherBank.load(config, destination, config_key=bank_key)
-    context_root = destination / str(cfg["teacher"]["context_cache"])
-    contexts = NativeArtistContextCache(
-        context_root, capacity=int(cfg["teacher"].get("context_lru_shards", 8))
-    )
-    domain_cfgs = list(cfg["teacher"].get("reference_domains", []))
-    if not domain_cfgs:
-        domain_cfgs = [{
-            "name": str(
-                cfg["teacher"].get(
-                    "reference_domain_name", "synthetic_anima_artist_tag"
-                )
-            ),
-            "weight": 1,
-            "reference_caches": list(cfg["teacher"]["reference_caches"]),
-        }]
     teacher_loaders: list[tuple[str, CachedTeacherReferenceLoader]] = []
     weighted_teacher_domains: list[int] = []
-    for domain_index, domain_cfg in enumerate(domain_cfgs):
-        name = str(domain_cfg["name"])
-        weight = int(domain_cfg.get("weight", 1))
-        roots = [
-            destination / str(value)
-            for value in domain_cfg["reference_caches"]
-        ]
-        if weight <= 0 or not roots:
-            raise ValueError(
-                f"Teacher reference domain {name!r} needs positive weight "
-                "and at least one cache"
+    bank = None
+    contexts = None
+    if exact_self_flow_only:
+        timestep_weighting = None
+        print(
+            "detail-style exact-self flow-only mode: no teacher bank, "
+            "no native timestep weighting, no auxiliary losses",
+            flush=True,
+        )
+    else:
+        bank_key = str(
+            cfg["teacher"].get("bank_config_key", "dual_domain_native_teacher")
+        )
+        bank = NativeCenteredTeacherBank.load(
+            config, destination, config_key=bank_key
+        )
+        context_root = destination / str(cfg["teacher"]["context_cache"])
+        contexts = NativeArtistContextCache(
+            context_root,
+            capacity=int(cfg["teacher"].get("context_lru_shards", 8)),
+        )
+        domain_cfgs = list(cfg["teacher"].get("reference_domains", []))
+        if not domain_cfgs:
+            domain_cfgs = [{
+                "name": str(
+                    cfg["teacher"].get(
+                        "reference_domain_name", "synthetic_anima_artist_tag"
+                    )
+                ),
+                "weight": 1,
+                "reference_caches": list(cfg["teacher"]["reference_caches"]),
+            }]
+        for domain_index, domain_cfg in enumerate(domain_cfgs):
+            name = str(domain_cfg["name"])
+            weight = int(domain_cfg.get("weight", 1))
+            roots = [
+                destination / str(value)
+                for value in domain_cfg["reference_caches"]
+            ]
+            if weight <= 0 or not roots:
+                raise ValueError(
+                    f"Teacher reference domain {name!r} needs positive weight "
+                    "and at least one cache"
+                )
+            loader = CachedTeacherReferenceLoader(
+                roots,
+                split="train",
+                style_ids=list(bank.summary["train_style_ids"]),
+                batch_size=int(training.get("teacher_batch_rows", 16)),
+                references=int(training.get("teacher_references", 4)),
+                seed=(seed ^ 0x7EA4CE11) + domain_index * 1_000_003,
+                token_lru_shards=int(
+                    cfg["teacher"].get("reference_lru_shards", 8)
+                ),
+                strict_style_ids=False,
             )
-        loader = CachedTeacherReferenceLoader(
-            roots,
-            split="train",
-            style_ids=list(bank.summary["train_style_ids"]),
-            batch_size=int(training.get("teacher_batch_rows", 16)),
-            references=int(training.get("teacher_references", 4)),
-            seed=(seed ^ 0x7EA4CE11) + domain_index * 1_000_003,
-            token_lru_shards=int(
-                cfg["teacher"].get("reference_lru_shards", 8)
-            ),
-            strict_style_ids=False,
+            teacher_loaders.append((name, loader))
+            weighted_teacher_domains.extend([domain_index] * weight)
+        print(
+            "detail-style teacher domains "
+            + ", ".join(
+                f"{name}={len(loader.styles)} styles roots="
+                f"{[str(root) for root in loader.token_roots]}"
+                for name, loader in teacher_loaders
+            )
+            + f" schedule={tuple(weighted_teacher_domains)}",
+            flush=True,
         )
-        teacher_loaders.append((name, loader))
-        weighted_teacher_domains.extend([domain_index] * weight)
+        timestep_weighting = _build_native_effect_timestep_weighting(bank, training)
     teacher_domain_schedule = tuple(weighted_teacher_domains)
-    print(
-        "detail-style teacher domains "
-        + ", ".join(
-            f"{name}={len(loader.styles)} styles roots="
-            f"{[str(root) for root in loader.token_roots]}"
-            for name, loader in teacher_loaders
-        )
-        + f" schedule={teacher_domain_schedule}",
-        flush=True,
-    )
-    timestep_weighting = _build_native_effect_timestep_weighting(bank, training)
     main_common_output_penalty = None
-    if float(training.get("main_common_output_weight", 0.0)) > 0:
+    if (
+        not exact_self_flow_only
+        and float(training.get("main_common_output_weight", 0.0)) > 0
+    ):
         main_common_output_penalty = NativeScaleCommonOutputPenalty()
 
     anima = _resolve_anima_model(config, destination, device).requires_grad_(False).eval()
@@ -2872,36 +2891,55 @@ def train_detail_style_cross_attention(
                 f"step={int(reader_state.get('step', 0))}",
                 flush=True,
             )
-        calibration = _calibrate_alpha(
-            # Calibrate against the same synthetic-reference domain used by
-            # native artist-tag distillation. Human references never receive
-            # an artist-tag residual target.
-            anima, reader, adapter, bank, contexts, teacher_loaders[0][1], device,
-            int(training.get("alpha_calibration_batches", 4)),
-            training,
-        )
-        write_json(output / "alpha_calibration.json", calibration)
-        if isinstance(adapter, SharedBaseKVStyleCrossAttention):
+        if exact_self_flow_only:
+            initial_alpha = float(training.get("fixed_initial_alpha", 0.10))
+            if initial_alpha <= 0:
+                raise ValueError("fixed_initial_alpha must be positive")
+            with torch.no_grad():
+                adapter.alpha.fill_(initial_alpha)
+                adapter.alpha_by_timestep.fill_(initial_alpha)
+                adapter.timestep_strength_enabled.fill_(False)
+                adapter.fixed_output_strength_enabled.fill_(False)
+            adapter.restore_timestep_strength_state()
             write_json(output / "style_strength.json", {
-                "mode": "block_timestep_native_effect_calibrated",
-                "global_gain": adapter.global_gain,
-                "base_alpha": calibration["base_alpha"],
-                "alpha": adapter.alpha.detach().float().cpu().tolist(),
-                "alpha_by_timestep": calibration["alpha_by_timestep"],
-                "native_lower_by_timestep": calibration[
-                    "native_lower_by_timestep"
-                ],
-                "native_upper_by_timestep": calibration[
-                    "native_upper_by_timestep"
-                ],
-                "native_fixed_output_by_timestep": calibration[
-                    "native_fixed_output_by_timestep"
-                ],
-                "fixed_output_quantile": calibration["fixed_output_quantile"],
-                "relative_block_gain": "disabled",
-                "medoid_blocks": list(adapter.medoid_blocks),
-                "block_to_base": adapter.block_to_base.detach().cpu().tolist(),
+                "mode": "fixed_teacher_free",
+                "alpha": initial_alpha,
+                "global_gain": float(getattr(adapter, "global_gain", 1.0)),
+                "timestep_strength": False,
+                "fixed_output_strength": False,
             })
+        else:
+            assert bank is not None and contexts is not None and teacher_loaders
+            calibration = _calibrate_alpha(
+                # Calibrate against the same synthetic-reference domain used by
+                # native artist-tag distillation. Human references never receive
+                # an artist-tag residual target.
+                anima, reader, adapter, bank, contexts, teacher_loaders[0][1], device,
+                int(training.get("alpha_calibration_batches", 4)),
+                training,
+            )
+            write_json(output / "alpha_calibration.json", calibration)
+            if isinstance(adapter, SharedBaseKVStyleCrossAttention):
+                write_json(output / "style_strength.json", {
+                    "mode": "block_timestep_native_effect_calibrated",
+                    "global_gain": adapter.global_gain,
+                    "base_alpha": calibration["base_alpha"],
+                    "alpha": adapter.alpha.detach().float().cpu().tolist(),
+                    "alpha_by_timestep": calibration["alpha_by_timestep"],
+                    "native_lower_by_timestep": calibration[
+                        "native_lower_by_timestep"
+                    ],
+                    "native_upper_by_timestep": calibration[
+                        "native_upper_by_timestep"
+                    ],
+                    "native_fixed_output_by_timestep": calibration[
+                        "native_fixed_output_by_timestep"
+                    ],
+                    "fixed_output_quantile": calibration["fixed_output_quantile"],
+                    "relative_block_gain": "disabled",
+                    "medoid_blocks": list(adapter.medoid_blocks),
+                    "block_to_base": adapter.block_to_base.detach().cpu().tolist(),
+                })
 
     reader_parameters = [value for value in reader.parameters() if value.requires_grad]
     kv_parameters = adapter.kv_parameters()
@@ -3010,9 +3048,27 @@ def train_detail_style_cross_attention(
         ("validation", validation_loader, episode, sample_seed + (index + 4) * 10_007)
         for index, episode in enumerate(_select_sample_episodes(validation_loader, 4))
     ]
+    exact_self_sampling = str(
+        cfg.get("sampling", {}).get("reference_mode", "heldout")
+    ) == "self"
+    fixed_sample_requests = (
+        [
+            (
+                "fixed_validation",
+                validation_loader,
+                episode,
+                sample_seed + (index + 100) * 10_007,
+            )
+            for index, episode in enumerate(
+                _select_sample_episodes(validation_loader, 7)
+            )
+        ]
+        if exact_self_sampling and fixed_sample_every > 0
+        else []
+    )
     fixed_prepared = (
         load_dual_query_external_sample(config, destination)
-        if fixed_sample_every > 0
+        if fixed_sample_every > 0 and not exact_self_sampling
         else None
     )
     history_path = output / "history.json"
@@ -3071,8 +3127,10 @@ def train_detail_style_cross_attention(
                 }, step=start_step)
         for step in range(start_step + 1, steps + 1):
             step_started = time.perf_counter()
-            performance_stage = _active_performance_stage(
-                training, performance_curriculum
+            performance_stage = (
+                None
+                if exact_self_flow_only
+                else _active_performance_stage(training, performance_curriculum)
             )
             lr_scale = _delayed_learning_rate_multiplier(
                 step, steps, warmup, decay_start, minimum_ratio
@@ -3101,8 +3159,9 @@ def train_detail_style_cross_attention(
                 loss, metrics, captured_probe = _flow_step(
                     anima, reader, adapter, batch, device, training,
                     timestep_weighting,
-                    generator=generator, step=step, mode="curriculum",
-                    train_auxiliaries=True,
+                    generator=generator, step=step,
+                    mode=("self" if exact_self_flow_only else "curriculum"),
+                    train_auxiliaries=not exact_self_flow_only,
                     measure_base=(step % log_every == 0 and micro == accumulation - 1),
                     capture_auxiliary_probe=(
                         (main_common_due or wrong_gradient_due)
@@ -3141,8 +3200,12 @@ def train_detail_style_cross_attention(
                     1 if step <= teacher_bootstrap_end else teacher_every_after
                 )
             )
-            teacher_due = step % max(1, stage_teacher_every) == 0
+            teacher_due = (
+                not exact_self_flow_only
+                and step % max(1, stage_teacher_every) == 0
+            )
             if teacher_due:
+                assert bank is not None and contexts is not None
                 teacher_domain, domain_update = _teacher_domain_update(
                     teacher_domain_schedule, teacher_update
                 )
@@ -3229,10 +3292,14 @@ def train_detail_style_cross_attention(
                     for group in optimizer.param_groups
                 })
                 averaged.update(adapter.runtime_stats())
+                teacher_label = (
+                    f"{averaged['teacher_total_loss']:.5f}"
+                    if "teacher_total_loss" in averaged else "disabled"
+                )
                 print(
                     f"detail-style step={step}/{steps} loss={averaged['loss']:.5f} "
                     f"flow={averaged['flow_loss']:.5f} grad={averaged['grad_norm']:.4f} "
-                    f"teacher={averaged.get('teacher_total_loss', float('nan')):.5f} "
+                    f"teacher={teacher_label} "
                     f"step_s={averaged['step_s']:.3f}", flush=True,
                 )
                 if wandb_run is not None:
@@ -3258,46 +3325,51 @@ def train_detail_style_cross_attention(
                     wandb_run.log(namespaces, step=step)
 
             if step % validation_every == 0 or step == steps:
-                validation = {
-                    "self": _evaluate(
+                if exact_self_flow_only:
+                    validation = {
+                        "exact_self": _evaluate(
+                            anima, reader, adapter, validation_loader, device,
+                            training, None, step=step,
+                            batches=int(training.get("validation_batches", 8)),
+                            mode="self", seed=seed ^ 0xEAC751E,
+                        )
+                    }
+                else:
+                    validation = {
+                        "self": _evaluate(
+                            anima, reader, adapter, validation_loader, device, training,
+                            timestep_weighting, step=step,
+                            batches=int(training.get("validation_batches", 8)),
+                            mode="curriculum", seed=seed ^ 0xBEEF,
+                            performance_stage=performance_stage,
+                        ),
+                        "exact_self_probe": _evaluate(
+                            anima, reader, adapter, validation_loader, device, training,
+                            timestep_weighting, step=step,
+                            batches=int(training.get("validation_batches", 8)),
+                            mode="self", seed=seed ^ 0xEAC751E,
+                        ),
+                        "heldout": _evaluate(
+                            anima, reader, adapter, validation_loader, device, training,
+                            timestep_weighting, step=step,
+                            batches=int(training.get("validation_batches", 8)),
+                            mode="heldout", seed=seed ^ 0xC0FFEE,
+                        ),
+                        "wrong_artist": _evaluate(
+                            anima, reader, adapter, validation_loader, device, training,
+                            timestep_weighting, step=step,
+                            batches=int(training.get("validation_batches", 8)),
+                            mode="wrong_artist", seed=seed ^ 0xBAD417,
+                        ),
+                    }
+                    validation["artist_effect"] = _evaluate_artist_effect_consistency(
                         anima, reader, adapter, validation_loader, device, training,
-                        timestep_weighting, step=step,
-                        batches=int(training.get("validation_batches", 8)),
-                        mode="curriculum", seed=seed ^ 0xBEEF,
-                        performance_stage=performance_stage,
-                    ),
-                    "exact_self_probe": _evaluate(
-                        anima, reader, adapter, validation_loader, device, training,
-                        timestep_weighting, step=step,
-                        batches=int(training.get("validation_batches", 8)),
-                        mode="self", seed=seed ^ 0xEAC751E,
-                    ),
-                    "heldout": _evaluate(
-                        anima, reader, adapter, validation_loader, device, training,
-                        timestep_weighting, step=step,
-                        batches=int(training.get("validation_batches", 8)),
-                        mode="heldout", seed=seed ^ 0xC0FFEE,
-                    ),
-                    "wrong_artist": _evaluate(
-                        anima, reader, adapter, validation_loader, device, training,
-                        timestep_weighting, step=step,
-                        batches=int(training.get("validation_batches", 8)),
-                        mode="wrong_artist", seed=seed ^ 0xBAD417,
-                    ),
-                }
-                validation["artist_effect"] = _evaluate_artist_effect_consistency(
-                    anima,
-                    reader,
-                    adapter,
-                    validation_loader,
-                    device,
-                    training,
-                    step=step,
-                    batches=int(
-                        training.get("artist_effect_validation_batches", 2)
-                    ),
-                    seed=seed ^ 0xA47157,
-                )
+                        step=step,
+                        batches=int(
+                            training.get("artist_effect_validation_batches", 2)
+                        ),
+                        seed=seed ^ 0xA47157,
+                    )
                 curriculum_metrics, curriculum_changed = (
                     _update_performance_curriculum(
                         training,
@@ -3347,20 +3419,39 @@ def train_detail_style_cross_attention(
                     reader=reader, adapter=adapter, optimizer=optimizer, cfg=cfg,
                     performance_curriculum=performance_curriculum,
                 )
-            if sample_every > 0 and (step % sample_every == 0 or step == steps):
+            panel_due = sample_every > 0 and (
+                step % sample_every == 0 or step == steps
+            )
+            exact_fixed_due = bool(
+                fixed_sample_requests
+                and fixed_sample_every > 0
+                and step % fixed_sample_every == 0
+            )
+            if panel_due or exact_fixed_due:
+                requested_samples = (
+                    (sample_requests if panel_due else [])
+                    + (fixed_sample_requests if exact_fixed_due else [])
+                )
                 sample_records, vae = _sample_query_style_tokenizer(
-                    anima, adapter, reader, sample_requests, config, destination,
+                    anima, adapter, reader, requested_samples, config, destination,
                     output, device, step, vae,
                     config_section="detail_preserving_style_cross_attention",
                 )
                 if wandb_run is not None:
                     import wandb
-                    wandb_run.log({
-                        "val/functional/panel": [
+                    panel_count = len(sample_requests) if panel_due else 0
+                    payload = {}
+                    if panel_due:
+                        payload["val/functional/panel"] = [
                             wandb.Image(str(path), caption=label)
-                            for label, path in sample_records
+                            for label, path in sample_records[:panel_count]
                         ]
-                    }, step=step)
+                    if exact_fixed_due:
+                        payload["val/functional/fixed_reference"] = [
+                            wandb.Image(str(path), caption=label)
+                            for label, path in sample_records[panel_count:]
+                        ]
+                    wandb_run.log(payload, step=step)
             if fixed_prepared is not None and step % fixed_sample_every == 0:
                 fixed = _generate_fixed_reference_sample(
                     fixed_prepared, config, destination, anima, reader, adapter,

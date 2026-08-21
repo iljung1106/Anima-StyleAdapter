@@ -1030,3 +1030,29 @@ Raw flow tensor의 cross-reference 일치는 같은 controlled condition 안에�
 주요 선택 지표는 heldout repeatable ratio/ICC, all-artist retrieval, common-output,
 fixed-reference 시각적 작가 차이와 이미지 안정성이다. Paired flow improvement는
 보조 지표로만 사용한다.
+
+## 25. v24 teacher-free exact-self flow baseline
+
+v23 500스텝에서 synthetic teacher와 repeatable-artist 내부 지표는 개선됐지만,
+heldout flow와 실제 생성 이미지의 스타일 효과는 개선되지 않았다. 목표 간 충돌과
+약한 teacher 효과를 구조 자체의 학습 가능성과 분리하기 위해 1,000스텝의 최소
+baseline을 새로 시작한다.
+
+- Frozen Anima만 재사용하고 Reader, shared K/V, block delta, base mixer는 모두
+  무작위 초기화한다. 이전 Reader·adapter 체크포인트는 사용하지 않는다.
+- 모든 학습 행은 target의 cached 84-token 표현 한 장만 reference로 사용한다.
+- 최적화 목적은 표준 rectified-flow MSE 하나뿐이다. Teacher bank와 native
+  timestep weighting, reconstruction, prototype, contrastive/ranking, magnitude,
+  common-output 및 post-gate 증류는 계산하지 않는다.
+- Teacher calibration도 사용하지 않는다. 블록별 alpha는 timestep과 무관한
+  `0.10`, global gain은 `1.0`으로 고정한다.
+- Prompt mode는 Full 30%, Tag Dropout 40%, Short 20%, Empty 10%다. Empty가 아닌
+  행은 50% 확률로 quality prefix를 사용하고, Empty는 그대로 빈 prompt를 쓴다.
+- 250스텝마다 train/validation exact-self panel을, 500스텝마다 고정된 validation
+  이미지 일곱 장의 exact-self panel을 생성한다. 모든 시트의 reference는 표시된
+  target 자체이며 heldout reference를 섞지 않는다.
+
+이 실험은 스타일 일반화를 평가하지 않는다. Exact-self에서도 이미지를 따라가는
+효과가 생기지 않으면 teacher나 보조 loss가 아니라 Reader→K/V→Anima 주입 경로와
+고정 alpha가 병목이다. Exact-self가 성공하면 이후에만 같은 작가의 다른 reference로
+일반화하는 목적을 하나씩 추가한다.
