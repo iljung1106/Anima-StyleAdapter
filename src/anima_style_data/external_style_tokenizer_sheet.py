@@ -416,18 +416,29 @@ def _decode_latents(
     vae = _load_sampling_vae(config, destination).to(
         device=device, dtype=torch.bfloat16
     )
-    all_latents = torch.cat(list(groups.values()))
-    decoded = []
-    with torch.inference_mode(), torch.autocast(
-        "cuda", dtype=torch.bfloat16, enabled=device.startswith("cuda")
-    ):
-        for offset in range(0, len(all_latents), batch_size):
-            values = vae.decode_to_pixels(
-                all_latents[offset : offset + batch_size].to(
-                    device, dtype=torch.bfloat16
-                )
-            ).float()
-            decoded.extend(_to_image(value) for value in values)
+    try:
+        all_latents = torch.cat(list(groups.values()))
+        decoded = []
+        with torch.inference_mode(), torch.autocast(
+            "cuda", dtype=torch.bfloat16, enabled=device.startswith("cuda")
+        ):
+            for offset in range(0, len(all_latents), batch_size):
+                values = vae.decode_to_pixels(
+                    all_latents[offset : offset + batch_size].to(
+                        device, dtype=torch.bfloat16
+                    )
+                ).float()
+                decoded.extend(_to_image(value) for value in values)
+    finally:
+        # QwenImage VAE keeps large CUDA-side buffers unless its module is
+        # explicitly migrated before the last Python reference disappears.
+        # Fixed-reference sampling runs inside training, so retaining those
+        # buffers can leave less than 1 GiB free for the following update.
+        vae.to("cpu")
+        del vae
+        gc.collect()
+        if device.startswith("cuda"):
+            torch.cuda.empty_cache()
     result = {}
     offset = 0
     for name, latents in groups.items():
