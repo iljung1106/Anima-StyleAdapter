@@ -483,6 +483,7 @@ class FreshKVStyleCrossAttention(nn.Module):
         blocks: int = 28,
         initial_alpha: float = 0.1,
         null_tokens: int = 28,
+        null_init_std: float = 0.02,
         common_gain: float = 1.0,
         artist_gain: float = 1.0,
     ) -> None:
@@ -490,8 +491,8 @@ class FreshKVStyleCrossAttention(nn.Module):
         self.context_dim = int(context_dim)
         self.blocks = int(blocks)
         self.null_tokens = int(null_tokens)
-        if self.null_tokens <= 0:
-            raise ValueError("null_tokens must be positive")
+        if self.null_tokens <= 0 or null_init_std <= 0:
+            raise ValueError("null_tokens and null_init_std must be positive")
         if common_gain < 0 or artist_gain <= 0:
             raise ValueError("common_gain must be non-negative and artist_gain positive")
         self.style_k = nn.ModuleList()
@@ -500,8 +501,9 @@ class FreshKVStyleCrossAttention(nn.Module):
         # context.  This makes the artist-varying path identifiable instead of
         # letting one large reference-independent effect dominate every row.
         self.null_style_context = nn.Parameter(
-            torch.zeros(1, self.null_tokens, self.context_dim)
+            torch.empty(1, self.null_tokens, self.context_dim)
         )
+        nn.init.normal_(self.null_style_context, std=float(null_init_std))
         self.register_buffer(
             "common_gain", torch.tensor(float(common_gain)), persistent=True
         )
@@ -2044,6 +2046,7 @@ class SharedBaseKVStyleCrossAttention(FreshKVStyleCrossAttention):
         mix_logit_scale: float = 4.0,
         global_gain: float = 1.0,
         null_tokens: int = 28,
+        null_init_std: float = 0.02,
         common_gain: float = 1.0,
         artist_gain: float = 1.0,
         relative_block_gain: list[float] | tuple[float, ...] | None = None,
@@ -2069,6 +2072,7 @@ class SharedBaseKVStyleCrossAttention(FreshKVStyleCrossAttention):
             blocks=blocks,
             initial_alpha=1.0,
             null_tokens=null_tokens,
+            null_init_std=null_init_std,
             common_gain=common_gain,
             artist_gain=artist_gain,
         )

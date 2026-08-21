@@ -3959,6 +3959,7 @@ detail_preserving_style_cross_attention:
     # Separate a learned reference-independent null/common component from the
     # artist residual. Each receives its own native post-gate target and gain.
     null_tokens: 28
+    null_init_std: 0.02
     common_gain: 1.0
     artist_gain: 1.0
   strength_profile:
@@ -4041,7 +4042,7 @@ detail_preserving_style_cross_attention:
     shared_kv_learning_rate: 0.00010
     block_delta_learning_rate: 0.00020
     base_mix_learning_rate: 0.00004
-    null_context_learning_rate: 0.00010
+    null_context_learning_rate: 0.00001
     betas: [0.9, 0.95]
     adam_eps: 0.00000001
     weight_decay: 0.01
@@ -4049,6 +4050,9 @@ detail_preserving_style_cross_attention:
     lr_decay_start_step: 4000
     minimum_lr_ratio: 0.10
     max_grad_norm: 1.0
+    reader_max_grad_norm: 1.0
+    adapter_max_grad_norm: 1.0
+    null_context_max_grad_norm: 0.1
     gradient_accumulation_steps: 4
     fused_adamw: true
     allow_tf32: true

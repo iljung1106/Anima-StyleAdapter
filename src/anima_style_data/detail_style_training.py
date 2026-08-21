@@ -3303,6 +3303,10 @@ def train_detail_style_cross_attention(
 
     reader_parameters = [value for value in reader.parameters() if value.requires_grad]
     kv_parameters = adapter.kv_parameters()
+    null_parameter_ids = {id(value) for value in adapter.null_parameters()}
+    adapter_core_parameters = [
+        value for value in kv_parameters if id(value) not in null_parameter_ids
+    ]
     optimizer_groups: list[dict[str, Any]] = [
         {
             "params": reader_parameters,
@@ -3690,10 +3694,28 @@ def train_detail_style_cross_attention(
                         else adapter.kv_parameters()
                     ),
                 })
-            grad_norm = torch.nn.utils.clip_grad_norm_(
-                reader_parameters + kv_parameters,
-                float(training.get("max_grad_norm", 1.0)),
+            reader_grad_norm = torch.nn.utils.clip_grad_norm_(
+                reader_parameters,
+                float(training.get("reader_max_grad_norm", 1.0)),
             )
+            adapter_grad_norm = torch.nn.utils.clip_grad_norm_(
+                adapter_core_parameters,
+                float(training.get("adapter_max_grad_norm", 1.0)),
+            )
+            null_grad_norm = torch.nn.utils.clip_grad_norm_(
+                adapter.null_parameters(),
+                float(training.get("null_context_max_grad_norm", 0.1)),
+            )
+            grad_norm = (
+                reader_grad_norm.float().square()
+                + adapter_grad_norm.float().square()
+                + null_grad_norm.float().square()
+            ).sqrt()
+            metric_rows[-1].update({
+                "reader_grad_norm": reader_grad_norm.detach(),
+                "adapter_grad_norm": adapter_grad_norm.detach(),
+                "null_context_grad_norm": null_grad_norm.detach(),
+            })
             if not bool(torch.isfinite(grad_norm)):
                 nonfinite = []
                 for prefix, module in (("reader", reader), ("adapter", adapter)):
@@ -3757,7 +3779,7 @@ def train_detail_style_cross_attention(
                             namespace = "system/perf"
                         elif (
                             key.startswith(("style_", "grad_"))
-                            or key.endswith(("_lr", "_gradient_rms"))
+                            or key.endswith(("_lr", "_gradient_rms", "_grad_norm"))
                         ):
                             namespace = "model/activation"
                         elif (
