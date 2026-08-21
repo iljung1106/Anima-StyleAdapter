@@ -4073,7 +4073,10 @@ detail_preserving_style_cross_attention:
         consecutive_validations: 2
       common_objective:
         common_direction_weight: 1.0
-        magnitude_weight: 0.25
+        # At v29 step 1,250 cosine had reached 0.766 while the RMS ratio was
+        # still 0.612.  The old 0.25 term contributed only ~9% of the Common
+        # objective, so increase radial pressure without changing direction.
+        magnitude_weight: 0.75
         magnitude_floor_start_step: 1
         magnitude_floor_end_step: 750
         magnitude_floor_start: 0.50

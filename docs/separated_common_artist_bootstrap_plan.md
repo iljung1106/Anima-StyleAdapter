@@ -70,6 +70,10 @@ Common을 동결했다. 이후의 common projection `1.29`는 Common 단독값�
 - 전체 bootstrap은 Artist cosine `0.28`, projection `0.40`, InfoNCE gap `0.0`
   이상을 두 번 연속 만족해야 종료한다. 최대 5,000스텝 안에 통과하지 못하면
   본 curriculum으로 자동 진입하지 않고 병목을 다시 진단한다.
+- 추가 1,250스텝에서 Common cosine은 `0.766`까지 올랐지만 RMS ratio가
+  `0.612`에 머물렀다. 이때 magnitude 항은 전체 Common objective의 약 9%에
+  불과했으므로, 저장된 optimizer 상태에서 magnitude weight만 `0.25→0.75`로
+  올려 방향 정렬을 유지하면서 radial convergence를 가속한다.
 
 통과한 체크포인트만 별도의 본 curriculum 실행에 사용한다. 본 단계는
 Exact-Self 비중이 높은 구간에서 시작해 target 포함 1~4장, 포함률 anneal,
