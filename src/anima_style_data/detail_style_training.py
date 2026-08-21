@@ -70,6 +70,22 @@ def _build_style_adapter(cfg: dict[str, Any]) -> FreshKVStyleCrossAttention:
     raise ValueError(f"Unsupported style adapter architecture: {architecture}")
 
 
+def _teacher_domain_update(
+    weighted_domains: tuple[int, ...], update: int
+) -> tuple[int, int]:
+    """Map a global teacher update to one domain and its local update index."""
+
+    if not weighted_domains:
+        raise ValueError("Teacher domain schedule must not be empty")
+    if update < 0:
+        raise ValueError("Teacher update must be non-negative")
+    cycle, offset = divmod(int(update), len(weighted_domains))
+    domain = weighted_domains[offset]
+    per_cycle = weighted_domains.count(domain)
+    local_update = cycle * per_cycle + weighted_domains[:offset].count(domain)
+    return domain, local_update
+
+
 def _delayed_learning_rate_multiplier(
     step: int,
     total_steps: int,
@@ -2525,16 +2541,50 @@ def train_detail_style_cross_attention(
     contexts = NativeArtistContextCache(
         context_root, capacity=int(cfg["teacher"].get("context_lru_shards", 8))
     )
-    synthetic_roots = [destination / str(value) for value in cfg["teacher"]["reference_caches"]]
-    teacher_loader = CachedTeacherReferenceLoader(
-        synthetic_roots,
-        split="train",
-        style_ids=list(bank.summary["train_style_ids"]),
-        batch_size=int(training.get("teacher_batch_rows", 16)),
-        references=int(training.get("teacher_references", 4)),
-        seed=seed ^ 0x7EA4CE11,
-        token_lru_shards=int(cfg["teacher"].get("reference_lru_shards", 8)),
-        strict_style_ids=False,
+    domain_cfgs = list(cfg["teacher"].get("reference_domains", []))
+    if not domain_cfgs:
+        domain_cfgs = [{
+            "name": "legacy",
+            "weight": 1,
+            "reference_caches": list(cfg["teacher"]["reference_caches"]),
+        }]
+    teacher_loaders: list[tuple[str, CachedTeacherReferenceLoader]] = []
+    weighted_teacher_domains: list[int] = []
+    for domain_index, domain_cfg in enumerate(domain_cfgs):
+        name = str(domain_cfg["name"])
+        weight = int(domain_cfg.get("weight", 1))
+        roots = [
+            destination / str(value)
+            for value in domain_cfg["reference_caches"]
+        ]
+        if weight <= 0 or not roots:
+            raise ValueError(
+                f"Teacher reference domain {name!r} needs positive weight "
+                "and at least one cache"
+            )
+        loader = CachedTeacherReferenceLoader(
+            roots,
+            split="train",
+            style_ids=list(bank.summary["train_style_ids"]),
+            batch_size=int(training.get("teacher_batch_rows", 16)),
+            references=int(training.get("teacher_references", 4)),
+            seed=(seed ^ 0x7EA4CE11) + domain_index * 1_000_003,
+            token_lru_shards=int(
+                cfg["teacher"].get("reference_lru_shards", 8)
+            ),
+            strict_style_ids=False,
+        )
+        teacher_loaders.append((name, loader))
+        weighted_teacher_domains.extend([domain_index] * weight)
+    teacher_domain_schedule = tuple(weighted_teacher_domains)
+    print(
+        "detail-style teacher domains "
+        + ", ".join(
+            f"{name}={len(loader.styles)} styles"
+            for name, loader in teacher_loaders
+        )
+        + f" schedule={teacher_domain_schedule}",
+        flush=True,
     )
     timestep_weighting = _build_native_effect_timestep_weighting(bank, training)
     main_common_output_penalty = None
@@ -2845,9 +2895,15 @@ def train_detail_style_cross_attention(
             )
             teacher_due = step % max(1, stage_teacher_every) == 0
             if teacher_due:
+                teacher_domain, domain_update = _teacher_domain_update(
+                    teacher_domain_schedule, teacher_update
+                )
+                teacher_domain_name, teacher_loader = teacher_loaders[
+                    teacher_domain
+                ]
                 teacher_metrics = _teacher_step(
                     anima, reader, adapter, bank, contexts,
-                    teacher_loader.load_step(teacher_update), device, training,
+                    teacher_loader.load_step(domain_update), device, training,
                     timestep_weighting, kv_parameters,
                     step=step, probe_index=teacher_update,
                     post_gate_magnitude_enabled=bool(
@@ -2856,6 +2912,18 @@ def train_detail_style_cross_attention(
                         )
                     ) if performance_stage is not None else True,
                 )
+                teacher_metrics["teacher_reference_domain_index"] = (
+                    torch.tensor(float(teacher_domain), device=device)
+                )
+                for index, (name, _) in enumerate(teacher_loaders):
+                    metric_name = "".join(
+                        char if char.isalnum() else "_" for char in name
+                    )
+                    teacher_metrics[
+                        f"teacher_reference_domain_{metric_name}"
+                    ] = torch.tensor(
+                        float(index == teacher_domain), device=device
+                    )
                 metric_rows[-1].update(teacher_metrics)
                 teacher_curriculum_rows.append({
                     key: float(value.detach())

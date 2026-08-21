@@ -910,3 +910,32 @@ projection coefficient는 magnitude floor ramp가 완료된 후에도 `0.227`에
 2,000스텝 checkpoint와 optimizer/RNG state를 그대로 resume하며, 전환
 후에는 heldout paired improvement, correct-vs-wrong advantage, fixed-reference
 작가 간 차이를 주요 선택 기준으로 본다.
+
+## 21. v20 전체 작가 dual-domain teacher
+
+v19은 4,500스텝에서 완전 target-excluded stage로 정상 전환되고 5,000스텝
+heldout paired improvement도 양수였지만, 같은 prompt/seed의 일곱 fixed
+reference가 거의 같은 기본 Anima 화풍을 만들었다. Teacher InfoNCE가 70%를
+넘어도 실제 화풍이 분리되지 않았으므로 내부 retrieval 수치만으로 성공을
+판정할 수 없다. 직접 원인은 controlled native teacher가 synthetic cache와
+교차하는 1,800명만 보았고, 나머지 human 작가는 noisy main flow만 받았다는
+것이다.
+
+v20은 모델 구조와 Reader 선행학습은 유지하고 지도 범위를 바로잡는다.
+
+- Human frozen-Resampler cache는 native bank의 train 작가 4,000명 전체를
+  controlled teacher 대상으로 사용한다.
+- 기존 Anima synthetic cache 1,800명은 별도 domain으로 유지한다. 한 reference
+  set에서 두 domain을 섞지 않고 human:synth teacher batch를 `3:1`로 교대한다.
+- 완전 heldout stage에서도 controlled teacher를 매 스텝 유지한다.
+- Final centered all-wrong InfoNCE는 `0.05 -> 0.10`, 16-artist common-output은
+  `0.15 -> 0.20`으로 올리고 common threshold는 `0.45`로 낮춘다.
+- 일반 human main batch에도 네 작가가 같은 `x_t`, timestep, prompt를 쓰는
+  common-output + artist-energy 항을 4스텝마다 `0.02` 가중치로 적용한다.
+- 출력 디렉터리와 W&B run을 v19와 분리하고 adapter는 다시 무작위 초기화한다.
+  Reader만 검증된 4k reconstruction checkpoint에서 시작한다.
+
+성공 기준은 heldout flow 수치가 아니라 fixed-reference 1x 시트에서 서로 다른
+화풍이 육안으로 확인되고, pixel common component와 final controlled common-output이
+함께 감소하는 것이다. 이 기준을 만족하지 못하면 shared-K/V 용량보다 먼저
+teacher-to-human 전달 경로와 final functional objective를 다시 진단한다.

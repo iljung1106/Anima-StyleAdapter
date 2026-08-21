@@ -26,6 +26,7 @@ from anima_style_data.detail_style_training import (  # noqa: E402
     _native_effect_scales_for_timesteps,
     _native_teacher_objective_config,
     _soft_common_output_objective,
+    _teacher_domain_update,
     _teacher_direction_ranking_loss,
     _update_performance_curriculum,
     _wrong_flow_ranking_loss,
@@ -35,6 +36,24 @@ from anima_style_data.detail_style_gradient_diagnostics import (  # noqa: E402
     _gradient_sample_plan,
     _measure_gradient_sketches,
 )
+
+
+def test_teacher_domains_follow_weighted_schedule_with_local_indices():
+    schedule = (0, 0, 0, 1)
+    assert [
+        _teacher_domain_update(schedule, update)
+        for update in range(8)
+    ] == [
+        (0, 0), (0, 1), (0, 2), (1, 0),
+        (0, 3), (0, 4), (0, 5), (1, 1),
+    ]
+
+
+def test_teacher_domain_schedule_rejects_invalid_updates():
+    with pytest.raises(ValueError):
+        _teacher_domain_update((), 0)
+    with pytest.raises(ValueError):
+        _teacher_domain_update((0,), -1)
 
 
 def test_native_scale_common_output_penalty_uses_current_controlled_batch():
