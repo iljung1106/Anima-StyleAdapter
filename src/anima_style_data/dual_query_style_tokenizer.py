@@ -667,14 +667,34 @@ class CachedTeacherReferenceLoader:
     def _pin(value: torch.Tensor) -> torch.Tensor:
         return value.pin_memory() if torch.cuda.is_available() else value
 
-    def load_step(self, step: int) -> dict[str, Any]:
+    def load_step(
+        self,
+        step: int,
+        *,
+        reference_count_weights: list[float] | tuple[float, ...] | None = None,
+    ) -> dict[str, Any]:
         rng = random.Random(self.seed + int(step) * 1_000_003)
+        effective_weights = (
+            self.reference_count_weights
+            if reference_count_weights is None
+            else tuple(float(value) for value in reference_count_weights)
+        )
+        if effective_weights is not None:
+            if len(effective_weights) != self.references:
+                raise ValueError(
+                    "Teacher reference_count_weights must contain one value "
+                    "for every count from 1 through references"
+                )
+            if any(value < 0 for value in effective_weights):
+                raise ValueError("Teacher reference count weights cannot be negative")
+            if sum(effective_weights) <= 0:
+                raise ValueError("Teacher reference count weights must have positive mass")
         reference_count = (
             self.references
-            if self.reference_count_weights is None
+            if effective_weights is None
             else rng.choices(
                 range(1, self.references + 1),
-                weights=self.reference_count_weights,
+                weights=effective_weights,
                 k=1,
             )[0]
         )

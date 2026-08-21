@@ -38,6 +38,8 @@ from anima_style_data.detail_style_training import (  # noqa: E402
     _soft_common_output_objective,
     _teacher_domain_update,
     _teacher_direction_ranking_loss,
+    _teacher_infonce_weight,
+    _teacher_reference_count_weights,
     _update_performance_curriculum,
     _wrong_flow_ranking_loss,
 )
@@ -67,6 +69,39 @@ def test_teacher_domain_schedule_rejects_invalid_updates():
         _teacher_domain_update((), 0)
     with pytest.raises(ValueError):
         _teacher_domain_update((0,), -1)
+
+
+def test_teacher_reference_count_curriculum_interpolates_without_hard_shift():
+    training = {
+        "teacher_reference_count_curriculum": {
+            "start_step": 3001,
+            "end_step": 4001,
+            "before_weights": [0.0, 0.0, 0.0, 1.0],
+            "start_weights": [0.1, 0.15, 0.0, 0.75],
+            "end_weights": [0.5, 0.3, 0.0, 0.2],
+        }
+    }
+    assert _teacher_reference_count_weights(training, 3000) == (
+        0.0, 0.0, 0.0, 1.0
+    )
+    assert _teacher_reference_count_weights(training, 3001) == (
+        0.1, 0.15, 0.0, 0.75
+    )
+    assert _teacher_reference_count_weights(training, 3501) == pytest.approx(
+        (0.3, 0.225, 0.0, 0.475)
+    )
+    assert _teacher_reference_count_weights(training, 5000) == pytest.approx((
+        0.5, 0.3, 0.0, 0.2
+    ))
+
+
+def test_teacher_infonce_weight_is_stronger_for_single_reference():
+    training = {
+        "teacher_infonce_weight": 0.2,
+        "teacher_infonce_weight_by_reference_count": [0.35, 0.3, 0.25, 0.2],
+    }
+    assert _teacher_infonce_weight(training, 1) == 0.35
+    assert _teacher_infonce_weight(training, 4) == 0.2
 
 
 def test_exact_self_sampling_uses_only_the_target_reference():

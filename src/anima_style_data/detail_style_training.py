@@ -90,6 +90,61 @@ def _teacher_domain_update(
     return domain, local_update
 
 
+def _teacher_reference_count_weights(
+    training: dict[str, Any], step: int
+) -> tuple[float, ...] | None:
+    """Linearly introduce low-reference teacher batches without a hard shift."""
+
+    curriculum = dict(training.get("teacher_reference_count_curriculum", {}))
+    if not curriculum:
+        configured = training.get("teacher_reference_count_weights")
+        return (
+            None
+            if configured is None
+            else tuple(float(value) for value in configured)
+        )
+    start_step = int(curriculum["start_step"])
+    end_step = int(curriculum["end_step"])
+    if end_step < start_step:
+        raise ValueError(
+            "teacher_reference_count_curriculum end_step must be >= start_step"
+        )
+    before = tuple(float(value) for value in curriculum["before_weights"])
+    start = tuple(float(value) for value in curriculum["start_weights"])
+    end = tuple(float(value) for value in curriculum["end_weights"])
+    if not (len(before) == len(start) == len(end)):
+        raise ValueError(
+            "teacher reference-count curriculum weight vectors must match"
+        )
+    if step < start_step:
+        return before
+    progress = min(
+        1.0,
+        max(0.0, (step - start_step) / max(1, end_step - start_step)),
+    )
+    return tuple(
+        left + progress * (right - left)
+        for left, right in zip(start, end, strict=True)
+    )
+
+
+def _teacher_infonce_weight(
+    training: dict[str, Any], reference_count: int
+) -> float:
+    """Give noisy low-reference batches stronger artist discrimination."""
+
+    by_count = training.get("teacher_infonce_weight_by_reference_count")
+    if by_count is None:
+        return float(training.get("teacher_infonce_weight", 0.25))
+    weights = tuple(float(value) for value in by_count)
+    if not 1 <= int(reference_count) <= len(weights):
+        raise ValueError(
+            "teacher_infonce_weight_by_reference_count does not cover the "
+            f"sampled count {reference_count}"
+        )
+    return weights[int(reference_count) - 1]
+
+
 def _delayed_learning_rate_multiplier(
     step: int,
     total_steps: int,
@@ -2612,7 +2667,9 @@ def _teacher_step(
         )
     )
     infonce_weight = (
-        0.0 if common_phase else float(training.get("teacher_infonce_weight", 0.25))
+        0.0
+        if common_phase
+        else _teacher_infonce_weight(training, int(references.shape[1]))
     )
     global_weight = float(training.get("teacher_global_weight", 0.10))
     timestep_weight = _native_effect_weights_for_timesteps(
@@ -3983,7 +4040,13 @@ def train_detail_style_cross_attention(
                 ]
                 teacher_metrics = _teacher_step(
                     anima, reader, adapter, bank, contexts,
-                    teacher_loader.load_step(domain_update), device, training,
+                    teacher_loader.load_step(
+                        domain_update,
+                        reference_count_weights=_teacher_reference_count_weights(
+                            training, step
+                        ),
+                    ),
+                    device, training,
                     timestep_weighting, native_common_cache,
                     step=step, probe_index=teacher_update,
                     post_gate_magnitude_enabled=bool(

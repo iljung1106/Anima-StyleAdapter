@@ -3830,7 +3830,7 @@ real_artist_teacher:
 # Detail-preserving typed-slot, separate-softmax Style Cross-Attention v1.
 # Contract: docs/detail_preserving_style_cross_attention_plan.md
 detail_preserving_style_cross_attention:
-  output_directory: detail_preserving_style_cross_attention_v29_clean_bootstrap
+  output_directory: detail_preserving_style_cross_attention_v30_reference_curriculum
   seed: 20260819
   train_split: train
   validation_split: validation
@@ -3843,10 +3843,10 @@ detail_preserving_style_cross_attention:
   # v24 is an intentionally clean capacity test. The 86M Reader, shared K/V,
   # block deltas and slot mixer all start from their normal random initializers.
   reader_checkpoint: null
-  # v28 step 500 is the last clean Common-only state: Reader and Artist K/V
-  # have never received a gradient. Continue Common from there, then open the
-  # untouched Artist path only after measured final-output alignment passes.
-  initial_checkpoint: detail_preserving_style_cross_attention_v28_separated_bootstrap/checkpoints/step-0000500.pt
+  # v29 step 3000 is the best state before abruptly switching 55% of teacher
+  # batches to one reference drove the artist path back toward Common. Resume
+  # from it and introduce low-reference inputs continuously.
+  initial_checkpoint: detail_preserving_style_cross_attention_v29_clean_bootstrap/checkpoints/step-0003000.pt
   reader_pretraining:
     output_directory: detail_style_reader_pretrain_v1
     device: cuda
@@ -4255,12 +4255,17 @@ detail_preserving_style_cross_attention:
     teacher_batch_rows: 16
     teacher_microbatch_rows: 4
     teacher_references: 4
-    # The fixed-reference diagnostic uses one image. Training only on four
-    # references let the artist residual depend on multi-image averaging and
-    # collapse back to the Common branch for one-image inference. Sample one
-    # shared count per controlled batch, favouring the real single-reference
-    # use case while retaining multi-reference improvement.
-    teacher_reference_count_weights: [0.55, 0.30, 0.0, 0.15]
+    # The fixed-reference diagnostic uses one image, but abruptly changing 55%
+    # of controlled batches from four to one reference increased common-output
+    # ratio from 0.858 to 0.917. Keep calibration deterministic at four refs,
+    # then ramp 1/2-ref batches over 1k updates from the v29 step-3000 state.
+    teacher_reference_count_weights: [0.0, 0.0, 0.0, 1.0]
+    teacher_reference_count_curriculum:
+      start_step: 3001
+      end_step: 4000
+      before_weights: [0.0, 0.0, 0.0, 1.0]
+      start_weights: [0.10, 0.15, 0.0, 0.75]
+      end_weights: [0.50, 0.30, 0.0, 0.20]
     teacher_every_step_until: 4000
     teacher_every_after_bootstrap: 1
     teacher_end_step: 4000
@@ -4292,7 +4297,10 @@ detail_preserving_style_cross_attention:
     # optimizer range.
     teacher_global_weight: 0.50
     # Every controlled row is contrasted against all other frozen artists.
-    teacher_infonce_weight: 0.15
+    teacher_infonce_weight: 0.20
+    # A single lossy view needs stronger discrimination from the frozen
+    # sixteen-artist bank than a stable four-view estimate.
+    teacher_infonce_weight_by_reference_count: [0.35, 0.30, 0.25, 0.20]
     teacher_infonce_temperature: 0.10
     # Legacy zero-common suppression is absent. One native tagged final forward
     # per cached content/timestep recovers the global common component exactly:
@@ -4381,8 +4389,8 @@ detail_preserving_style_cross_attention:
     wandb:
       enabled: true
       project: anima-style-adapter
-      name: detail-style-v29-clean-bootstrap
-      id: detail-style-v29-clean-bootstrap
+      name: detail-style-v30-reference-curriculum
+      id: detail-style-v30-reference-curriculum
   gradient_diagnostics:
     checkpoint_step: 1500
     teacher_batch_step: 1500

@@ -82,3 +82,21 @@ Common을 동결했다. 이후의 common projection `1.29`는 Common 단독값�
 통과한 체크포인트만 별도의 본 curriculum 실행에 사용한다. 본 단계는
 Exact-Self 비중이 높은 구간에서 시작해 target 포함 1~4장, 포함률 anneal,
 target-excluded 1~8장 순서로 진행하며 flow/정성 샘플이 악화되면 전환을 보류한다.
+
+## v30 reference-count correction
+
+v29의 4-reference Artist 상태에서 1-reference 배치를 즉시 55%로 바꾸자
+step 3,000→3,500 동안 native cosine `0.230→0.200`, projection
+`0.397→0.329`, InfoNCE gap `-0.039→-0.066`으로 악화됐고 functional common
+output ratio는 `0.858→0.910`으로 증가했다. 따라서 이 구간은 채택하지 않는다.
+
+- v29 `step-0003000.pt`에서 새 output directory로 분기한다.
+- 3,001~4,000스텝 동안 1/2/4-reference 비율을 `10/15/75%`에서
+  `50/30/20%`로 선형 보간한다. 3-reference는 사용하지 않는다.
+- all-wrong InfoNCE weight는 정보가 불안정한 1/2-reference에서 각각
+  `0.35/0.30`, 4-reference에서 `0.20`으로 둔다.
+- 기존 multi-reference 검증과 별도로 정확히 한 장의 heldout reference를
+  사용한 artist-effect/prototype 지표를 기록한다.
+- 동일 prompt/seed의 fixed-reference 7개 출력에 대해 pairwise pixel RMS와
+  baseline 변형량 대비 diversity ratio를 기록한다. 출력 크기가 있어도
+  reference별 결과가 같으면 실패로 판정한다.

@@ -204,6 +204,18 @@ def test_teacher_reference_loader_samples_configured_reference_counts(tmp_path):
     assert four["reference_mask"].shape == (2, 4)
     assert four["cached_reference_tokens"].shape == (8, 3, 8)
 
+    overridden = CachedTeacherReferenceLoader(
+        tmp_path,
+        split="train",
+        style_ids=["human:0", "human:1"],
+        batch_size=2,
+        references=4,
+        reference_count_weights=[0.0, 0.0, 0.0, 1.0],
+        seed=11,
+    ).load_step(0, reference_count_weights=[1.0, 0.0, 0.0, 0.0])
+    assert overridden["reference_count"] == 1
+    assert overridden["reference_mask"].shape == (2, 1)
+
 
 def test_reference_set_is_order_invariant():
     torch.manual_seed(31)
