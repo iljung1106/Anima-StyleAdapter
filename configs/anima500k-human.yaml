@@ -4255,6 +4255,12 @@ detail_preserving_style_cross_attention:
     teacher_batch_rows: 16
     teacher_microbatch_rows: 4
     teacher_references: 4
+    # The fixed-reference diagnostic uses one image. Training only on four
+    # references let the artist residual depend on multi-image averaging and
+    # collapse back to the Common branch for one-image inference. Sample one
+    # shared count per controlled batch, favouring the real single-reference
+    # use case while retaining multi-reference improvement.
+    teacher_reference_count_weights: [0.55, 0.30, 0.0, 0.15]
     teacher_every_step_until: 4000
     teacher_every_after_bootstrap: 1
     teacher_end_step: 4000

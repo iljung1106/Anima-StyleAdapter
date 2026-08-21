@@ -585,6 +585,7 @@ class CachedTeacherReferenceLoader:
         batch_size: int,
         references: int,
         seed: int,
+        reference_count_weights: list[float] | tuple[float, ...] | None = None,
         token_lru_shards: int = 8,
         ram_resident_tokens: bool = False,
         ram_preload_workers: int = 8,
@@ -605,9 +606,24 @@ class CachedTeacherReferenceLoader:
         root_label = ",".join(str(root) for root in token_roots)
         self.batch_size = int(batch_size)
         self.references = int(references)
+        self.reference_count_weights = (
+            None
+            if reference_count_weights is None
+            else tuple(float(value) for value in reference_count_weights)
+        )
         self.seed = int(seed)
         if self.batch_size <= 0 or self.references <= 0:
             raise ValueError("Teacher batch and reference counts must be positive")
+        if self.reference_count_weights is not None:
+            if len(self.reference_count_weights) != self.references:
+                raise ValueError(
+                    "Teacher reference_count_weights must contain one value "
+                    "for every count from 1 through references"
+                )
+            if any(value < 0 for value in self.reference_count_weights):
+                raise ValueError("Teacher reference count weights cannot be negative")
+            if sum(self.reference_count_weights) <= 0:
+                raise ValueError("Teacher reference count weights must have positive mass")
         allowed = set(style_ids)
         grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
         for root_index, root in enumerate(token_roots):
@@ -653,13 +669,22 @@ class CachedTeacherReferenceLoader:
 
     def load_step(self, step: int) -> dict[str, Any]:
         rng = random.Random(self.seed + int(step) * 1_000_003)
+        reference_count = (
+            self.references
+            if self.reference_count_weights is None
+            else rng.choices(
+                range(1, self.references + 1),
+                weights=self.reference_count_weights,
+                k=1,
+            )[0]
+        )
         styles = (
             rng.sample(self.styles, self.batch_size)
             if len(self.styles) >= self.batch_size
             else [rng.choice(self.styles) for _ in range(self.batch_size)]
         )
         selected = [
-            rng.sample(self.by_style[style_id], self.references)
+            rng.sample(self.by_style[style_id], reference_count)
             for style_id in styles
         ]
         rows = [row for group in selected for row in group]
@@ -691,16 +716,17 @@ class CachedTeacherReferenceLoader:
         positions = [
             (batch_index, reference_index)
             for batch_index in range(self.batch_size)
-            for reference_index in range(self.references)
+            for reference_index in range(reference_count)
         ]
         mask = torch.ones(
-            self.batch_size, self.references, dtype=torch.bool
+            self.batch_size, reference_count, dtype=torch.bool
         )
         return {
             "episodes": episodes,
             "cached_reference_tokens": self._pin(tokens),
             "reference_positions": positions,
             "reference_mask": self._pin(mask),
+            "reference_count": reference_count,
         }
 
     def prefetch(

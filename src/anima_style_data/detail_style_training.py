@@ -2710,6 +2710,9 @@ def _teacher_step(
         )
         metrics.update(infonce_metrics)
         metrics.update({
+            "teacher_reference_count": main_loss.new_tensor(
+                references.shape[1]
+            ),
             "teacher_infonce_weight": main_loss.new_tensor(infonce_weight),
             "teacher_artist_objective_weight": main_loss.new_tensor(
                 artist_objective_weight
@@ -3366,6 +3369,9 @@ def train_detail_style_cross_attention(
                 style_ids=list(bank.summary["train_style_ids"]),
                 batch_size=int(training.get("teacher_batch_rows", 16)),
                 references=int(training.get("teacher_references", 4)),
+                reference_count_weights=training.get(
+                    "teacher_reference_count_weights"
+                ),
                 seed=(seed ^ 0x7EA4CE11) + domain_index * 1_000_003,
                 token_lru_shards=int(
                     cfg["teacher"].get("reference_lru_shards", 8)

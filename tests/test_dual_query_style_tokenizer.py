@@ -160,6 +160,51 @@ def test_teacher_reference_loader_combines_disjoint_cache_roots(tmp_path):
     assert set(batch["cached_reference_tokens"][:, 0, 0].tolist()) == {1.0, 101.0}
 
 
+def test_teacher_reference_loader_samples_configured_reference_counts(tmp_path):
+    rows = [
+        {
+            "id": style_index * 10 + image_index,
+            "style_id": f"human:{style_index}",
+            "split": "train",
+            "token_shard": "part-00000.safetensors",
+            "token_row": style_index * 4 + image_index,
+        }
+        for style_index in range(2)
+        for image_index in range(4)
+    ]
+    write_records(tmp_path / "manifest.parquet", rows)
+    save_file(
+        {"tokens": torch.randn(8, 3, 8)},
+        tmp_path / "part-00000.safetensors",
+    )
+
+    single = CachedTeacherReferenceLoader(
+        tmp_path,
+        split="train",
+        style_ids=["human:0", "human:1"],
+        batch_size=2,
+        references=4,
+        reference_count_weights=[1.0, 0.0, 0.0, 0.0],
+        seed=11,
+    ).load_step(0)
+    assert single["reference_count"] == 1
+    assert single["reference_mask"].shape == (2, 1)
+    assert single["cached_reference_tokens"].shape == (2, 3, 8)
+
+    four = CachedTeacherReferenceLoader(
+        tmp_path,
+        split="train",
+        style_ids=["human:0", "human:1"],
+        batch_size=2,
+        references=4,
+        reference_count_weights=[0.0, 0.0, 0.0, 1.0],
+        seed=11,
+    ).load_step(0)
+    assert four["reference_count"] == 4
+    assert four["reference_mask"].shape == (2, 4)
+    assert four["cached_reference_tokens"].shape == (8, 3, 8)
+
+
 def test_reference_set_is_order_invariant():
     torch.manual_seed(31)
     model = _model(include_summary=True)

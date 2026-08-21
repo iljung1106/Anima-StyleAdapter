@@ -67,6 +67,10 @@ Common을 동결했다. 이후의 common projection `1.29`는 Common 단독값�
   혼동하지 않는다.
 - Artist 단계의 `artist_mean_weight`는 `0`이다. Centered direction, 약한 RMS
   band, 16-way all-wrong InfoNCE만으로 작가 residual을 학습한다.
+- Artist teacher batch는 1/2/4개 reference를 55%/30%/15%로 섞는다. 네 장만
+  사용하면 Reader가 reference-set 평균에 의존해 단일 레퍼런스 inference에서
+  Common 출력으로 회귀하므로, 실제 주요 사용 조건인 한 장을 가장 자주
+  노출하면서 다중 레퍼런스 이득도 보존한다.
 - 전체 bootstrap은 Artist cosine `0.28`, projection `0.40`, InfoNCE gap `0.0`
   이상을 두 번 연속 만족해야 종료한다. 최대 5,000스텝 안에 통과하지 못하면
   본 curriculum으로 자동 진입하지 않고 병목을 다시 진단한다.
