@@ -1297,6 +1297,29 @@ class FreshKVStyleCrossAttention(nn.Module):
             )
         return cross_attention.k_norm(key), cross_attention.v_norm(value)
 
+    def _combine_style_components(
+        self,
+        style_attended: torch.Tensor,
+        common_attended: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return effective, common, and artist attention-space components.
+
+        Legacy adapters represent an artist as a residual from the learned
+        null context.  Newer adapters override this hook so the common and
+        artist branches can remain structurally independent while reusing the
+        native-Q/O attention plumbing below.
+        """
+
+        artist_attended = style_attended - common_attended.detach()
+        common_gain, artist_gain = self._component_gains()
+        artist_component = artist_gain.to(
+            device=artist_attended.device, dtype=artist_attended.dtype
+        ) * artist_attended
+        common_component = common_gain.to(
+            device=artist_attended.device, dtype=artist_attended.dtype
+        ) * common_attended
+        return artist_component + common_component, common_component, artist_component
+
     def merged_cross_attention(
         self,
         block_index: int,
@@ -1330,19 +1353,9 @@ class FreshKVStyleCrossAttention(nn.Module):
         null_attended = _run_attention(
             cross_attention, query, null_key, null_value, attn_params
         )
-        # Preserve the exact forward decomposition while preventing the common
-        # path's gradient from cancelling when common_gain == artist_gain.
-        # Centered final-artist losses train the reference path; the final
-        # common loss trains the learned null path directly.
-        artist_attended = style_attended - null_attended.detach()
-        common_gain, artist_gain = self._component_gains()
-        artist_component = artist_gain.to(
-            device=artist_attended.device, dtype=artist_attended.dtype
-        ) * artist_attended
-        common_component = common_gain.to(
-            device=artist_attended.device, dtype=artist_attended.dtype
-        ) * null_attended
-        effective_attended = artist_component + common_component
+        effective_attended, common_component, artist_component = (
+            self._combine_style_components(style_attended, null_attended)
+        )
         if self._style_enabled is not None:
             effective_attended = effective_attended * self._style_enabled.to(
                 device=effective_attended.device, dtype=effective_attended.dtype
@@ -2329,6 +2342,166 @@ class SharedBaseKVStyleCrossAttention(FreshKVStyleCrossAttention):
                     torch.arange(self.blocks, device=probabilities.device),
                     self.block_to_base,
                 ].mean()
+            ),
+        })
+        return result
+
+
+class SeparatedCommonArtistKVStyleCrossAttention(
+    SharedBaseKVStyleCrossAttention
+):
+    """Small Q-conditioned common K/V bank plus reference-conditioned artist K/V.
+
+    The common branch is intentionally asymmetric: it owns a small set of
+    attention-space K/V latents and never reads a reference image.  The artist
+    branch retains the full typed Reader, shared projections, and block-local
+    low-rank deltas.  Both branches use separate softmax operations before
+    being added and passed through the same frozen Anima output projection.
+    """
+
+    _VALID_PHASES = frozenset(("common_only", "artist_only", "combined"))
+
+    def __init__(
+        self,
+        *,
+        common_tokens: int = 16,
+        **kwargs: Any,
+    ) -> None:
+        if common_tokens <= 0:
+            raise ValueError("common_tokens must be positive")
+        # The inherited null/gain tensors remain checkpoint-compatible but are
+        # frozen and never participate in this architecture's forward path.
+        kwargs.update(common_gain=1.0, artist_gain=1.0, gain_maximum=2.0)
+        super().__init__(**kwargs)
+        self.common_tokens = int(common_tokens)
+        self.null_style_context.requires_grad_(False)
+        self.log_common_gain.requires_grad_(False)
+        self.log_artist_gain.requires_grad_(False)
+        self.common_k = nn.ParameterList()
+        self.common_v = nn.ParameterList()
+        common_logits = torch.zeros(
+            self.blocks, self.shared_bases, dtype=torch.float32
+        )
+        common_logits[
+            torch.arange(self.blocks), self.block_to_base.cpu()
+        ] = 4.0
+        self.common_mix_logits = nn.Parameter(common_logits)
+        self._bootstrap_phase = "combined"
+
+    def initialize_from_anima(self, anima: nn.Module) -> None:
+        if self._initialized:
+            return
+        super().initialize_from_anima(anima)
+        first_cross = anima.blocks[self.medoid_blocks[0]].cross_attn
+        output_dim = int(first_cross.n_heads) * int(first_cross.head_dim)
+        native = first_cross.output_proj.weight
+        for _ in range(self.shared_bases):
+            key = nn.Parameter(
+                torch.empty(
+                    self.common_tokens,
+                    output_dim,
+                    device=native.device,
+                    dtype=native.dtype,
+                )
+            )
+            value = nn.Parameter(torch.empty_like(key))
+            nn.init.xavier_uniform_(key)
+            nn.init.xavier_uniform_(value)
+            self.common_k.append(key)
+            self.common_v.append(value)
+
+    def set_bootstrap_phase(self, phase: str) -> None:
+        phase = str(phase)
+        if phase not in self._VALID_PHASES:
+            raise ValueError(f"Unsupported separated bootstrap phase: {phase}")
+        self._bootstrap_phase = phase
+
+    @property
+    def bootstrap_phase(self) -> str:
+        return self._bootstrap_phase
+
+    def common_parameters(self) -> list[nn.Parameter]:
+        return (
+            list(self.common_k.parameters())
+            + list(self.common_v.parameters())
+            + [self.common_mix_logits]
+        )
+
+    def artist_parameters(self) -> list[nn.Parameter]:
+        return (
+            self.shared_parameters()
+            + self.delta_parameters()
+            + self.mixing_parameters()
+        )
+
+    def null_parameters(self) -> list[nn.Parameter]:
+        return []
+
+    def gain_parameters(self) -> list[nn.Parameter]:
+        return []
+
+    def kv_parameters(self) -> list[nn.Parameter]:
+        return self.common_parameters() + self.artist_parameters()
+
+    def _component_gains(self) -> tuple[torch.Tensor, torch.Tensor]:
+        one = self.alpha.new_ones(())
+        return one, one
+
+    def _null_style_kv(
+        self, index: int, cross_attention: nn.Module, batch: int
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        weights = self.common_mix_logits[index].float().softmax(dim=0)
+        key = sum(
+            weight.to(value.dtype) * value
+            for weight, value in zip(weights, self.common_k, strict=True)
+        )
+        value = sum(
+            weight.to(item.dtype) * item
+            for weight, item in zip(weights, self.common_v, strict=True)
+        )
+        key = rearrange(
+            key, "s (h d) -> 1 s h d",
+            h=cross_attention.n_heads, d=cross_attention.head_dim,
+        )
+        value = rearrange(
+            value, "s (h d) -> 1 s h d",
+            h=cross_attention.n_heads, d=cross_attention.head_dim,
+        )
+        return (
+            cross_attention.k_norm(key).expand(batch, -1, -1, -1),
+            cross_attention.v_norm(value).expand(batch, -1, -1, -1),
+        )
+
+    def _combine_style_components(
+        self,
+        style_attended: torch.Tensor,
+        common_attended: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        phase = self._bootstrap_phase
+        common_component = (
+            torch.zeros_like(common_attended)
+            if phase == "artist_only" else common_attended
+        )
+        artist_component = (
+            torch.zeros_like(style_attended)
+            if phase == "common_only" else style_attended
+        )
+        return common_component + artist_component, common_component, artist_component
+
+    def runtime_stats(self) -> dict[str, float]:
+        result = super().runtime_stats()
+        probabilities = self.common_mix_logits.detach().float().softmax(dim=-1)
+        entropy = -(probabilities * probabilities.clamp_min(1e-8).log()).sum(dim=-1)
+        result.update({
+            "style_common_mix_entropy": float(entropy.mean()),
+            "style_bootstrap_common_only": float(
+                self._bootstrap_phase == "common_only"
+            ),
+            "style_bootstrap_artist_only": float(
+                self._bootstrap_phase == "artist_only"
+            ),
+            "style_bootstrap_combined": float(
+                self._bootstrap_phase == "combined"
             ),
         })
         return result

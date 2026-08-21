@@ -10,6 +10,7 @@ from torch import nn  # noqa: E402
 from anima_style_data.detail_style_cross_attention import (  # noqa: E402
     DetailPreservingTypedSlotReader,
     FreshKVStyleCrossAttention,
+    SeparatedCommonArtistKVStyleCrossAttention,
     SharedBaseKVStyleCrossAttention,
     _leave_one_out_artist_center,
 )
@@ -22,6 +23,7 @@ from anima_style_data.detail_style_training import (  # noqa: E402
     _centered_native_magnitude_band,
     _common_native_teacher_objective,
     _compose_separate_text_style_guidance,
+    _configure_separated_bootstrap_trainability,
     _delayed_learning_rate_multiplier,
     _effect_stage_metrics,
     _main_flow_total_magnitude_loss,
@@ -30,6 +32,7 @@ from anima_style_data.detail_style_training import (  # noqa: E402
     _native_effect_scales_for_timesteps,
     _native_bootstrap_status,
     _native_teacher_objective_config,
+    _separated_bootstrap_phase,
     _soft_common_output_objective,
     _teacher_domain_update,
     _teacher_direction_ranking_loss,
@@ -769,6 +772,60 @@ def test_shared_xavier_bases_are_cached_and_block_deltas_train():
     # becoming untrainable through exact algebraic cancellation.
     assert adapter.null_style_context.grad.norm() > 0
     assert all(block.cross_attn.k_proj.weight.grad is None for block in anima.blocks)
+
+
+def test_separated_common_artist_bootstrap_routes_gradients_by_phase():
+    torch.manual_seed(117)
+    anima = _Anima().requires_grad_(False)
+    reader = nn.Linear(6, 6)
+    adapter = SeparatedCommonArtistKVStyleCrossAttention(
+        context_dim=6,
+        blocks=2,
+        shared_bases=2,
+        medoid_blocks=(0, 1),
+        block_to_base=(0, 1),
+        delta_rank=3,
+        common_tokens=3,
+    )
+    adapter.initialize_from_anima(anima)
+    style = torch.randn(2, 3, 6)
+    hidden = torch.randn(2, 5, 8)
+    text = torch.randn(2, 4, 6)
+
+    _configure_separated_bootstrap_trainability(
+        reader, adapter, "common_only"
+    )
+    adapter.set_style_context(style)
+    common_output = adapter.merged_cross_attention(
+        0, hidden, text, anima.blocks[0].cross_attn, None
+    )
+    adapter.set_style_context(style.flip(0))
+    common_output_other_reference = adapter.merged_cross_attention(
+        0, hidden, text, anima.blocks[0].cross_attn, None
+    )
+    torch.testing.assert_close(common_output, common_output_other_reference)
+    common_output.square().mean().backward()
+    assert adapter.common_k[0].grad is not None
+    assert adapter.common_v[0].grad is not None
+    assert all(parameter.grad is None for parameter in adapter.artist_parameters())
+    assert all(not parameter.requires_grad for parameter in reader.parameters())
+
+    adapter.zero_grad(set_to_none=True)
+    _configure_separated_bootstrap_trainability(reader, adapter, "combined")
+    adapter.set_style_context(style)
+    combined_output = adapter.merged_cross_attention(
+        0, hidden, text, anima.blocks[0].cross_attn, None
+    )
+    combined_output.square().mean().backward()
+    assert all(parameter.grad is None for parameter in adapter.common_parameters())
+    assert any(parameter.grad is not None for parameter in adapter.artist_parameters())
+    assert all(parameter.requires_grad for parameter in reader.parameters())
+    assert _separated_bootstrap_phase(
+        500, {"separated_component_bootstrap": {"enabled": True, "common_steps": 500}}
+    ) == "common_only"
+    assert _separated_bootstrap_phase(
+        501, {"separated_component_bootstrap": {"enabled": True, "common_steps": 500}}
+    ) == "combined"
 
 
 def test_delayed_lr_holds_peak_until_requested_decay_step():

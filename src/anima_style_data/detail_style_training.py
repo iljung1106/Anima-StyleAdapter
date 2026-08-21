@@ -23,6 +23,7 @@ from .artist_effect_losses import (
 from .detail_style_cross_attention import (
     DetailPreservingTypedSlotReader,
     FreshKVStyleCrossAttention,
+    SeparatedCommonArtistKVStyleCrossAttention,
     SharedBaseKVStyleCrossAttention,
 )
 from .detail_style_teacher_context import NativeArtistContextCache
@@ -64,6 +65,8 @@ from .style_transfer import (
 def _build_style_adapter(cfg: dict[str, Any]) -> FreshKVStyleCrossAttention:
     adapter_cfg = dict(cfg["adapter"])
     architecture = str(adapter_cfg.pop("architecture", "fresh_per_block"))
+    if architecture == "separated_common_artist_shared_base":
+        return SeparatedCommonArtistKVStyleCrossAttention(**adapter_cfg)
     if architecture == "shared_base_lora":
         return SharedBaseKVStyleCrossAttention(**adapter_cfg)
     if architecture == "fresh_per_block":
@@ -111,6 +114,36 @@ def _delayed_learning_rate_multiplier(
     )
     cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
     return minimum_ratio + (1.0 - minimum_ratio) * cosine
+
+
+def _separated_bootstrap_phase(
+    step: int,
+    training: dict[str, Any],
+) -> str:
+    config = dict(training.get("separated_component_bootstrap", {}))
+    if not bool(config.get("enabled", False)):
+        return "combined"
+    common_steps = int(config.get("common_steps", 500))
+    if common_steps <= 0:
+        raise ValueError("separated common bootstrap needs common_steps > 0")
+    return "common_only" if int(step) <= common_steps else "combined"
+
+
+def _configure_separated_bootstrap_trainability(
+    reader: torch.nn.Module,
+    adapter: FreshKVStyleCrossAttention,
+    phase: str,
+) -> None:
+    if not isinstance(adapter, SeparatedCommonArtistKVStyleCrossAttention):
+        return
+    adapter.set_bootstrap_phase(phase)
+    common_active = phase == "common_only"
+    for parameter in adapter.common_parameters():
+        parameter.requires_grad_(common_active)
+    for parameter in adapter.artist_parameters():
+        parameter.requires_grad_(not common_active)
+    for parameter in reader.parameters():
+        parameter.requires_grad_(not common_active)
 
 
 def _loader_config(
@@ -1985,7 +2018,15 @@ def _main_common_output_step(
         dtype=torch.bfloat16,
         enabled=torch.device(device).type == "cuda",
     ):
-        style = reader(references, mask).tokens
+        if (
+            isinstance(adapter, SeparatedCommonArtistKVStyleCrossAttention)
+            and adapter.bootstrap_phase == "common_only"
+        ):
+            # The common dictionary is reference-free. A one-token sentinel
+            # only activates the adapter hook; the artist branch is disabled.
+            style = references.new_zeros(rows, 1, adapter.context_dim)
+        else:
+            style = reader(references, mask).tokens
         adapter.set_style_context(style)
         adapter.set_timesteps(timestep.expand(rows))
         try:
@@ -2277,7 +2318,15 @@ def _controlled_teacher_forward(
         dtype=torch.bfloat16,
         enabled=torch.device(device).type == "cuda",
     ):
-        style = reader(references, mask).tokens
+        if (
+            isinstance(adapter, SeparatedCommonArtistKVStyleCrossAttention)
+            and adapter.bootstrap_phase == "common_only"
+        ):
+            # The common dictionary is reference-free. A one-token sentinel
+            # only activates the adapter hook; the artist branch is disabled.
+            style = references.new_zeros(rows, 1, adapter.context_dim)
+        else:
+            style = reader(references, mask).tokens
         adapter.reset_internal_teacher()
         adapter.set_style_context(style)
         if tagged is not None:
@@ -2449,21 +2498,43 @@ def _teacher_step(
         )
     student_center = torch.cat(detached_students, dim=0).mean(dim=0, keepdim=True)
     objective_cfg = _native_teacher_objective_config(training)
+    separated_cfg = dict(training.get("separated_component_bootstrap", {}))
+    common_objective_cfg = dict(objective_cfg)
+    common_objective_cfg.update(dict(separated_cfg.get("common_objective", {})))
+    artist_objective_cfg = dict(objective_cfg)
+    artist_objective_cfg.update(dict(separated_cfg.get("artist_objective", {})))
     common_proxy = student_center.detach().float().requires_grad_(True)
     common_loss, common_metrics = _common_native_teacher_objective(
         common_proxy,
         teacher_common,
-        objective_cfg,
+        common_objective_cfg,
         step=step,
     )
     common_gradient = torch.autograd.grad(common_loss, common_proxy)[0].detach()
-    infonce_weight = float(training.get("teacher_infonce_weight", 0.25))
+    common_phase = bool(
+        separated_cfg.get("enabled", False)
+        and step <= int(separated_cfg.get("common_steps", 500))
+    )
+    artist_objective_weight = (
+        0.0 if common_phase else float(
+            separated_cfg.get("artist_objective_weight", 1.0)
+        )
+    )
+    common_objective_weight = float(
+        separated_cfg.get(
+            "common_objective_weight" if common_phase else "artist_mean_weight",
+            1.0 if common_phase else 0.10,
+        )
+    )
+    infonce_weight = (
+        0.0 if common_phase else float(training.get("teacher_infonce_weight", 0.25))
+    )
     global_weight = float(training.get("teacher_global_weight", 0.10))
     timestep_weight = _native_effect_weights_for_timesteps(
         timestep.float().reshape(1), timestep_weighting
     )[0]
     metric_rows: list[dict[str, torch.Tensor]] = []
-    detached_total = common_loss.detach()
+    detached_total = common_objective_weight * common_loss.detach()
     for offset in range(0, rows, microbatch_rows):
         stop = min(rows, offset + microbatch_rows)
         row_fraction = (stop - offset) / rows
@@ -2478,7 +2549,7 @@ def _teacher_step(
         final_loss, metrics = _minimal_native_teacher_objective(
             student,
             teacher_rows,
-            objective_cfg,
+            artist_objective_cfg,
             step=step,
             student_center=student_center,
             teacher_center=teacher_center,
@@ -2497,8 +2568,11 @@ def _teacher_step(
             student.float() * common_gradient
         ).sum() / rows
         main_loss = global_weight * timestep_weight * (
-            row_fraction * (final_loss + infonce_weight * infonce_loss)
-            + common_surrogate
+            row_fraction * (
+                artist_objective_weight * final_loss
+                + infonce_weight * infonce_loss
+            )
+            + common_objective_weight * common_surrogate
         )
         post_gate_loss = None
         if post_gate_active:
@@ -2546,11 +2620,21 @@ def _teacher_step(
             )
         main_loss.backward()
         detached_total = detached_total + row_fraction * (
-            final_loss.detach() + infonce_weight * infonce_loss.detach()
+            artist_objective_weight * final_loss.detach()
+            + infonce_weight * infonce_loss.detach()
         )
         metrics.update(infonce_metrics)
         metrics.update({
             "teacher_infonce_weight": main_loss.new_tensor(infonce_weight),
+            "teacher_artist_objective_weight": main_loss.new_tensor(
+                artist_objective_weight
+            ),
+            "teacher_common_objective_weight": main_loss.new_tensor(
+                common_objective_weight
+            ),
+            "teacher_common_bootstrap_phase": main_loss.new_tensor(
+                float(common_phase)
+            ),
             "teacher_infonce_weighted_loss": (
                 infonce_weight * infonce_loss.detach()
             ),
@@ -3301,6 +3385,13 @@ def train_detail_style_cross_attention(
             })
         else:
             assert bank is not None and contexts is not None and teacher_loaders
+            if isinstance(
+                adapter, SeparatedCommonArtistKVStyleCrossAttention
+            ):
+                # Alpha calibration is an artist-path scale calibration.  The
+                # tiny common K/V bank learns against its final native target
+                # during phase A rather than contaminating these statistics.
+                adapter.set_bootstrap_phase("artist_only")
             calibration = _calibrate_alpha(
                 # Calibrate against the same synthetic-reference domain used by
                 # native artist-tag distillation. Human references never receive
@@ -3309,6 +3400,10 @@ def train_detail_style_cross_attention(
                 int(training.get("alpha_calibration_batches", 4)),
                 training,
             )
+            if isinstance(
+                adapter, SeparatedCommonArtistKVStyleCrossAttention
+            ):
+                adapter.set_bootstrap_phase("combined")
             write_json(output / "alpha_calibration.json", calibration)
             if isinstance(adapter, SharedBaseKVStyleCrossAttention):
                 write_json(output / "style_strength.json", {
@@ -3347,7 +3442,32 @@ def train_detail_style_cross_attention(
             "name": "reader",
         }
     ]
-    if isinstance(adapter, SharedBaseKVStyleCrossAttention):
+    if isinstance(adapter, SeparatedCommonArtistKVStyleCrossAttention):
+        optimizer_groups.extend([
+            {
+                "params": adapter.common_parameters(),
+                "lr": float(training.get("common_kv_learning_rate", 1e-4)),
+                "name": "common_kv",
+                "weight_decay": 0.0,
+            },
+            {
+                "params": adapter.shared_parameters(),
+                "lr": float(training.get("shared_kv_learning_rate", 5e-5)),
+                "name": "artist_shared_kv",
+            },
+            {
+                "params": adapter.delta_parameters(),
+                "lr": float(training.get("block_delta_learning_rate", 1e-4)),
+                "name": "artist_block_delta",
+            },
+            {
+                "params": adapter.mixing_parameters(),
+                "lr": float(training.get("base_mix_learning_rate", 2e-5)),
+                "name": "artist_base_mix",
+                "weight_decay": 0.0,
+            },
+        ])
+    elif isinstance(adapter, SharedBaseKVStyleCrossAttention):
         optimizer_groups.extend([
             {
                 "params": adapter.shared_parameters(),
@@ -3501,6 +3621,8 @@ def train_detail_style_cross_attention(
     bootstrap_complete = False
     started = time.perf_counter()
     vae = None
+    initial_phase = _separated_bootstrap_phase(max(1, start_step), training)
+    _configure_separated_bootstrap_trainability(reader, adapter, initial_phase)
     try:
         resumed_fixed_summary = (
             output / "external_reference_samples"
@@ -3538,6 +3660,10 @@ def train_detail_style_cross_attention(
                 }, step=start_step)
         for step in range(start_step + 1, steps + 1):
             step_started = time.perf_counter()
+            separated_phase = _separated_bootstrap_phase(step, training)
+            _configure_separated_bootstrap_trainability(
+                reader, adapter, separated_phase
+            )
             performance_stage = (
                 None
                 if exact_self_flow_only
@@ -3548,6 +3674,17 @@ def train_detail_style_cross_attention(
             )
             for group in optimizer.param_groups:
                 group["lr"] = base_group_lrs[str(group["name"])] * lr_scale
+                if isinstance(
+                    adapter, SeparatedCommonArtistKVStyleCrossAttention
+                ):
+                    name = str(group["name"])
+                    active = (
+                        name == "common_kv"
+                        if separated_phase == "common_only"
+                        else name != "common_kv"
+                    )
+                    if not active:
+                        group["lr"] = 0.0
             optimizer.zero_grad(set_to_none=True)
             metric_rows: list[dict[str, torch.Tensor]] = []
             main_common_due = bool(
@@ -3722,6 +3859,18 @@ def train_detail_style_cross_attention(
             if step == 1 or step % log_every == 0:
                 metric_rows[-1].update({
                     "reader_gradient_rms": _gradient_rms(reader_parameters),
+                    "common_kv_gradient_rms": _gradient_rms(
+                        adapter.common_parameters()
+                        if isinstance(
+                            adapter, SeparatedCommonArtistKVStyleCrossAttention
+                        ) else []
+                    ),
+                    "artist_kv_gradient_rms": _gradient_rms(
+                        adapter.artist_parameters()
+                        if isinstance(
+                            adapter, SeparatedCommonArtistKVStyleCrossAttention
+                        ) else []
+                    ),
                     "null_context_gradient_rms": _gradient_rms(
                         adapter.null_parameters()
                     ),
@@ -3750,12 +3899,15 @@ def train_detail_style_cross_attention(
                 adapter.gain_parameters(),
                 float(training.get("component_gain_max_grad_norm", 1.0)),
             )
-            grad_norm = (
-                reader_grad_norm.float().square()
-                + adapter_grad_norm.float().square()
-                + null_grad_norm.float().square()
-                + gain_grad_norm.float().square()
-            ).sqrt()
+            grad_norm = torch.stack([
+                value.to(device=device, dtype=torch.float32)
+                for value in (
+                    reader_grad_norm,
+                    adapter_grad_norm,
+                    null_grad_norm,
+                    gain_grad_norm,
+                )
+            ]).square().sum().sqrt()
             metric_rows[-1].update({
                 "reader_grad_norm": reader_grad_norm.detach(),
                 "adapter_grad_norm": adapter_grad_norm.detach(),
@@ -3811,6 +3963,8 @@ def train_detail_style_cross_attention(
                     f"flow={averaged['flow_loss']:.5f} grad={averaged['grad_norm']:.4f} "
                     f"teacher={teacher_label} "
                     f"reader_grad={averaged.get('reader_gradient_rms', 0.0):.3e} "
+                    f"common_grad={averaged.get('common_kv_gradient_rms', 0.0):.3e} "
+                    f"artist_grad={averaged.get('artist_kv_gradient_rms', 0.0):.3e} "
                     f"null_grad={averaged.get('null_context_gradient_rms', 0.0):.3e} "
                     f"step_s={averaged['step_s']:.3f}", flush=True,
                 )

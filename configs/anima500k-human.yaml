@@ -1550,7 +1550,7 @@ style_transfer:
     # Smoke runs deliberately skip optimizer resume because their local step
     # limit is below 2k; initialize those from the matching adapter weights.
     initial_checkpoint: style_transfer_ip_adapter_exposure_bootstrap_5k_v1/checkpoints/step-0002000.pt
-    steps: 4000
+    steps: 2000
     learning_rate: 0.00001
     bridge_learning_rate: 0.00001
     bridge_optimizer: adamw
@@ -3830,7 +3830,7 @@ real_artist_teacher:
 # Detail-preserving typed-slot, separate-softmax Style Cross-Attention v1.
 # Contract: docs/detail_preserving_style_cross_attention_plan.md
 detail_preserving_style_cross_attention:
-  output_directory: detail_preserving_style_cross_attention_v27b_final_component_bootstrap
+  output_directory: detail_preserving_style_cross_attention_v28_separated_bootstrap
   seed: 20260819
   train_split: train
   validation_split: validation
@@ -3934,7 +3934,7 @@ detail_preserving_style_cross_attention:
     slot_type_counts: [16, 8, 4]
     strict_v1: true
   adapter:
-    architecture: shared_base_lora
+    architecture: separated_common_artist_shared_base
     context_dim: 1024
     blocks: 28
     shared_bases: 4
@@ -3956,13 +3956,13 @@ detail_preserving_style_cross_attention:
     # Keep the calibrated native-strength profile unchanged. Absolute
     # inference strength remains available through this single control.
     global_gain: 1.0
-    # Separate a learned reference-independent null/common component from the
-    # artist residual. Each receives its own native post-gate target and gain.
+    # A small reference-free K/V dictionary learns the Q-conditioned native
+    # common scaffold. The full Reader/shared-base/delta path is reserved for
+    # reference-conditioned artist residuals; neither path has a trainable
+    # scalar gain.
+    common_tokens: 16
     null_tokens: 28
     null_init_std: 0.02
-    common_gain: 1.0
-    artist_gain: 1.0
-    gain_maximum: 100.0
   strength_profile:
     output_directory: diagnostics/detail_style_block_timestep_strength_v1
     checkpoint: checkpoints/step-0001000.pt
@@ -4019,14 +4019,12 @@ detail_preserving_style_cross_attention:
       - synthetic_teacher_additional_1500x6/dual_query_reference_tokens_v8_step10000
   training:
     device: cuda
-    steps: 4000
-    # v27 uses only final functional effects: native common direction, centered
-    # artist direction, all-wrong InfoNCE, and a weak RMS band shared by the
-    # common/artist components. Per-block post-gate values remain available in
-    # code for diagnostics but are not an optimization target in this run.
+    steps: 2000
+    # v28 first learns a small Q-conditioned common scaffold, freezes it, then
+    # spends 1,500 updates on the centered reference-conditioned artist path.
     native_bootstrap:
       enabled: true
-      minimum_steps: 750
+      minimum_steps: 2000
       final_cosine: 0.35
       final_projection: 0.30
       common_cosine: 0.30
@@ -4039,22 +4037,48 @@ detail_preserving_style_cross_attention:
     # Preserve the pretrained information bottleneck while allowing slow
     # task-specific adaptation. Adapter K/V groups retain their original LR.
     learning_rate: 0.00010
+    common_kv_learning_rate: 0.00030
     shared_kv_learning_rate: 0.00010
     block_delta_learning_rate: 0.00020
     base_mix_learning_rate: 0.00004
-    null_context_learning_rate: 0.00001
-    component_gain_learning_rate: 0.01
     betas: [0.9, 0.95]
     adam_eps: 0.00000001
     weight_decay: 0.01
     warmup_steps: 100
-    lr_decay_start_step: 4000
+    lr_decay_start_step: 2000
     minimum_lr_ratio: 0.10
     max_grad_norm: 1.0
     reader_max_grad_norm: 1.0
     adapter_max_grad_norm: 1.0
-    null_context_max_grad_norm: 0.1
-    component_gain_max_grad_norm: 1.0
+    # Phase A trains only the small direct Common K/V bank. Phase B freezes it
+    # and trains the Reader plus reference-conditioned Artist K/V against the
+    # remaining native effect. The weak mean objective corrects residual error
+    # left by the frozen Common without letting it dominate artist separation.
+    separated_component_bootstrap:
+      enabled: true
+      common_steps: 500
+      artist_steps: 1500
+      common_objective_weight: 1.0
+      artist_objective_weight: 1.0
+      artist_mean_weight: 0.10
+      common_objective:
+        common_direction_weight: 1.0
+        magnitude_weight: 0.25
+        magnitude_floor_start_step: 1
+        magnitude_floor_end_step: 400
+        magnitude_floor_start: 0.50
+        magnitude_floor_end: 0.90
+        magnitude_upper: 1.25
+        magnitude_upper_weight: 0.50
+      artist_objective:
+        artist_direction_weight: 1.0
+        magnitude_weight: 0.10
+        magnitude_floor_start_step: 501
+        magnitude_floor_end_step: 1250
+        magnitude_floor_start: 0.25
+        magnitude_floor_end: 0.75
+        magnitude_upper: 1.50
+        magnitude_upper_weight: 0.25
     gradient_accumulation_steps: 4
     fused_adamw: true
     allow_tf32: true
@@ -4338,8 +4362,8 @@ detail_preserving_style_cross_attention:
     wandb:
       enabled: true
       project: anima-style-adapter
-      name: detail-style-v27b-final-component-bootstrap
-      id: detail-style-v27b-final-component-bootstrap
+      name: detail-style-v28-separated-bootstrap
+      id: detail-style-v28-separated-bootstrap
   gradient_diagnostics:
     checkpoint_step: 1500
     teacher_batch_step: 1500
