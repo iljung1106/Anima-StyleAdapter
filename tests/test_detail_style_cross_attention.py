@@ -27,6 +27,7 @@ from anima_style_data.detail_style_training import (  # noqa: E402
     _main_flow_projection_floor_loss,
     _minimal_native_teacher_objective,
     _native_effect_scales_for_timesteps,
+    _native_bootstrap_status,
     _native_teacher_objective_config,
     _soft_common_output_objective,
     _teacher_domain_update,
@@ -428,6 +429,29 @@ def test_style_uses_separate_softmax_one_native_o_and_trains_fresh_kv():
     assert output.shape == (2, 5, 8)
 
 
+def test_null_common_and_artist_residual_recompose_reference_attention():
+    torch.manual_seed(108)
+    anima = _Anima(blocks=1).requires_grad_(False)
+    adapter = FreshKVStyleCrossAttention(
+        context_dim=6, blocks=1, initial_alpha=0.2, null_tokens=3
+    )
+    adapter.initialize_from_anima(anima)
+    common = torch.randn(1, 3, 6)
+    with torch.no_grad():
+        adapter.null_style_context.copy_(common)
+    adapter.set_style_context(common.expand(2, -1, -1))
+    hidden = torch.randn(2, 5, 8)
+    text = torch.randn(2, 4, 6)
+    cross = anima.blocks[0].cross_attn
+
+    clean = cross(hidden, None, text)
+    styled = adapter.merged_cross_attention(0, hidden, text, cross, None)
+
+    # ref == null makes artist residual exactly zero, but the explicit common
+    # branch remains active rather than silently disabling one side.
+    assert not torch.allclose(styled, clean)
+
+
 def test_same_q_internal_teacher_produces_live_gradient_and_calibrates_alpha():
     torch.manual_seed(109)
     anima = _Anima().requires_grad_(False)
@@ -530,6 +554,8 @@ def test_post_gate_teacher_distillation_only_records_selected_block():
     assert "post_gate_teacher_block_1_loss" in metrics
     assert "post_gate_teacher_block_0_loss" not in metrics
     assert style.grad is not None and style.grad.norm() > 0
+    assert adapter.null_style_context.grad is not None
+    assert adapter.null_style_context.grad.norm() > 0
 
 
 def test_post_gate_direction_and_magnitude_are_independent():
@@ -543,17 +569,25 @@ def test_post_gate_direction_and_magnitude_are_independent():
         [[0.0, -1.0, 0.0, 0.0]],
     ])
     student = 0.25 * teacher
-    adapter._record_post_gate_distillation(0, student, teacher)
+    adapter._record_post_gate_distillation(
+        0, student, torch.zeros_like(student), teacher
+    )
 
     direction_only, direction_metrics = adapter.post_gate_teacher_loss(
         direction_weight=1.0,
         magnitude_weight=0.0,
+        common_weight=0.0,
+        artist_common_leakage_weight=0.0,
     )
-    adapter._record_post_gate_distillation(0, student, teacher)
+    adapter._record_post_gate_distillation(
+        0, student, torch.zeros_like(student), teacher
+    )
     with_magnitude, magnitude_metrics = adapter.post_gate_teacher_loss(
         direction_weight=1.0,
         magnitude_weight=1.0,
         magnitude_lower=0.5,
+        common_weight=0.0,
+        artist_common_leakage_weight=0.0,
     )
 
     assert float(direction_only) == pytest.approx(0.0, abs=1e-7)
@@ -715,13 +749,20 @@ def test_shared_xavier_bases_are_cached_and_block_deltas_train():
     for hook in hooks:
         hook.remove()
 
-    assert calls == [1, 1, 1, 1]
+    # Each shared projection is evaluated once for reference tokens and once
+    # for the learned null context, then reused across all blocks.
+    assert calls == [2, 2, 2, 2]
     assert adapter.base_k[0].weight.grad is not None
     assert adapter.delta_k_down[0].weight.grad is not None
     assert adapter.delta_v_down[1].weight.grad is not None
     assert adapter.delta_k_up[0].weight.grad is not None
     assert adapter.delta_v_up[1].weight.grad is not None
     assert adapter.base_mix_logits.grad is not None
+    assert adapter.null_style_context.grad is not None
+    # With common_gain == artist_gain the summed forward is algebraically the
+    # raw reference path. The dedicated native common/artist bootstrap—not the
+    # unsplit main output—supplies the null-context gradient.
+    assert adapter.null_style_context.grad.norm() == 0
     assert all(block.cross_attn.k_proj.weight.grad is None for block in anima.blocks)
 
 
@@ -951,6 +992,37 @@ def test_performance_curriculum_requires_consecutive_validation_windows():
         training, state, validation, teacher_rows, step=200
     )
     assert changed and second["stage_index"] == 1
+
+
+def test_native_bootstrap_requires_both_common_and_artist_alignment():
+    config = {
+        "minimum_steps": 500,
+        "final_cosine": 0.3,
+        "final_projection": 0.25,
+        "post_gate_cosine": 0.3,
+        "common_cosine": 0.3,
+        "common_projection": 0.25,
+        "artist_common_leakage": 0.4,
+        "consecutive_validations": 2,
+    }
+    rows = [{
+        "native_teacher_cosine": 0.4,
+        "native_teacher_projection_coefficient": 0.35,
+        "post_gate_teacher_cosine": 0.45,
+        "post_gate_teacher_common_cosine": 0.4,
+        "post_gate_teacher_common_projection_coefficient": 0.3,
+        "post_gate_teacher_artist_common_leakage": 0.2,
+    }]
+    first, consecutive, complete = _native_bootstrap_status(
+        rows, config, step=500, previous_consecutive=0
+    )
+    second, consecutive, complete = _native_bootstrap_status(
+        rows, config, step=750, previous_consecutive=consecutive
+    )
+
+    assert first["native_bootstrap_window_passed"] == 1.0
+    assert second["native_bootstrap_complete"] == 1.0
+    assert consecutive == 2 and complete
 
 
 def test_student_prompt_audit_uses_tag_boundaries_not_substrings():

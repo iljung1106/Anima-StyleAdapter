@@ -482,12 +482,32 @@ class FreshKVStyleCrossAttention(nn.Module):
         context_dim: int = 1024,
         blocks: int = 28,
         initial_alpha: float = 0.1,
+        null_tokens: int = 28,
+        common_gain: float = 1.0,
+        artist_gain: float = 1.0,
     ) -> None:
         super().__init__()
         self.context_dim = int(context_dim)
         self.blocks = int(blocks)
+        self.null_tokens = int(null_tokens)
+        if self.null_tokens <= 0:
+            raise ValueError("null_tokens must be positive")
+        if common_gain < 0 or artist_gain <= 0:
+            raise ValueError("common_gain must be non-negative and artist_gain positive")
         self.style_k = nn.ModuleList()
         self.style_v = nn.ModuleList()
+        # The adapter represents style as a residual from a learned null
+        # context.  This makes the artist-varying path identifiable instead of
+        # letting one large reference-independent effect dominate every row.
+        self.null_style_context = nn.Parameter(
+            torch.zeros(1, self.null_tokens, self.context_dim)
+        )
+        self.register_buffer(
+            "common_gain", torch.tensor(float(common_gain)), persistent=True
+        )
+        self.register_buffer(
+            "artist_gain", torch.tensor(float(artist_gain)), persistent=True
+        )
         self.register_buffer(
             "alpha", torch.full((blocks,), float(initial_alpha)), persistent=True
         )
@@ -544,6 +564,8 @@ class FreshKVStyleCrossAttention(nn.Module):
                 torch.Tensor,
                 torch.Tensor,
                 torch.Tensor,
+                torch.Tensor,
+                torch.Tensor,
             ],
         ] = {}
         self._block_gate_context: dict[
@@ -553,6 +575,13 @@ class FreshKVStyleCrossAttention(nn.Module):
         self._post_gate_distillation_terms: list[
             tuple[int, dict[str, torch.Tensor]]
         ] = []
+        self._post_gate_center_collection = False
+        self._post_gate_center_samples: dict[
+            int, list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]
+        ] = {}
+        self._post_gate_centers: dict[
+            int, tuple[torch.Tensor, torch.Tensor]
+        ] = {}
         self._calibration = False
         self._calibration_bin_edges: tuple[float, ...] = (0.0, 1.000001)
         self._calibration_bin_index: int | None = None
@@ -606,7 +635,14 @@ class FreshKVStyleCrossAttention(nn.Module):
         self._initialized = True
 
     def kv_parameters(self) -> list[nn.Parameter]:
-        return list(self.style_k.parameters()) + list(self.style_v.parameters())
+        return (
+            list(self.style_k.parameters())
+            + list(self.style_v.parameters())
+            + [self.null_style_context]
+        )
+
+    def null_parameters(self) -> list[nn.Parameter]:
+        return [self.null_style_context]
 
     def set_style_context(
         self,
@@ -848,6 +884,39 @@ class FreshKVStyleCrossAttention(nn.Module):
         self._pending_internal.clear()
         self._internal_terms.clear()
         self._post_gate_distillation_terms.clear()
+
+    def begin_post_gate_center_collection(self) -> None:
+        self._post_gate_center_collection = True
+        self._post_gate_center_samples.clear()
+        self._post_gate_centers.clear()
+
+    def finish_post_gate_center_collection(
+        self,
+    ) -> dict[int, tuple[torch.Tensor, torch.Tensor]]:
+        if not self._post_gate_center_collection:
+            raise RuntimeError("Post-gate center collection is not active")
+        centers: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+        for block_index, rows in self._post_gate_center_samples.items():
+            student_artist = torch.cat([row[0] for row in rows], dim=0)
+            teacher = torch.cat([row[2] for row in rows], dim=0)
+            centers[block_index] = (
+                student_artist.mean(dim=0, keepdim=True),
+                teacher.mean(dim=0, keepdim=True),
+            )
+        self._post_gate_center_collection = False
+        self._post_gate_center_samples.clear()
+        return centers
+
+    def set_post_gate_centers(
+        self, centers: dict[int, tuple[torch.Tensor, torch.Tensor]]
+    ) -> None:
+        self._post_gate_centers = {
+            int(index): (student.detach(), teacher.detach())
+            for index, (student, teacher) in centers.items()
+        }
+
+    def clear_post_gate_centers(self) -> None:
+        self._post_gate_centers.clear()
 
     def begin_alpha_calibration(
         self,
@@ -1172,6 +1241,24 @@ class FreshKVStyleCrossAttention(nn.Module):
         )
         return cross_attention.k_norm(key), cross_attention.v_norm(value)
 
+    def _null_style_kv(
+        self, index: int, cross_attention: nn.Module, batch: int
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        key = self.style_k[index](self.null_style_context)
+        value = self.style_v[index](self.null_style_context)
+        key = rearrange(
+            key, "b s (h d) -> b s h d",
+            h=cross_attention.n_heads, d=cross_attention.head_dim,
+        )
+        value = rearrange(
+            value, "b s (h d) -> b s h d",
+            h=cross_attention.n_heads, d=cross_attention.head_dim,
+        )
+        return (
+            cross_attention.k_norm(key).expand(batch, -1, -1, -1),
+            cross_attention.v_norm(value).expand(batch, -1, -1, -1),
+        )
+
     @staticmethod
     def _native_output_weight(cross_attention: nn.Module, values: torch.Tensor) -> torch.Tensor:
         return F.linear(values, cross_attention.output_proj.weight, None)
@@ -1210,20 +1297,36 @@ class FreshKVStyleCrossAttention(nn.Module):
             normalized_x, text_context
         )
         style_key, style_value = self._style_kv(block_index, cross_attention)
+        null_key, null_value = self._null_style_kv(
+            block_index, cross_attention, style_key.shape[0]
+        )
         query, text_key, text_value, style_key, style_value = (
             _match_native_attention_dtypes(
                 query, text_key, text_value, style_key, style_value, attn_params
             )
         )
+        null_key = null_key.to(style_key.dtype)
+        null_value = null_value.to(style_value.dtype)
         text_attended = _run_attention(
             cross_attention, query, text_key, text_value, attn_params
         )
         style_attended = _run_attention(
             cross_attention, query, style_key, style_value, attn_params
         )
+        null_attended = _run_attention(
+            cross_attention, query, null_key, null_value, attn_params
+        )
+        artist_attended = style_attended - null_attended
+        artist_component = self.artist_gain.to(
+            device=artist_attended.device, dtype=artist_attended.dtype
+        ) * artist_attended
+        common_component = self.common_gain.to(
+            device=artist_attended.device, dtype=artist_attended.dtype
+        ) * null_attended
+        effective_attended = artist_component + common_component
         if self._style_enabled is not None:
-            style_attended = style_attended * self._style_enabled.to(
-                device=style_attended.device, dtype=style_attended.dtype
+            effective_attended = effective_attended * self._style_enabled.to(
+                device=effective_attended.device, dtype=effective_attended.dtype
             )[:, None, None]
         fixed_output = self._fixed_output_strength_active and not self._calibration
         if fixed_output:
@@ -1236,7 +1339,7 @@ class FreshKVStyleCrossAttention(nn.Module):
             gate_cross, spatial_shape = gate_context
             frames, height, width = spatial_shape
             raw_style_delta = self._native_output_weight(
-                cross_attention, style_attended
+                cross_attention, effective_attended
             )
             gate = gate_cross.expand(-1, frames, height, width, -1).reshape(
                 raw_style_delta.shape[0], -1, raw_style_delta.shape[-1]
@@ -1293,18 +1396,24 @@ class FreshKVStyleCrossAttention(nn.Module):
                 self._pending_internal[block_index] = (
                     effective_style_delta,
                     teacher_delta,
-                    style_attended,
+                    effective_attended,
                     scale.detach().float().reshape(-1, 1, 1),
+                    self._native_output_weight(
+                        cross_attention, common_component
+                    ) * scale.to(common_component.dtype).reshape(-1, 1, 1),
+                    self._native_output_weight(
+                        cross_attention, artist_component
+                    ) * scale.to(artist_component.dtype).reshape(-1, 1, 1),
                 )
             return cross_attention.output_dropout(merged_output)
 
         alpha = self._effective_alpha(
             block_index,
-            style_attended.shape[0],
-            device=style_attended.device,
-            dtype=style_attended.dtype,
+            effective_attended.shape[0],
+            device=effective_attended.device,
+            dtype=effective_attended.dtype,
         )
-        effective_style_attended = alpha * style_attended
+        effective_style_attended = alpha * effective_attended
         self._runtime_alphas[block_index] = alpha.detach().float().mean()
         self.record_diagnostic_stage(
             block_index, "pre_o_style", effective_style_attended
@@ -1316,7 +1425,8 @@ class FreshKVStyleCrossAttention(nn.Module):
         )
         text_rms = text_attended.detach().float().square().mean().sqrt().clamp_min(1e-8)
         self._runtime_ratios[block_index] = (
-            (alpha * style_attended.detach()).float().square().mean().sqrt() / text_rms
+            (alpha * effective_attended.detach()).float().square().mean().sqrt()
+            / text_rms
         )
 
         if self._teacher_enabled_for_block(block_index):
@@ -1336,6 +1446,12 @@ class FreshKVStyleCrossAttention(nn.Module):
             student_delta = self._native_output_weight(
                 cross_attention, effective_style_attended
             )
+            student_common_delta = self._native_output_weight(
+                cross_attention, alpha * common_component
+            )
+            student_artist_delta = self._native_output_weight(
+                cross_attention, alpha * artist_component
+            )
             self.record_diagnostic_stage(
                 block_index, "pre_o_teacher", teacher_attention_delta
             )
@@ -1346,7 +1462,8 @@ class FreshKVStyleCrossAttention(nn.Module):
                 block_index, "post_o_teacher", teacher_delta
             )
             self._pending_internal[block_index] = (
-                student_delta, teacher_delta, style_attended, alpha.detach().float()
+                student_delta, teacher_delta, effective_attended,
+                alpha.detach().float(), student_common_delta, student_artist_delta
             )
         return cross_attention.output_dropout(cross_attention.output_proj(merged))
 
@@ -1359,17 +1476,28 @@ class FreshKVStyleCrossAttention(nn.Module):
         pair = self._pending_internal.pop(block_index, None)
         if pair is None:
             return
-        student, teacher, raw_style_attention, effective_alpha = pair
+        (
+            student,
+            teacher,
+            raw_style_attention,
+            effective_alpha,
+            student_common,
+            student_artist,
+        ) = pair
         frames, height, width = spatial_shape
         gate = gate_cross.expand(-1, frames, height, width, -1).reshape(
             student.shape[0], -1, student.shape[-1]
         )
         student = student * gate
         teacher = teacher * gate
+        student_common = student_common * gate
+        student_artist = student_artist * gate
         self.record_diagnostic_stage(block_index, "post_gate_style", student)
         self.record_diagnostic_stage(block_index, "post_gate_teacher", teacher)
         if self._post_gate_distillation_enabled:
-            self._record_post_gate_distillation(block_index, student, teacher)
+            self._record_post_gate_distillation(
+                block_index, student_artist, student_common, teacher
+            )
             return
         if student.shape[0] > 1:
             student = student - student.mean(dim=0, keepdim=True)
@@ -1471,18 +1599,49 @@ class FreshKVStyleCrossAttention(nn.Module):
     def _record_post_gate_distillation(
         self,
         block_index: int,
-        student: torch.Tensor,
+        student_artist: torch.Tensor,
+        student_common: torch.Tensor,
         teacher: torch.Tensor,
     ) -> None:
-        """Record an instantaneous artist-specific post-gate comparison."""
+        """Record separate native common and artist post-gate targets."""
 
-        student = _leave_one_out_artist_center(student.float())
-        teacher = _leave_one_out_artist_center(teacher.detach().float())
-        dimensions = tuple(range(1, teacher.ndim))
-        teacher_row_rms = teacher.square().mean(dim=dimensions).sqrt()
-        student_row_rms = student.square().mean(dim=dimensions).sqrt()
-        native_scale = teacher.square().mean().sqrt().clamp_min(1e-4)
-        normalized_delta = (student - teacher) / native_scale
+        raw_teacher = teacher.detach().float()
+        raw_student_artist = student_artist.float()
+        raw_student_common = student_common.float()
+        if self._post_gate_center_collection:
+            self._post_gate_center_samples.setdefault(
+                int(block_index), []
+            ).append((
+                raw_student_artist.detach(),
+                raw_student_common.detach(),
+                raw_teacher.detach(),
+            ))
+            return
+        external = self._post_gate_centers.get(int(block_index))
+        if external is None:
+            metric_student_artist_mean = raw_student_artist.mean(
+                dim=0, keepdim=True
+            )
+            teacher_common = raw_teacher.mean(dim=0, keepdim=True)
+        else:
+            metric_student_artist_mean, teacher_common = external
+            metric_student_artist_mean = metric_student_artist_mean.to(
+                raw_student_artist
+            )
+            teacher_common = teacher_common.to(raw_teacher)
+        teacher_artist = raw_teacher - teacher_common
+        # The artist branch is already defined as ref-null. Match it directly
+        # to a zero-mean native target so null cannot disappear through another
+        # student-centering invariance.
+        centered_student_artist = raw_student_artist
+        live_student_artist_mean = raw_student_artist.mean(dim=0, keepdim=True)
+        dimensions = tuple(range(1, teacher_artist.ndim))
+        teacher_row_rms = teacher_artist.square().mean(dim=dimensions).sqrt()
+        student_row_rms = centered_student_artist.square().mean(dim=dimensions).sqrt()
+        native_scale = teacher_artist.square().mean().sqrt().clamp_min(1e-4)
+        normalized_delta = (
+            centered_student_artist - teacher_artist
+        ) / native_scale
         huber = F.smooth_l1_loss(
             normalized_delta,
             torch.zeros_like(normalized_delta),
@@ -1490,13 +1649,41 @@ class FreshKVStyleCrossAttention(nn.Module):
             reduction="none",
         ).mean(dim=dimensions)
         cosine = F.cosine_similarity(
-            student.flatten(1), teacher.flatten(1), dim=1, eps=1e-8
+            centered_student_artist.flatten(1),
+            teacher_artist.flatten(1), dim=1, eps=1e-8
         )
-        teacher_energy = teacher.flatten(1).square().sum(dim=1).clamp_min(1e-8)
+        teacher_energy = teacher_artist.flatten(1).square().sum(dim=1).clamp_min(1e-8)
         projection_coefficient = (
-            student.flatten(1) * teacher.flatten(1)
+            centered_student_artist.flatten(1) * teacher_artist.flatten(1)
         ).sum(dim=1) / teacher_energy
         valid = teacher_row_rms >= native_scale.detach() * 0.10
+        common_scale = teacher_common.square().mean().sqrt().clamp_min(1e-4)
+        combined_native_scale = (
+            native_scale.square() + common_scale.square()
+        ).sqrt()
+        common_huber = F.smooth_l1_loss(
+            (raw_student_common - teacher_common) / common_scale,
+            torch.zeros_like(raw_student_common),
+            beta=0.10,
+        )
+        common_cosine = F.cosine_similarity(
+            raw_student_common.flatten(1),
+            teacher_common.expand_as(raw_student_common).flatten(1),
+            dim=1, eps=1e-8,
+        ).mean()
+        common_projection = (
+            raw_student_common.flatten(1)
+            * teacher_common.expand_as(raw_student_common).flatten(1)
+        ).sum(dim=1) / teacher_common.flatten(1).square().sum(dim=1).clamp_min(1e-8)
+        common_projection = common_projection.mean()
+        artist_common_leakage = (
+            metric_student_artist_mean.square().mean().sqrt()
+            / native_scale.detach().clamp_min(1e-8)
+        )
+        artist_common_leakage_loss = (
+            live_student_artist_mean.square().mean()
+            / native_scale.detach().square().clamp_min(1e-8)
+        )
         self._post_gate_distillation_terms.append(
             (
                 int(block_index),
@@ -1508,6 +1695,14 @@ class FreshKVStyleCrossAttention(nn.Module):
                     "student_rms": student_row_rms,
                     "native_scale": native_scale.expand_as(teacher_row_rms),
                     "valid": valid,
+                    "common_huber": common_huber,
+                    "common_cosine": common_cosine,
+                    "common_projection_coefficient": common_projection,
+                    "common_teacher_rms": common_scale,
+                    "common_student_rms": raw_student_common.square().mean().sqrt(),
+                    "artist_common_leakage": artist_common_leakage,
+                    "artist_common_leakage_loss": artist_common_leakage_loss,
+                    "combined_native_scale": combined_native_scale,
                 },
             )
         )
@@ -1521,6 +1716,11 @@ class FreshKVStyleCrossAttention(nn.Module):
         magnitude_lower: float = 0.50,
         magnitude_upper: float = 1.25,
         cosine_weight: float | None = None,
+        native_strength_weighting: bool = True,
+        strength_weight_min: float = 0.25,
+        strength_weight_max: float = 4.0,
+        common_weight: float = 0.25,
+        artist_common_leakage_weight: float = 0.10,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         """Align post-gate direction first, then its teacher-axis magnitude.
 
@@ -1534,7 +1734,10 @@ class FreshKVStyleCrossAttention(nn.Module):
             # Compatibility for diagnostics created before the direction and
             # magnitude objectives were separated.
             direction_weight = float(cosine_weight)
-        if min(direction_weight, magnitude_weight, huber_weight) < 0:
+        if min(
+            direction_weight, magnitude_weight, huber_weight,
+            common_weight, artist_common_leakage_weight,
+        ) < 0:
             raise ValueError("Post-gate loss weights must be non-negative")
         if magnitude_lower < 0 or magnitude_upper < magnitude_lower:
             raise ValueError("Invalid post-gate magnitude band")
@@ -1542,10 +1745,22 @@ class FreshKVStyleCrossAttention(nn.Module):
             reference = self.alpha.float().sum() * 0.0
             return reference, {}
         block_losses: list[torch.Tensor] = []
+        block_strengths: list[torch.Tensor] = []
+        block_cosines: list[torch.Tensor] = []
+        block_coefficients: list[torch.Tensor] = []
+        block_common_cosines: list[torch.Tensor] = []
+        block_common_coefficients: list[torch.Tensor] = []
+        block_artist_common_leakages: list[torch.Tensor] = []
         metrics: dict[str, torch.Tensor] = {}
         for block_index, values in self._post_gate_distillation_terms:
             valid = values["valid"]
             weights = valid.to(values["huber"].dtype)
+            if native_strength_weighting:
+                relative = (
+                    values["teacher_rms"].detach()
+                    / values["native_scale"].detach().clamp_min(1e-8)
+                ).clamp(float(strength_weight_min), float(strength_weight_max))
+                weights = weights * relative
             denominator = weights.sum().clamp_min(1.0)
             huber = (values["huber"] * weights).sum() / denominator
             direction = ((1.0 - values["cosine"]) * weights).sum() / denominator
@@ -1557,12 +1772,34 @@ class FreshKVStyleCrossAttention(nn.Module):
                 F.relu(coefficient - float(magnitude_upper)).square() * weights
             ).sum() / denominator
             magnitude = magnitude_lower_loss + 0.25 * magnitude_upper_loss
+            common = (
+                (1.0 - values["common_cosine"])
+                + values["common_huber"]
+                + F.relu(0.50 - values["common_projection_coefficient"]).square()
+            )
+            artist_common_leakage = values["artist_common_leakage_loss"]
             loss = (
                 float(direction_weight) * direction
                 + float(magnitude_weight) * magnitude
                 + float(huber_weight) * huber
+                + float(common_weight) * common
+                + float(artist_common_leakage_weight) * artist_common_leakage
             )
             block_losses.append(loss)
+            block_strengths.append(values["combined_native_scale"].detach())
+            block_cosines.append(
+                (values["cosine"].detach() * weights).sum() / denominator
+            )
+            block_coefficients.append(
+                (coefficient.detach() * weights).sum() / denominator
+            )
+            block_common_cosines.append(values["common_cosine"].detach())
+            block_common_coefficients.append(
+                values["common_projection_coefficient"].detach()
+            )
+            block_artist_common_leakages.append(
+                values["artist_common_leakage"].detach()
+            )
             prefix = f"post_gate_teacher_block_{block_index}"
             metrics.update({
                 f"{prefix}_loss": loss.detach(),
@@ -1585,12 +1822,37 @@ class FreshKVStyleCrossAttention(nn.Module):
                 ).sum() / denominator,
                 f"{prefix}_native_scale": values["native_scale"].detach().mean(),
                 f"{prefix}_valid_fraction": valid.detach().float().mean(),
+                f"{prefix}_common_loss": common.detach(),
+                f"{prefix}_common_cosine": values["common_cosine"].detach(),
+                f"{prefix}_common_projection_coefficient": values[
+                    "common_projection_coefficient"
+                ].detach(),
+                f"{prefix}_common_teacher_rms": values[
+                    "common_teacher_rms"
+                ].detach(),
+                f"{prefix}_common_student_rms": values[
+                    "common_student_rms"
+                ].detach(),
+                f"{prefix}_artist_common_leakage": values[
+                    "artist_common_leakage"
+                ].detach(),
             })
         self._post_gate_distillation_terms.clear()
         if not block_losses:
             reference = self.alpha.float().sum() * 0.0
             return reference, metrics
-        total = torch.stack(block_losses).mean()
+        stacked_losses = torch.stack(block_losses)
+        if native_strength_weighting:
+            strengths = torch.stack(block_strengths)
+            reference = strengths.median().clamp_min(1e-8)
+            block_weights = (strengths / reference).clamp(
+                float(strength_weight_min), float(strength_weight_max)
+            )
+            block_weights = block_weights / block_weights.mean().clamp_min(1e-8)
+            total = (stacked_losses * block_weights).sum() / block_weights.sum()
+        else:
+            block_weights = torch.ones_like(stacked_losses)
+            total = stacked_losses.mean()
         metrics.update({
             "post_gate_teacher_loss": total.detach(),
             "post_gate_teacher_blocks": total.new_tensor(len(block_losses)),
@@ -1608,6 +1870,30 @@ class FreshKVStyleCrossAttention(nn.Module):
             ),
             "post_gate_teacher_magnitude_upper": total.new_tensor(
                 float(magnitude_upper)
+            ),
+            "post_gate_teacher_native_strength_weighting": total.new_tensor(
+                float(native_strength_weighting)
+            ),
+            "post_gate_teacher_block_weight_max": block_weights.detach().max(),
+            "post_gate_teacher_block_weight_min": block_weights.detach().min(),
+            "post_gate_teacher_cosine": (
+                torch.stack(block_cosines) * block_weights
+            ).sum() / block_weights.sum(),
+            "post_gate_teacher_projection_coefficient": (
+                torch.stack(block_coefficients) * block_weights
+            ).sum() / block_weights.sum(),
+            "post_gate_teacher_common_cosine": (
+                torch.stack(block_common_cosines) * block_weights
+            ).sum() / block_weights.sum(),
+            "post_gate_teacher_common_projection_coefficient": (
+                torch.stack(block_common_coefficients) * block_weights
+            ).sum() / block_weights.sum(),
+            "post_gate_teacher_artist_common_leakage": (
+                torch.stack(block_artist_common_leakages) * block_weights
+            ).sum() / block_weights.sum(),
+            "post_gate_teacher_common_weight": total.new_tensor(float(common_weight)),
+            "post_gate_teacher_artist_common_leakage_weight": total.new_tensor(
+                float(artist_common_leakage_weight)
             ),
         })
         return total, metrics
@@ -1757,6 +2043,9 @@ class SharedBaseKVStyleCrossAttention(FreshKVStyleCrossAttention):
         delta_v_init_scale: float = 0.03,
         mix_logit_scale: float = 4.0,
         global_gain: float = 1.0,
+        null_tokens: int = 28,
+        common_gain: float = 1.0,
+        artist_gain: float = 1.0,
         relative_block_gain: list[float] | tuple[float, ...] | None = None,
     ) -> None:
         if shared_bases <= 0 or delta_rank <= 0:
@@ -1775,7 +2064,14 @@ class SharedBaseKVStyleCrossAttention(FreshKVStyleCrossAttention):
         if global_gain <= 0:
             raise ValueError("global_gain must be positive")
 
-        super().__init__(context_dim=context_dim, blocks=blocks, initial_alpha=1.0)
+        super().__init__(
+            context_dim=context_dim,
+            blocks=blocks,
+            initial_alpha=1.0,
+            null_tokens=null_tokens,
+            common_gain=common_gain,
+            artist_gain=artist_gain,
+        )
         self.shared_bases = int(shared_bases)
         self.delta_rank = int(delta_rank)
         self.delta_scale = float(delta_scale)
@@ -1812,6 +2108,9 @@ class SharedBaseKVStyleCrossAttention(FreshKVStyleCrossAttention):
         self.delta_v_down = nn.ModuleList()
         self.delta_v_up = nn.ModuleList()
         self._base_projection_cache: tuple[list[torch.Tensor], list[torch.Tensor]] | None = None
+        self._null_base_projection_cache: (
+            tuple[list[torch.Tensor], list[torch.Tensor]] | None
+        ) = None
 
     def initialize_from_anima(self, anima: nn.Module) -> None:
         if self._initialized:
@@ -1884,7 +2183,12 @@ class SharedBaseKVStyleCrossAttention(FreshKVStyleCrossAttention):
         return [self.base_mix_logits]
 
     def kv_parameters(self) -> list[nn.Parameter]:
-        return self.shared_parameters() + self.delta_parameters() + self.mixing_parameters()
+        return (
+            self.shared_parameters()
+            + self.delta_parameters()
+            + self.mixing_parameters()
+            + self.null_parameters()
+        )
 
     def set_style_context(
         self,
@@ -1894,12 +2198,14 @@ class SharedBaseKVStyleCrossAttention(FreshKVStyleCrossAttention):
         strength: float = 1.0,
     ) -> None:
         self._base_projection_cache = None
+        self._null_base_projection_cache = None
         super().set_style_context(tokens, enabled=enabled, strength=strength)
 
     set_style_tokens = set_style_context
 
     def clear_style_tokens(self) -> None:
         self._base_projection_cache = None
+        self._null_base_projection_cache = None
         super().clear_style_tokens()
 
     def _base_projections(self) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
@@ -1911,6 +2217,16 @@ class SharedBaseKVStyleCrossAttention(FreshKVStyleCrossAttention):
                 [module(self._style_context) for module in self.base_v],
             )
         return self._base_projection_cache
+
+    def _null_base_projections(
+        self,
+    ) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
+        if self._null_base_projection_cache is None:
+            self._null_base_projection_cache = (
+                [module(self.null_style_context) for module in self.base_k],
+                [module(self.null_style_context) for module in self.base_v],
+            )
+        return self._null_base_projection_cache
 
     def _style_kv(
         self, index: int, cross_attention: nn.Module
@@ -1942,6 +2258,38 @@ class SharedBaseKVStyleCrossAttention(FreshKVStyleCrossAttention):
             h=cross_attention.n_heads, d=cross_attention.head_dim,
         )
         return cross_attention.k_norm(key), cross_attention.v_norm(value)
+
+    def _null_style_kv(
+        self, index: int, cross_attention: nn.Module, batch: int
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        base_keys, base_values = self._null_base_projections()
+        weights = self.base_mix_logits[index].float().softmax(dim=0)
+        key = sum(
+            weight.to(value.dtype) * value
+            for weight, value in zip(weights, base_keys, strict=True)
+        )
+        value = sum(
+            weight.to(item.dtype) * item
+            for weight, item in zip(weights, base_values, strict=True)
+        )
+        key = key + self.delta_scale * self.delta_k_up[index](
+            self.delta_k_down[index](self.null_style_context)
+        )
+        value = value + self.delta_scale * self.delta_v_up[index](
+            self.delta_v_down[index](self.null_style_context)
+        )
+        key = rearrange(
+            key, "b s (h d) -> b s h d",
+            h=cross_attention.n_heads, d=cross_attention.head_dim,
+        )
+        value = rearrange(
+            value, "b s (h d) -> b s h d",
+            h=cross_attention.n_heads, d=cross_attention.head_dim,
+        )
+        return (
+            cross_attention.k_norm(key).expand(batch, -1, -1, -1),
+            cross_attention.v_norm(value).expand(batch, -1, -1, -1),
+        )
 
     def runtime_stats(self) -> dict[str, float]:
         result = super().runtime_stats()

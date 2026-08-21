@@ -873,12 +873,35 @@ def _minimal_native_teacher_objective(
         scale_floor**2
     )
     teacher_rms = teacher_power.sqrt()
+    strength_weighting = bool(
+        training.get("native_strength_weighting", True)
+    )
+    if strength_weighting:
+        positive = teacher_rms.detach()[teacher_rms.detach() > scale_floor]
+        reference_strength = (
+            positive.median() if positive.numel() else teacher_rms.new_tensor(1.0)
+        ).clamp_min(scale_floor)
+        row_weights = (teacher_rms.detach() / reference_strength).clamp(
+            float(training.get("native_strength_weight_min", 0.25)),
+            float(training.get("native_strength_weight_max", 4.0)),
+        )
+        row_weights = row_weights / row_weights.mean().clamp_min(1e-8)
+    else:
+        row_weights = torch.ones_like(teacher_rms)
+
+    def weighted_mean(rows: torch.Tensor) -> torch.Tensor:
+        if rows.shape != row_weights.shape:
+            raise ValueError("Native teacher row objective has an invalid shape")
+        return (rows * row_weights).sum() / row_weights.sum().clamp_min(1e-8)
+
     scale = teacher_rms.reshape(-1, *([1] * (student.ndim - 1)))
-    residual = F.smooth_l1_loss(
+    residual_rows = F.smooth_l1_loss(
         (student - teacher) / scale,
         torch.zeros_like(student),
         beta=float(training.get("native_teacher_huber_beta", 0.10)),
-    )
+        reduction="none",
+    ).mean(dim=dimensions)
+    residual = weighted_mean(residual_rows)
 
     low_frequency_scales = tuple(
         int(value)
@@ -905,11 +928,12 @@ def _minimal_native_teacher_objective(
                 -1, *([1] * (pooled_teacher.ndim - 1))
             )
             low_frequency_rows.append(
-                F.smooth_l1_loss(
+                weighted_mean(F.smooth_l1_loss(
                     (pooled_student - pooled_teacher) / pooled_scale,
                     torch.zeros_like(pooled_student),
                     beta=float(training.get("native_teacher_huber_beta", 0.10)),
-                )
+                    reduction="none",
+                ).mean(dim=pooled_dimensions))
             )
     low_frequency_residual = (
         torch.stack(low_frequency_rows).mean()
@@ -931,13 +955,15 @@ def _minimal_native_teacher_objective(
             / max(1, floor_end_step - floor_start_step),
         )
         magnitude_floor = floor_start + progress * (floor_end - floor_start)
-    magnitude_lower_loss = F.relu(magnitude_floor - coefficient).square().mean()
+    magnitude_lower_loss = weighted_mean(
+        F.relu(magnitude_floor - coefficient).square()
+    )
     magnitude_upper = float(training.get("magnitude_upper", 1.50))
     if magnitude_upper < magnitude_floor:
         raise ValueError("magnitude_upper must not be below the magnitude floor")
-    magnitude_upper_loss = F.relu(
-        coefficient - magnitude_upper
-    ).square().mean()
+    magnitude_upper_loss = weighted_mean(
+        F.relu(coefficient - magnitude_upper).square()
+    )
     magnitude_upper_weight = float(
         training.get("magnitude_upper_weight", 0.25)
     )
@@ -945,7 +971,7 @@ def _minimal_native_teacher_objective(
     cosine = F.cosine_similarity(
         student.flatten(1), teacher.flatten(1), dim=-1, eps=1e-8
     )
-    direction = (1.0 - cosine).mean()
+    direction = weighted_mean(1.0 - cosine)
 
     residual_weight = float(training.get("residual_weight", 0.025))
     low_frequency_weight = float(
@@ -1001,6 +1027,9 @@ def _minimal_native_teacher_objective(
         "native_teacher_centered_student_to_target_rms": (
             student_rms.detach() / teacher_rms.detach()
         ).mean(),
+        "native_teacher_strength_weight_mean": row_weights.detach().mean(),
+        "native_teacher_strength_weight_max": row_weights.detach().max(),
+        "native_teacher_strength_weight_min": row_weights.detach().min(),
         "native_teacher_minimal_loss": total.detach(),
     }
 
@@ -1120,12 +1149,83 @@ def _backward_adapter_only(
             parameter.grad.add_(detached)
 
 
+def _gradient_rms(parameters: list[torch.nn.Parameter]) -> torch.Tensor:
+    """Return a parameter-count-weighted gradient RMS for path health logs."""
+
+    squared = None
+    count = 0
+    for parameter in parameters:
+        if parameter.grad is None:
+            continue
+        value = parameter.grad.detach().float()
+        term = value.square().sum()
+        squared = term if squared is None else squared + term
+        count += value.numel()
+    if squared is None or count == 0:
+        reference = parameters[0] if parameters else torch.tensor(0.0)
+        return reference.new_zeros((), dtype=torch.float32)
+    return (squared / count).sqrt()
+
+
 def _native_teacher_objective_config(training: dict[str, Any]) -> dict[str, Any]:
     """Resolve the final centered native-teacher objective for a teacher step."""
 
     objective = dict(training)
     objective.update(dict(training.get("teacher_objective", {})))
     return objective
+
+
+def _native_bootstrap_status(
+    rows: list[dict[str, float]],
+    config: dict[str, Any],
+    *,
+    step: int,
+    previous_consecutive: int,
+) -> tuple[dict[str, float], int, bool]:
+    """Evaluate a native-teacher bootstrap on stable window means."""
+
+    required = {
+        "native_teacher_cosine": float(config.get("final_cosine", 0.30)),
+        "native_teacher_projection_coefficient": float(
+            config.get("final_projection", 0.25)
+        ),
+        "post_gate_teacher_cosine": float(
+            config.get("post_gate_cosine", 0.30)
+        ),
+        "post_gate_teacher_common_cosine": float(
+            config.get("common_cosine", 0.30)
+        ),
+        "post_gate_teacher_common_projection_coefficient": float(
+            config.get("common_projection", 0.25)
+        ),
+    }
+    maximum_artist_leakage = float(
+        config.get("artist_common_leakage", 0.35)
+    )
+    means = {
+        key: float(np.mean([row[key] for row in rows if key in row]))
+        for key in (*required, "post_gate_teacher_artist_common_leakage")
+        if any(key in row for row in rows)
+    }
+    enough_steps = step >= int(config.get("minimum_steps", 500))
+    passed = enough_steps and all(
+        means.get(key, float("-inf")) >= threshold
+        for key, threshold in required.items()
+    ) and means.get(
+        "post_gate_teacher_artist_common_leakage", float("inf")
+    ) <= maximum_artist_leakage
+    consecutive = previous_consecutive + 1 if passed else 0
+    required_consecutive = int(config.get("consecutive_validations", 3))
+    complete = consecutive >= required_consecutive
+    metrics = {
+        **{f"native_bootstrap_{key}": value for key, value in means.items()},
+        "native_bootstrap_minimum_steps_met": float(enough_steps),
+        "native_bootstrap_window_passed": float(passed),
+        "native_bootstrap_consecutive": float(consecutive),
+        "native_bootstrap_required_consecutive": float(required_consecutive),
+        "native_bootstrap_complete": float(complete),
+    }
+    return metrics, consecutive, complete
 
 
 def _rho_min(step: int) -> float:
@@ -2219,7 +2319,6 @@ def _teacher_step(
     device: str,
     training: dict[str, Any],
     timestep_weighting: dict[str, torch.Tensor] | None,
-    adapter_parameters: list[torch.nn.Parameter],
     *,
     step: int,
     probe_index: int,
@@ -2292,6 +2391,8 @@ def _teacher_step(
     # First pass obtains the exact sixteen-artist common effect without keeping
     # four frozen-DiT graphs alive. The second pass supplies all gradients.
     detached_students = []
+    if post_gate_active:
+        adapter.begin_post_gate_center_collection()
     with torch.no_grad():
         for offset in range(0, rows, microbatch_rows):
             stop = min(rows, offset + microbatch_rows)
@@ -2300,8 +2401,14 @@ def _teacher_step(
                     anima, reader, adapter,
                     references[offset:stop], mask[offset:stop],
                     noisy, base, base_context, timestep, device,
+                    tagged=(tagged[offset:stop] if tagged is not None else None),
+                    block_indices=block_indices,
                 ).detach()
             )
+    if post_gate_active:
+        adapter.set_post_gate_centers(
+            adapter.finish_post_gate_center_collection()
+        )
     student_center = torch.cat(detached_students, dim=0).mean(dim=0, keepdim=True)
     common_proxy = student_center.detach().float().requires_grad_(True)
     common_loss, common_metrics = _soft_common_output_objective(
@@ -2369,6 +2476,19 @@ def _teacher_step(
                 huber_weight=float(post_gate_cfg.get("huber_weight", 0.0)),
                 magnitude_lower=float(post_gate_cfg.get("magnitude_lower", 0.50)),
                 magnitude_upper=float(post_gate_cfg.get("magnitude_upper", 1.25)),
+                native_strength_weighting=bool(
+                    post_gate_cfg.get("native_strength_weighting", True)
+                ),
+                strength_weight_min=float(
+                    post_gate_cfg.get("native_strength_weight_min", 0.25)
+                ),
+                strength_weight_max=float(
+                    post_gate_cfg.get("native_strength_weight_max", 4.0)
+                ),
+                common_weight=float(post_gate_cfg.get("common_weight", 0.25)),
+                artist_common_leakage_weight=float(
+                    post_gate_cfg.get("artist_common_leakage_weight", 0.10)
+                ),
             )
             if not post_gate_metrics:
                 raise RuntimeError("Post-gate distillation captured no selected blocks")
@@ -2376,18 +2496,15 @@ def _teacher_step(
                 global_weight * timestep_weight * row_fraction
                 * post_gate_weight * post_gate_loss
             )
-            # Only adapter leaves receive this local block objective. Reader
-            # gradients come exclusively from final direction/InfoNCE/flow/rec.
-            _backward_adapter_only(
-                weighted_post_gate,
-                adapter_parameters,
-                retain_graph=True,
-            )
+            # Reader and adapter are one trainable visual path.  The local
+            # native teacher must align both sides of that path, especially
+            # when the Reader starts from a fresh initialization.
+            main_loss = main_loss + weighted_post_gate
             metrics.update(post_gate_metrics)
             metrics.update({
                 "post_gate_teacher_weight": main_loss.new_tensor(post_gate_weight),
                 "post_gate_teacher_weighted_loss": weighted_post_gate.detach(),
-                "post_gate_teacher_reader_detached": main_loss.new_tensor(1.0),
+                "post_gate_teacher_reader_detached": main_loss.new_tensor(0.0),
             })
             detached_total = detached_total + row_fraction * (
                 post_gate_weight * post_gate_loss.detach()
@@ -2427,6 +2544,7 @@ def _teacher_step(
         "teacher_student_view_rms": torch.cat(detached_students).square().mean().sqrt(),
         "post_gate_teacher_enabled": timestep.new_tensor(float(post_gate_active)),
     })
+    adapter.clear_post_gate_centers()
     return metrics
 
 
@@ -2966,6 +3084,10 @@ def train_detail_style_cross_attention(
     cfg = copy.deepcopy(config["detail_preserving_style_cross_attention"])
     training = dict(cfg["training"])
     exact_self_flow_only = bool(training.get("exact_self_flow_only", False))
+    native_bootstrap_cfg = dict(training.get("native_bootstrap", {}))
+    native_bootstrap_only = bool(native_bootstrap_cfg.get("enabled", False))
+    if exact_self_flow_only and native_bootstrap_only:
+        raise ValueError("exact_self_flow_only and native_bootstrap are exclusive")
     steps = int(steps_override or training["steps"])
     training["steps"] = steps
     device = str(training.get("device", "cuda"))
@@ -3094,8 +3216,23 @@ def train_detail_style_cross_attention(
         adapter.restore_timestep_strength_state()
         start_step = int(resume["step"])
     else:
+        initial_checkpoint = cfg.get("initial_checkpoint")
+        if initial_checkpoint:
+            initial_state = torch.load(
+                destination / str(initial_checkpoint),
+                map_location="cpu",
+                weights_only=False,
+            )
+            reader.load_state_dict(initial_state["reader"], strict=True)
+            adapter.load_state_dict(initial_state["adapter"], strict=True)
+            adapter.restore_timestep_strength_state()
+            print(
+                f"loaded detail-style Reader and adapter bootstrap from "
+                f"{initial_checkpoint} step={int(initial_state.get('step', 0))}",
+                flush=True,
+            )
         reader_checkpoint = cfg.get("reader_checkpoint")
-        if reader_checkpoint:
+        if reader_checkpoint and not initial_checkpoint:
             reader_state = torch.load(
                 destination / str(reader_checkpoint),
                 map_location="cpu",
@@ -3107,7 +3244,9 @@ def train_detail_style_cross_attention(
                 f"step={int(reader_state.get('step', 0))}",
                 flush=True,
             )
-        if exact_self_flow_only or bool(
+        if initial_checkpoint:
+            pass
+        elif exact_self_flow_only or bool(
             training.get("use_fixed_initial_alpha", False)
         ):
             initial_alpha = float(training.get("fixed_initial_alpha", 0.10))
@@ -3189,6 +3328,12 @@ def train_detail_style_cross_attention(
                 "name": "base_mix",
                 "weight_decay": 0.0,
             },
+            {
+                "params": adapter.null_parameters(),
+                "lr": float(training.get("null_context_learning_rate", 1e-4)),
+                "name": "null_context",
+                "weight_decay": 0.0,
+            },
         ])
     else:
         optimizer_groups.append({
@@ -3255,7 +3400,7 @@ def train_detail_style_cross_attention(
     ]
     teacher_every_after = int(training.get("teacher_every_after_bootstrap", 2))
     teacher_bootstrap_end = int(training.get("teacher_every_step_until", 500))
-    prefetched = train_loader.prefetch(
+    prefetched = None if native_bootstrap_only else train_loader.prefetch(
         start_step * accumulation,
         (steps - start_step) * accumulation,
         workers=int(training.get("prefetch_workers", 2)),
@@ -3309,6 +3454,7 @@ def train_detail_style_cross_attention(
         )
     )
     completed = start_step
+    bootstrap_complete = False
     started = time.perf_counter()
     vae = None
     try:
@@ -3361,17 +3507,20 @@ def train_detail_style_cross_attention(
             optimizer.zero_grad(set_to_none=True)
             metric_rows: list[dict[str, torch.Tensor]] = []
             main_common_due = bool(
-                main_common_output_penalty is not None
+                not native_bootstrap_only
+                and main_common_output_penalty is not None
                 and step >= int(training.get("main_common_output_start_step", 250))
                 and step % int(training.get("main_common_output_every", 4)) == 0
             )
             wrong_gradient_due = bool(
-                float(training.get("functional_wrong_gradient_scale", 0.0)) > 0
+                not native_bootstrap_only
+                and float(training.get("functional_wrong_gradient_scale", 0.0)) > 0
                 and step >= int(training.get("functional_start_step", 250))
                 and step % int(training.get("functional_wrong_gradient_every", 1)) == 0
             )
             controlled_artist_due = bool(
                 not exact_self_flow_only
+                and not native_bootstrap_only
                 and step % max(
                     1, int(training.get("controlled_artist_every", 4))
                 ) == 0
@@ -3392,7 +3541,8 @@ def train_detail_style_cross_attention(
             )
             auxiliary_probe = None
             auxiliary_batch = None
-            for micro in range(accumulation):
+            for micro in range(0 if native_bootstrap_only else accumulation):
+                assert prefetched is not None
                 batch = next(prefetched)
                 generator = torch.Generator(device=device).manual_seed(
                     seed + step * 100_003 + micro
@@ -3463,7 +3613,7 @@ def train_detail_style_cross_attention(
             )
             teacher_due = (
                 not exact_self_flow_only
-                and step <= int(training.get("teacher_end_step", steps))
+                and (native_bootstrap_only or step <= int(training.get("teacher_end_step", steps)))
                 and step % max(1, stage_teacher_every) == 0
             )
             if teacher_due:
@@ -3477,7 +3627,7 @@ def train_detail_style_cross_attention(
                 teacher_metrics = _teacher_step(
                     anima, reader, adapter, bank, contexts,
                     teacher_loader.load_step(domain_update), device, training,
-                    timestep_weighting, kv_parameters,
+                    timestep_weighting,
                     step=step, probe_index=teacher_update,
                     post_gate_magnitude_enabled=bool(
                         performance_stage.get(
@@ -3497,7 +3647,14 @@ def train_detail_style_cross_attention(
                     ] = torch.tensor(
                         float(index == teacher_domain), device=device
                     )
-                metric_rows[-1].update(teacher_metrics)
+                if native_bootstrap_only:
+                    metric_rows.append({
+                        "loss": teacher_metrics["teacher_total_loss"],
+                        "flow_loss": teacher_metrics["teacher_total_loss"].new_zeros(()),
+                        **teacher_metrics,
+                    })
+                else:
+                    metric_rows[-1].update(teacher_metrics)
                 teacher_curriculum_rows.append({
                     key: float(value.detach())
                     for key, value in teacher_metrics.items()
@@ -3505,6 +3662,11 @@ def train_detail_style_cross_attention(
                         key == "native_teacher_projection_coefficient"
                         or key == "native_teacher_cosine"
                         or key == "native_teacher_common_output_ratio"
+                        or key == "post_gate_teacher_cosine"
+                        or key == "post_gate_teacher_projection_coefficient"
+                        or key == "post_gate_teacher_common_cosine"
+                        or key == "post_gate_teacher_common_projection_coefficient"
+                        or key == "post_gate_teacher_artist_common_leakage"
                         or key == "teacher_infonce_accuracy"
                         or (
                             key.startswith("post_gate_teacher_block_")
@@ -3514,6 +3676,20 @@ def train_detail_style_cross_attention(
                 })
                 teacher_update += 1
                 performance_curriculum["teacher_update"] = teacher_update
+            if not metric_rows:
+                raise RuntimeError("Training step produced no objective")
+            if step == 1 or step % log_every == 0:
+                metric_rows[-1].update({
+                    "reader_gradient_rms": _gradient_rms(reader_parameters),
+                    "null_context_gradient_rms": _gradient_rms(
+                        adapter.null_parameters()
+                    ),
+                    "shared_kv_gradient_rms": _gradient_rms(
+                        adapter.shared_parameters()
+                        if isinstance(adapter, SharedBaseKVStyleCrossAttention)
+                        else adapter.kv_parameters()
+                    ),
+                })
             grad_norm = torch.nn.utils.clip_grad_norm_(
                 reader_parameters + kv_parameters,
                 float(training.get("max_grad_norm", 1.0)),
@@ -3546,7 +3722,11 @@ def train_detail_style_cross_attention(
                 averaged.update({
                     "grad_norm": float(grad_norm),
                     "step_s": time.perf_counter() - step_started,
-                    "images_per_s": train_loader.batch_size * accumulation /
+                    "images_per_s": (
+                        int(training.get("teacher_batch_rows", 16))
+                        if native_bootstrap_only
+                        else train_loader.batch_size * accumulation
+                    ) /
                     max(time.perf_counter() - step_started, 1e-6),
                 })
                 averaged.update({
@@ -3641,6 +3821,26 @@ def train_detail_style_cross_attention(
                         step=step,
                     )
                 )
+                if native_bootstrap_only:
+                    bootstrap_metrics, consecutive, bootstrap_complete = (
+                        _native_bootstrap_status(
+                            teacher_curriculum_rows,
+                            native_bootstrap_cfg,
+                            step=step,
+                            previous_consecutive=int(
+                                performance_curriculum.get(
+                                    "native_bootstrap_consecutive", 0
+                                )
+                            ),
+                        )
+                    )
+                    performance_curriculum[
+                        "native_bootstrap_consecutive"
+                    ] = consecutive
+                    performance_curriculum[
+                        "native_bootstrap_complete"
+                    ] = bootstrap_complete
+                    curriculum_metrics.update(bootstrap_metrics)
                 teacher_curriculum_rows.clear()
                 row = {
                     "step": step,
@@ -3738,6 +3938,12 @@ def train_detail_style_cross_attention(
                         },
                     }, step=step)
             completed = step
+            if bootstrap_complete:
+                print(
+                    f"detail-style native bootstrap criteria satisfied at step={step}",
+                    flush=True,
+                )
+                break
     finally:
         if wandb_run is not None:
             wandb_run.finish()
