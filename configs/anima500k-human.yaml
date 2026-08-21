@@ -3830,7 +3830,7 @@ real_artist_teacher:
 # Detail-preserving typed-slot, separate-softmax Style Cross-Attention v1.
 # Contract: docs/detail_preserving_style_cross_attention_plan.md
 detail_preserving_style_cross_attention:
-  output_directory: detail_preserving_style_cross_attention_v26_native_bootstrap
+  output_directory: detail_preserving_style_cross_attention_v26b_native_bootstrap
   seed: 20260819
   train_split: train
   validation_split: validation
@@ -4365,8 +4365,8 @@ detail_preserving_style_cross_attention:
     wandb:
       enabled: true
       project: anima-style-adapter
-      name: detail-style-v26-native-bootstrap
-      id: detail-style-v26-native-bootstrap
+      name: detail-style-v26b-native-bootstrap
+      id: detail-style-v26b-native-bootstrap
   gradient_diagnostics:
     checkpoint_step: 1500
     teacher_batch_step: 1500
