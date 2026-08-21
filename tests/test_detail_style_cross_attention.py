@@ -758,6 +758,10 @@ def test_shared_xavier_bases_are_cached_and_block_deltas_train():
     assert adapter.delta_k_up[0].weight.grad is not None
     assert adapter.delta_v_up[1].weight.grad is not None
     assert adapter.base_mix_logits.grad is not None
+    assert adapter.log_common_gain.grad is not None
+    assert adapter.log_artist_gain.grad is not None
+    assert adapter.log_common_gain.grad.abs() > 0
+    assert adapter.log_artist_gain.grad.abs() > 0
     assert adapter.null_style_context.grad is not None
     # With common_gain == artist_gain the summed forward is algebraically the
     # raw reference path. The dedicated native common/artist bootstrap—not the

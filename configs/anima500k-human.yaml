@@ -3830,7 +3830,7 @@ real_artist_teacher:
 # Detail-preserving typed-slot, separate-softmax Style Cross-Attention v1.
 # Contract: docs/detail_preserving_style_cross_attention_plan.md
 detail_preserving_style_cross_attention:
-  output_directory: detail_preserving_style_cross_attention_v26b_native_bootstrap
+  output_directory: detail_preserving_style_cross_attention_v26c_native_bootstrap
   seed: 20260819
   train_split: train
   validation_split: validation
@@ -3962,6 +3962,7 @@ detail_preserving_style_cross_attention:
     null_init_std: 0.02
     common_gain: 1.0
     artist_gain: 1.0
+    gain_maximum: 100.0
   strength_profile:
     output_directory: diagnostics/detail_style_block_timestep_strength_v1
     checkpoint: checkpoints/step-0001000.pt
@@ -4043,6 +4044,7 @@ detail_preserving_style_cross_attention:
     block_delta_learning_rate: 0.00020
     base_mix_learning_rate: 0.00004
     null_context_learning_rate: 0.00001
+    component_gain_learning_rate: 0.01
     betas: [0.9, 0.95]
     adam_eps: 0.00000001
     weight_decay: 0.01
@@ -4053,6 +4055,7 @@ detail_preserving_style_cross_attention:
     reader_max_grad_norm: 1.0
     adapter_max_grad_norm: 1.0
     null_context_max_grad_norm: 0.1
+    component_gain_max_grad_norm: 1.0
     gradient_accumulation_steps: 4
     fused_adamw: true
     allow_tf32: true
@@ -4365,8 +4368,8 @@ detail_preserving_style_cross_attention:
     wandb:
       enabled: true
       project: anima-style-adapter
-      name: detail-style-v26b-native-bootstrap
-      id: detail-style-v26b-native-bootstrap
+      name: detail-style-v26c-native-bootstrap
+      id: detail-style-v26c-native-bootstrap
   gradient_diagnostics:
     checkpoint_step: 1500
     teacher_batch_step: 1500

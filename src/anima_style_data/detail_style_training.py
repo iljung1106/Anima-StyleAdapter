@@ -3304,8 +3304,10 @@ def train_detail_style_cross_attention(
     reader_parameters = [value for value in reader.parameters() if value.requires_grad]
     kv_parameters = adapter.kv_parameters()
     null_parameter_ids = {id(value) for value in adapter.null_parameters()}
+    gain_parameter_ids = {id(value) for value in adapter.gain_parameters()}
     adapter_core_parameters = [
-        value for value in kv_parameters if id(value) not in null_parameter_ids
+        value for value in kv_parameters
+        if id(value) not in null_parameter_ids | gain_parameter_ids
     ]
     optimizer_groups: list[dict[str, Any]] = [
         {
@@ -3336,6 +3338,12 @@ def train_detail_style_cross_attention(
                 "params": adapter.null_parameters(),
                 "lr": float(training.get("null_context_learning_rate", 1e-4)),
                 "name": "null_context",
+                "weight_decay": 0.0,
+            },
+            {
+                "params": adapter.gain_parameters(),
+                "lr": float(training.get("component_gain_learning_rate", 1e-2)),
+                "name": "component_gains",
                 "weight_decay": 0.0,
             },
         ])
@@ -3693,6 +3701,9 @@ def train_detail_style_cross_attention(
                         if isinstance(adapter, SharedBaseKVStyleCrossAttention)
                         else adapter.kv_parameters()
                     ),
+                    "component_gain_gradient_rms": _gradient_rms(
+                        adapter.gain_parameters()
+                    ),
                 })
             reader_grad_norm = torch.nn.utils.clip_grad_norm_(
                 reader_parameters,
@@ -3706,15 +3717,21 @@ def train_detail_style_cross_attention(
                 adapter.null_parameters(),
                 float(training.get("null_context_max_grad_norm", 0.1)),
             )
+            gain_grad_norm = torch.nn.utils.clip_grad_norm_(
+                adapter.gain_parameters(),
+                float(training.get("component_gain_max_grad_norm", 1.0)),
+            )
             grad_norm = (
                 reader_grad_norm.float().square()
                 + adapter_grad_norm.float().square()
                 + null_grad_norm.float().square()
+                + gain_grad_norm.float().square()
             ).sqrt()
             metric_rows[-1].update({
                 "reader_grad_norm": reader_grad_norm.detach(),
                 "adapter_grad_norm": adapter_grad_norm.detach(),
                 "null_context_grad_norm": null_grad_norm.detach(),
+                "component_gain_grad_norm": gain_grad_norm.detach(),
             })
             if not bool(torch.isfinite(grad_norm)):
                 nonfinite = []

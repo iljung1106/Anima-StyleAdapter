@@ -486,6 +486,7 @@ class FreshKVStyleCrossAttention(nn.Module):
         null_init_std: float = 0.02,
         common_gain: float = 1.0,
         artist_gain: float = 1.0,
+        gain_maximum: float = 100.0,
     ) -> None:
         super().__init__()
         self.context_dim = int(context_dim)
@@ -493,8 +494,8 @@ class FreshKVStyleCrossAttention(nn.Module):
         self.null_tokens = int(null_tokens)
         if self.null_tokens <= 0 or null_init_std <= 0:
             raise ValueError("null_tokens and null_init_std must be positive")
-        if common_gain < 0 or artist_gain <= 0:
-            raise ValueError("common_gain must be non-negative and artist_gain positive")
+        if common_gain <= 0 or artist_gain <= 0 or gain_maximum <= 1:
+            raise ValueError("Style gains must be positive and gain_maximum > 1")
         self.style_k = nn.ModuleList()
         self.style_v = nn.ModuleList()
         # The adapter represents style as a residual from a learned null
@@ -504,11 +505,12 @@ class FreshKVStyleCrossAttention(nn.Module):
             torch.empty(1, self.null_tokens, self.context_dim)
         )
         nn.init.normal_(self.null_style_context, std=float(null_init_std))
-        self.register_buffer(
-            "common_gain", torch.tensor(float(common_gain)), persistent=True
+        self.gain_maximum = float(gain_maximum)
+        self.log_common_gain = nn.Parameter(
+            torch.tensor(math.log(float(common_gain)))
         )
-        self.register_buffer(
-            "artist_gain", torch.tensor(float(artist_gain)), persistent=True
+        self.log_artist_gain = nn.Parameter(
+            torch.tensor(math.log(float(artist_gain)))
         )
         self.register_buffer(
             "alpha", torch.full((blocks,), float(initial_alpha)), persistent=True
@@ -641,10 +643,20 @@ class FreshKVStyleCrossAttention(nn.Module):
             list(self.style_k.parameters())
             + list(self.style_v.parameters())
             + [self.null_style_context]
+            + self.gain_parameters()
         )
 
     def null_parameters(self) -> list[nn.Parameter]:
         return [self.null_style_context]
+
+    def gain_parameters(self) -> list[nn.Parameter]:
+        return [self.log_common_gain, self.log_artist_gain]
+
+    def _component_gains(self) -> tuple[torch.Tensor, torch.Tensor]:
+        return (
+            self.log_common_gain.exp().clamp_max(self.gain_maximum),
+            self.log_artist_gain.exp().clamp_max(self.gain_maximum),
+        )
 
     def set_style_context(
         self,
@@ -1319,10 +1331,11 @@ class FreshKVStyleCrossAttention(nn.Module):
             cross_attention, query, null_key, null_value, attn_params
         )
         artist_attended = style_attended - null_attended
-        artist_component = self.artist_gain.to(
+        common_gain, artist_gain = self._component_gains()
+        artist_component = artist_gain.to(
             device=artist_attended.device, dtype=artist_attended.dtype
         ) * artist_attended
-        common_component = self.common_gain.to(
+        common_component = common_gain.to(
             device=artist_attended.device, dtype=artist_attended.dtype
         ) * null_attended
         effective_attended = artist_component + common_component
@@ -2000,6 +2013,7 @@ class FreshKVStyleCrossAttention(nn.Module):
         target_values = torch.stack(fixed_targets).float().cpu() if fixed_targets else torch.zeros(1)
         actual_values = torch.stack(fixed_actuals).float().cpu() if fixed_actuals else torch.zeros(1)
         scale_values = torch.stack(fixed_scales).float().cpu() if fixed_scales else torch.zeros(1)
+        common_gain, artist_gain = self._component_gains()
         return {
             "style_block_residual_ratio_mean": float(values.mean()),
             "style_block_residual_ratio_max": float(values.max()),
@@ -2009,6 +2023,8 @@ class FreshKVStyleCrossAttention(nn.Module):
             "style_alpha_runtime_mean": float(runtime_alpha.mean()),
             "style_alpha_runtime_max": float(runtime_alpha.max()),
             "style_global_gain": float(getattr(self, "global_gain", 1.0)),
+            "style_common_gain": float(common_gain.detach()),
+            "style_artist_gain": float(artist_gain.detach()),
             "style_fixed_output_enabled": float(self._fixed_output_strength_active),
             "style_fixed_target_mean": float(target_values.mean()),
             "style_fixed_actual_mean": float(actual_values.mean()),
@@ -2049,6 +2065,7 @@ class SharedBaseKVStyleCrossAttention(FreshKVStyleCrossAttention):
         null_init_std: float = 0.02,
         common_gain: float = 1.0,
         artist_gain: float = 1.0,
+        gain_maximum: float = 100.0,
         relative_block_gain: list[float] | tuple[float, ...] | None = None,
     ) -> None:
         if shared_bases <= 0 or delta_rank <= 0:
@@ -2075,6 +2092,7 @@ class SharedBaseKVStyleCrossAttention(FreshKVStyleCrossAttention):
             null_init_std=null_init_std,
             common_gain=common_gain,
             artist_gain=artist_gain,
+            gain_maximum=gain_maximum,
         )
         self.shared_bases = int(shared_bases)
         self.delta_rank = int(delta_rank)
@@ -2192,6 +2210,7 @@ class SharedBaseKVStyleCrossAttention(FreshKVStyleCrossAttention):
             + self.delta_parameters()
             + self.mixing_parameters()
             + self.null_parameters()
+            + self.gain_parameters()
         )
 
     def set_style_context(
