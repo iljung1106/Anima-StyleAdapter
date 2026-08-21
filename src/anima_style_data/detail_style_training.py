@@ -2628,7 +2628,9 @@ def train_detail_style_cross_attention(
                 flush=True,
             )
         calibration = _calibrate_alpha(
-            anima, reader, adapter, bank, contexts, teacher_loader, device,
+            # Calibrate against the complete human domain. Synthetic batches
+            # remain an independent regularizer once optimizer updates start.
+            anima, reader, adapter, bank, contexts, teacher_loaders[0][1], device,
             int(training.get("alpha_calibration_batches", 4)),
             training,
         )
