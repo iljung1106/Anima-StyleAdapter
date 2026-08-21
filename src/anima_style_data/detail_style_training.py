@@ -2928,7 +2928,9 @@ def _evaluate_artist_effect_consistency(
     reader.eval()
     adapter.eval()
     effect_rows: list[dict[str, float]] = []
+    single_reference_effect_rows: list[dict[str, float]] = []
     prototype_rows: list[dict[str, float]] = []
+    single_reference_prototype_rows: list[dict[str, float]] = []
     timestep_values = [
         float(value)
         for value in training.get(
@@ -2954,6 +2956,9 @@ def _evaluate_artist_effect_consistency(
         ):
             target_tokens = reader(target_references, target_mask).tokens
             heldout_tokens = reader(heldout_references, heldout_mask).tokens
+            single_reference_tokens = reader(
+                heldout_references[:, :1], heldout_mask[:, :1]
+            ).tokens
         prototype_loss, prototype_metrics = episodic_artist_prototype_loss(
             target_tokens,
             heldout_tokens,
@@ -2969,6 +2974,29 @@ def _evaluate_artist_effect_consistency(
         prototype_metrics["artist_prototype_loss"] = prototype_loss.detach()
         prototype_rows.append({
             key: float(value) for key, value in prototype_metrics.items()
+        })
+        single_prototype_loss, single_prototype_metrics = (
+            episodic_artist_prototype_loss(
+                target_tokens,
+                single_reference_tokens,
+                style_ids,
+                temperature=float(
+                    training.get("artist_prototype_temperature", 0.10)
+                ),
+                slot_type_counts=tuple(
+                    int(value)
+                    for value in training.get(
+                        "artist_prototype_slot_type_counts", [16, 8, 4]
+                    )
+                ),
+            )
+        )
+        single_prototype_metrics["artist_prototype_loss"] = (
+            single_prototype_loss.detach()
+        )
+        single_reference_prototype_rows.append({
+            key: float(value)
+            for key, value in single_prototype_metrics.items()
         })
 
         artists = len(style_ids)
@@ -3008,7 +3036,11 @@ def _evaluate_artist_effect_consistency(
                 ).squeeze(2).float()
 
                 predictions = []
-                for tokens in (target_tokens, heldout_tokens):
+                for tokens in (
+                    target_tokens,
+                    heldout_tokens,
+                    single_reference_tokens,
+                ):
                     adapter.set_style_context(tokens)
                     adapter.set_timesteps(timestep)
                     try:
@@ -3031,9 +3063,32 @@ def _evaluate_artist_effect_consistency(
             effect_rows.append({
                 key: float(value) for key, value in effect_metrics.items()
             })
+            _, single_effect_metrics = _weighted_artist_effect_objective(
+                predictions[0] - base,
+                predictions[2] - base,
+                style_ids,
+                training,
+                step=step,
+            )
+            single_reference_effect_rows.append({
+                key: float(value)
+                for key, value in single_effect_metrics.items()
+            })
 
     result = _mean_scalar_rows(effect_rows)
     result.update(_mean_scalar_rows(prototype_rows))
+    result.update({
+        f"single_reference_{key}": value
+        for key, value in _mean_scalar_rows(
+            single_reference_effect_rows
+        ).items()
+    })
+    result.update({
+        f"single_reference_{key}": value
+        for key, value in _mean_scalar_rows(
+            single_reference_prototype_rows
+        ).items()
+    })
     result.update({
         "artists_per_probe": float(loader.batch_size),
         "random_retrieval_top1": 1.0 / max(1, loader.batch_size),
@@ -3215,10 +3270,26 @@ def _generate_fixed_reference_sample(
         sheet_path = sample_dir / f"detail-style-fixed-reference-{label}.png"
         sheet.save(sheet_path, compress_level=4)
         rms = _pixel_rms_from_baseline(base, styled)
+        pairwise_rms = []
+        for left in range(len(styled)):
+            left_pixels = np.asarray(styled[left], dtype=np.float32) / 255.0
+            for right in range(left + 1, len(styled)):
+                right_pixels = (
+                    np.asarray(styled[right], dtype=np.float32) / 255.0
+                )
+                pairwise_rms.append(float(np.sqrt(np.mean(
+                    np.square(left_pixels - right_pixels)
+                ))))
+        mean_pairwise_rms = float(np.mean(pairwise_rms))
+        mean_baseline_rms = float(np.mean(rms))
         sheets[label] = str(sheet_path)
         metrics[label] = {
-            "mean_pixel_rms_from_baseline": float(np.mean(rms)),
+            "mean_pixel_rms_from_baseline": mean_baseline_rms,
             "pixel_rms_from_baseline": rms,
+            "mean_pairwise_output_pixel_rms": mean_pairwise_rms,
+            "pairwise_output_to_baseline_ratio": (
+                mean_pairwise_rms / max(mean_baseline_rms, 1e-8)
+            ),
         }
     primary_label = "1x" if "1x" in sheets else f"{strengths[0]:g}x"
     summary = {
@@ -3748,6 +3819,16 @@ def train_detail_style_cross_attention(
                     **{
                         f"val/functional/fixed_reference_pixel_rms/{label}":
                         values["mean_pixel_rms_from_baseline"]
+                        for label, values in fixed["metrics"].items()
+                    },
+                    **{
+                        f"val/functional/fixed_reference_pairwise_rms/{label}":
+                        values["mean_pairwise_output_pixel_rms"]
+                        for label, values in fixed["metrics"].items()
+                    },
+                    **{
+                        f"val/functional/fixed_reference_diversity_ratio/{label}":
+                        values["pairwise_output_to_baseline_ratio"]
                         for label, values in fixed["metrics"].items()
                     },
                 }, step=start_step)
@@ -4310,6 +4391,16 @@ def train_detail_style_cross_attention(
                         **{
                             f"val/functional/fixed_reference_pixel_rms/{label}":
                             values["mean_pixel_rms_from_baseline"]
+                            for label, values in fixed["metrics"].items()
+                        },
+                        **{
+                            f"val/functional/fixed_reference_pairwise_rms/{label}":
+                            values["mean_pairwise_output_pixel_rms"]
+                            for label, values in fixed["metrics"].items()
+                        },
+                        **{
+                            f"val/functional/fixed_reference_diversity_ratio/{label}":
+                            values["pairwise_output_to_baseline_ratio"]
                             for label, values in fixed["metrics"].items()
                         },
                     }, step=step)
