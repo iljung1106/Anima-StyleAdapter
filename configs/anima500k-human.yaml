@@ -3830,7 +3830,7 @@ real_artist_teacher:
 # Detail-preserving typed-slot, separate-softmax Style Cross-Attention v1.
 # Contract: docs/detail_preserving_style_cross_attention_plan.md
 detail_preserving_style_cross_attention:
-  output_directory: detail_preserving_style_cross_attention_centered_v21_synthetic_only_20k
+  output_directory: detail_preserving_style_cross_attention_centered_v22_full_rms_20k
   seed: 20260819
   train_split: train
   validation_split: validation
@@ -4076,21 +4076,20 @@ detail_preserving_style_cross_attention:
     reconstruction_weight: 0.01
     reconstruction_final_weight: 0.01
     reconstruction_hold_steps: 20000
-    # Main human flow is the only human image-space teacher. Every fourth
-    # update, compare the final adapter velocity to frozen Anima on the same
-    # noisy latent. Enforce a lower bound only on the component aligned with
-    # the true target residual, so orthogonal noise cannot satisfy the floor.
-    main_flow_projection_start_step: 1
-    main_flow_projection_full_step: 500
-    main_flow_projection_every: 4
-    main_flow_projection_weight: 0.50
-    main_flow_projection_floor_start_step: 1
-    main_flow_projection_floor_end_step: 500
-    main_flow_projection_floor_start: 0.05
-    main_flow_projection_floor_end: 0.20
-    main_flow_projection_rms_upper: 0.75
-    main_flow_projection_upper_weight: 0.10
-    main_flow_projection_scale_floor: 0.0001
+    # v22 deliberately removes the direction-gated projection floor. On every
+    # main update and in every curriculum stage, match the complete final
+    # style-delta RMS to the residual left by frozen Anima. Orthogonal output
+    # is accepted by this term; ordinary flow MSE must rotate it afterward.
+    # A 0.5 Smooth-L1 weight makes magnitude dominate the initial near-zero
+    # shortcut without replacing the raw flow objective.
+    main_flow_projection_weight: 0.0
+    main_flow_magnitude_start_step: 1
+    main_flow_magnitude_full_step: 1
+    main_flow_magnitude_every: 1
+    main_flow_magnitude_weight: 0.50
+    main_flow_magnitude_target_ratio: 1.0
+    main_flow_magnitude_huber_beta: 0.10
+    main_flow_magnitude_scale_floor: 0.0001
     # Legacy main-flow ranking is disabled below. The controlled frozen
     # teacher-direction ranking is configured beside the post-gate objective.
     functional_start_step: 250
@@ -4256,7 +4255,6 @@ detail_preserving_style_cross_attention:
           target_only: true
           target_probability: 1.0
           teacher_every: 1
-          main_flow_projection_scale: 1.0
           post_gate_magnitude_enabled: false
           advance:
             # v19 reached a stable exact-self improvement and separated all
@@ -4276,7 +4274,6 @@ detail_preserving_style_cross_attention:
           target_only: false
           target_probability: 0.65
           teacher_every: 1
-          main_flow_projection_scale: 0.50
           post_gate_magnitude_enabled: true
           advance:
             # Keep this mixed target/reference phase for roughly 2k updates
@@ -4295,7 +4292,6 @@ detail_preserving_style_cross_attention:
           target_only: false
           target_probability: 0.0
           teacher_every: 2
-          main_flow_projection_scale: 0.25
           post_gate_magnitude_enabled: true
     prefetch_workers: 2
     prefetch_batches: 6
@@ -4312,8 +4308,8 @@ detail_preserving_style_cross_attention:
     wandb:
       enabled: true
       project: anima-style-adapter
-      name: detail-style-centered-v21-synthetic-only-20k
-      id: detail-style-centered-v21-synthetic-only-20k
+      name: detail-style-centered-v22-full-rms-20k
+      id: detail-style-centered-v22-full-rms-20k
   gradient_diagnostics:
     checkpoint_step: 1500
     teacher_batch_step: 1500

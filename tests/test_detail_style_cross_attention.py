@@ -22,6 +22,7 @@ from anima_style_data.detail_style_training import (  # noqa: E402
     _compose_separate_text_style_guidance,
     _delayed_learning_rate_multiplier,
     _effect_stage_metrics,
+    _main_flow_total_magnitude_loss,
     _main_flow_projection_floor_loss,
     _minimal_native_teacher_objective,
     _native_effect_scales_for_timesteps,
@@ -91,6 +92,34 @@ def test_main_flow_projection_floor_rewards_only_aligned_output():
     )
     assert float(orthogonal_metrics["main_flow_projection_coefficient"]) == pytest.approx(0.0)
     assert float(orthogonal_loss) == pytest.approx(0.04)
+
+
+def test_main_flow_total_magnitude_accepts_orthogonal_equal_rms():
+    base = torch.zeros(2, 1, 1, 2)
+    target = torch.tensor([[[[1.0, 0.0]]], [[[1.0, 0.0]]]])
+    training = {
+        "main_flow_magnitude_target_ratio": 1.0,
+        "main_flow_magnitude_huber_beta": 0.10,
+    }
+
+    orthogonal = torch.tensor(
+        [[[[0.0, 1.0]]], [[[0.0, 1.0]]]], requires_grad=True
+    )
+    equal_loss, equal_metrics = _main_flow_total_magnitude_loss(
+        orthogonal, base, target, training=training
+    )
+    assert float(equal_metrics["main_flow_magnitude_rms_ratio"]) == pytest.approx(1.0)
+    assert float(equal_loss) == pytest.approx(0.0)
+
+    small = (0.1 * orthogonal.detach()).requires_grad_(True)
+    small_loss, small_metrics = _main_flow_total_magnitude_loss(
+        small, base, target, training=training
+    )
+    assert float(small_metrics["main_flow_magnitude_rms_ratio"]) == pytest.approx(0.1)
+    assert float(small_loss) == pytest.approx(0.85)
+    small_loss.backward()
+    assert small.grad is not None
+    assert float((small.grad * small.detach()).sum()) < 0
 
 
 def test_native_scale_common_output_penalty_uses_current_controlled_batch():

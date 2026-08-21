@@ -1195,6 +1195,53 @@ def _main_flow_projection_floor_loss(
     }
 
 
+def _main_flow_total_magnitude_loss(
+    prediction: torch.Tensor,
+    base_prediction: torch.Tensor,
+    target: torch.Tensor,
+    *,
+    training: dict[str, Any],
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Match final style-delta RMS to the complete desired-residual RMS.
+
+    This objective deliberately ignores direction.  It prevents the frozen
+    denoiser's already-good prediction from making a near-zero style branch
+    the easiest solution; the ordinary flow MSE remains responsible for
+    rotating the resulting non-trivial delta toward the target.
+    """
+
+    delta = prediction.float() - base_prediction.detach().float()
+    desired = target.float() - base_prediction.detach().float()
+    dimensions = tuple(range(1, delta.ndim))
+    scale_floor = float(training.get("main_flow_magnitude_scale_floor", 1e-4))
+    delta_rms = delta.square().mean(dim=dimensions).clamp_min(
+        scale_floor**2
+    ).sqrt()
+    desired_rms = desired.square().mean(dim=dimensions).clamp_min(
+        scale_floor**2
+    ).sqrt()
+    ratio = delta_rms / desired_rms
+    target_ratio = float(training.get("main_flow_magnitude_target_ratio", 1.0))
+    huber_beta = float(training.get("main_flow_magnitude_huber_beta", 0.10))
+    if target_ratio <= 0:
+        raise ValueError("main_flow_magnitude_target_ratio must be positive")
+    if huber_beta <= 0:
+        raise ValueError("main_flow_magnitude_huber_beta must be positive")
+    target_tensor = torch.full_like(ratio, target_ratio)
+    loss = F.smooth_l1_loss(ratio, target_tensor, beta=huber_beta)
+    return loss, {
+        "main_flow_magnitude_rms_ratio": ratio.detach().mean(),
+        "main_flow_magnitude_target_ratio": loss.new_tensor(target_ratio),
+        "main_flow_magnitude_absolute_error": (
+            ratio.detach() - target_ratio
+        ).abs().mean(),
+        "main_flow_magnitude_below_target_fraction": (
+            ratio.detach() < target_ratio
+        ).float().mean(),
+        "main_flow_magnitude_loss": loss.detach(),
+    }
+
+
 def _flow_step(
     anima: torch.nn.Module,
     reader: DetailPreservingTypedSlotReader,
@@ -1347,19 +1394,19 @@ def _flow_step(
         and step % int(training.get("functional_every", 4)) == 0
         and prediction.shape[0] >= 2
     )
-    main_projection_weight = _ramp(
+    main_magnitude_weight = _ramp(
         step,
-        int(training.get("main_flow_projection_start_step", 1)),
-        int(training.get("main_flow_projection_full_step", 500)),
-        float(training.get("main_flow_projection_weight", 0.0)),
+        int(training.get("main_flow_magnitude_start_step", 1)),
+        int(training.get("main_flow_magnitude_full_step", 1)),
+        float(training.get("main_flow_magnitude_weight", 0.0)),
     )
-    main_projection_every = int(
-        training.get("main_flow_projection_every", 4)
+    main_magnitude_every = int(
+        training.get("main_flow_magnitude_every", 1)
     )
-    need_main_projection = (
+    need_main_magnitude = (
         train_auxiliaries
-        and main_projection_weight > 0
-        and step % max(1, main_projection_every) == 0
+        and main_magnitude_weight > 0
+        and step % max(1, main_magnitude_every) == 0
     )
     base_prediction = None
     if (
@@ -1367,7 +1414,7 @@ def _flow_step(
         or need_wrong
         or need_artist_effect
         or capture_auxiliary_probe
-        or need_main_projection
+        or need_main_magnitude
     ):
         with torch.no_grad(), torch.autocast(
             device_type=torch.device(device).type,
@@ -1380,34 +1427,25 @@ def _flow_step(
                 padding_mask=padding, target_input_ids=None,
             ).squeeze(2).float()
 
-    if need_main_projection:
+    if need_main_magnitude:
         assert base_prediction is not None
-        stage_scale = float(
-            performance_stage.get("main_flow_projection_scale", 1.0)
-            if performance_stage is not None else 1.0
-        )
-        projection_loss, projection_metrics = (
-            _main_flow_projection_floor_loss(
+        magnitude_loss, magnitude_metrics = (
+            _main_flow_total_magnitude_loss(
                 prediction,
                 base_prediction,
                 target,
-                step=step,
                 training=training,
-                stage_scale=stage_scale,
             )
         )
-        weighted_projection = main_projection_weight * projection_loss
-        total = total + weighted_projection
-        metrics.update(projection_metrics)
+        weighted_magnitude = main_magnitude_weight * magnitude_loss
+        total = total + weighted_magnitude
+        metrics.update(magnitude_metrics)
         metrics.update({
-            "main_flow_projection_weight": flow_loss.new_tensor(
-                main_projection_weight
+            "main_flow_magnitude_weight": flow_loss.new_tensor(
+                main_magnitude_weight
             ),
-            "main_flow_projection_stage_scale": flow_loss.new_tensor(
-                stage_scale
-            ),
-            "main_flow_projection_weighted_loss": (
-                weighted_projection.detach()
+            "main_flow_magnitude_weighted_loss": (
+                weighted_magnitude.detach()
             ),
         })
 

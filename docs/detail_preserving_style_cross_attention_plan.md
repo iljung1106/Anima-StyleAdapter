@@ -978,3 +978,23 @@ Reader, adapter, optimizer는 모두 새 v21 run에서 처음부터 시작하되
 선택 기준은 projection loss 자체가 아니라 exact-self/heldout paired improvement,
 final style delta 크기, common-output, fixed-reference 1x 시각적 작가 차이와 이미지
 안정성을 함께 사용한다.
+
+## 23. v22 전체 final-delta RMS 강제 bootstrap
+
+v21 500~720스텝에서 final style delta는 desired residual RMS의 약 `0.12`에
+머물렀고, 실제 desired 방향 projection coefficient는 약 `0.006`이었다. 기존
+projection floor는 네 스텝마다만 적용되어 스텝당 실효 기여가 main flow의 약
+4%였고, 모델은 하한을 만족시키지 않은 채 작은 출력 패널티를 감수했다.
+
+v22는 방향이 맞는 성분에만 하한을 주던 main projection objective를 끈다. 대신
+모든 main-flow 스텝과 모든 performance stage에서 다음 실제 출력 비율을 직접
+`1.0`으로 맞춘다.
+
+`RMS(v_style - v_frozen) / RMS(v_target - v_frozen)`
+
+이 loss는 방향을 보지 않으므로 직교 residual도 크기가 같으면 만족한다. 가중치
+`0.50`, Smooth-L1 beta `0.10`을 첫 스텝부터 적용해 전체 크기를 먼저 확보한다.
+별도의 normalized-direction loss는 추가하지 않는다. 기존 raw flow MSE가 충분히
+큰 style delta를 target residual 쪽으로 회전시키도록 하여, magnitude 강제와 방향
+학습의 역할을 명확히 분리한다. Synthetic-only native artist teacher, Reader 초기값,
+LR 및 나머지 v21 구성은 유지하고 adapter와 optimizer는 새로 시작한다.
