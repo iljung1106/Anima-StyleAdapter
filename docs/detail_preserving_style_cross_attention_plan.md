@@ -998,3 +998,35 @@ v22는 방향이 맞는 성분에만 하한을 주던 main projection objective�
 큰 style delta를 target residual 쪽으로 회전시키도록 하여, magnitude 강제와 방향
 학습의 역할을 명확히 분리한다. Synthetic-only native artist teacher, Reader 초기값,
 LR 및 나머지 v21 구성은 유지하고 adapter와 optimizer는 새로 시작한다.
+
+## 24. v23 non-reconstructive repeatable artist effect
+
+v22는 500스텝에서 self/heldout 모두 style delta RMS를 desired residual의 약
+`0.96`까지 키웠지만 방향 cosine은 `0.02` 안팎, orthogonal ratio는 약 `0.96`,
+paired improvement는 약 `-0.89`였다. 전체 desired residual에는 작가 화풍 외에
+개별 content, noise/timestep 성분과 Frozen Anima 오차가 포함되므로, lossy style
+reference가 알 수 없는 성분까지 큰 출력으로 만들게 한 것이 실패 원인이다.
+
+v23은 DEADiff의 same-style/different-content 학습과 contrastive style learning을
+따라 다음처럼 바꾼다.
+
+- Full final-delta RMS 강제 loss를 완전히 제거하고 표준 rectified-flow MSE를 주
+  목표로 복원한다.
+- 각 작가에서 target을 포함하지 않는 heldout reference를 두 개의 disjoint view로
+  나눈다. 두 view는 동일한 `x_t`, timestep, prompt, seed와 Student Q에서 평가한다.
+- 첫 view의 final Anima effect는 detach하고 두 번째 view가 그 artist-centered
+  low/mid-frequency effect를 재현하게 한다. Batch artist mean은 비교 전에 제거한다.
+- Batch의 다른 모든 작가를 negative로 쓰는 symmetric InfoNCE와 동일 작가
+  repeatability를 함께 사용한다. 단일 cyclic wrong만 쓰지 않는다.
+- Repeatable teacher 방향 projection에는 약한 magnitude band만 둔다. Full desired
+  residual 크기나 직교 성분에는 하한을 주지 않는다.
+- Frozen Resampler 정보 보존 reconstruction은 `0.03`, token prototype은 `0.03`의
+  약한 보조 항으로 유지한다. Functional effect는 `0.15`, common-output은 `0.02`,
+  repeatable magnitude band는 `0.05`를 사용한다.
+
+Raw flow tensor의 cross-reference 일치는 같은 controlled condition 안에서만
+정의한다. 서로 다른 content/noise/timestep 사이에서는 raw tensor를 같게 만들지
+않고 pooled functional effect, retrieval, ICC와 생성 샘플로 일반화를 평가한다.
+주요 선택 지표는 heldout repeatable ratio/ICC, all-artist retrieval, common-output,
+fixed-reference 시각적 작가 차이와 이미지 안정성이다. Paired flow improvement는
+보조 지표로만 사용한다.

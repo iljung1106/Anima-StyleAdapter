@@ -53,6 +53,7 @@ from .query_style_tokenizer import (
 )
 from .same_q_style_adapter import attach_same_q_style_adapter
 from .style_tokenizer import _flow_metrics, _mean_metrics
+from .style_tokenizer import _split_reference_views
 from .style_transfer import (
     _optimize_frozen_anima,
     _resolve_anima_model,
@@ -580,10 +581,12 @@ def _weighted_artist_effect_objective(
     magnitude_teacher = str(
         training.get("artist_magnitude_teacher", "exact_target")
     )
-    if magnitude_teacher not in {"exact_target", "native_centered_bank"}:
+    if magnitude_teacher not in {
+        "exact_target", "disjoint_heldout", "native_centered_bank",
+    }:
         raise ValueError(
-            "artist_magnitude_teacher must be exact_target or "
-            "native_centered_bank"
+            "artist_magnitude_teacher must be exact_target, "
+            "disjoint_heldout, or native_centered_bank"
         )
     pool_scales = tuple(
         int(value)
@@ -657,7 +660,7 @@ def _weighted_artist_effect_objective(
             int(training.get("artist_magnitude_full_step", 1_000)),
             float(training.get("artist_magnitude_weight", 0.0)),
         )
-        if magnitude_teacher == "exact_target"
+        if magnitude_teacher in {"exact_target", "disjoint_heldout"}
         else 0.0
     )
     weighted_effect = effect_weight * effect
@@ -1512,48 +1515,117 @@ def _flow_step(
 
         if need_artist_effect:
             assert base_prediction is not None
+            artist_effect_teacher_view = str(
+                training.get("artist_effect_teacher_view", "exact_target")
+            )
+            if artist_effect_teacher_view not in {
+                "exact_target", "disjoint_heldout",
+            }:
+                raise ValueError(
+                    "artist_effect_teacher_view must be exact_target or "
+                    "disjoint_heldout"
+                )
+            if artist_effect_teacher_view == "disjoint_heldout":
+                # DEADiff-style non-reconstructive supervision: both views
+                # exclude the target and contain different images by the same
+                # artist.  They are evaluated with exactly the same x_t,
+                # timestep, text and frozen-Anima Q.  One view is detached;
+                # the other receives the functional/InfoNCE gradient after
+                # the primary graph has been released.
+                eligible, first_mask, second_mask = _split_reference_views(
+                    heldout_mask
+                )
+                eligible_indices = eligible.nonzero(as_tuple=False).flatten()
+                if eligible_indices.numel() >= 2:
+                    first_references = heldout_references[eligible]
+                    second_references = heldout_references[eligible]
+                    disjoint_style_ids = [
+                        style_ids[int(index)]
+                        for index in eligible_indices.detach().cpu().tolist()
+                    ]
+                    with torch.no_grad(), torch.autocast(
+                        device_type=torch.device(device).type,
+                        dtype=torch.bfloat16,
+                        enabled=torch.device(device).type == "cuda",
+                    ):
+                        first_tokens = reader(
+                            first_references, first_mask
+                        ).tokens
+                        adapter.set_style_context(first_tokens)
+                        adapter.set_timesteps(timesteps[eligible])
+                        try:
+                            first_prediction = anima(
+                                noisy[eligible].unsqueeze(2),
+                                timesteps[eligible].to(latents.dtype),
+                                context=context[eligible],
+                                padding_mask=padding[eligible],
+                                target_input_ids=None,
+                            ).squeeze(2).float()
+                        finally:
+                            adapter.clear_style_tokens()
+                    deferred_artist_effect = {
+                        "teacher_prediction": first_prediction.detach(),
+                        "student_references": second_references,
+                        "student_mask": second_mask,
+                        "style_ids": disjoint_style_ids,
+                        "row_indices": eligible_indices,
+                        "teacher_view": "disjoint_heldout",
+                    }
+                else:
+                    metrics["functional_artist_eligible_fraction"] = (
+                        flow_loss.new_tensor(0.0)
+                    )
+                # The exact-target branch below is intentionally skipped.
+                target_prediction = None
+            else:
+                target_prediction = None
             # Exact-target style is a detached functional teacher.  If the
             # primary path is not already the heldout view, defer that
             # trainable Anima pass until after the primary graph is backwarded.
             # Two simultaneous batch-four DiT graphs exceed an H100 80GB.
-            if main_is_target:
-                target_prediction = prediction.detach()
-            else:
-                with torch.no_grad(), torch.autocast(
-                    device_type=torch.device(device).type,
-                    dtype=torch.bfloat16,
-                    enabled=torch.device(device).type == "cuda",
-                ):
-                    adapter.set_style_context(target_view_tokens.detach())
-                    adapter.set_timesteps(timesteps)
-                    try:
-                        target_prediction = anima(
-                            noisy.unsqueeze(2), timesteps.to(latents.dtype),
-                            context=context, padding_mask=padding,
-                            target_input_ids=None,
-                        ).squeeze(2).float()
-                    finally:
-                        adapter.clear_style_tokens()
-            if main_is_heldout:
-                heldout_prediction = prediction
-                weighted_artist_effect, artist_effect_metrics = (
-                    _weighted_artist_effect_objective(
-                        target_prediction.detach() - base_prediction,
-                        heldout_prediction - base_prediction,
-                        style_ids,
-                        training,
-                        step=step,
+            if artist_effect_teacher_view == "exact_target":
+                if main_is_target:
+                    target_prediction = prediction.detach()
+                else:
+                    with torch.no_grad(), torch.autocast(
+                        device_type=torch.device(device).type,
+                        dtype=torch.bfloat16,
+                        enabled=torch.device(device).type == "cuda",
+                    ):
+                        adapter.set_style_context(target_view_tokens.detach())
+                        adapter.set_timesteps(timesteps)
+                        try:
+                            target_prediction = anima(
+                                noisy.unsqueeze(2), timesteps.to(latents.dtype),
+                                context=context, padding_mask=padding,
+                                target_input_ids=None,
+                            ).squeeze(2).float()
+                        finally:
+                            adapter.clear_style_tokens()
+                if main_is_heldout:
+                    heldout_prediction = prediction
+                    weighted_artist_effect, artist_effect_metrics = (
+                        _weighted_artist_effect_objective(
+                            target_prediction.detach() - base_prediction,
+                            heldout_prediction - base_prediction,
+                            style_ids,
+                            training,
+                            step=step,
+                        )
                     )
-                )
-                total = total + weighted_artist_effect
-                metrics.update(artist_effect_metrics)
-            else:
-                deferred_artist_effect = (
-                    target_prediction.detach(),
-                    heldout_references,
-                    heldout_mask,
-                    style_ids,
-                )
+                    total = total + weighted_artist_effect
+                    metrics.update(artist_effect_metrics)
+                else:
+                    deferred_artist_effect = {
+                        "teacher_prediction": target_prediction.detach(),
+                        "student_references": heldout_references,
+                        "student_mask": heldout_mask,
+                        "style_ids": style_ids,
+                        "row_indices": torch.arange(
+                            prediction.shape[0], device=device
+                        ),
+                        "teacher_view": "exact_target",
+                    }
     if need_wrong:
         wrong_references, wrong_mask = _reference_inputs(batch, device, "wrong_artist")
         # The wrong-reference branch is a comparator, not a target that should be
@@ -1600,9 +1672,11 @@ def _flow_step(
 
     reported_loss = total.detach()
     if deferred_artist_effect is not None:
-        target_prediction, heldout_references, heldout_mask, style_ids = (
-            deferred_artist_effect
-        )
+        target_prediction = deferred_artist_effect["teacher_prediction"]
+        heldout_references = deferred_artist_effect["student_references"]
+        heldout_mask = deferred_artist_effect["student_mask"]
+        style_ids = deferred_artist_effect["style_ids"]
+        row_indices = deferred_artist_effect["row_indices"]
         if backward_scale is not None:
             (total * float(backward_scale)).backward()
             total = flow_loss.new_zeros(())
@@ -1618,28 +1692,41 @@ def _flow_step(
                 heldout_references, heldout_mask
             ).tokens
             adapter.set_style_context(heldout_view_tokens)
-            adapter.set_timesteps(timesteps)
+            adapter.set_timesteps(timesteps[row_indices])
             try:
                 heldout_prediction = anima(
-                    noisy.unsqueeze(2), timesteps.to(latents.dtype),
-                    context=context, padding_mask=padding,
+                    noisy[row_indices].unsqueeze(2),
+                    timesteps[row_indices].to(latents.dtype),
+                    context=context[row_indices], padding_mask=padding[row_indices],
                     target_input_ids=None,
                 ).squeeze(2).float()
             finally:
                 adapter.clear_style_tokens()
         assert base_prediction is not None
+        base_rows = base_prediction[row_indices]
         weighted_artist_effect, artist_effect_metrics = (
             _weighted_artist_effect_objective(
-            target_prediction - base_prediction,
-            heldout_prediction - base_prediction,
-            style_ids,
-            training,
-            step=step,
+                target_prediction - base_rows,
+                heldout_prediction - base_rows,
+                style_ids,
+                training,
+                step=step,
             )
         )
         total = total + weighted_artist_effect
         reported_loss = reported_loss + weighted_artist_effect.detach()
         metrics.update(artist_effect_metrics)
+        metrics.update({
+            "functional_artist_eligible_fraction": flow_loss.new_tensor(
+                len(style_ids) / prediction.shape[0]
+            ),
+            "functional_artist_disjoint_heldout": flow_loss.new_tensor(
+                float(
+                    deferred_artist_effect["teacher_view"]
+                    == "disjoint_heldout"
+                )
+            ),
+        })
     auxiliary_probe = None
     if capture_auxiliary_probe:
         assert base_prediction is not None

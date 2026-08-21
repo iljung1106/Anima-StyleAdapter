@@ -3830,7 +3830,7 @@ real_artist_teacher:
 # Detail-preserving typed-slot, separate-softmax Style Cross-Attention v1.
 # Contract: docs/detail_preserving_style_cross_attention_plan.md
 detail_preserving_style_cross_attention:
-  output_directory: detail_preserving_style_cross_attention_centered_v22_full_rms_20k
+  output_directory: detail_preserving_style_cross_attention_v23_repeatable_artist_20k
   seed: 20260819
   train_split: train
   validation_split: validation
@@ -4073,20 +4073,18 @@ detail_preserving_style_cross_attention:
     # but reconstruction is no longer allowed to dominate the functional
     # flow experiment. The frozen upstream Resampler already preserves its
     # source features; this weak term only prevents catastrophic forgetting.
-    reconstruction_weight: 0.01
-    reconstruction_final_weight: 0.01
+    reconstruction_weight: 0.03
+    reconstruction_final_weight: 0.03
     reconstruction_hold_steps: 20000
-    # v22 deliberately removes the direction-gated projection floor. On every
-    # main update and in every curriculum stage, match the complete final
-    # style-delta RMS to the residual left by frozen Anima. Orthogonal output
-    # is accepted by this term; ordinary flow MSE must rotate it afterward.
-    # A 0.5 Smooth-L1 weight makes magnitude dominate the initial near-zero
-    # shortcut without replacing the raw flow objective.
+    # v23 removes the failed v22 full-residual RMS bootstrap. The complete
+    # target-minus-frozen residual contains content/noise/base-model error that
+    # cannot be recovered from a lossy style reference; forcing its norm made
+    # a nearly orthogonal delta accumulate as cracked high-frequency texture.
     main_flow_projection_weight: 0.0
     main_flow_magnitude_start_step: 1
     main_flow_magnitude_full_step: 1
     main_flow_magnitude_every: 1
-    main_flow_magnitude_weight: 0.50
+    main_flow_magnitude_weight: 0.0
     main_flow_magnitude_target_ratio: 1.0
     main_flow_magnitude_huber_beta: 0.10
     main_flow_magnitude_scale_floor: 0.0001
@@ -4102,14 +4100,16 @@ detail_preserving_style_cross_attention:
     functional_weight: 0.0
     functional_wrong_gradient_scale: 0.0
     functional_wrong_gradient_every: 1
-    # Compare detached exact-target and trainable heldout-reference effects at
-    # identical noisy latent/text/timestep conditions.  The batch artist mean
-    # is removed before low/mid-frequency contrastive matching.
+    # DEADiff-style non-reconstructive supervision. Two disjoint heldout
+    # reference sets from the same artist are evaluated with identical x_t,
+    # timestep, prompt and Q. The first effect is detached and the second is
+    # trained with centered multi-scale agreement plus all-wrong InfoNCE.
     artist_effect_domains: [anima]
     artist_effect_start_step: 250
     artist_effect_full_step: 1000
-    artist_effect_every: 4
-    artist_effect_weight: 0.0
+    artist_effect_every: 2
+    artist_effect_weight: 0.15
+    artist_effect_teacher_view: disjoint_heldout
     # The primary loss is backwarded before the auxiliary heldout-reference
     # Anima pass, so two batch-four DiT graphs never coexist on an H100 80GB.
     artist_effect_temperature: 0.10
@@ -4120,8 +4120,8 @@ detail_preserving_style_cross_attention:
     # scale; no cross-step EMA or student-derived denominator is used.
     common_output_start_step: 250
     common_output_full_step: 750
-    common_output_weight: 0.0
-    common_output_teacher: native_centered
+    common_output_weight: 0.02
+    common_output_teacher: student_batch
     common_output_native_ratio_threshold: 0.60
     artist_energy_native_ratio_floor: 0.50
     artist_energy_weight: 0.0
@@ -4141,15 +4141,15 @@ detail_preserving_style_cross_attention:
     common_output_threshold_end_step: 4000
     common_output_threshold_start: 0.90
     common_output_threshold_end: 0.65
-    # Preserve absolute artist-specific energy only along the immutable
-    # NativeCenteredTeacherBank direction. Exact-target remains a repeatability
-    # teacher, but no longer defines the absolute artist magnitude.
-    artist_magnitude_teacher: native_centered_bank
+    # Preserve only the artist component repeated by the other disjoint
+    # heldout view. This deliberately avoids the complete target-minus-frozen
+    # residual and its inaccessible content/noise components.
+    artist_magnitude_teacher: disjoint_heldout
     artist_magnitude_start_step: 1
     artist_magnitude_full_step: 1000
-    # Reduce the failed v11 weight by 80% (0.75 -> 0.15). With the native bank
-    # selected, this is applied to the bounded projection objective below.
-    artist_magnitude_weight: 0.0
+    # Keep this band weak: it preserves a repeatable effect without making
+    # magnitude more important than its direction or the main flow objective.
+    artist_magnitude_weight: 0.05
     artist_magnitude_lower_start_step: 250
     artist_magnitude_lower_end_step: 2000
     artist_magnitude_lower_start: 0.35
@@ -4161,7 +4161,7 @@ detail_preserving_style_cross_attention:
     artist_prototype_start_step: 250
     artist_prototype_full_step: 1000
     artist_prototype_every: 2
-    artist_prototype_weight: 0.0
+    artist_prototype_weight: 0.03
     artist_prototype_temperature: 0.10
     artist_prototype_slot_type_counts: [16, 8, 4]
     artist_effect_validation_batches: 2
@@ -4308,8 +4308,8 @@ detail_preserving_style_cross_attention:
     wandb:
       enabled: true
       project: anima-style-adapter
-      name: detail-style-centered-v22-full-rms-20k
-      id: detail-style-centered-v22-full-rms-20k
+      name: detail-style-v23-repeatable-artist-20k
+      id: detail-style-v23-repeatable-artist-20k
   gradient_diagnostics:
     checkpoint_step: 1500
     teacher_batch_step: 1500
