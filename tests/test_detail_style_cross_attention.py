@@ -26,6 +26,7 @@ from anima_style_data.detail_style_training import (  # noqa: E402
     _configure_separated_bootstrap_trainability,
     _delayed_learning_rate_multiplier,
     _effect_stage_metrics,
+    _initial_performance_curriculum_state,
     _main_flow_total_magnitude_loss,
     _main_flow_projection_floor_loss,
     _minimal_native_teacher_objective,
@@ -33,6 +34,7 @@ from anima_style_data.detail_style_training import (  # noqa: E402
     _native_bootstrap_status,
     _native_teacher_objective_config,
     _separated_bootstrap_phase,
+    _separated_common_transition_status,
     _soft_common_output_objective,
     _teacher_domain_update,
     _teacher_direction_ranking_loss,
@@ -826,6 +828,68 @@ def test_separated_common_artist_bootstrap_routes_gradients_by_phase():
     assert _separated_bootstrap_phase(
         501, {"separated_component_bootstrap": {"enabled": True, "common_steps": 500}}
     ) == "combined"
+
+
+def test_separated_common_transition_requires_stable_metric_windows():
+    training = {
+        "separated_component_bootstrap": {
+            "enabled": True,
+            "common_transition": {"enabled": True},
+        }
+    }
+    assert _separated_bootstrap_phase(5_000, training, {}) == "common_only"
+    rows = [{
+        "native_teacher_common_cosine": 0.75,
+        "native_teacher_common_projection_coefficient": 0.60,
+        "native_teacher_common_rms_ratio": 1.05,
+    }]
+    first, consecutive, complete = _separated_common_transition_status(
+        rows,
+        {
+            "minimum_steps": 500,
+            "cosine": 0.70,
+            "projection": 0.50,
+            "rms_lower": 0.70,
+            "rms_upper": 1.30,
+            "consecutive_validations": 2,
+        },
+        step=500,
+        previous_consecutive=0,
+    )
+    assert first["separated_common_window_passed"] == 1.0
+    assert consecutive == 1 and not complete
+    _, consecutive, complete = _separated_common_transition_status(
+        rows,
+        {
+            "minimum_steps": 500,
+            "cosine": 0.70,
+            "projection": 0.50,
+            "rms_lower": 0.70,
+            "rms_upper": 1.30,
+            "consecutive_validations": 2,
+        },
+        step=750,
+        previous_consecutive=consecutive,
+    )
+    assert consecutive == 2 and complete
+    state = {"separated_common_complete": True}
+    assert _separated_bootstrap_phase(751, training, state) == "combined"
+
+    restored = _initial_performance_curriculum_state(
+        training,
+        {
+            "performance_curriculum": {
+                "separated_common_complete": True,
+                "separated_common_consecutive": 2,
+                "separated_common_transition_step": 750,
+                "separated_common_metrics": {
+                    "native_teacher_common_cosine": 0.75,
+                },
+            }
+        },
+    )
+    assert restored["separated_common_complete"] is True
+    assert restored["separated_common_transition_step"] == 750
 
 
 def test_delayed_lr_holds_peak_until_requested_decay_step():

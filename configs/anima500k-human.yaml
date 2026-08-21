@@ -3830,7 +3830,7 @@ real_artist_teacher:
 # Detail-preserving typed-slot, separate-softmax Style Cross-Attention v1.
 # Contract: docs/detail_preserving_style_cross_attention_plan.md
 detail_preserving_style_cross_attention:
-  output_directory: detail_preserving_style_cross_attention_v28_separated_bootstrap
+  output_directory: detail_preserving_style_cross_attention_v29_clean_bootstrap
   seed: 20260819
   train_split: train
   validation_split: validation
@@ -3843,7 +3843,10 @@ detail_preserving_style_cross_attention:
   # v24 is an intentionally clean capacity test. The 86M Reader, shared K/V,
   # block deltas and slot mixer all start from their normal random initializers.
   reader_checkpoint: null
-  initial_checkpoint: null
+  # v28 step 500 is the last clean Common-only state: Reader and Artist K/V
+  # have never received a gradient. Continue Common from there, then open the
+  # untouched Artist path only after measured final-output alignment passes.
+  initial_checkpoint: detail_preserving_style_cross_attention_v28_separated_bootstrap/checkpoints/step-0000500.pt
   reader_pretraining:
     output_directory: detail_style_reader_pretrain_v1
     device: cuda
@@ -4019,18 +4022,18 @@ detail_preserving_style_cross_attention:
       - synthetic_teacher_additional_1500x6/dual_query_reference_tokens_v8_step10000
   training:
     device: cuda
-    steps: 2000
-    # v28 first learns a small Q-conditioned common scaffold, freezes it, then
-    # spends 1,500 updates on the centered reference-conditioned artist path.
+    steps: 5000
+    # v29 gates the phase transition on Common-only final velocity metrics.
+    # The full native bootstrap also stops only after stable Artist alignment.
     native_bootstrap:
       enabled: true
       minimum_steps: 2000
-      final_cosine: 0.35
-      final_projection: 0.30
-      common_cosine: 0.30
-      common_projection: 0.25
-      infonce_gap: 0.02
-      consecutive_validations: 3
+      final_cosine: 0.28
+      final_projection: 0.40
+      common_cosine: 0.70
+      common_projection: 0.50
+      infonce_gap: 0.00
+      consecutive_validations: 2
     exact_self_flow_only: false
     use_fixed_initial_alpha: false
     fixed_initial_alpha: 0.10
@@ -4045,27 +4048,34 @@ detail_preserving_style_cross_attention:
     adam_eps: 0.00000001
     weight_decay: 0.01
     warmup_steps: 100
-    lr_decay_start_step: 2000
+    lr_decay_start_step: 4000
     minimum_lr_ratio: 0.10
     max_grad_norm: 1.0
     reader_max_grad_norm: 1.0
     adapter_max_grad_norm: 1.0
-    # Phase A trains only the small direct Common K/V bank. Phase B freezes it
-    # and trains the Reader plus reference-conditioned Artist K/V against the
-    # remaining native effect. The weak mean objective corrects residual error
-    # left by the frozen Common without letting it dominate artist separation.
+    # Phase A trains only the direct Common K/V bank. Phase B freezes it and
+    # trains the Reader plus Artist K/V. No Artist-mean correction is allowed:
+    # Common must satisfy its own target before Artist receives gradients.
     separated_component_bootstrap:
       enabled: true
       common_steps: 500
       artist_steps: 1500
       common_objective_weight: 1.0
       artist_objective_weight: 1.0
-      artist_mean_weight: 0.10
+      artist_mean_weight: 0.0
+      common_transition:
+        enabled: true
+        minimum_steps: 500
+        cosine: 0.70
+        projection: 0.50
+        rms_lower: 0.70
+        rms_upper: 1.30
+        consecutive_validations: 2
       common_objective:
         common_direction_weight: 1.0
         magnitude_weight: 0.25
         magnitude_floor_start_step: 1
-        magnitude_floor_end_step: 400
+        magnitude_floor_end_step: 750
         magnitude_floor_start: 0.50
         magnitude_floor_end: 0.90
         magnitude_upper: 1.25
@@ -4073,8 +4083,8 @@ detail_preserving_style_cross_attention:
       artist_objective:
         artist_direction_weight: 1.0
         magnitude_weight: 0.10
-        magnitude_floor_start_step: 501
-        magnitude_floor_end_step: 1250
+        magnitude_floor_start_step: 1
+        magnitude_floor_end_step: 2500
         magnitude_floor_start: 0.25
         magnitude_floor_end: 0.75
         magnitude_upper: 1.50
@@ -4273,7 +4283,7 @@ detail_preserving_style_cross_attention:
     # optimizer range.
     teacher_global_weight: 0.50
     # Every controlled row is contrasted against all other frozen artists.
-    teacher_infonce_weight: 0.10
+    teacher_infonce_weight: 0.15
     teacher_infonce_temperature: 0.10
     # Legacy zero-common suppression is absent. One native tagged final forward
     # per cached content/timestep recovers the global common component exactly:
@@ -4362,8 +4372,8 @@ detail_preserving_style_cross_attention:
     wandb:
       enabled: true
       project: anima-style-adapter
-      name: detail-style-v28-separated-bootstrap
-      id: detail-style-v28-separated-bootstrap
+      name: detail-style-v29-clean-bootstrap
+      id: detail-style-v29-clean-bootstrap
   gradient_diagnostics:
     checkpoint_step: 1500
     teacher_batch_step: 1500

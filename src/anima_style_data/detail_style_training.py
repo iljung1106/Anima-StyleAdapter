@@ -119,10 +119,18 @@ def _delayed_learning_rate_multiplier(
 def _separated_bootstrap_phase(
     step: int,
     training: dict[str, Any],
+    state: dict[str, Any] | None = None,
 ) -> str:
     config = dict(training.get("separated_component_bootstrap", {}))
     if not bool(config.get("enabled", False)):
         return "combined"
+    transition = dict(config.get("common_transition", {}))
+    if bool(transition.get("enabled", False)):
+        return (
+            "combined"
+            if bool((state or {}).get("separated_common_complete", False))
+            else "common_only"
+        )
     common_steps = int(config.get("common_steps", 500))
     if common_steps <= 0:
         raise ValueError("separated common bootstrap needs common_steps > 0")
@@ -214,9 +222,32 @@ def _initial_performance_curriculum_state(
     training: dict[str, Any], resume: dict[str, Any] | None
 ) -> dict[str, Any]:
     stages = _performance_stages(training)
-    if not stages:
-        return {"enabled": False, "stage_index": 0, "consecutive_passes": 0}
     restored = dict((resume or {}).get("performance_curriculum", {}))
+    if not stages:
+        return {
+            "enabled": False,
+            "stage_index": 0,
+            "consecutive_passes": 0,
+            "teacher_update": int(restored.get("teacher_update", 0)),
+            "native_bootstrap_consecutive": int(
+                restored.get("native_bootstrap_consecutive", 0)
+            ),
+            "native_bootstrap_complete": bool(
+                restored.get("native_bootstrap_complete", False)
+            ),
+            "separated_common_complete": bool(
+                restored.get("separated_common_complete", False)
+            ),
+            "separated_common_consecutive": int(
+                restored.get("separated_common_consecutive", 0)
+            ),
+            "separated_common_transition_step": int(
+                restored.get("separated_common_transition_step", 0)
+            ),
+            "separated_common_metrics": dict(
+                restored.get("separated_common_metrics", {})
+            ),
+        }
     stage_index = min(
         max(0, int(restored.get("stage_index", 0))), len(stages) - 1
     )
@@ -1215,6 +1246,7 @@ def _native_bootstrap_status(
     *,
     step: int,
     previous_consecutive: int,
+    common_override: dict[str, float] | None = None,
 ) -> tuple[dict[str, float], int, bool]:
     """Evaluate a native-teacher bootstrap on stable window means."""
 
@@ -1236,6 +1268,13 @@ def _native_bootstrap_status(
         for key in required
         if any(key in row for row in rows)
     }
+    if common_override:
+        for key in (
+            "native_teacher_common_cosine",
+            "native_teacher_common_projection_coefficient",
+        ):
+            if key in common_override:
+                means[key] = float(common_override[key])
     enough_steps = step >= int(config.get("minimum_steps", 500))
     passed = enough_steps and all(
         means.get(key, float("-inf")) >= threshold
@@ -1251,6 +1290,52 @@ def _native_bootstrap_status(
         "native_bootstrap_consecutive": float(consecutive),
         "native_bootstrap_required_consecutive": float(required_consecutive),
         "native_bootstrap_complete": float(complete),
+    }
+    return metrics, consecutive, complete
+
+
+def _separated_common_transition_status(
+    rows: list[dict[str, float]],
+    config: dict[str, Any],
+    *,
+    step: int,
+    previous_consecutive: int,
+) -> tuple[dict[str, float], int, bool]:
+    """Gate the Artist path on stable Common-only final-output alignment."""
+
+    keys = (
+        "native_teacher_common_cosine",
+        "native_teacher_common_projection_coefficient",
+        "native_teacher_common_rms_ratio",
+    )
+    means = {
+        key: float(np.mean([row[key] for row in rows if key in row]))
+        for key in keys
+        if any(key in row for row in rows)
+    }
+    enough_steps = int(step) >= int(config.get("minimum_steps", 500))
+    passed = (
+        enough_steps
+        and means.get("native_teacher_common_cosine", -float("inf"))
+        >= float(config.get("cosine", 0.70))
+        and means.get(
+            "native_teacher_common_projection_coefficient", -float("inf")
+        ) >= float(config.get("projection", 0.50))
+        and means.get("native_teacher_common_rms_ratio", -float("inf"))
+        >= float(config.get("rms_lower", 0.70))
+        and means.get("native_teacher_common_rms_ratio", float("inf"))
+        <= float(config.get("rms_upper", 1.30))
+    )
+    consecutive = previous_consecutive + 1 if passed else 0
+    required = int(config.get("consecutive_validations", 2))
+    complete = consecutive >= required
+    metrics = {
+        **{f"separated_common_{key}": value for key, value in means.items()},
+        "separated_common_minimum_steps_met": float(enough_steps),
+        "separated_common_window_passed": float(passed),
+        "separated_common_consecutive": float(consecutive),
+        "separated_common_required_consecutive": float(required),
+        "separated_common_complete": float(complete),
     }
     return metrics, consecutive, complete
 
@@ -2512,8 +2597,8 @@ def _teacher_step(
     )
     common_gradient = torch.autograd.grad(common_loss, common_proxy)[0].detach()
     common_phase = bool(
-        separated_cfg.get("enabled", False)
-        and step <= int(separated_cfg.get("common_steps", 500))
+        isinstance(adapter, SeparatedCommonArtistKVStyleCrossAttention)
+        and adapter.bootstrap_phase == "common_only"
     )
     artist_objective_weight = (
         0.0 if common_phase else float(
@@ -3621,7 +3706,9 @@ def train_detail_style_cross_attention(
     bootstrap_complete = False
     started = time.perf_counter()
     vae = None
-    initial_phase = _separated_bootstrap_phase(max(1, start_step), training)
+    initial_phase = _separated_bootstrap_phase(
+        max(1, start_step), training, performance_curriculum
+    )
     _configure_separated_bootstrap_trainability(reader, adapter, initial_phase)
     try:
         resumed_fixed_summary = (
@@ -3660,7 +3747,9 @@ def train_detail_style_cross_attention(
                 }, step=start_step)
         for step in range(start_step + 1, steps + 1):
             step_started = time.perf_counter()
-            separated_phase = _separated_bootstrap_phase(step, training)
+            separated_phase = _separated_bootstrap_phase(
+                step, training, performance_curriculum
+            )
             _configure_separated_bootstrap_trainability(
                 reader, adapter, separated_phase
             )
@@ -3844,6 +3933,7 @@ def train_detail_style_cross_attention(
                         or key == "native_teacher_cosine"
                         or key == "native_teacher_common_cosine"
                         or key == "native_teacher_common_projection_coefficient"
+                        or key == "native_teacher_common_rms_ratio"
                         or key == "teacher_infonce_accuracy"
                         or key == "teacher_infonce_cosine_gap"
                         or (
@@ -4049,6 +4139,54 @@ def train_detail_style_cross_attention(
                     )
                 )
                 if native_bootstrap_only:
+                    separated_cfg = dict(
+                        training.get("separated_component_bootstrap", {})
+                    )
+                    common_transition_cfg = dict(
+                        separated_cfg.get("common_transition", {})
+                    )
+                    if (
+                        bool(common_transition_cfg.get("enabled", False))
+                        and separated_phase == "common_only"
+                    ):
+                        common_metrics, common_consecutive, common_complete = (
+                            _separated_common_transition_status(
+                                teacher_curriculum_rows,
+                                common_transition_cfg,
+                                step=step,
+                                previous_consecutive=int(
+                                    performance_curriculum.get(
+                                        "separated_common_consecutive", 0
+                                    )
+                                ),
+                            )
+                        )
+                        performance_curriculum[
+                            "separated_common_consecutive"
+                        ] = common_consecutive
+                        performance_curriculum[
+                            "separated_common_complete"
+                        ] = common_complete
+                        curriculum_metrics.update(common_metrics)
+                        if common_complete:
+                            frozen_common_metrics = {
+                                key.removeprefix("separated_common_"): value
+                                for key, value in common_metrics.items()
+                                if key.startswith(
+                                    "separated_common_native_teacher_common_"
+                                )
+                            }
+                            performance_curriculum[
+                                "separated_common_metrics"
+                            ] = frozen_common_metrics
+                            performance_curriculum[
+                                "separated_common_transition_step"
+                            ] = int(step)
+                            print(
+                                "detail-style separated Common criteria "
+                                f"satisfied at step={step}; Artist opens next step",
+                                flush=True,
+                            )
                     bootstrap_metrics, consecutive, bootstrap_complete = (
                         _native_bootstrap_status(
                             teacher_curriculum_rows,
@@ -4057,6 +4195,11 @@ def train_detail_style_cross_attention(
                             previous_consecutive=int(
                                 performance_curriculum.get(
                                     "native_bootstrap_consecutive", 0
+                                )
+                            ),
+                            common_override=dict(
+                                performance_curriculum.get(
+                                    "separated_common_metrics", {}
                                 )
                             ),
                         )

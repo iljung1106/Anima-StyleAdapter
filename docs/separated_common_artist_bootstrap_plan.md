@@ -50,3 +50,27 @@ Bootstrap 체크포인트를 검증한 뒤 별도 실험에서 진행한다.
 
 전환은 고정 step만으로 결정하지 않고 centered artist cosine/projection,
 all-wrong margin, common-output ratio와 fixed-reference 정성 샘플을 함께 본다.
+
+## v29 clean bootstrap correction
+
+v28은 Common-only 500스텝에서 cosine `0.576`, projection `0.227`인 상태로
+Common을 동결했다. 이후의 common projection `1.29`는 Common 단독값이 아니라
+`Common + mean(Artist)`였으므로, Artist가 아직 남은 공통 오차를 흡수했다. 이를
+본 curriculum의 초기값으로 사용하지 않는다.
+
+- v28 `step-0000500.pt`에서 다시 시작한다. 이 시점에는 Reader와 Artist K/V가
+  아직 gradient를 받지 않았으므로 Common만 이어 학습할 수 있다.
+- Common은 고정 스텝에 열지 않는다. final velocity 기준 cosine `0.70`, native
+  projection `0.50`, RMS ratio `0.70~1.30`을 250-step validation 두 번 연속
+  만족한 뒤에만 동결하고 Artist를 연다.
+- 전환 시점의 Common-only 지표를 고정해 이후 합성 출력의 Artist 평균값과
+  혼동하지 않는다.
+- Artist 단계의 `artist_mean_weight`는 `0`이다. Centered direction, 약한 RMS
+  band, 16-way all-wrong InfoNCE만으로 작가 residual을 학습한다.
+- 전체 bootstrap은 Artist cosine `0.28`, projection `0.40`, InfoNCE gap `0.0`
+  이상을 두 번 연속 만족해야 종료한다. 최대 5,000스텝 안에 통과하지 못하면
+  본 curriculum으로 자동 진입하지 않고 병목을 다시 진단한다.
+
+통과한 체크포인트만 별도의 본 curriculum 실행에 사용한다. 본 단계는
+Exact-Self 비중이 높은 구간에서 시작해 target 포함 1~4장, 포함률 anneal,
+target-excluded 1~8장 순서로 진행하며 flow/정성 샘플이 악화되면 전환을 보류한다.
