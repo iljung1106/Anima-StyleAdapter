@@ -452,11 +452,21 @@ def _flow_loss(anima, latents, conditions, cfg, generator):
     )
     sigma = timesteps[:, None, None, None].to(dtype=latents.dtype)
     noisy = (1.0 - sigma) * latents + sigma * noise
+    padding_mask = torch.zeros(
+        latents.shape[0],
+        1,
+        latents.shape[-2],
+        latents.shape[-1],
+        device=latents.device,
+        dtype=latents.dtype,
+    )
     with torch.autocast("cuda", dtype=torch.bfloat16):
         prediction = anima(
             noisy.unsqueeze(2),
             timesteps.to(dtype=latents.dtype),
             context=conditions,
+            padding_mask=padding_mask,
+            target_input_ids=None,
         ).squeeze(2)
     target = noise - latents
     return F.mse_loss(prediction.float(), target.float())
