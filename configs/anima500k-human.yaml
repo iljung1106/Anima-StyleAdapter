@@ -3830,7 +3830,7 @@ real_artist_teacher:
 # Detail-preserving typed-slot, separate-softmax Style Cross-Attention v1.
 # Contract: docs/detail_preserving_style_cross_attention_plan.md
 detail_preserving_style_cross_attention:
-  output_directory: detail_preserving_style_cross_attention_v36_reference_fidelity
+  output_directory: detail_preserving_style_cross_attention_v37_v34_diversity_warmstart
   seed: 20260819
   train_split: train
   validation_split: validation
@@ -3846,11 +3846,11 @@ detail_preserving_style_cross_attention:
   # v31 step 3500 has the best pre-compensation artist-null residual. Start a
   # fresh optimizer/step schedule from its weights and move from synthetic-only
   # bootstrap to human flow plus disjoint-view functional separation.
-  # v35 step 750 retained the best reference-specific retrieval/repeatability
-  # before the increasingly target-excluded curriculum weakened the output.
-  # Resume its Adam moments and RNG as well as the model weights.
-  resume_checkpoint: detail_preserving_style_cross_attention_v35_centered_energy/checkpoints/step-0000750.pt
-  initial_checkpoint: detail_preserving_style_cross_attention_v31_artist_null_residual/checkpoints/step-0003500.pt
+  # v34 step 500 has the best measured fixed-reference diversity: 0.897 at
+  # 1x, with 0.909 coming from Artist-only and zero pairwise variation from
+  # Common-only. Load model weights only and restart optimizer/RNG/curriculum.
+  resume_checkpoint: null
+  initial_checkpoint: detail_preserving_style_cross_attention_v34_anti_common_functional/checkpoints/step-0000500.pt
   reader_pretraining:
     output_directory: detail_style_reader_pretrain_v1
     device: cuda
@@ -3975,6 +3975,9 @@ detail_preserving_style_cross_attention:
     # Keep training at its natural scale. Strength sweeps are inference-only;
     # putting 2x inside training made K/V shrink to compensate for the gain.
     artist_residual_gain: 1.0
+    # Common keeps learning, but ordinary flow gradients are deliberately weak.
+    # Its full-strength update comes from the isolated native-common teacher.
+    common_combined_gradient_scale: 0.10
     null_tokens: 28
     null_init_std: 0.02
   strength_profile:
@@ -4050,16 +4053,15 @@ detail_preserving_style_cross_attention:
     fixed_initial_alpha: 0.10
     # Preserve the pretrained information bottleneck while allowing slow
     # task-specific adaptation. Adapter K/V groups retain their original LR.
-    learning_rate: 0.00010
-    common_kv_learning_rate: 0.00030
+    learning_rate: 0.00002
+    common_kv_learning_rate: 0.00003
     shared_kv_learning_rate: 0.00010
     block_delta_learning_rate: 0.00020
     base_mix_learning_rate: 0.00004
     artist_null_learning_rate: 0.00020
-    # v36 continues the v35 step-750 optimizer state.  The structural path is
-    # unchanged; only reference-fidelity curriculum and auxiliary gradients
-    # are adjusted so the comparison remains attributable.
-    resume_optimizer: true
+    # Warm-start only the v34 model tensors. Old Adam moments encoded the loss
+    # geometry that collapsed reference diversity and must not be reused.
+    resume_optimizer: false
     reset_artist_null_context_on_upgrade: true
     betas: [0.9, 0.95]
     adam_eps: 0.00000001
@@ -4080,7 +4082,9 @@ detail_preserving_style_cross_attention:
       artist_objective_weight: 1.0
       # Frozen Common already represents the native global mean. Do not push
       # that reference-independent direction back into Artist K/V.
-      artist_mean_weight: 0.0
+      # In combined mode this is the isolated native-common objective weight;
+      # it no longer backpropagates through Artist.
+      artist_mean_weight: 1.0
       common_transition:
         enabled: true
         minimum_steps: 500
@@ -4091,16 +4095,15 @@ detail_preserving_style_cross_attention:
         consecutive_validations: 2
       common_objective:
         common_direction_weight: 1.0
-        # At v29 step 1,250 cosine had reached 0.766 while the RMS ratio was
-        # still 0.612.  The old 0.25 term contributed only ~9% of the Common
-        # objective, so increase radial pressure without changing direction.
-        magnitude_weight: 0.75
+        # Common direction remains learned, while its final velocity RMS is
+        # held in a tight frozen-native band.
+        magnitude_weight: 1.0
         magnitude_floor_start_step: 1
-        magnitude_floor_end_step: 750
-        magnitude_floor_start: 0.50
+        magnitude_floor_end_step: 1
+        magnitude_floor_start: 0.90
         magnitude_floor_end: 0.90
-        magnitude_upper: 1.25
-        magnitude_upper_weight: 0.50
+        magnitude_upper: 1.10
+        magnitude_upper_weight: 1.0
       artist_objective:
         artist_direction_weight: 1.0
         magnitude_weight: 0.10
@@ -4111,6 +4114,10 @@ detail_preserving_style_cross_attention:
         magnitude_upper: 1.50
         magnitude_upper_weight: 0.25
     gradient_accumulation_steps: 4
+    # Native teacher updates run Common-only and Artist-only forwards. This
+    # prevents either branch from learning to cancel the other.
+    train_common_in_combined: true
+    separated_teacher_gradients: true
     fused_adamw: true
     allow_tf32: true
     low_precision_rmsnorm: true
@@ -4158,7 +4165,7 @@ detail_preserving_style_cross_attention:
     empty_prompt_forces_target: true
     # Weakly preserve the random Reader's 84 -> 28 information path without
     # turning reconstruction into the style objective.
-    reconstruction_weight: 0.01
+    reconstruction_weight: 0.005
     reconstruction_final_weight: 0.005
     reconstruction_hold_steps: 2000
     # v23 removes the failed v22 full-residual RMS bootstrap. The complete
@@ -4180,7 +4187,7 @@ detail_preserving_style_cross_attention:
     controlled_exact_self_end_step: 250
     controlled_magnitude_start_step: 1
     controlled_magnitude_full_step: 500
-    controlled_magnitude_weight: 0.10
+    controlled_magnitude_weight: 0.05
     controlled_magnitude_lower_start_step: 1
     controlled_magnitude_lower_end_step: 500
     controlled_magnitude_lower_start: 0.25
@@ -4189,7 +4196,7 @@ detail_preserving_style_cross_attention:
     controlled_magnitude_upper_weight: 0.10
     controlled_contrastive_start_step: 251
     controlled_contrastive_full_step: 500
-    controlled_contrastive_weight: 0.05
+    controlled_contrastive_weight: 0.0
     controlled_contrastive_temperature: 0.10
     controlled_contrastive_pool_scales: [2, 4]
     controlled_repeatability_weight: 0.0
@@ -4205,13 +4212,12 @@ detail_preserving_style_cross_attention:
     functional_weight: 0.0
     functional_wrong_gradient_scale: 0.0
     functional_wrong_gradient_every: 1
-    # DEADiff-style non-reconstructive supervision. Two disjoint heldout
-    # reference sets from the same artist are evaluated with identical x_t,
-    # timestep, prompt and Q. The first effect is detached and the second is
-    # trained with centered multi-scale agreement plus all-wrong InfoNCE.
+    # Two disjoint heldout reference sets share x_t/timestep/prompt/Q. Replace
+    # the unbounded symmetric InfoNCE contraction with an all-wrong functional
+    # margin and only a weak corresponding-view similarity floor.
     artist_effect_domains: [anima]
     artist_effect_start_step: 250
-    artist_effect_full_step: 750
+    artist_effect_full_step: 500
     # The centered objective is invariant to a shared output, so run the human
     # disjoint-view objective densely enough that artist-specific directions do
     # not become a sparse correction to ordinary flow MSE.
@@ -4222,11 +4228,11 @@ detail_preserving_style_cross_attention:
     # Anima pass, so two batch-four DiT graphs never coexist on an H100 80GB.
     artist_effect_temperature: 0.10
     artist_effect_pool_scales: [2, 4]
-    # Cross-artwork agreement is only a weak floor.  The old 0.75 objective
-    # rewarded ever more invariant outputs even though one artist can span
-    # several styles and the application accepts reference-content leakage.
-    artist_effect_repeatability_weight: 0.10
-    artist_effect_repeatability_floor: 0.30
+    artist_effect_contrastive_mode: all_wrong_margin
+    artist_effect_wrong_margin: 0.10
+    artist_effect_positive_floor: 0.25
+    artist_effect_repeatability_weight: 0.02
+    artist_effect_repeatability_floor: null
     # Estimate the common residual directly under a controlled same-content /
     # timestep native-teacher probe. Normalize only by the frozen native effect
     # scale; no cross-step EMA or student-derived denominator is used.
@@ -4236,13 +4242,13 @@ detail_preserving_style_cross_attention:
     # common-output ratio rose to 0.894. Give the raw (uncentered) artist mean
     # enough weight to constrain the null-centered Artist path without forcing
     # an unrealistically zero mean from a four-artist batch.
-    common_output_weight: 0.08
+    common_output_weight: 0.0
     common_output_teacher: student_batch
     common_output_native_ratio_threshold: 0.60
     artist_energy_native_ratio_floor: 0.50
     # Raise artist-centered energy instead of trying to obtain diversity only
     # by suppressing the batch mean. This reuses the existing controlled pass.
-    artist_energy_weight: 0.02
+    artist_energy_weight: 0.0
     # Apply the same frozen-native-normalized common-effect constraint to
     # ordinary human training artists. Four artists share one main-batch
     # x_t/timestep/content probe, so their mean residual is functionally valid.
@@ -4251,10 +4257,10 @@ detail_preserving_style_cross_attention:
     main_common_output_full_step: 750
     main_common_output_every: 4
     main_common_output_batch_rows: 4
-    main_common_output_weight: 0.04
+    main_common_output_weight: 0.0
     main_common_output_native_ratio_threshold: 0.60
     main_artist_energy_native_ratio_floor: 0.50
-    main_artist_energy_weight: 0.01
+    main_artist_energy_weight: 0.0
     common_output_threshold_start_step: 250
     common_output_threshold_end_step: 1500
     common_output_threshold_start: 0.80
@@ -4303,7 +4309,7 @@ detail_preserving_style_cross_attention:
     # Synthetic artist-tag alignment is useful initialization, but v33 let it
     # share every functional update after step 250. Human reference separation
     # is now the denser objective.
-    teacher_every_after_bootstrap: 8
+    teacher_every_after_bootstrap: 4
     teacher_end_step: 8000
     # Native @artist distillation aligns the Anima-facing K/V path.  Human flow
     # remains the main signal that may preserve reference-specific content;
@@ -4336,12 +4342,12 @@ detail_preserving_style_cross_attention:
     # This bootstrap has no competing main-flow or per-block teacher backward.
     # The outer factor keeps the four final-component objectives in a stable
     # optimizer range.
-    teacher_global_weight: 0.50
+    teacher_global_weight: 0.25
     # Every controlled row is contrasted against all other frozen artists.
-    teacher_infonce_weight: 0.20
+    teacher_infonce_weight: 0.0
     # A single lossy view needs stronger discrimination from the frozen
     # sixteen-artist bank than a stable four-view estimate.
-    teacher_infonce_weight_by_reference_count: [0.50, 0.40, 0.30, 0.25]
+    teacher_infonce_weight_by_reference_count: [0.0, 0.0, 0.0, 0.0]
     teacher_infonce_temperature: 0.10
     # Legacy zero-common suppression is absent. One native tagged final forward
     # per cached content/timestep recovers the global common component exactly:
@@ -4423,19 +4429,19 @@ detail_preserving_style_cross_attention:
     state_every: 250
     checkpoint_every: 250
     sample_every: 500
-    fixed_sample_every: 500
+    fixed_sample_every: 250
     fixed_sample_strengths: [1.0, 2.0]
     # Diagnose whether the frozen Common scaffold or the trained Artist path
     # dominates the visually similar v34 fixed-reference outputs.
-    fixed_sample_backfill_steps: [500]
-    fixed_sample_backfill_component_modes: [common_only, artist_only]
+    fixed_sample_backfill_steps: []
+    fixed_sample_backfill_component_modes: []
     fixed_sample_backfill_strengths: [1.0, 2.0]
     resume: true
     wandb:
       enabled: true
       project: anima-style-adapter
-      name: detail-style-v36-reference-fidelity
-      id: detail-style-v36-reference-fidelity
+      name: detail-style-v37-v34-diversity-warmstart
+      id: detail-style-v37-v34-diversity-warmstart
   gradient_diagnostics:
     checkpoint_step: 1500
     teacher_batch_step: 1500

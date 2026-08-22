@@ -933,6 +933,32 @@ def test_separated_common_artist_bootstrap_routes_gradients_by_phase():
         2.0 * (artist_output_1x - native_output),
     )
 
+    adapter.artist_residual_gain = 1.0
+    adapter.set_bootstrap_phase("combined")
+    adapter.set_style_context(style[:1], strength=1.0)
+    combined_strength_1x = adapter.merged_cross_attention(
+        0, hidden[:1], text[:1], anima.blocks[0].cross_attn, None
+    )
+    adapter.set_style_context(style[:1], strength=2.0)
+    combined_strength_2x = adapter.merged_cross_attention(
+        0, hidden[:1], text[:1], anima.blocks[0].cross_attn, None
+    )
+    adapter.set_bootstrap_phase("common_only")
+    adapter.set_style_context(style[:1], strength=1.0)
+    common_strength_1x = adapter.merged_cross_attention(
+        0, hidden[:1], text[:1], anima.blocks[0].cross_attn, None
+    )
+    adapter.set_style_context(style[:1], strength=2.0)
+    common_strength_2x = adapter.merged_cross_attention(
+        0, hidden[:1], text[:1], anima.blocks[0].cross_attn, None
+    )
+    torch.testing.assert_close(common_strength_1x, common_strength_2x)
+    torch.testing.assert_close(
+        combined_strength_2x - common_strength_2x,
+        2.0 * (combined_strength_1x - common_strength_1x),
+    )
+
+    adapter.set_bootstrap_phase("artist_only")
     with torch.no_grad():
         adapter.null_style_context.copy_(style[:1])
     adapter.set_style_context(style[:1])

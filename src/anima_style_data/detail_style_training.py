@@ -210,11 +210,15 @@ def _configure_separated_bootstrap_trainability(
     reader: torch.nn.Module,
     adapter: FreshKVStyleCrossAttention,
     phase: str,
+    *,
+    train_common_in_combined: bool = False,
 ) -> None:
     if not isinstance(adapter, SeparatedCommonArtistKVStyleCrossAttention):
         return
     adapter.set_bootstrap_phase(phase)
-    common_active = phase == "common_only"
+    common_active = phase == "common_only" or (
+        phase == "combined" and bool(train_common_in_combined)
+    )
     for parameter in adapter.common_parameters():
         parameter.requires_grad_(common_active)
     for parameter in adapter.artist_parameters():
@@ -738,6 +742,15 @@ def _weighted_artist_effect_objective(
             float(training["artist_effect_repeatability_floor"])
             if training.get("artist_effect_repeatability_floor") is not None
             else None
+        ),
+        contrastive_mode=str(
+            training.get("artist_effect_contrastive_mode", "symmetric_nce")
+        ),
+        positive_floor=float(
+            training.get("artist_effect_positive_floor", 0.25)
+        ),
+        wrong_margin=float(
+            training.get("artist_effect_wrong_margin", 0.10)
         ),
     )
     common_threshold = _scheduled_value(
@@ -2718,6 +2731,46 @@ def _teacher_step(
     timestep_weight = _native_effect_weights_for_timesteps(
         timestep.float().reshape(1), timestep_weighting
     )[0]
+    separate_component_gradients = bool(
+        training.get("separated_teacher_gradients", False)
+    ) and isinstance(adapter, SeparatedCommonArtistKVStyleCrossAttention)
+    common_surrogate_weight = common_objective_weight
+    direct_common_weighted = common_loss.new_zeros(())
+    if separate_component_gradients and not common_phase:
+        # Common owns the cross-artist mean; Artist owns only the centered
+        # residual. Train the two functions through their actual isolated
+        # forward paths so Artist never has to cancel a drifting Common output.
+        previous_phase = adapter.bootstrap_phase
+        adapter.set_bootstrap_phase("common_only")
+        try:
+            common_student = _controlled_teacher_forward(
+                anima,
+                reader,
+                adapter,
+                references[:1],
+                mask[:1],
+                noisy,
+                base,
+                base_context,
+                timestep,
+                device,
+            )
+            common_loss, common_metrics = _common_native_teacher_objective(
+                common_student,
+                teacher_common,
+                common_objective_cfg,
+                step=step,
+            )
+            direct_common_weighted = (
+                global_weight
+                * timestep_weight
+                * common_objective_weight
+                * common_loss
+            )
+            direct_common_weighted.backward()
+        finally:
+            adapter.set_bootstrap_phase(previous_phase)
+        common_surrogate_weight = 0.0
     metric_rows: list[dict[str, torch.Tensor]] = []
     detached_total = common_objective_weight * common_loss.detach()
     for offset in range(0, rows, microbatch_rows):
@@ -2757,7 +2810,7 @@ def _teacher_step(
                 artist_objective_weight * final_loss
                 + infonce_weight * infonce_loss
             )
-            + common_objective_weight * common_surrogate
+            + common_surrogate_weight * common_surrogate
         )
         post_gate_loss = None
         if post_gate_active:
@@ -2819,6 +2872,12 @@ def _teacher_step(
             ),
             "teacher_common_objective_weight": main_loss.new_tensor(
                 common_objective_weight
+            ),
+            "teacher_common_separate_update": main_loss.new_tensor(
+                float(separate_component_gradients and not common_phase)
+            ),
+            "teacher_common_direct_weighted_loss": (
+                direct_common_weighted.detach()
             ),
             "teacher_common_bootstrap_phase": main_loss.new_tensor(
                 float(common_phase)
@@ -3313,7 +3372,14 @@ def _generate_fixed_reference_sample(
                         positive_null - negative_null
                     )
                 else:
-                    adapter.set_style_context(style)
+                    if isinstance(
+                        adapter, SeparatedCommonArtistKVStyleCrossAttention
+                    ):
+                        adapter.set_style_context(style, strength=strength)
+                        guidance_strength = 1.0
+                    else:
+                        adapter.set_style_context(style)
+                        guidance_strength = strength
                     adapter.set_timesteps(timestep)
                     positive_style = anima(
                         x, timestep, context=text_batch,
@@ -3324,7 +3390,7 @@ def _generate_fixed_reference_sample(
                         positive_null,
                         positive_style,
                         text_cfg=text_cfg,
-                        style_strength=strength,
+                        style_strength=guidance_strength,
                     )
                 x = (
                     x.float()
@@ -3996,7 +4062,15 @@ def train_detail_style_cross_attention(
     initial_phase = _separated_bootstrap_phase(
         max(1, start_step), training, performance_curriculum
     )
-    _configure_separated_bootstrap_trainability(reader, adapter, initial_phase)
+    train_common_in_combined = bool(
+        training.get("train_common_in_combined", False)
+    )
+    _configure_separated_bootstrap_trainability(
+        reader,
+        adapter,
+        initial_phase,
+        train_common_in_combined=train_common_in_combined,
+    )
     try:
         resumed_fixed_summary = (
             output / "external_reference_samples"
@@ -4048,7 +4122,10 @@ def train_detail_style_cross_attention(
                 step, training, performance_curriculum
             )
             _configure_separated_bootstrap_trainability(
-                reader, adapter, separated_phase
+                reader,
+                adapter,
+                separated_phase,
+                train_common_in_combined=train_common_in_combined,
             )
             performance_stage = (
                 None
@@ -4067,7 +4144,11 @@ def train_detail_style_cross_attention(
                     active = (
                         name == "common_kv"
                         if separated_phase == "common_only"
-                        else name != "common_kv"
+                        else (
+                            True
+                            if name != "common_kv"
+                            else train_common_in_combined
+                        )
                     )
                     if not active:
                         group["lr"] = 0.0

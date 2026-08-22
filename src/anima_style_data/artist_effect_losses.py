@@ -134,6 +134,9 @@ def centered_functional_artist_loss(
     pool_scales: Sequence[int] = (2, 4),
     repeatability_weight: float = 0.25,
     repeatability_floor: float | None = None,
+    contrastive_mode: str = "symmetric_nce",
+    positive_floor: float = 0.25,
+    wrong_margin: float = 0.10,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """Learn the artist effect shared by two disjoint reference views.
 
@@ -149,6 +152,12 @@ def centered_functional_artist_loss(
         raise ValueError("repeatability_weight cannot be negative")
     if repeatability_floor is not None and not -1.0 <= repeatability_floor <= 1.0:
         raise ValueError("repeatability_floor must be between -1 and 1")
+    if contrastive_mode not in {"symmetric_nce", "all_wrong_margin"}:
+        raise ValueError(
+            "contrastive_mode must be symmetric_nce or all_wrong_margin"
+        )
+    if not -1.0 <= positive_floor <= 1.0 or wrong_margin < 0:
+        raise ValueError("invalid weak-positive floor or all-wrong margin")
     first_centered = first_delta.float() - first_delta.float().mean(
         dim=0, keepdim=True
     )
@@ -157,13 +166,55 @@ def centered_functional_artist_loss(
     )
     first_vector = multiscale_effect_vector(first_centered, pool_scales)
     second_vector = multiscale_effect_vector(second_centered, pool_scales)
-    contrastive, similarity, labels = _symmetric_multi_positive_nce(
-        first_vector, second_vector, style_ids, temperature
-    )
+    labels = _style_labels(style_ids, first_vector.device)
+    first_normalized = F.normalize(first_vector.float(), dim=1, eps=1e-8)
+    second_normalized = F.normalize(second_vector.float(), dim=1, eps=1e-8)
+    similarity = first_normalized @ second_normalized.T
+    positive = labels[:, None] == labels[None]
+    negative = ~positive
+    if contrastive_mode == "symmetric_nce":
+        contrastive, similarity, labels = _symmetric_multi_positive_nce(
+            first_vector, second_vector, style_ids, temperature
+        )
+        positive = labels[:, None] == labels[None]
+        negative = ~positive
+        margin_violation = contrastive.new_zeros(())
+    else:
+        # Match each disjoint view against every wrong artist, but stop once a
+        # finite margin is satisfied. Unlike InfoNCE, this does not keep
+        # contracting all works by one artist toward an invariant prototype.
+        corresponding = similarity.diagonal()
+
+        def all_wrong_margin(
+            values: torch.Tensor, scores: torch.Tensor, mask: torch.Tensor
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            violations = F.relu(
+                float(wrong_margin) + values - scores[:, None]
+            )
+            selected = violations[mask]
+            if selected.numel() == 0:
+                zero = values.new_zeros(())
+                return zero, zero
+            return selected.mean(), (selected > 0).float().mean()
+
+        forward, forward_violation = all_wrong_margin(
+            similarity, corresponding, negative
+        )
+        backward, backward_violation = all_wrong_margin(
+            similarity.T, corresponding, negative.T
+        )
+        contrastive = 0.5 * (forward + backward)
+        margin_violation = 0.5 * (forward_violation + backward_violation)
     dot = (first_vector * second_vector).sum(dim=1)
     energy = first_vector.square().sum(dim=1) + second_vector.square().sum(dim=1)
     repeatable_ratio = 2.0 * dot / energy.clamp_min(1e-8)
-    if repeatability_floor is None:
+    if contrastive_mode == "all_wrong_margin":
+        # Only require a modest corresponding-view similarity. Once reached,
+        # retain the remaining image-specific style and content information.
+        repeatability = F.relu(
+            float(positive_floor) - similarity.diagonal()
+        ).square().mean()
+    elif repeatability_floor is None:
         repeatability = (1.0 - repeatable_ratio).mean()
     else:
         # Different works by one artist are not interchangeable targets.  Once
@@ -175,8 +226,6 @@ def centered_functional_artist_loss(
         ).square().mean()
     total = contrastive + float(repeatability_weight) * repeatability
 
-    positive = labels[:, None] == labels[None]
-    negative = ~positive
     positive_similarity = similarity[positive].mean()
     negative_similarity = (
         (similarity * negative).sum() / negative.sum().clamp_min(1)
@@ -208,6 +257,18 @@ def centered_functional_artist_loss(
     return total, {
         "functional_artist_loss": total.detach(),
         "functional_artist_contrastive_loss": contrastive.detach(),
+        "functional_artist_all_wrong_margin": contrastive.new_tensor(
+            float(wrong_margin)
+        ),
+        "functional_artist_all_wrong_violation_fraction": (
+            margin_violation.detach()
+        ),
+        "functional_artist_positive_floor": contrastive.new_tensor(
+            float(positive_floor)
+        ),
+        "functional_artist_uses_symmetric_nce": contrastive.new_tensor(
+            float(contrastive_mode == "symmetric_nce")
+        ),
         "functional_artist_repeatability_loss": repeatability.detach(),
         "functional_artist_repeatability_floor": repeatability.new_tensor(
             -1.0 if repeatability_floor is None else float(repeatability_floor)

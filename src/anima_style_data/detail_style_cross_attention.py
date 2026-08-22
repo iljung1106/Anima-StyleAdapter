@@ -2394,11 +2394,17 @@ class SeparatedCommonArtistKVStyleCrossAttention(
         common_tokens: int = 16,
         artist_null_residual: bool = False,
         artist_residual_gain: float = 1.0,
+        common_combined_gradient_scale: float = 1.0,
         **kwargs: Any,
     ) -> None:
-        if common_tokens <= 0 or artist_residual_gain <= 0:
+        if (
+            common_tokens <= 0
+            or artist_residual_gain <= 0
+            or not 0.0 <= common_combined_gradient_scale <= 1.0
+        ):
             raise ValueError(
-                "common_tokens and artist_residual_gain must be positive"
+                "common tokens/gain must be positive and the combined Common "
+                "gradient scale must be between zero and one"
             )
         # The inherited null/gain tensors remain checkpoint-compatible but are
         # frozen and never participate in this architecture's forward path.
@@ -2407,6 +2413,9 @@ class SeparatedCommonArtistKVStyleCrossAttention(
         self.common_tokens = int(common_tokens)
         self.artist_null_residual = bool(artist_null_residual)
         self.artist_residual_gain = float(artist_residual_gain)
+        self.common_combined_gradient_scale = float(
+            common_combined_gradient_scale
+        )
         self.null_style_context.requires_grad_(self.artist_null_residual)
         self.log_common_gain.requires_grad_(False)
         self.log_artist_gain.requires_grad_(False)
@@ -2524,17 +2533,57 @@ class SeparatedCommonArtistKVStyleCrossAttention(
             torch.zeros_like(common_attended)
             if phase == "artist_only" else common_attended
         )
+        if phase == "combined" and self.common_combined_gradient_scale != 1.0:
+            common_component = common_component.detach() + float(
+                self.common_combined_gradient_scale
+            ) * (common_component - common_component.detach())
         artist_attended = style_attended
         if self.artist_null_residual:
             if artist_null_attended is None:
                 raise RuntimeError("Artist null residual needs its baseline attention")
             artist_attended = style_attended - artist_null_attended
-        artist_attended = self.artist_residual_gain * artist_attended
+        # Inference strength belongs only to the reference-dependent Artist
+        # residual. Common remains the native-strength scaffold at every
+        # artist-strength setting.
+        artist_attended = (
+            self.artist_residual_gain * float(self._style_strength)
+            * artist_attended
+        )
         artist_component = (
             torch.zeros_like(artist_attended)
             if phase == "common_only" else artist_attended
         )
         return common_component + artist_component, common_component, artist_component
+
+    def _effective_alpha(
+        self,
+        block_index: int,
+        batch: int,
+        *,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """Keep shared alpha independent of Artist-only inference strength."""
+
+        if self._timestep_strength_active:
+            base = self._interpolate_timestep_values(
+                self.alpha_by_timestep, block_index, batch
+            )
+        else:
+            base = self.alpha[block_index].float().expand(batch)
+        return (
+            base * float(getattr(self, "global_gain", 1.0))
+        ).to(device=device, dtype=dtype).reshape(batch, 1, 1)
+
+    def _fixed_output_target(self, block_index: int, batch: int) -> torch.Tensor:
+        """Do not scale the combined fixed target with Artist strength."""
+
+        if not self._fixed_output_strength_active:
+            raise RuntimeError("Fixed output strength is not configured")
+        base = self._interpolate_timestep_values(
+            self.native_fixed_output_by_timestep, block_index, batch
+        )
+        return base * float(getattr(self, "global_gain", 1.0))
 
     def runtime_stats(self) -> dict[str, float]:
         result = super().runtime_stats()
@@ -2553,5 +2602,8 @@ class SeparatedCommonArtistKVStyleCrossAttention(
             ),
             "style_artist_null_residual": float(self.artist_null_residual),
             "style_artist_residual_gain": self.artist_residual_gain,
+            "style_common_combined_gradient_scale": (
+                self.common_combined_gradient_scale
+            ),
         })
         return result

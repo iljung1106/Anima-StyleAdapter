@@ -59,6 +59,43 @@ def test_repeatability_floor_stops_compressing_already_related_views():
     assert unrelated_metrics["functional_artist_repeatability_loss"] > 0
 
 
+def test_all_wrong_margin_preserves_reference_variation_after_separation():
+    generator = torch.Generator().manual_seed(29)
+    first = torch.randn(4, 3, 16, 16, generator=generator)
+    # Keep meaningful per-reference variation while preserving the matching
+    # artist direction well above the deliberately modest positive floor.
+    second = first + 0.35 * torch.randn(
+        4, 3, 16, 16, generator=generator
+    )
+    style_ids = ["a", "b", "c", "d"]
+
+    good, good_metrics = centered_functional_artist_loss(
+        first,
+        second,
+        style_ids,
+        contrastive_mode="all_wrong_margin",
+        positive_floor=0.25,
+        wrong_margin=0.10,
+        repeatability_weight=0.02,
+    )
+    wrong, wrong_metrics = centered_functional_artist_loss(
+        first,
+        second.roll(1, dims=0),
+        style_ids,
+        contrastive_mode="all_wrong_margin",
+        positive_floor=0.25,
+        wrong_margin=0.10,
+        repeatability_weight=0.02,
+    )
+
+    assert good < wrong
+    assert good_metrics["functional_artist_uses_symmetric_nce"] == 0
+    assert good_metrics["functional_artist_repeatability_loss"] == 0
+    assert good_metrics["functional_artist_all_wrong_violation_fraction"] < (
+        wrong_metrics["functional_artist_all_wrong_violation_fraction"]
+    )
+
+
 def test_episodic_prototype_uses_disjoint_artist_view_as_the_class():
     generator = torch.Generator().manual_seed(23)
     first = torch.randn(4, 28, 32, generator=generator)
