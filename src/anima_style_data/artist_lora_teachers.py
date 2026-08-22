@@ -644,9 +644,8 @@ def _render_artist_lora_preview(
             base_latent = denoise(0.0)
             lora_latent = denoise(1.0)
             if vae is None:
-                vae = _load_sampling_vae(root_config, destination).to(
-                    device=device, dtype=torch.bfloat16
-                )
+                vae = _load_sampling_vae(root_config, destination)
+            vae.to(device=device, dtype=torch.bfloat16)
             generated = vae.decode_to_pixels(
                 torch.cat((base_latent, lora_latent), dim=0)
             )
@@ -656,6 +655,9 @@ def _render_artist_lora_preview(
         network.set_multiplier(1.0)
         network.train()
         anima.train()
+        if vae is not None:
+            vae.to("cpu")
+        torch.cuda.empty_cache()
 
     panel = _preview_panel(
         [

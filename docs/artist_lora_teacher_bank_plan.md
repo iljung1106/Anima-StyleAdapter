@@ -42,6 +42,8 @@ There is no VAE, text encoder, image decode or NFS read inside the 250-step
 loop. Gradient checkpointing, block swapping and CPU offload are disabled.
 The VAE is loaded lazily only for qualitative panels. The first artist and
 then every eighth artist get a panel, limiting inference-graph and VAE cost.
+It returns to CPU immediately after decoding so its weights do not reduce the
+headroom of later high-resolution training buckets.
 Per-block `torch.compile` remains enabled for the batch-4 production probe;
 the run is retained only if its measured image throughput matches or exceeds
 the earlier batch-2 compiled path.
