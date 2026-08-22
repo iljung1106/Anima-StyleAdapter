@@ -5,6 +5,7 @@ from anima_style_data.lora_oracle_bootstrap import (
     _artist_centered_oracle_objective,
     _interpolate_oracle_visual,
     _oracle_code_alignment_objective,
+    _materialize_reader_code_bank,
     OracleVisualProjector,
 )
 
@@ -84,3 +85,33 @@ def test_oracle_code_alignment_prefers_oracle_codes():
     assert float(exact_loss) < float(visual_loss)
     assert float(exact_metrics["centered_cosine"]) > 0.999
     assert float(visual_metrics["projected_to_oracle_rms"]) > 0.1
+
+
+class _ToyReferenceLoader:
+    def load_styles(self, style_ids, *, references_per_style, seed):
+        del seed
+        values = torch.arange(
+            len(style_ids) * references_per_style * 4 * 8,
+            dtype=torch.float32,
+        )
+        return {"tokens": values.reshape(len(style_ids), references_per_style, 4, 8)}
+
+
+class _ToyReader(torch.nn.Module):
+    def forward(self, references, mask):
+        del mask
+        return type("Output", (), {"tokens": references.mean(dim=1)})()
+
+
+def test_materialized_reader_bank_contains_single_pair_and_quad_views():
+    bank, counts = _materialize_reader_code_bank(
+        _ToyReader(),
+        _ToyReferenceLoader(),
+        ["a", "b"],
+        reference_images=4,
+        seed=1,
+        device="cpu",
+    )
+
+    assert bank.shape == (2, 7, 4, 8)
+    assert counts.tolist() == [1, 1, 1, 1, 2, 2, 4]

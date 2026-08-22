@@ -510,12 +510,12 @@ lora_oracle_bootstrap:
       name: lora-oracle-visual-bridge-v1
       id: lora-oracle-visual-bridge-v1
   visual_projector:
-    output_directory: lora_oracle_visual_projector_v2_full_batch
+    output_directory: lora_oracle_visual_projector_v3_materialized
     source_checkpoint: lora_oracle_bootstrap_v1/training_state.pt
-    steps: 750
+    steps: 1000
     batch_rows: 64
     token_lru_shards: 512
-    reference_count_weights: [1, 1, 1, 2, 2, 3, 4]
+    materialized_reference_images: 8
     dim: 1024
     slots: 28
     heads: 16
@@ -542,8 +542,8 @@ lora_oracle_bootstrap:
     wandb:
       enabled: true
       project: anima-style-adapter
-      name: lora-oracle-visual-projector-v2-full-batch
-      id: lora-oracle-visual-projector-v2-full-batch
+      name: lora-oracle-visual-projector-v3-materialized
+      id: lora-oracle-visual-projector-v3-materialized
 
 # B-prime per-reference encoder. C-RADIO spatial features and Qwen Image VAE
 # latents remain separate K/V banks; learned spatial/global queries read both.

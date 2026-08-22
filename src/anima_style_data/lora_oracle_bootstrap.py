@@ -1023,6 +1023,52 @@ def _save_visual_projector_state(
     temporary.replace(path)
 
 
+@torch.no_grad()
+def _materialize_reader_code_bank(
+    reader: DetailPreservingTypedSlotReader,
+    loader: CachedTeacherReferenceLoader,
+    style_ids: list[str],
+    *,
+    reference_images: int,
+    seed: int,
+    device: str,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compute reusable 1/2/4-reference Reader outputs once on the GPU."""
+
+    if reference_images < 4 or reference_images % 4:
+        raise ValueError("materialized_reference_images must be a multiple of four")
+    loaded = loader.load_styles(
+        style_ids,
+        references_per_style=reference_images,
+        seed=seed,
+    )
+    tokens = loaded["tokens"].to(
+        device=device, dtype=torch.bfloat16, non_blocking=True
+    )
+    groups: list[tuple[int, int]] = []
+    groups.extend((index, 1) for index in range(reference_images))
+    groups.extend((index, 2) for index in range(0, reference_images, 2))
+    groups.extend((index, 4) for index in range(0, reference_images, 4))
+    codes = []
+    reference_counts = []
+    reader.eval()
+    device_type = torch.device(device).type
+    with torch.autocast(
+        device_type=device_type,
+        dtype=torch.bfloat16,
+        enabled=device_type == "cuda",
+    ):
+        for start, count in groups:
+            part = tokens[:, start : start + count]
+            mask = torch.ones(part.shape[:2], device=device, dtype=torch.bool)
+            codes.append(reader(part, mask).tokens)
+            reference_counts.append(count)
+    return (
+        torch.stack(codes, dim=1).contiguous(),
+        torch.tensor(reference_counts, device=device, dtype=torch.float32),
+    )
+
+
 def train_lora_oracle_visual_projector(
     config: dict[str, Any],
     destination: Path,
@@ -1064,12 +1110,12 @@ def train_lora_oracle_visual_projector(
     single_ids = list(bank.by_kind["single"])
     style_ids = [str(bank.mixtures[index]["style_ids"][0]) for index in single_ids]
     batch_rows = int(cfg["batch_rows"])
-    max_references = max(int(value) for value in cfg["reference_count_weights"])
+    reference_images = int(cfg.get("materialized_reference_images", 8))
     loader_kwargs = {
         "split": "train",
         "style_ids": style_ids,
         "batch_size": batch_rows,
-        "references": max_references,
+        "references": reference_images,
         "token_lru_shards": int(cfg.get(
             "token_lru_shards",
             root_cfg["training"].get("token_lru_shards", 8),
@@ -1086,6 +1132,26 @@ def train_lora_oracle_visual_projector(
         seed=seed ^ 0x53594E54,
         **loader_kwargs,
     )
+    human_codes, reference_counts = _materialize_reader_code_bank(
+        reader,
+        human_loader,
+        style_ids,
+        reference_images=reference_images,
+        seed=seed ^ 0x11111111,
+        device=device,
+    )
+    synthetic_codes, synthetic_reference_counts = _materialize_reader_code_bank(
+        reader,
+        synthetic_loader,
+        style_ids,
+        reference_images=reference_images,
+        seed=seed ^ 0x22222222,
+        device=device,
+    )
+    if not torch.equal(reference_counts, synthetic_reference_counts):
+        raise RuntimeError("Human and synthetic Reader banks disagree on views")
+    visual_code_banks = torch.stack((human_codes, synthetic_codes), dim=0)
+    del human_codes, synthetic_codes
 
     optimizer = torch.optim.AdamW(
         projector.parameters(),
@@ -1119,7 +1185,6 @@ def train_lora_oracle_visual_projector(
             config={"lora_oracle_visual_projector": cfg},
         )
 
-    reference_choices = [int(value) for value in cfg["reference_count_weights"]]
     warmup = int(cfg.get("warmup_steps", 100))
     log_every = int(cfg.get("log_every", 10))
     checkpoint_every = int(cfg.get("checkpoint_every", 250))
@@ -1132,27 +1197,21 @@ def train_lora_oracle_visual_projector(
             optimizer.zero_grad(set_to_none=True)
             rng = random.Random(seed + step * 1_000_003)
             positions = rng.sample(range(len(single_ids)), batch_rows)
-            batch_style_ids = [style_ids[index] for index in positions]
-            references = rng.choice(reference_choices)
-            loader = human_loader if step % 2 else synthetic_loader
-            loaded = loader.load_styles(
-                batch_style_ids,
-                references_per_style=references,
-                seed=seed + step * 10_007,
+            position_index = torch.tensor(positions, device=device, dtype=torch.long)
+            view_index = torch.tensor(
+                [rng.randrange(visual_code_banks.shape[2]) for _ in positions],
+                device=device,
+                dtype=torch.long,
             )
-            reference_tokens = loaded["tokens"].to(
-                device=device, dtype=torch.bfloat16, non_blocking=True
-            )
-            reference_mask = torch.ones(
-                reference_tokens.shape[:2], device=device, dtype=torch.bool
-            )
-            with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
-                visual_codes = reader(reference_tokens, reference_mask).tokens
+            domain_index = step % 2
+            visual_codes = visual_code_banks[
+                domain_index, position_index, view_index
+            ]
             with torch.autocast("cuda", dtype=torch.bfloat16):
                 projected = projector(visual_codes)
             loss, metrics = _oracle_code_alignment_objective(
                 projected,
-                oracle_codes[positions],
+                oracle_codes[position_index],
                 visual_codes,
                 dict(cfg.get("loss_weights", {})),
             )
@@ -1164,7 +1223,10 @@ def train_lora_oracle_visual_projector(
             )
             optimizer.step()
             metrics.update({
-                "references": torch.tensor(float(references), device=device),
+                "references": reference_counts[view_index].mean(),
+                "domain_is_human": torch.tensor(
+                    float(domain_index == 1), device=device
+                ),
                 "projector_delta_rms": (
                     projected.float() - visual_codes.float()
                 ).square().mean().sqrt(),
