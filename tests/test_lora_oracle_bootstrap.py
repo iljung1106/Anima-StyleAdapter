@@ -128,6 +128,21 @@ def test_materialized_reader_bank_contains_single_pair_and_quad_views():
     assert counts.tolist() == [1, 1, 1, 1, 2, 2, 4]
 
 
+def test_materialized_reader_bank_chunks_large_style_sets():
+    bank, counts = _materialize_reader_code_bank(
+        _ToyReader(),
+        _ToyReferenceLoader(),
+        ["a", "b", "c", "d", "e"],
+        reference_images=4,
+        seed=1,
+        device="cpu",
+        style_chunk_size=2,
+    )
+
+    assert bank.shape == (5, 7, 4, 8)
+    assert counts.tolist() == [1, 1, 1, 1, 2, 2, 4]
+
+
 def test_projected_reader_composes_reader_and_projector():
     projector = OracleVisualProjector(
         dim=8, slots=4, heads=2, ff_dim=16, bottleneck_dim=4

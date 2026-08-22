@@ -27,6 +27,7 @@ from .lora_functional_distillation import (
     FunctionalLoRATeacherBank,
     decompose_teacher_effects,
 )
+from .native_centered_teacher import NativeCenteredTeacherBank
 from .same_q_style_adapter import attach_same_q_style_adapter
 from .style_transfer import _optimize_frozen_anima, _resolve_anima_model
 
@@ -1161,41 +1162,59 @@ def _materialize_reader_code_bank(
     reference_images: int,
     seed: int,
     device: str,
+    style_chunk_size: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Compute reusable 1/2/4-reference Reader outputs once on the GPU."""
 
     if reference_images < 4 or reference_images % 4:
         raise ValueError("materialized_reference_images must be a multiple of four")
-    loaded = loader.load_styles(
-        style_ids,
-        references_per_style=reference_images,
-        seed=seed,
-    )
-    tokens = loaded["tokens"].to(
-        device=device, dtype=torch.bfloat16, non_blocking=True
-    )
     groups: list[tuple[int, int]] = []
     groups.extend((index, 1) for index in range(reference_images))
     groups.extend((index, 2) for index in range(0, reference_images, 2))
     groups.extend((index, 4) for index in range(0, reference_images, 4))
-    codes = []
-    reference_counts = []
+    reference_counts = torch.tensor(
+        [count for _, count in groups], device=device, dtype=torch.float32
+    )
+    chunk_size = len(style_ids) if style_chunk_size is None else int(style_chunk_size)
+    if chunk_size <= 0:
+        raise ValueError("style_chunk_size must be positive")
+    materialized: torch.Tensor | None = None
     reader.eval()
     device_type = torch.device(device).type
-    with torch.autocast(
-        device_type=device_type,
-        dtype=torch.bfloat16,
-        enabled=device_type == "cuda",
-    ):
-        for start, count in groups:
-            part = tokens[:, start : start + count]
-            mask = torch.ones(part.shape[:2], device=device, dtype=torch.bool)
-            codes.append(reader(part, mask).tokens)
-            reference_counts.append(count)
-    return (
-        torch.stack(codes, dim=1).contiguous(),
-        torch.tensor(reference_counts, device=device, dtype=torch.float32),
-    )
+    for offset in range(0, len(style_ids), chunk_size):
+        chunk_ids = style_ids[offset : offset + chunk_size]
+        loaded = loader.load_styles(
+            chunk_ids,
+            references_per_style=reference_images,
+            seed=seed + offset * 1_000_003,
+        )
+        tokens = loaded["tokens"].to(
+            device=device, dtype=torch.bfloat16, non_blocking=True
+        )
+        codes = []
+        with torch.autocast(
+            device_type=device_type,
+            dtype=torch.bfloat16,
+            enabled=device_type == "cuda",
+        ):
+            for start, count in groups:
+                part = tokens[:, start : start + count]
+                mask = torch.ones(part.shape[:2], device=device, dtype=torch.bool)
+                codes.append(reader(part, mask).tokens)
+        chunk_codes = torch.stack(codes, dim=1)
+        if materialized is None:
+            materialized = torch.empty(
+                len(style_ids),
+                len(groups),
+                *chunk_codes.shape[2:],
+                device=device,
+                dtype=chunk_codes.dtype,
+            )
+        materialized[offset : offset + len(chunk_ids)].copy_(chunk_codes)
+        del tokens, codes, chunk_codes
+    if materialized is None:
+        raise ValueError("Cannot materialize an empty style list")
+    return materialized, reference_counts
 
 
 def train_lora_oracle_visual_projector(
@@ -1281,6 +1300,49 @@ def train_lora_oracle_visual_projector(
         raise RuntimeError("Human and synthetic Reader banks disagree on views")
     visual_code_banks = torch.stack((human_codes, synthetic_codes), dim=0)
     del human_codes, synthetic_codes
+
+    native_steps = int(cfg.get("native_pretrain_steps", 0))
+    native_bank = None
+    native_visual_codes = None
+    native_teacher_indices: list[int] = []
+    if native_steps > 0:
+        native_bank = NativeCenteredTeacherBank.load(
+            config, destination, config_key="dual_domain_native_teacher"
+        )
+        signature = native_bank.summary["signature"]
+        native_all_ids = [str(value) for value in signature["style_ids"]]
+        native_splits = [
+            str(value) for value in signature.get(
+                "splits", ["train"] * len(native_all_ids)
+            )
+        ]
+        native_teacher_indices = [
+            index
+            for index, split in enumerate(native_splits)
+            if split == "train"
+        ]
+        native_style_ids = [native_all_ids[index] for index in native_teacher_indices]
+        native_loader = CachedTeacherReferenceLoader(
+            destination / str(root_cfg["human_reference_cache"]),
+            split="train",
+            style_ids=native_style_ids,
+            batch_size=int(cfg.get("native_materialize_chunk_size", 64)),
+            references=reference_images,
+            seed=seed ^ 0x4E415449,
+            token_lru_shards=int(cfg.get("token_lru_shards", 512)),
+            strict_style_ids=True,
+        )
+        native_visual_codes, native_reference_counts = _materialize_reader_code_bank(
+            reader,
+            native_loader,
+            native_style_ids,
+            reference_images=reference_images,
+            seed=seed ^ 0x33333333,
+            device=device,
+            style_chunk_size=int(cfg.get("native_materialize_chunk_size", 64)),
+        )
+        if not torch.equal(reference_counts, native_reference_counts):
+            raise RuntimeError("Native and LoRA Reader banks disagree on views")
 
     optimizer = torch.optim.AdamW(
         projector.parameters(),
@@ -1571,53 +1633,81 @@ def train_lora_oracle_functional_projector(
             )
             optimizer.zero_grad(set_to_none=True)
             rng = random.Random(seed + step * 1_000_003)
-            positions = rng.sample(range(len(single_ids)), batch_rows)
+            is_native = step <= native_steps
+            available_rows = (
+                len(native_teacher_indices) if is_native else len(single_ids)
+            )
+            positions = rng.sample(range(available_rows), batch_rows)
             position_index = torch.tensor(positions, device=device, dtype=torch.long)
             view_index = torch.tensor(
                 [rng.randrange(visual_code_banks.shape[2]) for _ in positions],
                 device=device,
                 dtype=torch.long,
             )
-            domain_index = step % 2
-            visual_codes = visual_code_banks[
-                domain_index, position_index, view_index
-            ]
+            if is_native:
+                if native_visual_codes is None or native_bank is None:
+                    raise RuntimeError("Native pretraining bank was not initialized")
+                domain_index = -1
+                visual_codes = native_visual_codes[position_index, view_index]
+            else:
+                domain_index = step % 2
+                visual_codes = visual_code_banks[
+                    domain_index, position_index, view_index
+                ]
             with torch.autocast("cuda", dtype=torch.bfloat16):
                 projected = projector(visual_codes)
 
-            content_index = step % int(bank.base["noisy_inputs"].shape[0])
+            functional_bank = native_bank.tensors if is_native else bank.base
+            content_index = step % int(functional_bank["noisy_inputs"].shape[0])
             timestep_index = (
-                step // int(bank.base["noisy_inputs"].shape[0])
-            ) % int(bank.base["noisy_inputs"].shape[1])
-            noisy = bank.base["noisy_inputs"][content_index, timestep_index].to(
+                step // int(functional_bank["noisy_inputs"].shape[0])
+            ) % int(functional_bank["noisy_inputs"].shape[1])
+            noisy = functional_bank["noisy_inputs"][content_index, timestep_index].to(
                 device=device, dtype=torch.bfloat16, non_blocking=True
             )
-            base = bank.base["base_predictions"][content_index, timestep_index].to(
+            base = functional_bank["base_predictions"][content_index, timestep_index].to(
                 device=device, dtype=torch.float32, non_blocking=True
             )
-            context = bank.base["base_context"][content_index : content_index + 1].to(
+            context = functional_bank["base_context"][content_index : content_index + 1].to(
                 device=device, dtype=torch.bfloat16, non_blocking=True
             )
-            timestep = bank.base["timesteps"][timestep_index].to(
+            timestep = functional_bank["timesteps"][timestep_index].to(
                 device=device, dtype=torch.bfloat16
             )
-            teacher_indices = [single_ids[index] for index in positions]
-            teacher = bank.effects[
-                teacher_indices, content_index, timestep_index
-            ].to(device=device, dtype=torch.float32, non_blocking=True)
+            if is_native:
+                teacher_rows = [native_teacher_indices[index] for index in positions]
+                teacher = native_bank.tensors["centered_teacher"][
+                    teacher_rows, content_index, timestep_index
+                ].to(device=device, dtype=torch.float32, non_blocking=True)
+            else:
+                teacher_rows = [single_ids[index] for index in positions]
+                teacher = bank.effects[
+                    teacher_rows, content_index, timestep_index
+                ].to(device=device, dtype=torch.float32, non_blocking=True)
             student = _controlled_style_context_forward(
                 anima, adapter, projected, noisy, base, context, timestep, device
             )
             functional_loss, functional_metrics = _artist_centered_oracle_objective(
                 student, teacher, dict(cfg.get("functional_loss_weights", {}))
             )
-            code_loss, code_metrics = _oracle_code_alignment_objective(
-                projected,
-                oracle_codes[position_index],
-                visual_codes,
-                dict(cfg.get("code_loss_weights", {})),
-            )
-            loss = functional_loss + code_weight * code_loss
+            if is_native:
+                visual_scale = visual_codes.float().square().mean(
+                    dim=(1, 2), keepdim=True
+                ).sqrt().clamp_min(1e-4)
+                identity_loss = (
+                    (projected.float() - visual_codes.float()) / visual_scale
+                ).square().mean()
+                regularizer = float(cfg.get("native_identity_weight", 0.001)) * identity_loss
+                code_metrics = {"identity_loss": identity_loss.detach()}
+            else:
+                code_loss, code_metrics = _oracle_code_alignment_objective(
+                    projected,
+                    oracle_codes[position_index],
+                    visual_codes,
+                    dict(cfg.get("code_loss_weights", {})),
+                )
+                regularizer = code_weight * code_loss
+            loss = functional_loss + regularizer
             loss.backward()
             grad_norm = torch.nn.utils.clip_grad_norm_(
                 projector.parameters(),
@@ -1629,7 +1719,7 @@ def train_lora_oracle_functional_projector(
             metrics = {
                 "loss": loss.detach(),
                 "functional_loss": functional_loss.detach(),
-                "code_regularizer_weighted_loss": (code_weight * code_loss).detach(),
+                "code_regularizer_weighted_loss": regularizer.detach(),
                 **{
                     key: value
                     for key, value in functional_metrics.items()
@@ -1638,8 +1728,9 @@ def train_lora_oracle_functional_projector(
                 **{f"code/{key}": value for key, value in code_metrics.items()},
                 "references": reference_counts[view_index].mean(),
                 "domain_is_human": torch.tensor(
-                    float(domain_index == 1), device=device
+                    float(domain_index != 0), device=device
                 ),
+                "teacher_is_native": torch.tensor(float(is_native), device=device),
             }
             for key, value in metrics.items():
                 running[key].append(float(value.detach()))

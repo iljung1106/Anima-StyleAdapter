@@ -554,16 +554,19 @@ lora_oracle_bootstrap:
       name: lora-oracle-visual-projector-v3-materialized
       id: lora-oracle-visual-projector-v3-materialized
   functional_projector:
-    output_directory: lora_oracle_functional_projector_v1
+    output_directory: lora_oracle_functional_projector_v2_native_pretrain
     source_checkpoint: lora_oracle_bootstrap_v1/training_state.pt
     projector_checkpoint: lora_oracle_visual_projector_v3_materialized/training_state.pt
-    steps: 1500
+    steps: 2500
+    native_pretrain_steps: 1500
+    native_materialize_chunk_size: 64
     batch_rows: 8
     materialized_reference_images: 8
     token_lru_shards: 512
     learning_rate: 0.00010
     warmup_steps: 50
     code_alignment_weight: 0.10
+    native_identity_weight: 0.001
     checkpoint_every: 250
     sample_every: 250
     log_every: 10
@@ -591,8 +594,8 @@ lora_oracle_bootstrap:
     wandb:
       enabled: true
       project: anima-style-adapter
-      name: lora-oracle-functional-projector-v1
-      id: lora-oracle-functional-projector-v1
+      name: lora-oracle-functional-projector-v2-native-pretrain
+      id: lora-oracle-functional-projector-v2-native-pretrain
 
 # B-prime per-reference encoder. C-RADIO spatial features and Qwen Image VAE
 # latents remain separate K/V banks; learned spatial/global queries read both.
