@@ -27,6 +27,7 @@ from anima_style_data.detail_style_training import (  # noqa: E402
     _configure_separated_bootstrap_trainability,
     _delayed_learning_rate_multiplier,
     _effect_stage_metrics,
+    _fixed_reference_batch,
     _initial_performance_curriculum_state,
     _main_flow_total_magnitude_loss,
     _main_flow_projection_floor_loss,
@@ -63,6 +64,36 @@ def test_teacher_domains_follow_weighted_schedule_with_local_indices():
         (0, 0), (0, 1), (0, 2), (1, 0),
         (0, 3), (0, 4), (0, 5), (1, 1),
     ]
+
+
+def test_fixed_reference_batch_accepts_one_or_many_references():
+    single = torch.randn(3, 84, 16)
+    references, mask = _fixed_reference_batch(
+        {"reference_tokens": single}, "cpu"
+    )
+    assert references.shape == (3, 1, 84, 16)
+    assert mask.tolist() == [[True], [True], [True]]
+
+    multiple = torch.randn(3, 4, 84, 16)
+    configured_mask = torch.tensor([
+        [True, True, True, True],
+        [True, True, False, False],
+        [True, False, False, False],
+    ])
+    references, mask = _fixed_reference_batch({
+        "reference_tokens": multiple,
+        "reference_mask": configured_mask,
+    }, "cpu")
+    assert references.shape == (3, 4, 84, 16)
+    assert torch.equal(mask, configured_mask)
+
+
+def test_fixed_reference_batch_rejects_mismatched_mask():
+    with pytest.raises(ValueError, match="reference_mask shape"):
+        _fixed_reference_batch({
+            "reference_tokens": torch.randn(2, 4, 84, 16),
+            "reference_mask": torch.ones(2, 3, dtype=torch.bool),
+        }, "cpu")
 
 
 def test_loaded_checkpoint_preserves_existing_artist_null_baseline():

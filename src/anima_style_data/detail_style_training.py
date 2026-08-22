@@ -14,6 +14,7 @@ from typing import Any
 import numpy as np
 import torch
 import torch.nn.functional as F
+from PIL import Image
 
 from .artist_effect_losses import (
     centered_functional_artist_loss,
@@ -38,6 +39,7 @@ from .dual_query_style_training import (
 from .global_query_style_tokenizer import MultiPromptDualQueryCachedStyleLoader
 from .external_style_tokenizer_sheet import (
     _decode_latents,
+    _fit_with_padding,
     _make_sheet,
     _pixel_rms_from_baseline,
 )
@@ -3182,6 +3184,8 @@ def _generate_fixed_reference_sample(
     *,
     component_mode: str | None = None,
     strengths_override: list[float] | None = None,
+    sample_group: str = "external_reference_samples",
+    sample_suffix: str | None = None,
 ) -> dict[str, Any]:
     """Render the fixed TestSample1--7 contract through the style branch."""
 
@@ -3197,10 +3201,7 @@ def _generate_fixed_reference_sample(
     )
     if not strengths or any(value <= 0 for value in strengths):
         raise ValueError("fixed_sample_strengths must contain positive values")
-    references = prepared["reference_tokens"][:, None].to(
-        device, dtype=torch.bfloat16, non_blocking=True
-    )
-    mask = torch.ones(references.shape[:2], device=device, dtype=torch.bool)
+    references, mask = _fixed_reference_batch(prepared, device)
     reader_was_training = reader.training
     adapter_was_training = adapter.training
     previous_component_mode = None
@@ -3341,7 +3342,9 @@ def _generate_fixed_reference_sample(
     sample_name = f"step-{step:07d}"
     if component_mode is not None:
         sample_name += f"-{component_mode}"
-    sample_dir = output / "external_reference_samples" / sample_name
+    if sample_suffix:
+        sample_name += f"-{sample_suffix}"
+    sample_dir = output / sample_group / sample_name
     generated_dir = sample_dir / "generated"
     generated_dir.mkdir(parents=True, exist_ok=True)
     base.save(generated_dir / "no-style.png")
@@ -3395,7 +3398,10 @@ def _generate_fixed_reference_sample(
         "sheet": sheets[primary_label],
         "sheets": sheets,
         "strengths": strengths,
-        "references": 7,
+        "artists": int(references.shape[0]),
+        "references_per_artist": [
+            int(value) for value in mask.sum(dim=1).detach().cpu().tolist()
+        ],
         "prompt": str(cfg["prompt"]),
         "negative_prompt": str(cfg["negative_prompt"]),
         "text_cfg": text_cfg,
@@ -3412,6 +3418,33 @@ def _generate_fixed_reference_sample(
     if device.startswith("cuda"):
         torch.cuda.empty_cache()
     return summary
+
+
+def _fixed_reference_batch(
+    prepared: dict[str, Any], device: str
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Normalize one- or multi-reference cached tokens for fixed sampling."""
+
+    values = prepared["reference_tokens"]
+    if values.ndim == 3:
+        values = values[:, None]
+    elif values.ndim != 4:
+        raise ValueError(
+            "reference_tokens must have shape [artist,tokens,dim] or "
+            "[artist,references,tokens,dim]"
+        )
+    references = values.to(device, dtype=torch.bfloat16, non_blocking=True)
+    configured_mask = prepared.get("reference_mask")
+    if configured_mask is None:
+        mask = torch.ones(references.shape[:2], dtype=torch.bool)
+    else:
+        mask = configured_mask.to(dtype=torch.bool)
+        if tuple(mask.shape) != tuple(references.shape[:2]):
+            raise ValueError(
+                f"reference_mask shape {tuple(mask.shape)} does not match "
+                f"reference batch {tuple(references.shape[:2])}"
+            )
+    return references, mask.to(device, non_blocking=True)
 
 
 def _fixed_sample_complete(
@@ -5149,4 +5182,191 @@ def backfill_detail_style_fixed_samples(
         "reused_steps": reused,
     }
     write_json(output / "external_reference_samples" / "backfill_summary.json", summary)
+    return summary
+
+
+def _reference_montage(
+    paths: list[Path], destination: Path, size: tuple[int, int]
+) -> Path:
+    columns = 1 if len(paths) == 1 else 2
+    rows = math.ceil(len(paths) / columns)
+    cell = (size[0] // columns, size[1] // rows)
+    canvas = Image.new("RGB", size, "white")
+    for index, path in enumerate(paths):
+        with Image.open(path) as source:
+            preview = _fit_with_padding(source, cell)
+        x = (index % columns) * cell[0]
+        y = (index // columns) * cell[1]
+        canvas.paste(preview, (x, y))
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    canvas.save(destination, compress_level=4)
+    return destination
+
+
+def evaluate_detail_style_reference_counts(
+    config: dict[str, Any], destination: Path
+) -> dict[str, Any]:
+    """Compare one and four held-out references under identical generation."""
+
+    cfg = copy.deepcopy(config["detail_preserving_style_cross_attention"])
+    evaluation = dict(cfg.get("controlled_reference_evaluation", {}))
+    training = dict(cfg["training"])
+    device = str(training.get("device", "cuda"))
+    output = destination / str(cfg["output_directory"])
+    checkpoint_dir = output / "checkpoints"
+    checkpoint_steps = [
+        int(value) for value in evaluation.get("checkpoint_steps", [500])
+    ]
+    reference_counts = [
+        int(value) for value in evaluation.get("reference_counts", [1, 4])
+    ]
+    artist_count = int(evaluation.get("artists", 8))
+    selection_seed = int(evaluation.get("selection_seed", 20260822))
+    strengths = [
+        float(value) for value in evaluation.get("strengths", [1.0, 2.0])
+    ]
+    if reference_counts != [1, 4]:
+        raise ValueError("controlled reference evaluation requires counts [1,4]")
+    if artist_count <= 1:
+        raise ValueError("controlled reference evaluation needs at least two artists")
+
+    loaders: dict[int, MultiPromptDualQueryCachedStyleLoader] = {}
+    for count in reference_counts:
+        loader_cfg = _loader_config(
+            config, cfg, split=str(cfg.get("validation_split", "validation"))
+        )
+        loader_cfg.update({
+            "seed": selection_seed,
+            "batch_size": 1,
+            "min_references": count,
+            "max_references": count,
+            "reference_count_weights": None,
+            "reference_curriculum": {},
+            "pilot_reference_schedule": [],
+            "quality_probability": 0.0,
+            "prompt_modes": {
+                "full": 1.0,
+                "tag_dropout": 0.0,
+                "short": 0.0,
+                "empty": 0.0,
+            },
+        })
+        loaders[count] = MultiPromptDualQueryCachedStyleLoader(
+            destination, loader_cfg
+        )
+    episode_indices = _select_sample_episodes(loaders[1], artist_count)
+
+    fixed = load_dual_query_external_sample(config, destination)
+    width = int(fixed["cfg"]["width"])
+    height = int(fixed["cfg"]["height"])
+    prepared_by_count: dict[int, dict[str, Any]] = {}
+    artist_records: dict[int, list[dict[str, Any]]] = {}
+    expected_styles: list[str] | None = None
+    preview_root = output / "controlled_reference_counts" / "reference_previews"
+    for count, loader in loaders.items():
+        token_batches = []
+        preview_paths = []
+        records = []
+        styles = []
+        for artist_index, episode_index in enumerate(episode_indices, start=1):
+            batch = loader.load_step(episode_index)
+            episode = batch["episodes"][0]
+            styles.append(str(episode.style_id))
+            reference_ids = [int(value) for value in episode.reference_ids]
+            reference_paths = [
+                Path(str(loader.style_by_id[image_id]["local_path"]))
+                for image_id in reference_ids
+            ]
+            preview = _reference_montage(
+                reference_paths,
+                preview_root / f"{count}ref-artist-{artist_index:02d}.png",
+                (width, height),
+            )
+            token_batches.append(batch["cached_reference_tokens"])
+            preview_paths.append(preview)
+            records.append({
+                "artist_index": artist_index,
+                "style_id": str(episode.style_id),
+                "target_id_used_only_for_selection": int(episode.target_id),
+                "reference_ids": reference_ids,
+                "reference_paths": [str(value) for value in reference_paths],
+                "preview": str(preview),
+            })
+        if expected_styles is None:
+            expected_styles = styles
+        elif styles != expected_styles:
+            raise RuntimeError(
+                "1-reference and 4-reference loaders selected different artists"
+            )
+        prepared_by_count[count] = {
+            **fixed,
+            "reference_tokens": torch.stack(token_batches),
+            "reference_mask": torch.ones(
+                artist_count, count, dtype=torch.bool
+            ),
+            "paths": preview_paths,
+        }
+        artist_records[count] = records
+
+    anima = _resolve_anima_model(config, destination, device).requires_grad_(False).eval()
+    _optimize_frozen_anima(
+        anima,
+        low_precision_rmsnorm=bool(training.get("low_precision_rmsnorm", True)),
+        fuse_attention_projections=bool(training.get("fuse_attention_projections", True)),
+    )
+    reader = DetailPreservingTypedSlotReader(**dict(cfg["model"])).to(device).eval()
+    adapter = _build_style_adapter(cfg).to(device).eval()
+    attach_same_q_style_adapter(anima, adapter)
+
+    results = []
+    for step in checkpoint_steps:
+        checkpoint = checkpoint_dir / f"step-{step:07d}.pt"
+        if not checkpoint.exists():
+            raise FileNotFoundError(checkpoint)
+        state = torch.load(checkpoint, map_location="cpu", weights_only=False)
+        reader.load_state_dict(state["reader"], strict=True)
+        adapter.load_state_dict(state["adapter"], strict=True)
+        adapter.restore_timestep_strength_state()
+        del state
+        for count in reference_counts:
+            result = _generate_fixed_reference_sample(
+                prepared_by_count[count], config, destination,
+                anima, reader, adapter, output, device, step,
+                strengths_override=strengths,
+                sample_group="controlled_reference_counts",
+                sample_suffix=f"{count}ref",
+            )
+            results.append({
+                "step": step,
+                "reference_count": count,
+                "sheets": result["sheets"],
+                "metrics": result["metrics"],
+            })
+            print(
+                f"detail-style controlled reference evaluation step={step} "
+                f"references={count} sheet={result['sheet']}",
+                flush=True,
+            )
+
+    summary = {
+        "contract": {
+            "split": str(cfg.get("validation_split", "validation")),
+            "artists": artist_count,
+            "same_artists_across_reference_counts": True,
+            "same_prompt_across_artists_and_counts": True,
+            "same_seed_across_artists_and_counts": True,
+            "reference_counts": reference_counts,
+            "strengths": strengths,
+            "artist_id_in_prompt": False,
+        },
+        "prompt": str(fixed["cfg"]["prompt"]),
+        "negative_prompt": str(fixed["cfg"]["negative_prompt"]),
+        "seed": int(fixed["cfg"]["seed"]),
+        "checkpoint_steps": checkpoint_steps,
+        "artists_by_reference_count": {
+            str(key): value for key, value in artist_records.items()
+        },
+        "results": results,
+    }
+    write_json(output / "controlled_reference_counts" / "summary.json", summary)
     return summary

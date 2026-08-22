@@ -121,6 +121,10 @@ def build_parser() -> argparse.ArgumentParser:
             "Backfill fixed TestSample1-7 panels from detail-style checkpoints",
         ),
         (
+            "detail-style-reference-count-eval",
+            "Compare one and four validation references with fixed prompt and seed",
+        ),
+        (
             "detail-style-strength-profile",
             "Measure clean-path block-by-timestep native/style residual distributions",
         ),
@@ -408,6 +412,7 @@ def main() -> None:
         "detail-style-reader-pretrain",
         "detail-style-block-similarity",
         "detail-style-fixed-samples",
+        "detail-style-reference-count-eval",
         "detail-style-strength-profile",
         "detail-style-attenuation",
         "detail-style-gradient-diagnostics",
@@ -419,6 +424,7 @@ def main() -> None:
         from .detail_style_training import (
             backfill_detail_style_fixed_samples,
             diagnose_detail_style_attenuation,
+            evaluate_detail_style_reference_counts,
             profile_detail_style_block_timestep_strength,
             smoke_test_detail_style_cross_attention,
             train_detail_style_cross_attention,
@@ -439,6 +445,9 @@ def main() -> None:
             "detail-style-reader-pretrain": pretrain_detail_style_reader,
             "detail-style-block-similarity": analyze_anima_block_similarity,
             "detail-style-fixed-samples": backfill_detail_style_fixed_samples,
+            "detail-style-reference-count-eval": (
+                evaluate_detail_style_reference_counts
+            ),
             "detail-style-strength-profile": (
                 profile_detail_style_block_timestep_strength
             ),

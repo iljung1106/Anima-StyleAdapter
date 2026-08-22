@@ -4443,3 +4443,11 @@ detail_preserving_style_cross_attention:
     style_cfg: 1.0
     batch_size: 4
     vae_batch_size: 4
+  controlled_reference_evaluation:
+    # Same validation artists, prompt, seed, text CFG, and checkpoint. Only
+    # the number of target-excluded references changes between the two runs.
+    checkpoint_steps: [500]
+    reference_counts: [1, 4]
+    artists: 8
+    selection_seed: 20260822
+    strengths: [1.0, 2.0]
