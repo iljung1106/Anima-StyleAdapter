@@ -8,6 +8,7 @@ import json
 import math
 import random
 import time
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -733,6 +734,11 @@ def _weighted_artist_effect_objective(
         repeatability_weight=float(
             training.get("artist_effect_repeatability_weight", 0.25)
         ),
+        repeatability_floor=(
+            float(training["artist_effect_repeatability_floor"])
+            if training.get("artist_effect_repeatability_floor") is not None
+            else None
+        ),
     )
     common_threshold = _scheduled_value(
         step,
@@ -1280,6 +1286,30 @@ def _backward_adapter_only(
             parameter.grad = detached
         else:
             parameter.grad.add_(detached)
+
+
+@contextmanager
+def _scaled_parameter_gradients(
+    parameters: list[torch.nn.Parameter], scale: float
+):
+    """Scale gradients created inside one auxiliary backward region only."""
+
+    if scale < 0:
+        raise ValueError("gradient scale cannot be negative")
+    handles = []
+    if scale != 1.0:
+        for parameter in parameters:
+            if parameter.requires_grad:
+                handles.append(
+                    parameter.register_hook(
+                        lambda gradient, factor=float(scale): gradient * factor
+                    )
+                )
+    try:
+        yield
+    finally:
+        for handle in handles:
+            handle.remove()
 
 
 def _gradient_rms(parameters: list[torch.nn.Parameter]) -> torch.Tensor:
@@ -3626,8 +3656,25 @@ def train_detail_style_cross_attention(
         adapter.restore_timestep_strength_state()
         start_step = int(resume["step"])
     else:
+        resume_checkpoint = cfg.get("resume_checkpoint")
+        if resume_checkpoint:
+            resume = torch.load(
+                destination / str(resume_checkpoint),
+                map_location="cpu",
+                weights_only=False,
+            )
+            loaded_checkpoint_state = resume
+            reader.load_state_dict(resume["reader"], strict=True)
+            adapter.load_state_dict(resume["adapter"], strict=True)
+            adapter.restore_timestep_strength_state()
+            start_step = int(resume["step"])
+            print(
+                "resumed detail-style model, optimizer and RNG from "
+                f"{resume_checkpoint} step={start_step}",
+                flush=True,
+            )
         initial_checkpoint = cfg.get("initial_checkpoint")
-        if initial_checkpoint:
+        if initial_checkpoint and resume_checkpoint is None:
             initial_state = torch.load(
                 destination / str(initial_checkpoint),
                 map_location="cpu",
@@ -3643,7 +3690,7 @@ def train_detail_style_cross_attention(
                 flush=True,
             )
         reader_checkpoint = cfg.get("reader_checkpoint")
-        if reader_checkpoint and not initial_checkpoint:
+        if reader_checkpoint and not initial_checkpoint and resume_checkpoint is None:
             reader_state = torch.load(
                 destination / str(reader_checkpoint),
                 map_location="cpu",
@@ -4144,22 +4191,31 @@ def train_detail_style_cross_attention(
                 teacher_domain_name, teacher_loader = teacher_loaders[
                     teacher_domain
                 ]
-                teacher_metrics = _teacher_step(
-                    anima, reader, adapter, bank, contexts,
-                    teacher_loader.load_step(
-                        domain_update,
-                        reference_count_weights=_teacher_reference_count_weights(
-                            training, step
+                teacher_reader_gradient_scale = float(
+                    training.get("teacher_reader_gradient_scale", 1.0)
+                )
+                with _scaled_parameter_gradients(
+                    reader_parameters, teacher_reader_gradient_scale
+                ):
+                    teacher_metrics = _teacher_step(
+                        anima, reader, adapter, bank, contexts,
+                        teacher_loader.load_step(
+                            domain_update,
+                            reference_count_weights=_teacher_reference_count_weights(
+                                training, step
+                            ),
                         ),
-                    ),
-                    device, training,
-                    timestep_weighting, native_common_cache,
-                    step=step, probe_index=teacher_update,
-                    post_gate_magnitude_enabled=bool(
-                        performance_stage.get(
-                            "post_gate_magnitude_enabled", True
-                        )
-                    ) if performance_stage is not None else True,
+                        device, training,
+                        timestep_weighting, native_common_cache,
+                        step=step, probe_index=teacher_update,
+                        post_gate_magnitude_enabled=bool(
+                            performance_stage.get(
+                                "post_gate_magnitude_enabled", True
+                            )
+                        ) if performance_stage is not None else True,
+                    )
+                teacher_metrics["teacher_reader_gradient_scale"] = torch.tensor(
+                    teacher_reader_gradient_scale, device=device
                 )
                 teacher_metrics["teacher_reference_domain_index"] = (
                     torch.tensor(float(teacher_domain), device=device)

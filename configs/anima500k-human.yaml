@@ -3830,7 +3830,7 @@ real_artist_teacher:
 # Detail-preserving typed-slot, separate-softmax Style Cross-Attention v1.
 # Contract: docs/detail_preserving_style_cross_attention_plan.md
 detail_preserving_style_cross_attention:
-  output_directory: detail_preserving_style_cross_attention_v35_centered_energy
+  output_directory: detail_preserving_style_cross_attention_v36_reference_fidelity
   seed: 20260819
   train_split: train
   validation_split: validation
@@ -3846,6 +3846,10 @@ detail_preserving_style_cross_attention:
   # v31 step 3500 has the best pre-compensation artist-null residual. Start a
   # fresh optimizer/step schedule from its weights and move from synthetic-only
   # bootstrap to human flow plus disjoint-view functional separation.
+  # v35 step 750 retained the best reference-specific retrieval/repeatability
+  # before the increasingly target-excluded curriculum weakened the output.
+  # Resume its Adam moments and RNG as well as the model weights.
+  resume_checkpoint: detail_preserving_style_cross_attention_v35_centered_energy/checkpoints/step-0000750.pt
   initial_checkpoint: detail_preserving_style_cross_attention_v31_artist_null_residual/checkpoints/step-0003500.pt
   reader_pretraining:
     output_directory: detail_style_reader_pretrain_v1
@@ -3890,10 +3894,10 @@ detail_preserving_style_cross_attention:
     ram_resident_tokens: true
     ram_preload_workers: 8
     prompt_modes:
-      full: 0.30
+      full: 0.20
       tag_dropout: 0.40
-      short: 0.20
-      empty: 0.10
+      short: 0.25
+      empty: 0.15
     quality_probability: 0.50
     validation_prompt_modes:
       full: 1.0
@@ -4029,7 +4033,7 @@ detail_preserving_style_cross_attention:
       - synthetic_teacher_additional_1500x6/dual_query_reference_tokens_v8_step10000
   training:
     device: cuda
-    steps: 2000
+    steps: 8000
     # v33 leaves bootstrap-only mode: every step now includes the human main
     # flow objective, while synthetic teacher updates become an auxiliary.
     native_bootstrap:
@@ -4052,16 +4056,16 @@ detail_preserving_style_cross_attention:
     block_delta_learning_rate: 0.00020
     base_mix_learning_rate: 0.00004
     artist_null_learning_rate: 0.00020
-    # v35 is a loss-only continuation from the v34 step-500 state. Preserve
-    # Adam moments as well as model/data position so the comparison isolates
-    # the adjusted functional loss balance.
+    # v36 continues the v35 step-750 optimizer state.  The structural path is
+    # unchanged; only reference-fidelity curriculum and auxiliary gradients
+    # are adjusted so the comparison remains attributable.
     resume_optimizer: true
     reset_artist_null_context_on_upgrade: true
     betas: [0.9, 0.95]
     adam_eps: 0.00000001
     weight_decay: 0.01
     warmup_steps: 100
-    lr_decay_start_step: 2500
+    lr_decay_start_step: 6000
     minimum_lr_ratio: 0.10
     max_grad_norm: 1.0
     reader_max_grad_norm: 1.0
@@ -4128,25 +4132,25 @@ detail_preserving_style_cross_attention:
         max_references: 1
         reference_count_weights: [1.0]
       - name: target_included_1_2_4
-        end_step: 1000
+        end_step: 1500
         min_references: 1
         max_references: 4
-        reference_count_weights: [0.55, 0.30, 0.0, 0.15]
+        reference_count_weights: [0.70, 0.25, 0.0, 0.05]
       - name: target_anneal_1_2_4_8
-        end_step: 2000
+        end_step: 8000
         min_references: 1
         max_references: 8
-        reference_count_weights: [0.45, 0.30, 0.0, 0.17, 0.0, 0.0, 0.0, 0.08]
+        reference_count_weights: [0.55, 0.30, 0.0, 0.10, 0.0, 0.0, 0.0, 0.05]
     curriculum:
       gate_only_steps: 0
       self_reference_steps: 250
-      target_mix_end_step: 1000
+      target_mix_end_step: 750
       # v33 kept the exact target in every reference set through step 1,000.
       # The Reader then learned a strong reference-insensitive transform: its
       # centered InfoNCE improved while fixed-reference outputs converged. Start
       # removing the target immediately after the exact-self bootstrap.
-      target_mix_end_probability: 0.5
-      target_anneal_end: 2000
+      target_mix_end_probability: 0.8
+      target_anneal_end: 8000
       target_mix_min_references: 1
       target_mix_max_references: 4
       target_anneal_min_references: 1
@@ -4154,8 +4158,8 @@ detail_preserving_style_cross_attention:
     empty_prompt_forces_target: true
     # Weakly preserve the random Reader's 84 -> 28 information path without
     # turning reconstruction into the style objective.
-    reconstruction_weight: 0.0
-    reconstruction_final_weight: 0.0
+    reconstruction_weight: 0.01
+    reconstruction_final_weight: 0.005
     reconstruction_hold_steps: 2000
     # v23 removes the failed v22 full-residual RMS bootstrap. The complete
     # target-minus-frozen residual contains content/noise/base-model error that
@@ -4212,13 +4216,17 @@ detail_preserving_style_cross_attention:
     # disjoint-view objective densely enough that artist-specific directions do
     # not become a sparse correction to ordinary flow MSE.
     artist_effect_every: 2
-    artist_effect_weight: 0.10
+    artist_effect_weight: 0.05
     artist_effect_teacher_view: disjoint_heldout
     # The primary loss is backwarded before the auxiliary heldout-reference
     # Anima pass, so two batch-four DiT graphs never coexist on an H100 80GB.
     artist_effect_temperature: 0.10
     artist_effect_pool_scales: [2, 4]
-    artist_effect_repeatability_weight: 0.75
+    # Cross-artwork agreement is only a weak floor.  The old 0.75 objective
+    # rewarded ever more invariant outputs even though one artist can span
+    # several styles and the application accepts reference-content leakage.
+    artist_effect_repeatability_weight: 0.10
+    artist_effect_repeatability_floor: 0.30
     # Estimate the common residual directly under a controlled same-content /
     # timestep native-teacher probe. Normalize only by the frozen native effect
     # scale; no cross-step EMA or student-derived denominator is used.
@@ -4259,7 +4267,7 @@ detail_preserving_style_cross_attention:
     artist_magnitude_full_step: 1000
     # Keep this band weak: it preserves a repeatable effect without making
     # magnitude more important than its direction or the main flow objective.
-    artist_magnitude_weight: 0.03
+    artist_magnitude_weight: 0.01
     artist_magnitude_lower_start_step: 250
     artist_magnitude_lower_end_step: 2000
     artist_magnitude_lower_start: 0.35
@@ -4296,7 +4304,12 @@ detail_preserving_style_cross_attention:
     # share every functional update after step 250. Human reference separation
     # is now the denser objective.
     teacher_every_after_bootstrap: 8
-    teacher_end_step: 2000
+    teacher_end_step: 8000
+    # Native @artist distillation aligns the Anima-facing K/V path.  Human flow
+    # remains the main signal that may preserve reference-specific content;
+    # do not let the class-level teacher compress the Reader into an invariant
+    # artist representation.
+    teacher_reader_gradient_scale: 0.10
     # Local block-output regression is intentionally disabled. Native tagged
     # contexts are used only to recover the final global common effect removed
     # by the pre-centered teacher cache.
@@ -4421,8 +4434,8 @@ detail_preserving_style_cross_attention:
     wandb:
       enabled: true
       project: anima-style-adapter
-      name: detail-style-v35-centered-energy
-      id: detail-style-v35-centered-energy
+      name: detail-style-v36-reference-fidelity
+      id: detail-style-v36-reference-fidelity
   gradient_diagnostics:
     checkpoint_step: 1500
     teacher_batch_step: 1500

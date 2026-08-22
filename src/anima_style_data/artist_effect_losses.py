@@ -133,6 +133,7 @@ def centered_functional_artist_loss(
     temperature: float = 0.10,
     pool_scales: Sequence[int] = (2, 4),
     repeatability_weight: float = 0.25,
+    repeatability_floor: float | None = None,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """Learn the artist effect shared by two disjoint reference views.
 
@@ -146,6 +147,8 @@ def centered_functional_artist_loss(
         raise ValueError("Functional artist views need matching artist batches")
     if repeatability_weight < 0:
         raise ValueError("repeatability_weight cannot be negative")
+    if repeatability_floor is not None and not -1.0 <= repeatability_floor <= 1.0:
+        raise ValueError("repeatability_floor must be between -1 and 1")
     first_centered = first_delta.float() - first_delta.float().mean(
         dim=0, keepdim=True
     )
@@ -160,7 +163,16 @@ def centered_functional_artist_loss(
     dot = (first_vector * second_vector).sum(dim=1)
     energy = first_vector.square().sum(dim=1) + second_vector.square().sum(dim=1)
     repeatable_ratio = 2.0 * dot / energy.clamp_min(1e-8)
-    repeatability = (1.0 - repeatable_ratio).mean()
+    if repeatability_floor is None:
+        repeatability = (1.0 - repeatable_ratio).mean()
+    else:
+        # Different works by one artist are not interchangeable targets.  Once
+        # their coarse centered effects have a modest agreement, leave the
+        # remaining reference-specific signal untouched instead of rewarding
+        # an increasingly invariant (and eventually common) output.
+        repeatability = F.relu(
+            float(repeatability_floor) - repeatable_ratio
+        ).square().mean()
     total = contrastive + float(repeatability_weight) * repeatability
 
     positive = labels[:, None] == labels[None]
@@ -197,6 +209,9 @@ def centered_functional_artist_loss(
         "functional_artist_loss": total.detach(),
         "functional_artist_contrastive_loss": contrastive.detach(),
         "functional_artist_repeatability_loss": repeatability.detach(),
+        "functional_artist_repeatability_floor": repeatability.new_tensor(
+            -1.0 if repeatability_floor is None else float(repeatability_floor)
+        ),
         "functional_artist_repeatable_ratio": repeatable_ratio.detach().mean(),
         "functional_artist_icc": functional_icc.detach(),
         "functional_artist_positive_cosine": positive_similarity.detach(),

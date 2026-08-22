@@ -37,6 +37,7 @@ from anima_style_data.detail_style_training import (  # noqa: E402
     _native_teacher_objective_config,
     _separated_bootstrap_phase,
     _separated_common_transition_status,
+    _scaled_parameter_gradients,
     _soft_common_output_objective,
     _teacher_domain_update,
     _teacher_direction_ranking_loss,
@@ -53,6 +54,16 @@ from anima_style_data.detail_style_gradient_diagnostics import (  # noqa: E402
     _gradient_sample_plan,
     _measure_gradient_sketches,
 )
+
+
+def test_auxiliary_gradient_scale_only_changes_gradients_inside_region():
+    parameter = nn.Parameter(torch.tensor(2.0))
+
+    (parameter * 3.0).backward()
+    with _scaled_parameter_gradients([parameter], 0.1):
+        (parameter * 5.0).backward()
+
+    torch.testing.assert_close(parameter.grad, torch.tensor(3.5))
 
 
 def test_teacher_domains_follow_weighted_schedule_with_local_indices():

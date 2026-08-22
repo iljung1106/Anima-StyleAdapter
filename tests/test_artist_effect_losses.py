@@ -31,6 +31,34 @@ def test_centered_functional_loss_rewards_repeatable_artist_effects():
     assert metrics["functional_artist_icc"] > 0.99
 
 
+def test_repeatability_floor_stops_compressing_already_related_views():
+    generator = torch.Generator().manual_seed(19)
+    first = torch.randn(4, 3, 16, 16, generator=generator)
+    related = first + 0.25 * torch.randn(4, 3, 16, 16, generator=generator)
+    style_ids = ["a", "b", "c", "d"]
+
+    _, related_metrics = centered_functional_artist_loss(
+        first,
+        related,
+        style_ids,
+        repeatability_weight=0.1,
+        repeatability_floor=0.3,
+    )
+    _, unrelated_metrics = centered_functional_artist_loss(
+        first,
+        related.roll(1, dims=0),
+        style_ids,
+        repeatability_weight=0.1,
+        repeatability_floor=0.3,
+    )
+
+    torch.testing.assert_close(
+        related_metrics["functional_artist_repeatability_loss"],
+        torch.tensor(0.0),
+    )
+    assert unrelated_metrics["functional_artist_repeatability_loss"] > 0
+
+
 def test_episodic_prototype_uses_disjoint_artist_view_as_the_class():
     generator = torch.Generator().manual_seed(23)
     first = torch.randn(4, 28, 32, generator=generator)

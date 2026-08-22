@@ -1081,3 +1081,30 @@ Reference curriculum은 `1~250: target 한 장만`, `251~1000: 1~4장 중 target
 prototype, cyclic ranking, 별도 common-output, raw desired-residual magnitude loss는
 모두 끈다. Alpha는 v24와 동일하게 모든 블록 `0.10`, global gain `1.0`으로 시작해
 loss 구성과 reference curriculum만 비교한다.
+
+## 27. v36 reference-fidelity continuation
+
+v35에서는 750→1,000스텝 사이 target 포함률이 `0.67→0.50`으로 내려가면서
+style-output ratio, artist retrieval, ICC와 cross-reference repeatability가 함께
+감소했다. 같은 작가의 서로 다른 작품이 반드시 같은 화풍이라는 가정도 실제
+데이터와 맞지 않으므로, v36은 v35 750스텝의 모델·Adam 상태에서 다음처럼 잇는다.
+
+- 같은 작가의 disjoint-reference functional objective 총 가중치는 `0.10→0.05`,
+  repeatability 내부 가중치는 `0.75→0.10`으로 낮춘다.
+- Repeatability는 계속 1로 끌어올리지 않는다. Centered low/mid-frequency effect의
+  agreement가 `0.30`보다 낮을 때만 hinge penalty를 주고, 그 이상에서는 서로 다른
+  작품의 reference-specific 성분을 보존한다.
+- 750스텝의 target 포함률을 `0.80`으로 다시 올린 뒤 8,000스텝까지 천천히 0으로
+  낮춘다. 1,500스텝까지 reference 수는 1장 70%, 2장 25%, 4장 5%로 구성한다.
+- Prompt는 Full 20%, Tag Dropout 40%, Short 25%, Empty 15%이며 Empty는 항상
+  exact target 한 장을 사용한다. Reader reconstruction은 `0.01→0.005`의 약한
+  보존 항으로 유지한다.
+- Synthetic native-artist teacher는 8스텝마다 유지하되 Reader gradient만 0.1배로
+  줄인다. Teacher는 Anima-facing K/V를 정렬하고, Reader는 human flow를 통해
+  reference별 content·style 세부 정보를 보존하게 한다.
+- LR decay는 6,000스텝부터 시작한다. Common-output/artist-energy 제약은 유지하지만
+  disjoint-view magnitude weight는 `0.03→0.01`로 낮춘다.
+
+우선 평가는 paired flow 하나가 아니라 고정 reference 시각 결과, style-output
+ratio, artist retrieval/ICC, common-output ratio, 같은 작가에서 reference를 바꿨을
+때의 출력 다양성을 함께 사용한다.
