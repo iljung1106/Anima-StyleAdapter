@@ -1416,3 +1416,310 @@ def smoke_test_lora_oracle_visual_projector(
     return train_lora_oracle_visual_projector(
         effective, destination, steps_override=3
     )
+
+
+def train_lora_oracle_functional_projector(
+    config: dict[str, Any],
+    destination: Path,
+    *,
+    steps_override: int | None = None,
+) -> dict[str, Any]:
+    """Align visual codes through the frozen, oracle-trained connector.
+
+    Code-space regression is only a weak regularizer. The primary target is
+    the final centered LoRA effect after a frozen Anima forward, so the
+    connector's already verified oracle mapping is never relearned or erased.
+    """
+
+    root_cfg = copy.deepcopy(config["lora_oracle_bootstrap"])
+    cfg = dict(root_cfg["functional_projector"])
+    steps = int(steps_override if steps_override is not None else cfg["steps"])
+    device = str(root_cfg["training"].get("device", "cuda"))
+    seed = int(root_cfg.get("seed", 20260823)) ^ 0x46554E43
+    random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.set_float32_matmul_precision("high")
+
+    anima = _resolve_anima_model(config, destination, device).requires_grad_(False).eval()
+    _optimize_frozen_anima(anima, low_precision_rmsnorm=True, fuse_attention_projections=True)
+    detail_cfg = copy.deepcopy(config["detail_preserving_style_cross_attention"])
+    reader = DetailPreservingTypedSlotReader(**dict(detail_cfg["model"])).to(device)
+    adapter = _build_style_adapter(detail_cfg).to(device)
+    if not isinstance(adapter, SeparatedCommonArtistKVStyleCrossAttention):
+        raise TypeError("Functional projector requires the separated adapter")
+    attach_same_q_style_adapter(anima, adapter)
+
+    source = torch.load(
+        destination / str(cfg["source_checkpoint"]),
+        map_location="cpu",
+        weights_only=False,
+    )
+    reader.load_state_dict(source["reader"], strict=True)
+    adapter.load_state_dict(source["adapter"], strict=True)
+    adapter.restore_timestep_strength_state()
+    adapter.set_bootstrap_phase("artist_only")
+    reader.requires_grad_(False).eval()
+    adapter.requires_grad_(False).eval()
+    oracle_codes = source["oracle_codes"].to(device=device, dtype=torch.bfloat16)
+
+    projector_cfg = dict(root_cfg["visual_projector"])
+    projector = OracleVisualProjector(
+        dim=int(projector_cfg.get("dim", 1024)),
+        slots=int(projector_cfg.get("slots", 28)),
+        heads=int(projector_cfg.get("heads", 16)),
+        ff_dim=int(projector_cfg.get("ff_dim", 2048)),
+        bottleneck_dim=int(projector_cfg.get("bottleneck_dim", 256)),
+    ).to(device)
+    projector_source = torch.load(
+        destination / str(cfg["projector_checkpoint"]),
+        map_location="cpu",
+        weights_only=False,
+    )
+    projector.load_state_dict(projector_source["projector"], strict=True)
+    projected_reader = _ProjectedReader(reader, projector)
+
+    bank = FunctionalLoRATeacherBank(destination / str(root_cfg["teacher_cache"]))
+    single_ids = list(bank.by_kind["single"])
+    style_ids = [str(bank.mixtures[index]["style_ids"][0]) for index in single_ids]
+    reference_images = int(cfg.get("materialized_reference_images", 8))
+    loader_kwargs = {
+        "split": "train",
+        "style_ids": style_ids,
+        "batch_size": len(style_ids),
+        "references": reference_images,
+        "token_lru_shards": int(cfg.get(
+            "token_lru_shards",
+            root_cfg["training"].get("token_lru_shards", 8),
+        )),
+        "strict_style_ids": True,
+    }
+    human_loader = CachedTeacherReferenceLoader(
+        destination / str(root_cfg["human_reference_cache"]),
+        seed=seed ^ 0x48554D41,
+        **loader_kwargs,
+    )
+    synthetic_loader = CachedTeacherReferenceLoader(
+        destination / str(root_cfg["synthetic_reference_cache"]),
+        seed=seed ^ 0x53594E54,
+        **loader_kwargs,
+    )
+    human_codes, reference_counts = _materialize_reader_code_bank(
+        reader,
+        human_loader,
+        style_ids,
+        reference_images=reference_images,
+        seed=seed ^ 0x11111111,
+        device=device,
+    )
+    synthetic_codes, synthetic_reference_counts = _materialize_reader_code_bank(
+        reader,
+        synthetic_loader,
+        style_ids,
+        reference_images=reference_images,
+        seed=seed ^ 0x22222222,
+        device=device,
+    )
+    if not torch.equal(reference_counts, synthetic_reference_counts):
+        raise RuntimeError("Human and synthetic Reader banks disagree on views")
+    visual_code_banks = torch.stack((human_codes, synthetic_codes), dim=0)
+    del human_codes, synthetic_codes
+
+    optimizer = torch.optim.AdamW(
+        projector.parameters(),
+        lr=float(cfg["learning_rate"]),
+        betas=tuple(cfg.get("betas", [0.9, 0.95])),
+        eps=float(cfg.get("adam_eps", 1e-8)),
+        weight_decay=float(cfg.get("weight_decay", 0.01)),
+        fused=bool(cfg.get("fused_adamw", True)),
+    )
+    base_lr = float(cfg["learning_rate"])
+    output = destination / str(cfg["output_directory"])
+    checkpoints = output / "checkpoints"
+    checkpoints.mkdir(parents=True, exist_ok=True)
+    state_path = output / "training_state.pt"
+    start_step = 0
+    if bool(cfg.get("resume", True)) and state_path.exists():
+        resume = torch.load(state_path, map_location="cpu", weights_only=False)
+        projector.load_state_dict(resume["projector"], strict=True)
+        optimizer.load_state_dict(resume["optimizer"])
+        start_step = int(resume["step"])
+
+    wandb_run = None
+    wandb_cfg = dict(cfg.get("wandb", {}))
+    if bool(wandb_cfg.get("enabled", True)):
+        import wandb
+        wandb_run = wandb.init(
+            project=str(wandb_cfg.get("project", "anima-style-adapter")),
+            name=str(wandb_cfg.get("name", "lora-oracle-functional-projector-v1")),
+            id=str(wandb_cfg.get("id", "lora-oracle-functional-projector-v1")),
+            resume="allow",
+            config={"lora_oracle_functional_projector": cfg},
+        )
+
+    fixed = load_dual_query_external_sample(config, destination)
+    batch_rows = int(cfg["batch_rows"])
+    warmup = int(cfg.get("warmup_steps", 50))
+    code_weight = float(cfg.get("code_alignment_weight", 0.10))
+    running: dict[str, list[float]] = defaultdict(list)
+    started = time.perf_counter()
+    try:
+        for step in range(start_step + 1, steps + 1):
+            optimizer.param_groups[0]["lr"] = base_lr * min(
+                1.0, step / max(1, warmup)
+            )
+            optimizer.zero_grad(set_to_none=True)
+            rng = random.Random(seed + step * 1_000_003)
+            positions = rng.sample(range(len(single_ids)), batch_rows)
+            position_index = torch.tensor(positions, device=device, dtype=torch.long)
+            view_index = torch.tensor(
+                [rng.randrange(visual_code_banks.shape[2]) for _ in positions],
+                device=device,
+                dtype=torch.long,
+            )
+            domain_index = step % 2
+            visual_codes = visual_code_banks[
+                domain_index, position_index, view_index
+            ]
+            with torch.autocast("cuda", dtype=torch.bfloat16):
+                projected = projector(visual_codes)
+
+            content_index = step % int(bank.base["noisy_inputs"].shape[0])
+            timestep_index = (
+                step // int(bank.base["noisy_inputs"].shape[0])
+            ) % int(bank.base["noisy_inputs"].shape[1])
+            noisy = bank.base["noisy_inputs"][content_index, timestep_index].to(
+                device=device, dtype=torch.bfloat16, non_blocking=True
+            )
+            base = bank.base["base_predictions"][content_index, timestep_index].to(
+                device=device, dtype=torch.float32, non_blocking=True
+            )
+            context = bank.base["base_context"][content_index : content_index + 1].to(
+                device=device, dtype=torch.bfloat16, non_blocking=True
+            )
+            timestep = bank.base["timesteps"][timestep_index].to(
+                device=device, dtype=torch.bfloat16
+            )
+            teacher_indices = [single_ids[index] for index in positions]
+            teacher = bank.effects[
+                teacher_indices, content_index, timestep_index
+            ].to(device=device, dtype=torch.float32, non_blocking=True)
+            student = _controlled_style_context_forward(
+                anima, adapter, projected, noisy, base, context, timestep, device
+            )
+            functional_loss, functional_metrics = _artist_centered_oracle_objective(
+                student, teacher, dict(cfg.get("functional_loss_weights", {}))
+            )
+            code_loss, code_metrics = _oracle_code_alignment_objective(
+                projected,
+                oracle_codes[position_index],
+                visual_codes,
+                dict(cfg.get("code_loss_weights", {})),
+            )
+            loss = functional_loss + code_weight * code_loss
+            loss.backward()
+            grad_norm = torch.nn.utils.clip_grad_norm_(
+                projector.parameters(),
+                float(cfg.get("max_grad_norm", 1.0)),
+                foreach=True,
+            )
+            optimizer.step()
+
+            metrics = {
+                "loss": loss.detach(),
+                "functional_loss": functional_loss.detach(),
+                "code_regularizer_weighted_loss": (code_weight * code_loss).detach(),
+                **{
+                    key: value
+                    for key, value in functional_metrics.items()
+                    if key != "loss"
+                },
+                **{f"code/{key}": value for key, value in code_metrics.items()},
+                "references": reference_counts[view_index].mean(),
+                "domain_is_human": torch.tensor(
+                    float(domain_index == 1), device=device
+                ),
+            }
+            for key, value in metrics.items():
+                running[key].append(float(value.detach()))
+            running["grad_norm"].append(float(grad_norm))
+
+            if step % int(cfg.get("log_every", 10)) == 0:
+                row = {
+                    key: sum(values) / len(values)
+                    for key, values in running.items()
+                    if values
+                }
+                row["learning_rate"] = float(optimizer.param_groups[0]["lr"])
+                print(f"LoRA functional projector step={step}/{steps} {row}", flush=True)
+                if wandb_run is not None:
+                    wandb_run.log(
+                        {f"train/{key}": value for key, value in row.items()},
+                        step=step,
+                    )
+                running.clear()
+            if step % int(cfg.get("checkpoint_every", 250)) == 0 or step == steps:
+                for path in (state_path, checkpoints / f"step-{step:07d}.pt"):
+                    _save_visual_projector_state(
+                        path,
+                        step=step,
+                        projector=projector,
+                        optimizer=optimizer,
+                        config=cfg,
+                    )
+            if int(cfg.get("sample_every", 250)) > 0 and step % int(cfg["sample_every"]) == 0:
+                sample = _generate_fixed_reference_sample(
+                    fixed,
+                    config,
+                    destination,
+                    anima,
+                    projected_reader,
+                    adapter,
+                    output,
+                    device,
+                    step,
+                    component_mode="artist_only",
+                    strengths_override=[1.0],
+                    sample_group="fixed_reference_samples",
+                )
+                if wandb_run is not None:
+                    import wandb
+                    wandb_run.log({
+                        "val/functional/fixed_reference": wandb.Image(
+                            sample["sheet"], caption=f"step {step}, functional projector"
+                        )
+                    }, step=step)
+    finally:
+        adapter.clear_style_tokens()
+        if wandb_run is not None:
+            wandb_run.finish()
+
+    summary = {
+        "steps": steps,
+        "start_step": start_step,
+        "artists": len(style_ids),
+        "reader_frozen": True,
+        "adapter_frozen": True,
+        "anima_frozen": True,
+        "projector_trainable": True,
+        "code_alignment_weight": code_weight,
+        "elapsed_s": time.perf_counter() - started,
+    }
+    write_json(output / "summary.json", summary)
+    return summary
+
+
+def smoke_test_lora_oracle_functional_projector(
+    config: dict[str, Any], destination: Path
+) -> dict[str, Any]:
+    effective = copy.deepcopy(config)
+    cfg = effective["lora_oracle_bootstrap"]["functional_projector"]
+    cfg["output_directory"] = "lora_oracle_functional_projector_smoke"
+    cfg["resume"] = False
+    cfg["checkpoint_every"] = 1
+    cfg["sample_every"] = 0
+    cfg["wandb"]["enabled"] = False
+    return train_lora_oracle_functional_projector(
+        effective, destination, steps_override=3
+    )
