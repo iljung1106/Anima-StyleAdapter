@@ -1301,52 +1301,6 @@ def train_lora_oracle_visual_projector(
     visual_code_banks = torch.stack((human_codes, synthetic_codes), dim=0)
     del human_codes, synthetic_codes
 
-    native_steps = int(cfg.get("native_pretrain_steps", 0))
-    native_bank = None
-    native_visual_codes = None
-    native_teacher_indices: list[int] = []
-    if native_steps > 0:
-        native_bank = NativeCenteredTeacherBank.load(
-            config, destination, config_key="dual_domain_native_teacher"
-        )
-        signature = native_bank.summary["signature"]
-        native_all_ids = [str(value) for value in signature["style_ids"]]
-        native_splits = [
-            str(value) for value in signature.get(
-                "splits", ["train"] * len(native_all_ids)
-            )
-        ]
-        native_teacher_indices = [
-            index
-            for index, split in enumerate(native_splits)
-            if split == "train"
-        ]
-        native_artist_limit = int(cfg.get("native_artist_limit", 0))
-        if native_artist_limit > 0:
-            native_teacher_indices = native_teacher_indices[:native_artist_limit]
-        native_style_ids = [native_all_ids[index] for index in native_teacher_indices]
-        native_loader = CachedTeacherReferenceLoader(
-            destination / str(root_cfg["human_reference_cache"]),
-            split="train",
-            style_ids=native_style_ids,
-            batch_size=int(cfg.get("native_materialize_chunk_size", 64)),
-            references=reference_images,
-            seed=seed ^ 0x4E415449,
-            token_lru_shards=int(cfg.get("token_lru_shards", 512)),
-            strict_style_ids=True,
-        )
-        native_visual_codes, native_reference_counts = _materialize_reader_code_bank(
-            reader,
-            native_loader,
-            native_style_ids,
-            reference_images=reference_images,
-            seed=seed ^ 0x33333333,
-            device=device,
-            style_chunk_size=int(cfg.get("native_materialize_chunk_size", 64)),
-        )
-        if not torch.equal(reference_counts, native_reference_counts):
-            raise RuntimeError("Native and LoRA Reader banks disagree on views")
-
     optimizer = torch.optim.AdamW(
         projector.parameters(),
         lr=float(cfg["learning_rate"]),
@@ -1590,6 +1544,52 @@ def train_lora_oracle_functional_projector(
         raise RuntimeError("Human and synthetic Reader banks disagree on views")
     visual_code_banks = torch.stack((human_codes, synthetic_codes), dim=0)
     del human_codes, synthetic_codes
+
+    native_steps = int(cfg.get("native_pretrain_steps", 0))
+    native_bank = None
+    native_visual_codes = None
+    native_teacher_indices: list[int] = []
+    if native_steps > 0:
+        native_bank = NativeCenteredTeacherBank.load(
+            config, destination, config_key="dual_domain_native_teacher"
+        )
+        signature = native_bank.summary["signature"]
+        native_all_ids = [str(value) for value in signature["style_ids"]]
+        native_splits = [
+            str(value) for value in signature.get(
+                "splits", ["train"] * len(native_all_ids)
+            )
+        ]
+        native_teacher_indices = [
+            index
+            for index, split in enumerate(native_splits)
+            if split == "train"
+        ]
+        native_artist_limit = int(cfg.get("native_artist_limit", 0))
+        if native_artist_limit > 0:
+            native_teacher_indices = native_teacher_indices[:native_artist_limit]
+        native_style_ids = [native_all_ids[index] for index in native_teacher_indices]
+        native_loader = CachedTeacherReferenceLoader(
+            destination / str(root_cfg["human_reference_cache"]),
+            split="train",
+            style_ids=native_style_ids,
+            batch_size=int(cfg.get("native_materialize_chunk_size", 64)),
+            references=reference_images,
+            seed=seed ^ 0x4E415449,
+            token_lru_shards=int(cfg.get("token_lru_shards", 512)),
+            strict_style_ids=True,
+        )
+        native_visual_codes, native_reference_counts = _materialize_reader_code_bank(
+            reader,
+            native_loader,
+            native_style_ids,
+            reference_images=reference_images,
+            seed=seed ^ 0x33333333,
+            device=device,
+            style_chunk_size=int(cfg.get("native_materialize_chunk_size", 64)),
+        )
+        if not torch.equal(reference_counts, native_reference_counts):
+            raise RuntimeError("Native and LoRA Reader banks disagree on views")
 
     optimizer = torch.optim.AdamW(
         projector.parameters(),
