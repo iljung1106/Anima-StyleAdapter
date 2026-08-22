@@ -915,6 +915,20 @@ def test_separated_common_artist_bootstrap_routes_gradients_by_phase():
     assert adapter.null_style_context.grad is not None
     assert all(parameter.requires_grad for parameter in reader.parameters())
 
+    _configure_separated_bootstrap_trainability(
+        reader,
+        adapter,
+        "combined",
+        train_common_in_combined=True,
+    )
+    assert all(
+        parameter.requires_grad for parameter in adapter.common_parameters()
+    )
+    assert all(
+        parameter.requires_grad for parameter in adapter.artist_parameters()
+    )
+    assert all(parameter.requires_grad for parameter in reader.parameters())
+
     adapter.set_bootstrap_phase("artist_only")
     with torch.no_grad():
         adapter.null_style_context.zero_()

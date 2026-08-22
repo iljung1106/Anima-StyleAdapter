@@ -219,12 +219,13 @@ def _configure_separated_bootstrap_trainability(
     common_active = phase == "common_only" or (
         phase == "combined" and bool(train_common_in_combined)
     )
+    artist_active = phase != "common_only"
     for parameter in adapter.common_parameters():
         parameter.requires_grad_(common_active)
     for parameter in adapter.artist_parameters():
-        parameter.requires_grad_(not common_active)
+        parameter.requires_grad_(artist_active)
     for parameter in reader.parameters():
-        parameter.requires_grad_(not common_active)
+        parameter.requires_grad_(artist_active)
 
 
 def _loader_config(
