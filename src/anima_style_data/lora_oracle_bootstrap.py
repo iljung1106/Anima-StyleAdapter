@@ -1321,6 +1321,9 @@ def train_lora_oracle_visual_projector(
             for index, split in enumerate(native_splits)
             if split == "train"
         ]
+        native_artist_limit = int(cfg.get("native_artist_limit", 0))
+        if native_artist_limit > 0:
+            native_teacher_indices = native_teacher_indices[:native_artist_limit]
         native_style_ids = [native_all_ids[index] for index in native_teacher_indices]
         native_loader = CachedTeacherReferenceLoader(
             destination / str(root_cfg["human_reference_cache"]),
@@ -1810,6 +1813,8 @@ def smoke_test_lora_oracle_functional_projector(
     cfg["resume"] = False
     cfg["checkpoint_every"] = 1
     cfg["sample_every"] = 0
+    cfg["native_artist_limit"] = 64
+    cfg["native_materialize_chunk_size"] = 32
     cfg["wandb"]["enabled"] = False
     return train_lora_oracle_functional_projector(
         effective, destination, steps_override=3
