@@ -3,6 +3,7 @@ import torch
 from anima_style_data.lora_oracle_bootstrap import (
     _FixedOracleCodeReader,
     _artist_centered_oracle_objective,
+    _cross_view_artist_objective,
     _interpolate_oracle_visual,
     _oracle_code_alignment_objective,
     _materialize_reader_code_bank,
@@ -10,6 +11,17 @@ from anima_style_data.lora_oracle_bootstrap import (
     OracleVisualProjector,
     _ProjectedReader,
 )
+
+
+def test_cross_view_artist_objective_recognizes_matching_artists():
+    left = torch.eye(8).reshape(8, 1, 8)
+    loss, metrics = _cross_view_artist_objective(
+        left, left.clone(), temperature=0.10
+    )
+
+    assert torch.isfinite(loss)
+    assert float(metrics["accuracy"]) == 1.0
+    assert float(metrics["cosine_gap"]) > 0.5
 
 
 def test_piecewise_linear_value_supports_a_plateau_then_ramp():

@@ -97,6 +97,8 @@ def build_parser() -> argparse.ArgumentParser:
         ("lora-oracle-visual-projector-train", "Train compact visual-to-oracle projection"),
         ("lora-oracle-functional-projector-smoke", "Smoke-test functional visual projection"),
         ("lora-oracle-functional-projector-train", "Train visual projector through frozen connector"),
+        ("lora-oracle-joint-manifold-smoke", "Smoke-test joint visual/oracle manifold alignment"),
+        ("lora-oracle-joint-manifold-train", "Train joint visual/oracle manifold alignment"),
         ("style-train", "Train the multi-reference Anima style adapter"),
         ("style-token-cache", "Cache frozen production Resampler tokens"),
         ("style-smoke", "Run two real Anima style-adapter training steps"),
@@ -408,6 +410,8 @@ def main() -> None:
         "lora-oracle-visual-projector-train",
         "lora-oracle-functional-projector-smoke",
         "lora-oracle-functional-projector-train",
+        "lora-oracle-joint-manifold-smoke",
+        "lora-oracle-joint-manifold-train",
     }:
         from .lora_oracle_bootstrap import (
             sample_lora_oracle_checkpoint,
@@ -415,10 +419,12 @@ def main() -> None:
             smoke_test_lora_oracle_visual_bridge,
             smoke_test_lora_oracle_visual_projector,
             smoke_test_lora_oracle_functional_projector,
+            smoke_test_lora_oracle_joint_manifold,
             train_lora_oracle_bootstrap,
             train_lora_oracle_visual_bridge,
             train_lora_oracle_visual_projector,
             train_lora_oracle_functional_projector,
+            train_lora_oracle_joint_manifold,
         )
 
         stage = {
@@ -431,6 +437,8 @@ def main() -> None:
             "lora-oracle-visual-projector-train": train_lora_oracle_visual_projector,
             "lora-oracle-functional-projector-smoke": smoke_test_lora_oracle_functional_projector,
             "lora-oracle-functional-projector-train": train_lora_oracle_functional_projector,
+            "lora-oracle-joint-manifold-smoke": smoke_test_lora_oracle_joint_manifold,
+            "lora-oracle-joint-manifold-train": train_lora_oracle_joint_manifold,
         }[args.command]
         _run(stage, config, destination)
     elif args.command == "lora-reference-token-cache":

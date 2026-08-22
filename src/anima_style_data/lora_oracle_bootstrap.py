@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import json
 import math
 import random
 import time
@@ -1832,5 +1833,455 @@ def smoke_test_lora_oracle_functional_projector(
     cfg["native_materialize_chunk_size"] = 32
     cfg["wandb"]["enabled"] = False
     return train_lora_oracle_functional_projector(
+        effective, destination, steps_override=3
+    )
+
+
+def _compose_lora_mixture_contexts(
+    projector: OracleVisualProjector,
+    visual_banks: torch.Tensor,
+    oracle_codes: torch.Tensor,
+    mixture_rows: list[dict[str, Any]],
+    *,
+    domain_index: int,
+    rng: random.Random,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Compose visual and oracle contexts with the cached LoRA mixture weights."""
+
+    visual_parts: list[torch.Tensor] = []
+    oracle_parts: list[torch.Tensor] = []
+    raw_parts: list[torch.Tensor] = []
+    reference_counts: list[float] = []
+    for row in mixture_rows:
+        components = [int(value) for value in row["components"]]
+        weights = torch.tensor(
+            [float(value) for value in row["weights"]],
+            device=visual_banks.device,
+            dtype=torch.float32,
+        )
+        view_indices = [rng.randrange(visual_banks.shape[2]) for _ in components]
+        component_index = torch.tensor(
+            components, device=visual_banks.device, dtype=torch.long
+        )
+        view_index = torch.tensor(
+            view_indices, device=visual_banks.device, dtype=torch.long
+        )
+        raw = visual_banks[domain_index, component_index, view_index]
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            projected = projector(raw)
+        shape = (-1,) + (1,) * (projected.ndim - 1)
+        blend = weights.reshape(shape)
+        visual_parts.append((projected.float() * blend).sum(dim=0))
+        oracle_parts.append(
+            (oracle_codes[component_index].float() * blend).sum(dim=0)
+        )
+        raw_parts.append((raw.float() * blend).sum(dim=0))
+        reference_counts.append(float(len(components)))
+    return (
+        torch.stack(visual_parts).to(dtype=torch.bfloat16),
+        torch.stack(oracle_parts).to(dtype=torch.bfloat16),
+        torch.stack(raw_parts).to(dtype=torch.bfloat16),
+        torch.tensor(reference_counts, device=visual_banks.device),
+    )
+
+
+def _cross_view_artist_objective(
+    left: torch.Tensor,
+    right: torch.Tensor,
+    *,
+    temperature: float,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Keep broad visual artists separable without imposing native tag directions."""
+
+    if left.shape != right.shape or left.shape[0] < 2:
+        raise ValueError("Cross-view artist loss needs matching multi-artist batches")
+    common = torch.cat((left.float(), right.float()), dim=0).mean(
+        dim=0, keepdim=True
+    )
+    left_unit = F.normalize((left.float() - common).flatten(1), dim=1)
+    right_unit = F.normalize((right.float() - common).flatten(1), dim=1)
+    logits = left_unit @ right_unit.t() / temperature
+    labels = torch.arange(left.shape[0], device=left.device)
+    loss = 0.5 * (
+        F.cross_entropy(logits, labels) + F.cross_entropy(logits.t(), labels)
+    )
+    positive = logits.diagonal() * temperature
+    wrong = logits.masked_fill(
+        torch.eye(left.shape[0], device=left.device, dtype=torch.bool),
+        torch.finfo(logits.dtype).min,
+    ).max(dim=1).values * temperature
+    return loss, {
+        "loss": loss.detach(),
+        "accuracy": (logits.argmax(dim=1) == labels).float().mean().detach(),
+        "positive_cosine": positive.mean().detach(),
+        "hardest_wrong_cosine": wrong.mean().detach(),
+        "cosine_gap": (positive - wrong).mean().detach(),
+    }
+
+
+def train_lora_oracle_joint_manifold(
+    config: dict[str, Any],
+    destination: Path,
+    *,
+    steps_override: int | None = None,
+) -> dict[str, Any]:
+    """Jointly align visual styles while replaying the verified oracle mapping."""
+
+    root_cfg = copy.deepcopy(config["lora_oracle_bootstrap"])
+    cfg = dict(root_cfg["joint_manifold"])
+    steps = int(steps_override if steps_override is not None else cfg["steps"])
+    device = str(root_cfg["training"].get("device", "cuda"))
+    seed = int(root_cfg.get("seed", 20260823)) ^ 0x4A4F494E
+    random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.set_float32_matmul_precision("high")
+    torch.set_num_threads(int(cfg.get("cpu_threads", 16)))
+
+    anima = _resolve_anima_model(config, destination, device).requires_grad_(False).eval()
+    _optimize_frozen_anima(anima, low_precision_rmsnorm=True, fuse_attention_projections=True)
+    detail_cfg = copy.deepcopy(config["detail_preserving_style_cross_attention"])
+    reader = DetailPreservingTypedSlotReader(**dict(detail_cfg["model"])).to(device)
+    adapter = _build_style_adapter(detail_cfg).to(device)
+    if not isinstance(adapter, SeparatedCommonArtistKVStyleCrossAttention):
+        raise TypeError("Joint oracle manifold training requires the separated adapter")
+    attach_same_q_style_adapter(anima, adapter)
+
+    source = torch.load(
+        destination / str(cfg["source_checkpoint"]),
+        map_location="cpu",
+        weights_only=False,
+    )
+    reader.load_state_dict(source["reader"], strict=True)
+    adapter.load_state_dict(source["adapter"], strict=True)
+    adapter.restore_timestep_strength_state()
+    adapter.set_bootstrap_phase("artist_only")
+    reader.requires_grad_(False).eval()
+    for parameter in adapter.common_parameters():
+        parameter.requires_grad_(False)
+    oracle_codes = source["oracle_codes"].to(device=device, dtype=torch.bfloat16)
+
+    projector_cfg = dict(root_cfg["visual_projector"])
+    projector = OracleVisualProjector(
+        dim=int(projector_cfg.get("dim", 1024)),
+        slots=int(projector_cfg.get("slots", 28)),
+        heads=int(projector_cfg.get("heads", 16)),
+        ff_dim=int(projector_cfg.get("ff_dim", 2048)),
+        bottleneck_dim=int(projector_cfg.get("bottleneck_dim", 256)),
+    ).to(device)
+    projector_source = torch.load(
+        destination / str(cfg["projector_checkpoint"]),
+        map_location="cpu",
+        weights_only=False,
+    )
+    projector.load_state_dict(projector_source["projector"], strict=True)
+    projected_reader = _ProjectedReader(reader, projector)
+
+    bank = FunctionalLoRATeacherBank(destination / str(root_cfg["teacher_cache"]))
+    single_ids = list(bank.by_kind["single"])
+    style_ids = [str(bank.mixtures[index]["style_ids"][0]) for index in single_ids]
+    reference_images = int(cfg.get("materialized_reference_images", 8))
+    loader_kwargs = {
+        "split": "train",
+        "style_ids": style_ids,
+        "batch_size": len(style_ids),
+        "references": reference_images,
+        "token_lru_shards": int(cfg.get("token_lru_shards", 512)),
+        "strict_style_ids": True,
+    }
+    human_loader = CachedTeacherReferenceLoader(
+        destination / str(root_cfg["human_reference_cache"]),
+        seed=seed ^ 0x48554D41,
+        **loader_kwargs,
+    )
+    synthetic_loader = CachedTeacherReferenceLoader(
+        destination / str(root_cfg["synthetic_reference_cache"]),
+        seed=seed ^ 0x53594E54,
+        **loader_kwargs,
+    )
+    human_codes, reference_counts = _materialize_reader_code_bank(
+        reader, human_loader, style_ids,
+        reference_images=reference_images, seed=seed ^ 0x11111111, device=device,
+    )
+    synthetic_codes, synthetic_reference_counts = _materialize_reader_code_bank(
+        reader, synthetic_loader, style_ids,
+        reference_images=reference_images, seed=seed ^ 0x22222222, device=device,
+    )
+    if not torch.equal(reference_counts, synthetic_reference_counts):
+        raise RuntimeError("Human and synthetic Reader banks disagree on views")
+    visual_banks = torch.stack((human_codes, synthetic_codes), dim=0)
+    del human_codes, synthetic_codes
+
+    native_cfg = dict(config["dual_domain_native_teacher"])
+    native_root = destination / str(native_cfg["output_directory"])
+    native_summary = json.loads(
+        (native_root / "summary.json").read_text(encoding="utf-8")
+    )
+    signature = native_summary["signature"]
+    native_all_ids = [str(value) for value in signature["style_ids"]]
+    native_splits = [
+        str(value)
+        for value in signature.get("splits", ["train"] * len(native_all_ids))
+    ]
+    native_style_ids = [
+        style_id
+        for style_id, split in zip(native_all_ids, native_splits, strict=True)
+        if split == "train"
+    ]
+    native_limit = int(cfg.get("native_artist_limit", 0))
+    if native_limit > 0:
+        native_style_ids = native_style_ids[:native_limit]
+    native_loader = CachedTeacherReferenceLoader(
+        destination / str(root_cfg["human_reference_cache"]),
+        split="train",
+        style_ids=native_style_ids,
+        batch_size=int(cfg.get("native_materialize_chunk_size", 128)),
+        references=reference_images,
+        seed=seed ^ 0x4E415449,
+        token_lru_shards=int(cfg.get("token_lru_shards", 512)),
+        ram_resident_tokens=True,
+        ram_preload_workers=int(cfg.get("native_preload_workers", 16)),
+        strict_style_ids=True,
+    )
+    native_codes, native_reference_counts = _materialize_reader_code_bank(
+        reader, native_loader, native_style_ids,
+        reference_images=reference_images, seed=seed ^ 0x33333333,
+        device=device,
+        style_chunk_size=int(cfg.get("native_materialize_chunk_size", 128)),
+    )
+    if not torch.equal(reference_counts, native_reference_counts):
+        raise RuntimeError("Native and LoRA Reader banks disagree on views")
+
+    groups = [
+        {"params": projector.parameters(), "lr": float(cfg["projector_learning_rate"]), "name": "projector"},
+        {"params": adapter.shared_parameters(), "lr": float(cfg["shared_learning_rate"]), "name": "shared_kv"},
+        {"params": adapter.delta_parameters(), "lr": float(cfg["delta_learning_rate"]), "name": "block_delta"},
+        {"params": adapter.mixing_parameters(), "lr": float(cfg["mix_learning_rate"]), "name": "base_mix", "weight_decay": 0.0},
+    ]
+    optimizer = torch.optim.AdamW(
+        groups,
+        betas=tuple(cfg.get("betas", [0.9, 0.95])),
+        eps=float(cfg.get("adam_eps", 1e-8)),
+        weight_decay=float(cfg.get("weight_decay", 0.01)),
+        fused=bool(cfg.get("fused_adamw", True)),
+    )
+    base_lrs = {str(group["name"]): float(group["lr"]) for group in groups}
+    output = destination / str(cfg["output_directory"])
+    checkpoints = output / "checkpoints"
+    checkpoints.mkdir(parents=True, exist_ok=True)
+    state_path = output / "training_state.pt"
+    start_step = 0
+    if bool(cfg.get("resume", True)) and state_path.exists():
+        resume = torch.load(state_path, map_location="cpu", weights_only=False)
+        reader.load_state_dict(resume["reader"], strict=True)
+        adapter.load_state_dict(resume["adapter"], strict=True)
+        adapter.restore_timestep_strength_state()
+        adapter.set_bootstrap_phase("artist_only")
+        projector.load_state_dict(resume["projector"], strict=True)
+        optimizer.load_state_dict(resume["optimizer"])
+        start_step = int(resume["step"])
+
+    wandb_run = None
+    wandb_cfg = dict(cfg.get("wandb", {}))
+    if bool(wandb_cfg.get("enabled", True)):
+        import wandb
+        wandb_run = wandb.init(
+            project=str(wandb_cfg.get("project", "anima-style-adapter")),
+            name=str(wandb_cfg.get("name", "lora-oracle-joint-manifold-v1")),
+            id=str(wandb_cfg.get("id", "lora-oracle-joint-manifold-v1")),
+            resume="allow",
+            config={"lora_oracle_joint_manifold": cfg},
+        )
+
+    fixed = load_dual_query_external_sample(config, destination)
+    batch_rows = int(cfg.get("batch_rows", 8))
+    native_batch_rows = int(cfg.get("native_batch_rows", 8))
+    warmup = int(cfg.get("warmup_steps", 50))
+    replay_weight = float(cfg.get("oracle_replay_weight", 0.5))
+    code_weight = float(cfg.get("code_alignment_weight", 0.05))
+    native_weight = float(cfg.get("native_cross_view_weight", 0.10))
+    temperature = float(cfg.get("native_temperature", 0.10))
+    loss_weights = dict(cfg.get("functional_loss_weights", {}))
+    code_weights = dict(cfg.get("code_loss_weights", {}))
+    categories = ("single", "pair", "triple")
+    running: dict[str, list[float]] = defaultdict(list)
+    started = time.perf_counter()
+    try:
+        for step in range(start_step + 1, steps + 1):
+            lr_scale = min(1.0, step / max(1, warmup))
+            for group in optimizer.param_groups:
+                group["lr"] = base_lrs[str(group["name"])] * lr_scale
+            optimizer.zero_grad(set_to_none=True)
+            rng = random.Random(seed + step * 1_000_003)
+            category = categories[(step - 1) % len(categories)]
+            candidates = bank.by_kind[category]
+            mixture_indices = rng.sample(candidates, batch_rows)
+            mixture_rows = [bank.mixtures[index] for index in mixture_indices]
+            domain_index = step % 2
+            visual_context, oracle_context, raw_context, component_counts = (
+                _compose_lora_mixture_contexts(
+                    projector, visual_banks, oracle_codes, mixture_rows,
+                    domain_index=domain_index, rng=rng,
+                )
+            )
+            content_index = step % int(bank.base["noisy_inputs"].shape[0])
+            timestep_index = (
+                step // int(bank.base["noisy_inputs"].shape[0])
+            ) % int(bank.base["noisy_inputs"].shape[1])
+            noisy = bank.base["noisy_inputs"][content_index, timestep_index].to(
+                device=device, dtype=torch.bfloat16, non_blocking=True
+            )
+            base = bank.base["base_predictions"][content_index, timestep_index].to(
+                device=device, dtype=torch.float32, non_blocking=True
+            )
+            context = bank.base["base_context"][content_index : content_index + 1].to(
+                device=device, dtype=torch.bfloat16, non_blocking=True
+            )
+            timestep = bank.base["timesteps"][timestep_index].to(
+                device=device, dtype=torch.bfloat16
+            )
+            teacher = bank.effects[
+                mixture_indices, content_index, timestep_index
+            ].to(device=device, dtype=torch.float32, non_blocking=True)
+
+            visual_student = _controlled_style_context_forward(
+                anima, adapter, visual_context, noisy, base, context, timestep, device
+            )
+            visual_loss, visual_metrics = _artist_centered_oracle_objective(
+                visual_student, teacher, loss_weights
+            )
+            code_loss, code_metrics = _oracle_code_alignment_objective(
+                visual_context, oracle_context, raw_context, code_weights
+            )
+            visual_total = visual_loss + code_weight * code_loss
+            visual_total.backward()
+            del visual_student, visual_total
+
+            replay_student = _controlled_style_context_forward(
+                anima, adapter, oracle_context, noisy, base, context, timestep, device
+            )
+            replay_loss, replay_metrics = _artist_centered_oracle_objective(
+                replay_student, teacher, loss_weights
+            )
+            (replay_weight * replay_loss).backward()
+            del replay_student
+
+            native_positions = rng.sample(range(len(native_style_ids)), native_batch_rows)
+            native_index = torch.tensor(
+                native_positions, device=device, dtype=torch.long
+            )
+            left_view = torch.tensor(
+                [rng.randrange(native_codes.shape[1]) for _ in native_positions],
+                device=device, dtype=torch.long,
+            )
+            right_values = []
+            for value in left_view.tolist():
+                other = rng.randrange(native_codes.shape[1] - 1)
+                right_values.append(other + int(other >= value))
+            right_view = torch.tensor(right_values, device=device, dtype=torch.long)
+            native_raw = torch.cat((
+                native_codes[native_index, left_view],
+                native_codes[native_index, right_view],
+            ))
+            with torch.autocast("cuda", dtype=torch.bfloat16):
+                native_projected = projector(native_raw)
+            native_left, native_right = native_projected.chunk(2)
+            native_loss, native_metrics = _cross_view_artist_objective(
+                native_left, native_right, temperature=temperature
+            )
+            (native_weight * native_loss).backward()
+
+            parameters = [
+                parameter for group in optimizer.param_groups for parameter in group["params"]
+            ]
+            grad_norm = torch.nn.utils.clip_grad_norm_(
+                parameters, float(cfg.get("max_grad_norm", 1.0)), foreach=True
+            )
+            optimizer.step()
+            metrics: dict[str, torch.Tensor] = {
+                "loss": (
+                    visual_loss.detach()
+                    + code_weight * code_loss.detach()
+                    + replay_weight * replay_loss.detach()
+                    + native_weight * native_loss.detach()
+                ),
+                "category": torch.tensor(float(categories.index(category)), device=device),
+                "domain_is_human": torch.tensor(float(domain_index == 0), device=device),
+                "mixture_components": component_counts.mean(),
+                **{f"visual/{key}": value for key, value in visual_metrics.items()},
+                **{f"replay/{key}": value for key, value in replay_metrics.items()},
+                **{f"code/{key}": value for key, value in code_metrics.items()},
+                **{f"native/{key}": value for key, value in native_metrics.items()},
+            }
+            for key, value in metrics.items():
+                running[key].append(float(value.detach()))
+            running["grad_norm"].append(float(grad_norm))
+            if step % int(cfg.get("log_every", 10)) == 0:
+                row = {
+                    key: sum(values) / len(values)
+                    for key, values in running.items() if values
+                }
+                for group in optimizer.param_groups:
+                    row[f"lr/{group['name']}"] = float(group["lr"])
+                print(f"LoRA joint manifold step={step}/{steps} {row}", flush=True)
+                if wandb_run is not None:
+                    wandb_run.log(
+                        {f"train/{key}": value for key, value in row.items()}, step=step
+                    )
+                running.clear()
+            if step % int(cfg.get("checkpoint_every", 250)) == 0 or step == steps:
+                for path in (state_path, checkpoints / f"step-{step:07d}.pt"):
+                    _save_visual_bridge_state(
+                        path, step=step, reader=reader, adapter=adapter,
+                        oracle_codes=oracle_codes, projector=projector,
+                        optimizer=optimizer, config=cfg,
+                    )
+            if int(cfg.get("sample_every", 250)) > 0 and step % int(cfg["sample_every"]) == 0:
+                sample = _generate_fixed_reference_sample(
+                    fixed, config, destination, anima, projected_reader, adapter,
+                    output, device, step, component_mode="artist_only",
+                    strengths_override=[1.0], sample_group="fixed_reference_samples",
+                )
+                if wandb_run is not None:
+                    import wandb
+                    wandb_run.log({
+                        "val/functional/fixed_reference": wandb.Image(
+                            sample["sheet"], caption=f"step {step}, joint manifold"
+                        )
+                    }, step=step)
+    finally:
+        adapter.clear_style_tokens()
+        if wandb_run is not None:
+            wandb_run.finish()
+
+    summary = {
+        "steps": steps,
+        "start_step": start_step,
+        "lora_artists": len(style_ids),
+        "native_visual_artists": len(native_style_ids),
+        "reader_frozen": True,
+        "common_frozen_and_bypassed": True,
+        "anima_frozen": True,
+        "projector_and_artist_connector_trainable": True,
+        "elapsed_s": time.perf_counter() - started,
+    }
+    write_json(output / "summary.json", summary)
+    return summary
+
+
+def smoke_test_lora_oracle_joint_manifold(
+    config: dict[str, Any], destination: Path
+) -> dict[str, Any]:
+    effective = copy.deepcopy(config)
+    cfg = effective["lora_oracle_bootstrap"]["joint_manifold"]
+    cfg["output_directory"] = "lora_oracle_joint_manifold_smoke"
+    cfg["resume"] = False
+    cfg["checkpoint_every"] = 1
+    cfg["sample_every"] = 0
+    cfg["native_artist_limit"] = 64
+    cfg["native_materialize_chunk_size"] = 32
+    cfg["wandb"]["enabled"] = False
+    return train_lora_oracle_joint_manifold(
         effective, destination, steps_override=3
     )

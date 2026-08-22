@@ -598,6 +598,56 @@ lora_oracle_bootstrap:
       project: anima-style-adapter
       name: lora-oracle-functional-projector-v2-native-pretrain
       id: lora-oracle-functional-projector-v2-native-pretrain
+  joint_manifold:
+    output_directory: lora_oracle_joint_manifold_v1
+    source_checkpoint: lora_oracle_bootstrap_v1/training_state.pt
+    projector_checkpoint: lora_oracle_visual_projector_v3_materialized/training_state.pt
+    steps: 1500
+    cpu_threads: 16
+    batch_rows: 8
+    native_batch_rows: 8
+    materialized_reference_images: 8
+    native_materialize_chunk_size: 128
+    native_preload_workers: 16
+    token_lru_shards: 512
+    projector_learning_rate: 0.00010
+    shared_learning_rate: 0.00001
+    delta_learning_rate: 0.00002
+    mix_learning_rate: 0.000005
+    warmup_steps: 50
+    oracle_replay_weight: 0.50
+    code_alignment_weight: 0.05
+    native_cross_view_weight: 0.10
+    native_temperature: 0.10
+    checkpoint_every: 250
+    sample_every: 250
+    log_every: 10
+    max_grad_norm: 1.0
+    fused_adamw: true
+    weight_decay: 0.01
+    betas: [0.9, 0.95]
+    adam_eps: 0.00000001
+    resume: true
+    functional_loss_weights:
+      huber: 1.0
+      direction: 1.0
+      magnitude: 0.25
+      infonce: 0.50
+      zero_mean: 0.25
+      infonce_temperature: 0.10
+    code_loss_weights:
+      huber: 1.0
+      raw_direction: 0.25
+      centered_direction: 1.0
+      centered_magnitude: 0.10
+      infonce: 0.50
+      identity: 0.01
+      infonce_temperature: 0.10
+    wandb:
+      enabled: true
+      project: anima-style-adapter
+      name: lora-oracle-joint-manifold-v1
+      id: lora-oracle-joint-manifold-v1
 
 # B-prime per-reference encoder. C-RADIO spatial features and Qwen Image VAE
 # latents remain separate K/V banks; learned spatial/global queries read both.
