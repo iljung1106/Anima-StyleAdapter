@@ -349,6 +349,88 @@ lora_functional_distillation:
       name: detail-style-lora-functional-distill-v1
       id: detail-style-lora-functional-distill-v1
 
+
+# v2 fixes the measured v1 common-output collapse.  The v34 Common scaffold is
+# frozen, while all LoRA objectives are decomposed into a weak batch-common
+# target and a strong artist-centered functional target.  Pair/triple mixtures
+# are withheld until an individual-LoRA and native-artist introduction phase
+# has aligned the reference-dependent branch.
+lora_functional_distillation_v2:
+  output_directory: detail_style_lora_functional_distill_v2_artist_centered
+  seed: 20260823
+  lora_directory: artist_lora_teachers_rank16_64_b2_v4
+  initial_checkpoint: detail_preserving_style_cross_attention_v34_anti_common_functional/checkpoints/step-0000500.pt
+  human_reference_cache: dual_query_reference_tokens_v8_step10000
+  synthetic_reference_cache: lora_teacher_references_rank16_64x8_v1/dual_query_reference_tokens_v8_step10000
+  teacher_cache:
+    output_directory: lora_functional_teacher_bank_rank16_64_v1
+  native_teacher:
+    bank_config_key: dual_domain_native_teacher
+    context_cache: native_artist_post_llm_context_5000_v1
+    context_lru_shards: 8
+    reference_caches:
+      - synthetic_teacher_500x16/dual_query_reference_tokens_v8_step10000
+      - synthetic_teacher_additional_1500x6/dual_query_reference_tokens_v8_step10000
+  training:
+    device: cuda
+    steps: 8000
+    curriculum: artist_centered_v2
+    single_only_steps: 1500
+    artist_intro_steps: 500
+    functional_objective: teacher_decomposed
+    freeze_common: true
+    batch_rows: 8
+    references_per_component: 1
+    native_batch_rows: 8
+    native_microbatch_rows: 4
+    native_references: 4
+    reader_learning_rate: 0.00002
+    shared_learning_rate: 0.00010
+    delta_learning_rate: 0.00020
+    mix_learning_rate: 0.00004
+    null_learning_rate: 0.00020
+    warmup_steps: 100
+    lr_decay_start_step: 6500
+    minimum_lr_ratio: 0.10
+    betas: [0.9, 0.95]
+    adam_eps: 0.00000001
+    weight_decay: 0.01
+    max_grad_norm: 1.0
+    fused_adamw: true
+    token_lru_shards: 8
+    ram_resident_tokens: true
+    native_global_weight: 0.15
+    native_infonce_weight: 0.20
+    native_artist_mean_weight: 0.0
+    native_loss:
+      artist_direction_weight: 1.0
+      magnitude_weight: 0.10
+      magnitude_floor_start_step: 1
+      magnitude_floor_end_step: 1000
+      magnitude_floor_start: 0.25
+      magnitude_floor_end: 0.70
+      magnitude_upper: 1.50
+      magnitude_upper_weight: 0.25
+    loss_weights:
+      centered_huber: 1.00
+      centered_direction: 1.00
+      centered_magnitude: 0.25
+      functional_infonce: 0.50
+      functional_infonce_temperature: 0.10
+      common_huber: 0.05
+      common_direction: 0.025
+      common_ratio_excess: 2.00
+      common_ratio_margin: 0.03
+    log_every: 10
+    checkpoint_every: 250
+    sample_every: 500
+    resume: true
+    wandb:
+      enabled: true
+      project: anima-style-adapter
+      name: detail-style-lora-functional-distill-v2-artist-centered
+      id: detail-style-lora-functional-distill-v2-artist-centered
+
 # B-prime per-reference encoder. C-RADIO spatial features and Qwen Image VAE
 # latents remain separate K/V banks; learned spatial/global queries read both.
 dual_query_resampler:

@@ -62,6 +62,35 @@ def teacher_category(step: int, *, single_only_steps: int) -> str:
     ]
 
 
+def teacher_category_v2(
+    step: int,
+    *,
+    single_only_steps: int,
+    artist_intro_steps: int,
+) -> str:
+    """Center individual LoRA effects before introducing mixed teachers.
+
+    The middle stage keeps two individual-LoRA updates for every native artist
+    update.  Convex LoRA mixtures have a larger cross-artist common component,
+    so they are deliberately withheld until the artist residual has had enough
+    direct supervision.
+    """
+
+    if step <= 0:
+        raise ValueError("step must be positive")
+    single_only_steps = int(single_only_steps)
+    artist_intro_steps = int(artist_intro_steps)
+    if step <= single_only_steps:
+        return "lora_single"
+    if step <= single_only_steps + artist_intro_steps:
+        return ("lora_single", "artist_tag", "lora_single")[
+            (step - single_only_steps - 1) % 3
+        ]
+    return ("artist_tag", "lora_single", "lora_mixture")[
+        (step - single_only_steps - artist_intro_steps - 1) % 3
+    ]
+
+
 def build_mixture_specs(
     artists: int,
     *,
@@ -527,6 +556,124 @@ def _functional_objective(
     }
 
 
+def _teacher_decomposed_functional_objective(
+    student: torch.Tensor,
+    teacher: torch.Tensor,
+    weights: dict[str, float],
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Match a weak common scaffold and a strong artist-centered residual.
+
+    This is intentionally not a raw-residual objective.  A trainable shared
+    path can satisfy raw regression by emitting nearly the same effect for
+    every reference.  Decomposing both sides makes that shortcut observable,
+    while the all-wrong functional InfoNCE term requires each student residual
+    to identify its own LoRA teacher among the other artists in the batch.
+    """
+
+    student = student.float()
+    teacher = teacher.detach().float()
+    if student.shape != teacher.shape or student.shape[0] < 2:
+        raise ValueError("Decomposed functional supervision needs matching batch rows")
+
+    student_common, student_centered = decompose_teacher_effects(student)
+    teacher_common, teacher_centered = decompose_teacher_effects(teacher)
+    reduce_dims = tuple(range(1, student.ndim))
+    row_shape = (-1,) + (1,) * (student.ndim - 1)
+
+    teacher_centered_rms = (
+        teacher_centered.square().mean(dim=reduce_dims).sqrt().clamp_min(1e-4)
+    )
+    # sqrt has an infinite derivative at exactly zero.  A collapsed model is
+    # precisely the case this objective must recover from, so keep that
+    # backward path finite instead of relying on a post-sqrt clamp.
+    student_centered_rms = (
+        student_centered.square().mean(dim=reduce_dims) + 1e-12
+    ).sqrt()
+    centered_scale = teacher_centered_rms.reshape(row_shape)
+    centered_huber = F.smooth_l1_loss(
+        student_centered / centered_scale,
+        teacher_centered / centered_scale,
+        beta=0.10,
+    )
+    centered_cosine = F.cosine_similarity(
+        student_centered.flatten(1), teacher_centered.flatten(1), dim=1
+    ).mean()
+    centered_magnitude = F.smooth_l1_loss(
+        (student_centered_rms / teacher_centered_rms).clamp_min(1e-4).log().clamp(-4, 4),
+        torch.zeros_like(student_centered_rms),
+        beta=0.10,
+    )
+
+    temperature = float(weights.get("functional_infonce_temperature", 0.10))
+    if temperature <= 0:
+        raise ValueError("functional_infonce_temperature must be positive")
+    student_unit = F.normalize(student_centered.flatten(1), dim=1)
+    teacher_unit = F.normalize(teacher_centered.flatten(1), dim=1)
+    logits = student_unit @ teacher_unit.t() / temperature
+    labels = torch.arange(student.shape[0], device=student.device)
+    infonce = 0.5 * (
+        F.cross_entropy(logits, labels) + F.cross_entropy(logits.t(), labels)
+    )
+    positive = logits.diagonal() * temperature
+    wrong = logits.masked_fill(
+        torch.eye(student.shape[0], device=student.device, dtype=torch.bool),
+        torch.finfo(logits.dtype).min,
+    ).max(dim=1).values * temperature
+
+    teacher_common_rms = teacher_common.square().mean().sqrt().clamp_min(1e-4)
+    student_common_rms = student_common.square().mean().sqrt()
+    common_huber = F.smooth_l1_loss(
+        student_common / teacher_common_rms,
+        teacher_common / teacher_common_rms,
+        beta=0.10,
+    )
+    common_cosine = F.cosine_similarity(
+        student_common.flatten(), teacher_common.flatten(), dim=0
+    )
+    student_total_rms = student.square().mean().sqrt().clamp_min(1e-8)
+    teacher_total_rms = teacher.square().mean().sqrt().clamp_min(1e-8)
+    student_common_ratio = student_common_rms / student_total_rms
+    teacher_common_ratio = teacher_common_rms / teacher_total_rms
+    common_margin = float(weights.get("common_ratio_margin", 0.03))
+    common_excess = F.relu(
+        student_common_ratio - teacher_common_ratio - common_margin
+    )
+    common_excess_loss = common_excess.square()
+
+    total = (
+        float(weights.get("centered_huber", 1.0)) * centered_huber
+        + float(weights.get("centered_direction", 1.0)) * (1 - centered_cosine)
+        + float(weights.get("centered_magnitude", 0.25)) * centered_magnitude
+        + float(weights.get("functional_infonce", 0.25)) * infonce
+        + float(weights.get("common_huber", 0.10)) * common_huber
+        + float(weights.get("common_direction", 0.05)) * (1 - common_cosine)
+        + float(weights.get("common_ratio_excess", 1.0)) * common_excess_loss
+    )
+    return total, {
+        "loss": total.detach(),
+        "centered_huber": centered_huber.detach(),
+        "centered_cosine": centered_cosine.detach(),
+        "centered_magnitude_loss": centered_magnitude.detach(),
+        "centered_student_to_teacher_rms": (
+            student_centered_rms / teacher_centered_rms
+        ).mean().detach(),
+        "functional_infonce_loss": infonce.detach(),
+        "functional_infonce_accuracy": (
+            logits.argmax(dim=1) == labels
+        ).float().mean().detach(),
+        "functional_infonce_positive_cosine": positive.mean().detach(),
+        "functional_infonce_hardest_wrong_cosine": wrong.mean().detach(),
+        "functional_infonce_cosine_gap": (positive - wrong).mean().detach(),
+        "common_huber": common_huber.detach(),
+        "common_cosine": common_cosine.detach(),
+        "common_output_ratio": student_common_ratio.detach(),
+        "teacher_common_output_ratio": teacher_common_ratio.detach(),
+        "common_output_excess": common_excess.detach(),
+        "common_output_excess_loss": common_excess_loss.detach(),
+        "student_to_teacher_rms": (student_total_rms / teacher_total_rms).detach(),
+    }
+
+
 def _pack_mixture_references(
     loader: CachedTeacherReferenceLoader,
     rows: list[dict[str, Any]],
@@ -607,7 +754,15 @@ def _lora_teacher_step(
         noisy, base, context, timestep, device,
         reference_weights=reference_weights,
     )
-    loss, metrics = _functional_objective(
+    objective = str(training.get("functional_objective", "legacy_raw"))
+    objective_fn = (
+        _teacher_decomposed_functional_objective
+        if objective == "teacher_decomposed"
+        else _functional_objective
+    )
+    if objective not in {"legacy_raw", "teacher_decomposed"}:
+        raise ValueError(f"Unsupported functional objective: {objective}")
+    loss, metrics = objective_fn(
         student, teacher, dict(training.get("loss_weights", {}))
     )
     loss.backward()
@@ -619,9 +774,13 @@ def _lora_teacher_step(
 
 
 def train_lora_functional_distillation(
-    config: dict[str, Any], destination: Path, *, steps_override: int | None = None
+    config: dict[str, Any],
+    destination: Path,
+    *,
+    steps_override: int | None = None,
+    config_key: str = "lora_functional_distillation",
 ) -> dict[str, Any]:
-    cfg = copy.deepcopy(config["lora_functional_distillation"])
+    cfg = copy.deepcopy(config[config_key])
     training = dict(cfg["training"])
     if steps_override is not None:
         training["steps"] = int(steps_override)
@@ -647,6 +806,9 @@ def train_lora_functional_distillation(
     adapter.load_state_dict(initial["adapter"], strict=True)
     adapter.restore_timestep_strength_state()
     adapter.set_bootstrap_phase("combined")
+    freeze_common = bool(training.get("freeze_common", False))
+    for parameter in adapter.common_parameters():
+        parameter.requires_grad_(not freeze_common)
 
     bank = FunctionalLoRATeacherBank(destination / str(cfg["teacher_cache"]["output_directory"]))
     lora_root = destination / str(cfg["lora_directory"])
@@ -688,11 +850,16 @@ def train_lora_functional_distillation(
 
     groups = [
         {"params": list(reader.parameters()), "lr": float(training.get("reader_learning_rate", 2e-5)), "name": "reader"},
-        {"params": adapter.common_parameters(), "lr": float(training.get("common_learning_rate", 3e-5)), "name": "common"},
         {"params": adapter.shared_parameters(), "lr": float(training.get("shared_learning_rate", 1e-4)), "name": "shared_kv"},
         {"params": adapter.delta_parameters(), "lr": float(training.get("delta_learning_rate", 2e-4)), "name": "block_delta"},
         {"params": adapter.mixing_parameters(), "lr": float(training.get("mix_learning_rate", 4e-5)), "name": "base_mix", "weight_decay": 0.0},
     ]
+    if not freeze_common:
+        groups.insert(1, {
+            "params": adapter.common_parameters(),
+            "lr": float(training.get("common_learning_rate", 3e-5)),
+            "name": "common",
+        })
     if adapter.null_parameters():
         groups.append({"params": adapter.null_parameters(), "lr": float(training.get("null_learning_rate", 2e-4)), "name": "artist_null", "weight_decay": 0.0})
     base_lrs = {str(group["name"]): float(group["lr"]) for group in groups}
@@ -723,10 +890,12 @@ def train_lora_functional_distillation(
             name=str(wandb_cfg.get("name", "detail-style-lora-functional-distill-v1")),
             id=str(wandb_cfg.get("id", "detail-style-lora-functional-distill-v1")),
             resume="allow" if start_step else "never",
-            config={"lora_functional_distillation": cfg},
+            config={config_key: cfg},
         )
     fixed = load_dual_query_external_sample(config, destination)
     single_only = int(training.get("single_only_steps", 500))
+    artist_intro = int(training.get("artist_intro_steps", 0))
+    curriculum = str(training.get("curriculum", "legacy"))
     warmup = int(training.get("warmup_steps", 100))
     decay_start = int(training.get("lr_decay_start_step", 6000))
     min_lr = float(training.get("minimum_lr_ratio", 0.1))
@@ -750,7 +919,15 @@ def train_lora_functional_distillation(
             for group in optimizer.param_groups:
                 group["lr"] = base_lrs[str(group["name"])] * lr_scale
             optimizer.zero_grad(set_to_none=True)
-            category = teacher_category(step, single_only_steps=single_only)
+            category = (
+                teacher_category_v2(
+                    step,
+                    single_only_steps=single_only,
+                    artist_intro_steps=artist_intro,
+                )
+                if curriculum == "artist_centered_v2"
+                else teacher_category(step, single_only_steps=single_only)
+            )
             updates[category] += 1
             if category == "artist_tag":
                 native_training = {
@@ -760,10 +937,17 @@ def train_lora_functional_distillation(
                     "teacher_global_weight": float(training.get("native_global_weight", 0.25)),
                     "teacher_infonce_weight": float(training.get("native_infonce_weight", 0.10)),
                     "teacher_infonce_temperature": 0.10,
-                    "separated_teacher_gradients": True,
-                    "train_common_in_combined": True,
+                    "separated_teacher_gradients": not freeze_common,
+                    "train_common_in_combined": not freeze_common,
                     "teacher_objective": dict(training.get("native_loss", {})),
-                    "separated_component_bootstrap": {"enabled": False, "artist_mean_weight": 0.25},
+                    "separated_component_bootstrap": {
+                        "enabled": False,
+                        "artist_mean_weight": (
+                            0.0 if freeze_common else float(
+                                training.get("native_artist_mean_weight", 0.25)
+                            )
+                        ),
+                    },
                     "post_gate_teacher_distillation": {"enabled": False},
                 }
                 batch = native_loader.load_step(updates[category])
@@ -798,6 +982,7 @@ def train_lora_functional_distillation(
                 row = {key: sum(values) / len(values) for key, values in running.items() if values}
                 row["optimizer/learning_rate"] = float(optimizer.param_groups[0]["lr"])
                 row["progress/category"] = {"artist_tag": 0, "lora_single": 1, "lora_mixture": 2}[category]
+                row["progress/common_frozen"] = float(freeze_common)
                 print(f"LoRA distill step={step}/{steps} category={category} {row}", flush=True)
                 if wandb_run is not None:
                     wandb_run.log({f"train/{key}": value for key, value in row.items()}, step=step)
@@ -835,6 +1020,8 @@ def train_lora_functional_distillation(
         "elapsed_s": time.perf_counter() - started,
         "teacher_ratio_after_bootstrap": "1:1:1",
         "lora_reference_domains": "human:synthetic=1:1",
+        "curriculum": curriculum,
+        "common_frozen": freeze_common,
     }
     write_json(output / "summary.json", summary)
     return summary
@@ -852,3 +1039,37 @@ def smoke_test_lora_functional_distillation(
     cfg["training"]["sample_every"] = 0
     cfg["training"]["single_only_steps"] = 0
     return train_lora_functional_distillation(effective, destination, steps_override=3)
+
+
+def train_lora_functional_distillation_v2(
+    config: dict[str, Any], destination: Path
+) -> dict[str, Any]:
+    return train_lora_functional_distillation(
+        config,
+        destination,
+        config_key="lora_functional_distillation_v2",
+    )
+
+
+def smoke_test_lora_functional_distillation_v2(
+    config: dict[str, Any], destination: Path
+) -> dict[str, Any]:
+    effective = copy.deepcopy(config)
+    cfg = effective["lora_functional_distillation_v2"]
+    cfg["output_directory"] = str(
+        Path(cfg["output_directory"]).with_name(
+            "lora_functional_distillation_v2_smoke"
+        )
+    )
+    cfg["training"]["wandb"]["enabled"] = False
+    cfg["training"]["resume"] = False
+    cfg["training"]["checkpoint_every"] = 1
+    cfg["training"]["sample_every"] = 0
+    cfg["training"]["single_only_steps"] = 0
+    cfg["training"]["artist_intro_steps"] = 0
+    return train_lora_functional_distillation(
+        effective,
+        destination,
+        steps_override=3,
+        config_key="lora_functional_distillation_v2",
+    )

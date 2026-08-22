@@ -86,6 +86,8 @@ def build_parser() -> argparse.ArgumentParser:
         ("lora-functional-teacher-cache", "Cache single and mixed LoRA functional effects"),
         ("lora-functional-distill-smoke", "Smoke-test LoRA functional distillation"),
         ("lora-functional-distill-train", "Distill artist-tag, LoRA and mixed-LoRA teachers"),
+        ("lora-functional-distill-v2-smoke", "Smoke-test artist-centered LoRA distillation"),
+        ("lora-functional-distill-v2-train", "Train artist-centered LoRA distillation"),
         ("style-train", "Train the multi-reference Anima style adapter"),
         ("style-token-cache", "Cache frozen production Resampler tokens"),
         ("style-smoke", "Run two real Anima style-adapter training steps"),
@@ -366,12 +368,16 @@ def main() -> None:
         "lora-functional-teacher-cache",
         "lora-functional-distill-smoke",
         "lora-functional-distill-train",
+        "lora-functional-distill-v2-smoke",
+        "lora-functional-distill-v2-train",
     }:
         from .lora_functional_distillation import (
             cache_lora_functional_teacher,
             generate_lora_teacher_references,
             smoke_test_lora_functional_distillation,
+            smoke_test_lora_functional_distillation_v2,
             train_lora_functional_distillation,
+            train_lora_functional_distillation_v2,
         )
 
         stage = {
@@ -379,6 +385,8 @@ def main() -> None:
             "lora-functional-teacher-cache": cache_lora_functional_teacher,
             "lora-functional-distill-smoke": smoke_test_lora_functional_distillation,
             "lora-functional-distill-train": train_lora_functional_distillation,
+            "lora-functional-distill-v2-smoke": smoke_test_lora_functional_distillation_v2,
+            "lora-functional-distill-v2-train": train_lora_functional_distillation_v2,
         }[args.command]
         _run(stage, config, destination)
     elif args.command == "lora-reference-token-cache":
