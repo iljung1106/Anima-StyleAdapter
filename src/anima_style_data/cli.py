@@ -78,6 +78,9 @@ def build_parser() -> argparse.ArgumentParser:
         ("anima-latent-cache", "Cache packed Qwen-Image VAE latents"),
         ("anima-cache", "Cache all frozen Anima training inputs"),
         ("anima-cache-validate", "Validate packed Anima cache manifests and tensors"),
+        ("artist-lora-plan", "Select the 64 persistent Anima LoRA teacher artists"),
+        ("artist-lora-smoke", "Run two real persistent Anima LoRA teacher steps"),
+        ("artist-lora-train", "Train independent persistent Anima LoRA teachers"),
         ("style-train", "Train the multi-reference Anima style adapter"),
         ("style-token-cache", "Cache frozen production Resampler tokens"),
         ("style-smoke", "Run two real Anima style-adapter training steps"),
@@ -336,6 +339,23 @@ def main() -> None:
         _run(cache_all_anima_inputs, config, destination)
     elif args.command == "anima-cache-validate":
         _run(validate_anima_caches, config, destination)
+    elif args.command in {
+        "artist-lora-plan",
+        "artist-lora-smoke",
+        "artist-lora-train",
+    }:
+        from .artist_lora_teachers import (
+            prepare_artist_lora_teachers,
+            smoke_test_artist_lora_teachers,
+            train_artist_lora_teachers,
+        )
+
+        stage = {
+            "artist-lora-plan": prepare_artist_lora_teachers,
+            "artist-lora-smoke": smoke_test_artist_lora_teachers,
+            "artist-lora-train": train_artist_lora_teachers,
+        }[args.command]
+        _run(stage, config, destination)
     elif args.command in {
         "style-train", "style-token-cache", "style-smoke", "style-benchmark", "style-sample", "style-compare", "style-diagnose",
         "style-overfit", "style-overfit-sample", "style-exact-self-generalize",

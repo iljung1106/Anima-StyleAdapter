@@ -154,6 +154,76 @@ style_features:
     max_side: 512
     max_pixels: 262144
 
+# Independent high-capacity style teachers. Anima and the LoRA module graph
+# stay resident for the complete 64-artist run; only the rank-16 weights and
+# Adam state are reset between artists. Each artist reserves six images for a
+# held-out flow check. Artist identity is never present in cached prompts.
+artist_lora_teachers:
+  output_directory: artist_lora_teachers_rank16_64_v1
+  seed: 20260823
+  artist_count: 64
+  images_per_artist: 30
+  train_images_per_artist: 24
+  validation_images_per_artist: 6
+  split: train
+  maximum_bucket_count: 32
+  latent_cache: anima_latent_cache_qwen_2d
+  text_cache: anima_text_cache_post_llm_multimode_v1
+  text_conditioning_length: 512
+  pin_memory: true
+  variant_names:
+    - full
+    - full_quality
+    - tag_dropout
+    - tag_dropout_quality
+    - short
+    - short_quality
+  prompt:
+    mode_weights:
+      full: 0.30
+      tag_dropout: 0.40
+      short: 0.20
+      empty: 0.10
+    quality_probability: 0.50
+  training:
+    device: cuda
+    rank: 16
+    alpha: 16
+    steps: 500
+    batch_size: 2
+    learning_rate: 0.0001
+    warmup_steps: 50
+    minimum_lr_ratio: 0.10
+    betas: [0.9, 0.99]
+    adam_eps: 0.00000001
+    weight_decay: 0.01
+    max_grad_norm: 1.0
+    fused_adamw: true
+    allow_tf32: true
+    cudnn_benchmark: true
+    low_precision_rmsnorm: true
+    attention_mode: torch
+    timestep_sampling: shift
+    sigmoid_scale: 1.0
+    sigmoid_bias: 0.0
+    discrete_flow_shift: 3.0
+    log_every: 25
+    validation_every: 250
+    validation_batches: 4
+    state_every: 250
+    compile:
+      enabled: true
+      backend: inductor
+      mode: default
+      dynamic: auto
+      fullgraph: false
+      cache_size_limit: 32
+    wandb:
+      enabled: true
+      project: anima-style-adapter
+      name: artist-lora-teachers-r16-64
+      id: artist-lora-teachers-r16-64-v1
+
 # B-prime per-reference encoder. C-RADIO spatial features and Qwen Image VAE
 # latents remain separate K/V banks; learned spatial/global queries read both.
 dual_query_resampler:
