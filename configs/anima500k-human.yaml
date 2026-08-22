@@ -4403,8 +4403,8 @@ detail_preserving_style_cross_attention:
     wandb:
       enabled: true
       project: anima-style-adapter
-      name: detail-style-v33-human-functional-finetune
-      id: detail-style-v33-human-functional-finetune
+      name: detail-style-v33-human-functional-finetune-r1
+      id: detail-style-v33-human-functional-finetune-r1
   gradient_diagnostics:
     checkpoint_step: 1500
     teacher_batch_step: 1500
