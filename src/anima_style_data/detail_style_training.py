@@ -3170,14 +3170,20 @@ def _generate_fixed_reference_sample(
     step: int,
     *,
     component_mode: str | None = None,
+    strengths_override: list[float] | None = None,
 ) -> dict[str, Any]:
     """Render the fixed TestSample1--7 contract through the style branch."""
 
     cfg = dict(prepared["cfg"])
-    strengths = [
-        float(value) for value in config["detail_preserving_style_cross_attention"]
-        ["training"].get("fixed_sample_strengths", [1.0, 1.5, 2.0])
-    ]
+    strengths = (
+        [float(value) for value in strengths_override]
+        if strengths_override is not None
+        else [
+            float(value)
+            for value in config["detail_preserving_style_cross_attention"]
+            ["training"].get("fixed_sample_strengths", [1.0, 1.5, 2.0])
+        ]
+    )
     if not strengths or any(value <= 0 for value in strengths):
         raise ValueError("fixed_sample_strengths must contain positive values")
     references = prepared["reference_tokens"][:, None].to(
@@ -5047,7 +5053,10 @@ def backfill_detail_style_fixed_samples(
     every = int(training.get("fixed_sample_every", 1000))
     strengths = [
         float(value)
-        for value in training.get("fixed_sample_strengths", [1.0, 1.5, 2.0])
+        for value in training.get(
+            "fixed_sample_backfill_strengths",
+            training.get("fixed_sample_strengths", [1.0, 1.5, 2.0]),
+        )
     ]
     if every <= 0:
         raise ValueError("fixed_sample_every must be positive for backfill")
@@ -5110,6 +5119,7 @@ def backfill_detail_style_fixed_samples(
             result = _generate_fixed_reference_sample(
                 prepared, config, destination, anima, reader, adapter,
                 output, device, step, component_mode=component_mode,
+                strengths_override=strengths,
             )
             generated.append({
                 "step": step,
