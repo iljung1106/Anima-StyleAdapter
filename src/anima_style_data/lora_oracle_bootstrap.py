@@ -552,7 +552,10 @@ def sample_lora_oracle_checkpoint(
     codes = state["oracle_codes"][:rows].to(device=device, dtype=torch.bfloat16)
     reader = _FixedOracleCodeReader(codes).to(device).eval()
 
-    reference_root = destination / str(cfg["synthetic_reference_cache"]) / "images"
+    reference_cache = destination / str(cfg["synthetic_reference_cache"])
+    reference_root = reference_cache / "images"
+    if not reference_root.is_dir() and (reference_cache.parent / "images").is_dir():
+        reference_root = reference_cache.parent / "images"
     paths = [
         reference_root / f"artist-{index:03d}" / "content-00.webp"
         for index in range(rows)
