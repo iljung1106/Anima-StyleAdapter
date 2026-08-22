@@ -570,7 +570,8 @@ def _render_artist_lora_preview(
     validation_buckets,
     cache_index: _ArtistCacheIndex,
     null_condition,
-    config: dict[str, Any],
+    root_config: dict[str, Any],
+    artist_config: dict[str, Any],
     destination: Path,
     output: Path,
     plan: ArtistLoRAPlan,
@@ -581,7 +582,7 @@ def _render_artist_lora_preview(
 
     from .style_transfer import _load_sampling_vae
 
-    preview_cfg = dict(config.get("preview", {}))
+    preview_cfg = dict(artist_config.get("preview", {}))
     device = next(network.parameters()).device
     train_bucket = max(train_buckets.values(), key=lambda value: len(value.image_ids))
     validation_bucket = max(
@@ -643,7 +644,7 @@ def _render_artist_lora_preview(
             base_latent = denoise(0.0)
             lora_latent = denoise(1.0)
             if vae is None:
-                vae = _load_sampling_vae(config, destination).to(
+                vae = _load_sampling_vae(root_config, destination).to(
                     device=device, dtype=torch.bfloat16
                 )
             generated = vae.decode_to_pixels(
@@ -1056,6 +1057,7 @@ def train_artist_lora_teachers(
                     validation_buckets,
                     cache_index,
                     null_condition,
+                    config,
                     cfg,
                     destination,
                     output,
