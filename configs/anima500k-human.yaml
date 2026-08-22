@@ -155,13 +155,13 @@ style_features:
     max_pixels: 262144
 
 # Independent high-capacity style teachers. Anima and the LoRA module graph
-# stay resident for the complete 64-artist run; only the rank-16 weights and
+# stay resident for the complete 256-artist run; only the rank-16 weights and
 # Adam state are reset between artists. Each artist reserves six images for a
 # held-out flow check. Artist identity is never present in cached prompts.
 artist_lora_teachers:
-  output_directory: artist_lora_teachers_rank16_64_b2_v4
+  output_directory: artist_lora_teachers_rank16_256_b2_v5
   seed: 20260823
-  artist_count: 64
+  artist_count: 256
   images_per_artist: 30
   train_images_per_artist: 24
   validation_images_per_artist: 6
@@ -221,8 +221,8 @@ artist_lora_teachers:
     wandb:
       enabled: true
       project: anima-style-adapter
-      name: artist-lora-teachers-r16-64-b2
-      id: artist-lora-teachers-r16-64-b2-v4
+      name: artist-lora-teachers-r16-256-b2
+      id: artist-lora-teachers-r16-256-b2-v5
   preview:
     enabled: true
     every_artists: 8
