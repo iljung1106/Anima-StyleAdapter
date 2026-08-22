@@ -75,3 +75,27 @@ v2 makes the following structural corrections:
 The v2 run starts again from v34 step 500 with a fresh optimizer. It writes
 resume-compatible checkpoints every 250 steps and renders the fixed-reference
 panel every 500 steps during the high-risk alignment phase.
+
+## Oracle-code representability bootstrap
+
+The v2 step-500 controlled metrics improved, but fixed-reference 1x and 2x
+generation remained visually similar. Doubling Artist strength increased the
+baseline change while reducing pairwise output diversity. A direct controlled
+comparison also showed that the visual path and the connector were still only
+weakly aligned to the same LoRA residual. Jointly learning both sides against
+an often unrepresentable full-LoRA final effect is therefore split into two
+problems.
+
+First, initialize one 28x1024 code per LoRA artist from the frozen v34 Reader's
+average Human/Synthetic output. Freeze the Reader, bypass and freeze Common,
+and jointly optimize only these 64 visual-anchored codes plus the Artist K/V
+connector. The target is the LoRA effect after removing the controlled
+cross-artist mean. Normalized centered Huber/direction/magnitude, symmetric
+all-wrong InfoNCE, and a zero-mean Artist penalty define the objective. A weak
+code-to-initial-visual-anchor loss prevents arbitrary identity embeddings.
+
+This stage determines the strongest LoRA effect that the actual style
+cross-attention can represent before asking an image encoder to predict it.
+After its functional cosine and samples are satisfactory, freeze the oracle
+connector and distill Human and LoRA-generated references into the learned
+codes. Only then jointly fine-tune the visual Reader and connector.

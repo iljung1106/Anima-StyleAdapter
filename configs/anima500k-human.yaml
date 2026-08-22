@@ -431,6 +431,53 @@ lora_functional_distillation_v2:
       name: detail-style-lora-functional-distill-v2-artist-centered
       id: detail-style-lora-functional-distill-v2-artist-centered
 
+
+# Representability bootstrap.  A visual-anchored 28x1024 oracle code is learned
+# for each of the 64 LoRA teachers while the Reader and Common branch remain
+# frozen.  This first proves and learns the effect subspace available to the
+# actual artist-only style cross-attention; the Reader is distilled afterward.
+lora_oracle_bootstrap:
+  output_directory: lora_oracle_bootstrap_v1
+  seed: 20260823
+  initial_checkpoint: detail_preserving_style_cross_attention_v34_anti_common_functional/checkpoints/step-0000500.pt
+  teacher_cache: lora_functional_teacher_bank_rank16_64_v1
+  human_reference_cache: dual_query_reference_tokens_v8_step10000
+  synthetic_reference_cache: lora_teacher_references_rank16_64x8_v1/dual_query_reference_tokens_v8_step10000
+  training:
+    device: cuda
+    steps: 1500
+    batch_rows: 8
+    initialization_references: 4
+    initialization_batch_size: 8
+    oracle_learning_rate: 0.00050
+    shared_learning_rate: 0.00005
+    delta_learning_rate: 0.00010
+    mix_learning_rate: 0.00002
+    oracle_anchor_weight: 0.01
+    warmup_steps: 100
+    betas: [0.9, 0.95]
+    adam_eps: 0.00000001
+    weight_decay: 0.01
+    max_grad_norm: 1.0
+    fused_adamw: true
+    token_lru_shards: 8
+    loss_weights:
+      huber: 1.00
+      direction: 1.00
+      magnitude: 0.25
+      infonce: 0.50
+      infonce_temperature: 0.10
+      zero_mean: 0.25
+    log_every: 10
+    checkpoint_every: 250
+    sample_every: 500
+    resume: true
+    wandb:
+      enabled: true
+      project: anima-style-adapter
+      name: lora-oracle-bootstrap-v1
+      id: lora-oracle-bootstrap-v1
+
 # B-prime per-reference encoder. C-RADIO spatial features and Qwen Image VAE
 # latents remain separate K/V banks; learned spatial/global queries read both.
 dual_query_resampler:

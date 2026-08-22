@@ -88,6 +88,8 @@ def build_parser() -> argparse.ArgumentParser:
         ("lora-functional-distill-train", "Distill artist-tag, LoRA and mixed-LoRA teachers"),
         ("lora-functional-distill-v2-smoke", "Smoke-test artist-centered LoRA distillation"),
         ("lora-functional-distill-v2-train", "Train artist-centered LoRA distillation"),
+        ("lora-oracle-bootstrap-smoke", "Smoke-test visual-anchored LoRA oracle codes"),
+        ("lora-oracle-bootstrap-train", "Train visual-anchored LoRA oracle codes"),
         ("style-train", "Train the multi-reference Anima style adapter"),
         ("style-token-cache", "Cache frozen production Resampler tokens"),
         ("style-smoke", "Run two real Anima style-adapter training steps"),
@@ -387,6 +389,20 @@ def main() -> None:
             "lora-functional-distill-train": train_lora_functional_distillation,
             "lora-functional-distill-v2-smoke": smoke_test_lora_functional_distillation_v2,
             "lora-functional-distill-v2-train": train_lora_functional_distillation_v2,
+        }[args.command]
+        _run(stage, config, destination)
+    elif args.command in {
+        "lora-oracle-bootstrap-smoke",
+        "lora-oracle-bootstrap-train",
+    }:
+        from .lora_oracle_bootstrap import (
+            smoke_test_lora_oracle_bootstrap,
+            train_lora_oracle_bootstrap,
+        )
+
+        stage = {
+            "lora-oracle-bootstrap-smoke": smoke_test_lora_oracle_bootstrap,
+            "lora-oracle-bootstrap-train": train_lora_oracle_bootstrap,
         }[args.command]
         _run(stage, config, destination)
     elif args.command == "lora-reference-token-cache":
