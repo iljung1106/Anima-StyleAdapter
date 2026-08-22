@@ -115,6 +115,31 @@ class OracleVisualProjector(torch.nn.Module):
         return visual_codes + delta
 
 
+class _ProjectedReader(torch.nn.Module):
+    """Compose the frozen Reader and learned visual-to-oracle projector."""
+
+    def __init__(
+        self,
+        reader: DetailPreservingTypedSlotReader,
+        projector: OracleVisualProjector,
+    ) -> None:
+        super().__init__()
+        self.reader = reader
+        self.projector = projector
+
+    def forward(
+        self,
+        references: torch.Tensor,
+        reference_mask: torch.Tensor,
+        *,
+        reconstruct: bool = False,
+    ) -> SimpleNamespace:
+        output = self.reader(
+            references, reference_mask, reconstruct=reconstruct
+        )
+        return SimpleNamespace(tokens=self.projector(output.tokens))
+
+
 def _artist_centered_oracle_objective(
     student: torch.Tensor,
     teacher: torch.Tensor,
@@ -742,6 +767,7 @@ def _save_visual_bridge_state(
     reader: DetailPreservingTypedSlotReader,
     adapter: SeparatedCommonArtistKVStyleCrossAttention,
     oracle_codes: torch.Tensor,
+    projector: OracleVisualProjector,
     optimizer: torch.optim.Optimizer,
     config: dict[str, Any],
 ) -> None:
@@ -751,6 +777,10 @@ def _save_visual_bridge_state(
         "reader": {key: value.detach().cpu() for key, value in reader.state_dict().items()},
         "adapter": {key: value.detach().cpu() for key, value in adapter.state_dict().items()},
         "oracle_codes": oracle_codes.detach().cpu(),
+        "projector": {
+            key: value.detach().cpu()
+            for key, value in projector.state_dict().items()
+        },
         "optimizer": optimizer.state_dict(),
         "config": config,
         "python_rng": random.getstate(),
@@ -801,6 +831,22 @@ def train_lora_oracle_visual_bridge(
     for parameter in adapter.common_parameters():
         parameter.requires_grad_(False)
     oracle_codes = source["oracle_codes"].to(device=device, dtype=torch.bfloat16)
+    projector_cfg = dict(root_cfg["visual_projector"])
+    projector = OracleVisualProjector(
+        dim=int(projector_cfg.get("dim", 1024)),
+        slots=int(projector_cfg.get("slots", 28)),
+        heads=int(projector_cfg.get("heads", 16)),
+        ff_dim=int(projector_cfg.get("ff_dim", 2048)),
+        bottleneck_dim=int(projector_cfg.get("bottleneck_dim", 256)),
+    ).to(device)
+    projector_state = torch.load(
+        destination / str(cfg["projector_checkpoint"]),
+        map_location="cpu",
+        weights_only=False,
+    )
+    projector.load_state_dict(projector_state["projector"], strict=True)
+    projector.requires_grad_(False).eval()
+    projected_reader = _ProjectedReader(reader, projector).eval()
 
     bank = FunctionalLoRATeacherBank(destination / str(root_cfg["teacher_cache"]))
     single_ids = list(bank.by_kind["single"])
@@ -808,8 +854,8 @@ def train_lora_oracle_visual_bridge(
     loader_kwargs = {
         "split": "train",
         "style_ids": style_ids,
-        "batch_size": int(cfg["batch_rows"]),
-        "references": max(int(value) for value in cfg["reference_count_weights"]),
+        "batch_size": len(style_ids),
+        "references": int(cfg.get("materialized_reference_images", 8)),
         "token_lru_shards": int(cfg.get(
             "token_lru_shards",
             root_cfg["training"].get("token_lru_shards", 8),
@@ -826,6 +872,38 @@ def train_lora_oracle_visual_bridge(
         seed=seed ^ 0x53594E54,
         **loader_kwargs,
     )
+    reference_images = int(cfg.get("materialized_reference_images", 8))
+    human_codes, reference_counts = _materialize_reader_code_bank(
+        reader,
+        human_loader,
+        style_ids,
+        reference_images=reference_images,
+        seed=seed ^ 0x11111111,
+        device=device,
+    )
+    synthetic_codes, synthetic_reference_counts = _materialize_reader_code_bank(
+        reader,
+        synthetic_loader,
+        style_ids,
+        reference_images=reference_images,
+        seed=seed ^ 0x22222222,
+        device=device,
+    )
+    if not torch.equal(reference_counts, synthetic_reference_counts):
+        raise RuntimeError("Human and synthetic Reader banks disagree on views")
+    with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
+        projected_parts = []
+        for values in (human_codes, synthetic_codes):
+            flat = values.flatten(0, 1)
+            chunks = [
+                projector(flat[offset : offset + 64])
+                for offset in range(0, len(flat), 64)
+            ]
+            projected_parts.append(
+                torch.cat(chunks).reshape_as(values).contiguous()
+            )
+    visual_code_banks = torch.stack(projected_parts, dim=0)
+    del human_codes, synthetic_codes, projected_parts
 
     groups = [
         {"params": adapter.shared_parameters(), "lr": float(cfg["shared_learning_rate"]), "name": "shared_kv"},
@@ -870,7 +948,6 @@ def train_lora_oracle_visual_bridge(
     batch_rows = int(cfg["batch_rows"])
     warmup = int(cfg.get("warmup_steps", 100))
     ramp_steps = int(cfg.get("visual_fraction_ramp_steps", 750))
-    reference_choices = [int(value) for value in cfg["reference_count_weights"]]
     running: dict[str, list[float]] = defaultdict(list)
     started = time.perf_counter()
     try:
@@ -881,25 +958,21 @@ def train_lora_oracle_visual_bridge(
             optimizer.zero_grad(set_to_none=True)
             rng = random.Random(seed + step * 1_000_003)
             positions = rng.sample(range(len(single_ids)), batch_rows)
-            batch_style_ids = [style_ids[index] for index in positions]
-            references = rng.choice(reference_choices)
-            loader = human_loader if step % 2 else synthetic_loader
-            loaded = loader.load_styles(
-                batch_style_ids,
-                references_per_style=references,
-                seed=seed + step * 10_007,
+            position_index = torch.tensor(
+                positions, device=device, dtype=torch.long
             )
-            reference_tokens = loaded["tokens"].to(
-                device=device, dtype=torch.bfloat16, non_blocking=True
+            view_index = torch.tensor(
+                [rng.randrange(visual_code_banks.shape[2]) for _ in positions],
+                device=device,
+                dtype=torch.long,
             )
-            reference_mask = torch.ones(
-                reference_tokens.shape[:2], device=device, dtype=torch.bool
-            )
-            with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
-                visual_codes = reader(reference_tokens, reference_mask).tokens
+            domain_index = step % 2
+            visual_codes = visual_code_banks[
+                domain_index, position_index, view_index
+            ]
             fraction = min(1.0, step / max(1, ramp_steps))
             contexts = _interpolate_oracle_visual(
-                oracle_codes[positions], visual_codes, fraction
+                oracle_codes[position_index], visual_codes, fraction
             )
 
             content_index = step % int(bank.base["noisy_inputs"].shape[0])
@@ -922,10 +995,15 @@ def train_lora_oracle_visual_bridge(
                 parameters, float(cfg.get("max_grad_norm", 1.0)), foreach=True
             )
             optimizer.step()
-            visual_delta = (visual_codes.float() - oracle_codes[positions].float())
+            visual_delta = (
+                visual_codes.float() - oracle_codes[position_index].float()
+            )
             metrics.update({
                 "visual_fraction": torch.tensor(fraction, device=device),
-                "references": torch.tensor(float(references), device=device),
+                "references": reference_counts[view_index].mean(),
+                "domain_is_human": torch.tensor(
+                    float(domain_index == 1), device=device
+                ),
                 "visual_to_oracle_rms": visual_delta.square().mean().sqrt(),
                 "visual_to_oracle_cosine": F.cosine_similarity(
                     visual_codes.float().flatten(1),
@@ -952,12 +1030,13 @@ def train_lora_oracle_visual_bridge(
                         reader=reader,
                         adapter=adapter,
                         oracle_codes=oracle_codes,
+                        projector=projector,
                         optimizer=optimizer,
                         config=cfg,
                     )
             if int(cfg.get("sample_every", 500)) > 0 and step % int(cfg["sample_every"]) == 0:
                 sample = _generate_fixed_reference_sample(
-                    fixed, config, destination, anima, reader, adapter, output,
+                    fixed, config, destination, anima, projected_reader, adapter, output,
                     device, step, component_mode="artist_only",
                     strengths_override=[1.0], sample_group="fixed_reference_samples",
                 )
@@ -978,6 +1057,7 @@ def train_lora_oracle_visual_bridge(
         "artists": len(style_ids),
         "reader_frozen": True,
         "oracle_codes_frozen": True,
+        "visual_projector_frozen": True,
         "common_frozen_and_bypassed": True,
         "final_visual_fraction": min(1.0, steps / max(1, ramp_steps)),
         "elapsed_s": time.perf_counter() - started,

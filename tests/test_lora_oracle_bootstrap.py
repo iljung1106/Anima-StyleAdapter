@@ -7,6 +7,7 @@ from anima_style_data.lora_oracle_bootstrap import (
     _oracle_code_alignment_objective,
     _materialize_reader_code_bank,
     OracleVisualProjector,
+    _ProjectedReader,
 )
 
 
@@ -98,8 +99,8 @@ class _ToyReferenceLoader:
 
 
 class _ToyReader(torch.nn.Module):
-    def forward(self, references, mask):
-        del mask
+    def forward(self, references, mask, *, reconstruct=False):
+        del mask, reconstruct
         return type("Output", (), {"tokens": references.mean(dim=1)})()
 
 
@@ -115,3 +116,15 @@ def test_materialized_reader_bank_contains_single_pair_and_quad_views():
 
     assert bank.shape == (2, 7, 4, 8)
     assert counts.tolist() == [1, 1, 1, 1, 2, 2, 4]
+
+
+def test_projected_reader_composes_reader_and_projector():
+    projector = OracleVisualProjector(
+        dim=8, slots=4, heads=2, ff_dim=16, bottleneck_dim=4
+    )
+    wrapper = _ProjectedReader(_ToyReader(), projector)
+    references = torch.randn(2, 3, 4, 8)
+    output = wrapper(references, torch.ones(2, 3, dtype=torch.bool))
+
+    expected = projector(references.mean(dim=1))
+    assert torch.allclose(output.tokens, expected)
