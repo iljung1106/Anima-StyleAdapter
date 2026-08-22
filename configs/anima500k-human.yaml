@@ -514,6 +514,7 @@ lora_oracle_bootstrap:
     source_checkpoint: lora_oracle_bootstrap_v1/training_state.pt
     steps: 750
     batch_rows: 64
+    token_lru_shards: 512
     reference_count_weights: [1, 1, 1, 2, 2, 3, 4]
     dim: 1024
     slots: 28

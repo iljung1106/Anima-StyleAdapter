@@ -810,7 +810,10 @@ def train_lora_oracle_visual_bridge(
         "style_ids": style_ids,
         "batch_size": int(cfg["batch_rows"]),
         "references": max(int(value) for value in cfg["reference_count_weights"]),
-        "token_lru_shards": int(root_cfg["training"].get("token_lru_shards", 8)),
+        "token_lru_shards": int(cfg.get(
+            "token_lru_shards",
+            root_cfg["training"].get("token_lru_shards", 8),
+        )),
         "strict_style_ids": True,
     }
     human_loader = CachedTeacherReferenceLoader(
@@ -1067,7 +1070,10 @@ def train_lora_oracle_visual_projector(
         "style_ids": style_ids,
         "batch_size": batch_rows,
         "references": max_references,
-        "token_lru_shards": int(root_cfg["training"].get("token_lru_shards", 8)),
+        "token_lru_shards": int(cfg.get(
+            "token_lru_shards",
+            root_cfg["training"].get("token_lru_shards", 8),
+        )),
         "strict_style_ids": True,
     }
     human_loader = CachedTeacherReferenceLoader(
