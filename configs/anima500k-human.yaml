@@ -4409,10 +4409,11 @@ detail_preserving_style_cross_attention:
     sample_every: 500
     fixed_sample_every: 500
     fixed_sample_strengths: [1.0, 2.0]
-    # Component backfill remains pointed at the preserved v32 diagnostic.
-    fixed_sample_backfill_steps: [4000]
+    # Diagnose whether the frozen Common scaffold or the trained Artist path
+    # dominates the visually similar v34 fixed-reference outputs.
+    fixed_sample_backfill_steps: [500]
     fixed_sample_backfill_component_modes: [common_only, artist_only]
-    fixed_sample_backfill_strengths: [1.0]
+    fixed_sample_backfill_strengths: [1.0, 2.0]
     resume: true
     wandb:
       enabled: true
