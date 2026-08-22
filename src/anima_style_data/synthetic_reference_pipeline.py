@@ -49,8 +49,8 @@ def _teacher_split(row: dict[str, Any]) -> str:
     return "test" if value == "meta_test" else value
 
 
-def cache_additional_synthetic_dual_query_tokens(
-    config: dict[str, Any], destination: Path
+def _cache_synthetic_dual_query_tokens(
+    config: dict[str, Any], destination: Path, *, config_key: str
 ) -> dict[str, Any]:
     """Encode synthetic images directly into frozen Resampler tokens.
 
@@ -59,7 +59,7 @@ def cache_additional_synthetic_dual_query_tokens(
     and 512-D descriptors are materialized on the network volume.
     """
 
-    cfg = dict(config["synthetic_teacher_additional"])
+    cfg = dict(config[config_key])
     cache_cfg = dict(cfg["dual_query_token_cache"])
     device = str(cache_cfg.get("device", "cuda"))
     if device.startswith("cuda") and not torch.cuda.is_available():
@@ -108,6 +108,7 @@ def cache_additional_synthetic_dual_query_tokens(
     }
     signature_payload = {
         "kind": "direct-synthetic-dual-query-reference-tokens-v1",
+        "config_key": config_key,
         "checkpoint_sha256": checkpoint_sha256,
         "radio_model": radio_cfg["model_version"],
         "radio_ref": radio_cfg["torchhub_ref"],
@@ -406,3 +407,19 @@ def cache_additional_synthetic_dual_query_tokens(
     }
     write_json(summary_path, summary)
     return summary
+
+
+def cache_additional_synthetic_dual_query_tokens(
+    config: dict[str, Any], destination: Path
+) -> dict[str, Any]:
+    return _cache_synthetic_dual_query_tokens(
+        config, destination, config_key="synthetic_teacher_additional"
+    )
+
+
+def cache_lora_teacher_dual_query_tokens(
+    config: dict[str, Any], destination: Path
+) -> dict[str, Any]:
+    return _cache_synthetic_dual_query_tokens(
+        config, destination, config_key="lora_teacher_references"
+    )

@@ -2506,6 +2506,7 @@ def _controlled_teacher_forward(
     timestep: torch.Tensor,
     device: str,
     *,
+    reference_weights: torch.Tensor | None = None,
     tagged: torch.Tensor | None = None,
     block_indices: tuple[int, ...] = (),
 ) -> torch.Tensor:
@@ -2523,7 +2524,11 @@ def _controlled_teacher_forward(
             # only activates the adapter hook; the artist branch is disabled.
             style = references.new_zeros(rows, 1, adapter.context_dim)
         else:
-            style = reader(references, mask).tokens
+            style = reader(
+                references,
+                mask,
+                reference_weights=reference_weights,
+            ).tokens
         adapter.reset_internal_teacher()
         adapter.set_style_context(style)
         if tagged is not None:

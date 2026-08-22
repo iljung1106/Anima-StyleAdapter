@@ -81,6 +81,11 @@ def build_parser() -> argparse.ArgumentParser:
         ("artist-lora-plan", "Select the 64 persistent Anima LoRA teacher artists"),
         ("artist-lora-smoke", "Run two real persistent Anima LoRA teacher steps"),
         ("artist-lora-train", "Train independent persistent Anima LoRA teachers"),
+        ("lora-reference-generate", "Generate image references from the 64 LoRA teachers"),
+        ("lora-reference-token-cache", "Cache frozen Resampler tokens for LoRA images"),
+        ("lora-functional-teacher-cache", "Cache single and mixed LoRA functional effects"),
+        ("lora-functional-distill-smoke", "Smoke-test LoRA functional distillation"),
+        ("lora-functional-distill-train", "Distill artist-tag, LoRA and mixed-LoRA teachers"),
         ("style-train", "Train the multi-reference Anima style adapter"),
         ("style-token-cache", "Cache frozen production Resampler tokens"),
         ("style-smoke", "Run two real Anima style-adapter training steps"),
@@ -356,6 +361,32 @@ def main() -> None:
             "artist-lora-train": train_artist_lora_teachers,
         }[args.command]
         _run(stage, config, destination)
+    elif args.command in {
+        "lora-reference-generate",
+        "lora-functional-teacher-cache",
+        "lora-functional-distill-smoke",
+        "lora-functional-distill-train",
+    }:
+        from .lora_functional_distillation import (
+            cache_lora_functional_teacher,
+            generate_lora_teacher_references,
+            smoke_test_lora_functional_distillation,
+            train_lora_functional_distillation,
+        )
+
+        stage = {
+            "lora-reference-generate": generate_lora_teacher_references,
+            "lora-functional-teacher-cache": cache_lora_functional_teacher,
+            "lora-functional-distill-smoke": smoke_test_lora_functional_distillation,
+            "lora-functional-distill-train": train_lora_functional_distillation,
+        }[args.command]
+        _run(stage, config, destination)
+    elif args.command == "lora-reference-token-cache":
+        from .synthetic_reference_pipeline import (
+            cache_lora_teacher_dual_query_tokens,
+        )
+
+        _run(cache_lora_teacher_dual_query_tokens, config, destination)
     elif args.command in {
         "style-train", "style-token-cache", "style-smoke", "style-benchmark", "style-sample", "style-compare", "style-diagnose",
         "style-overfit", "style-overfit-sample", "style-exact-self-generalize",

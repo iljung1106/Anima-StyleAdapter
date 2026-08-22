@@ -353,7 +353,10 @@ class DetailPreservingTypedSlotReader(nn.Module):
         return content, reconstruction_target, torch.stack(maps, dim=1)
 
     def _pool_references(
-        self, per_reference: torch.Tensor, reference_mask: torch.Tensor
+        self,
+        per_reference: torch.Tensor,
+        reference_mask: torch.Tensor,
+        reference_weights: torch.Tensor | None = None,
     ) -> torch.Tensor:
         batch, references, slots, dim = per_reference.shape
         normalized = self.set_norm(per_reference)
@@ -391,6 +394,22 @@ class DetailPreservingTypedSlotReader(nn.Module):
             == memory_slot_ids[None]
         ).to(normalized.dtype)
         attention_bias = type_bias + self.same_slot_attention_bias * same_slot
+        if reference_weights is not None:
+            if reference_weights.shape != reference_mask.shape:
+                raise ValueError("reference_weights does not match references")
+            if bool((reference_weights[reference_mask] <= 0).any()):
+                raise ValueError("Every valid reference weight must be positive")
+            normalized_weights = reference_weights.to(normalized.dtype)
+            normalized_weights = normalized_weights / normalized_weights.sum(
+                dim=1, keepdim=True
+            ).clamp_min(torch.finfo(normalized.dtype).tiny)
+            weight_bias = normalized_weights.clamp_min(
+                torch.finfo(normalized.dtype).tiny
+            ).log()
+            weight_bias = weight_bias[:, :, None].expand(
+                -1, -1, slots
+            ).reshape(batch, references * slots)
+            attention_bias = attention_bias[None] + weight_bias[:, None]
         query = (
             self.set_query.to(normalized.dtype) + slot_identity
         )[None].expand(batch, -1, -1)
@@ -415,6 +434,7 @@ class DetailPreservingTypedSlotReader(nn.Module):
         references: torch.Tensor,
         reference_mask: torch.Tensor,
         *,
+        reference_weights: torch.Tensor | None = None,
         reconstruct: bool = False,
     ) -> DetailStyleOutput:
         if references.ndim != 4:
@@ -426,6 +446,8 @@ class DetailPreservingTypedSlotReader(nn.Module):
             )
         if reference_mask.shape != references.shape[:2]:
             raise ValueError("reference_mask does not match references")
+        if reference_weights is not None and reference_weights.shape != reference_mask.shape:
+            raise ValueError("reference_weights does not match references")
         if not reference_mask.is_cuda and not bool(reference_mask.any(dim=1).all()):
             raise ValueError("Every sample requires at least one reference")
 
@@ -435,7 +457,9 @@ class DetailPreservingTypedSlotReader(nn.Module):
             *references.shape[:2], self.output_tokens, self.dim
         )
         per_reference[reference_mask] = encoded
-        tokens = self._pool_references(per_reference, reference_mask)
+        tokens = self._pool_references(
+            per_reference, reference_mask, reference_weights
+        )
 
         reconstruction = None
         reconstruction_target = None

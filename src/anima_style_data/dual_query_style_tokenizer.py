@@ -749,6 +749,51 @@ class CachedTeacherReferenceLoader:
             "reference_count": reference_count,
         }
 
+    def load_styles(
+        self,
+        style_ids: list[str] | tuple[str, ...],
+        *,
+        references_per_style: int,
+        seed: int,
+    ) -> dict[str, Any]:
+        """Load an explicit ordered set of styles for mixture supervision."""
+
+        count = int(references_per_style)
+        if count <= 0 or count > self.references:
+            raise ValueError("references_per_style is outside the loader capacity")
+        missing = [style_id for style_id in style_ids if style_id not in self.by_style]
+        if missing:
+            raise KeyError(f"Reference cache is missing styles {missing[:4]}")
+        selected: list[list[dict[str, Any]]] = []
+        for index, style_id in enumerate(style_ids):
+            rng = random.Random(int(seed) + index * 1_000_003)
+            selected.append(rng.sample(self.by_style[style_id], count))
+        rows = [row for group in selected for row in group]
+        grouped_rows: dict[
+            tuple[int, str], list[tuple[int, dict[str, Any]]]
+        ] = defaultdict(list)
+        for index, row in enumerate(rows):
+            grouped_rows[
+                (int(row["_token_root_index"]), str(row["token_shard"]))
+            ].append((index, row))
+        values: list[torch.Tensor | None] = [None] * len(rows)
+        for (root_index, shard_name), shard_rows in grouped_rows.items():
+            shard = self.shards[root_index].get(shard_name)
+            for index, row in shard_rows:
+                values[index] = shard[int(row["token_row"])]
+        if any(value is None for value in values):
+            raise RuntimeError("Explicit teacher reference load is incomplete")
+        return {
+            "style_ids": tuple(str(value) for value in style_ids),
+            "tokens": self._pin(
+                torch.stack([value for value in values if value is not None])
+                .reshape(len(style_ids), count, 84, -1)
+            ),
+            "ids": tuple(
+                tuple(int(row["id"]) for row in group) for group in selected
+            ),
+        }
+
     def prefetch(
         self, start_step: int, steps: int, workers: int = 1, depth: int = 4
     ) -> Iterator[dict[str, Any]]:
