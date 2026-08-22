@@ -26,9 +26,8 @@ content conditions.
 - default DiT Block LoRA targets: self-attention, cross-attention and MLP;
   modulation, norms, embedders and final layer remain excluded
 - rectified-flow MSE, shifted sigmoid timestep distribution with shift 3.0
-- 250 optimizer updates per artist, batch 4, fused AdamW, BF16 autocast
-- the total remains 1,000 image exposures per artist; LR is linearly scaled to
-  `2e-4` and warmup is shortened to 25 updates
+- 500 optimizer updates per artist, batch 2, fused AdamW, BF16 autocast
+- 1,000 image exposures per artist, `1e-4` peak LR and 50-step warmup
 - every completed LoRA logs a four-column W&B panel: VAE-decoded train cache,
   held-out cache, matched Frozen Anima generation and matched LoRA generation
 
@@ -44,11 +43,12 @@ The VAE is loaded lazily only for qualitative panels. The first artist and
 then every eighth artist get a panel, limiting inference-graph and VAE cost.
 It returns to CPU immediately after decoding so its weights do not reduce the
 headroom of later high-resolution training buckets.
-Per-block `torch.compile` remains enabled for the batch-4 production probe;
-the run is retained only if its measured image throughput matches or exceeds
-the earlier batch-2 compiled path.
+Per-block `torch.compile` is enabled. A real batch-4/250-step probe reached
+only 11–13 images/s while accumulating 73 GB of compiled shape workspaces;
+the batch-2 path sustained 12–14 images/s around 32–36 GB, so batch 4 was
+rejected rather than assuming larger batches improve this DiT workload.
 
-The trainer writes a single resumable active state at step 125 and removes it
+The trainer writes a single resumable active state at step 250 and removes it
 after the corresponding final safetensors and metric record are committed.
 Finished artists are skipped on restart.
 
