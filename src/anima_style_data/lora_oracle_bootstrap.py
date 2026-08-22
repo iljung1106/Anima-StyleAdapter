@@ -539,11 +539,13 @@ def sample_lora_oracle_checkpoint(
     adapter = _build_style_adapter(detail_cfg).to(device)
     if not isinstance(adapter, SeparatedCommonArtistKVStyleCrossAttention):
         raise TypeError("LoRA oracle sampling requires the separated adapter")
+    # The block-conditioned K/V modules are materialized when the adapter is
+    # bound to Anima's 28 attention blocks, so binding must precede loading.
+    attach_same_q_style_adapter(anima, adapter)
     adapter.load_state_dict(state["adapter"], strict=True)
     adapter.restore_timestep_strength_state()
     adapter.set_bootstrap_phase("artist_only")
     adapter.requires_grad_(False).eval()
-    attach_same_q_style_adapter(anima, adapter)
 
     prepared = dict(load_dual_query_external_sample(config, destination))
     rows = len(prepared["paths"])
