@@ -505,7 +505,7 @@ def train_lora_oracle_bootstrap(
                 "timestep": timestep.detach().float(),
             })
             for key, value in metrics.items():
-                running[key].append(float(value))
+                running[key].append(float(value.detach()))
             running["grad_norm"].append(float(grad_norm))
             if step % log_every == 0:
                 row = {
@@ -931,7 +931,7 @@ def train_lora_oracle_visual_bridge(
                 ).mean(),
             })
             for key, value in metrics.items():
-                running[key].append(float(value))
+                running[key].append(float(value.detach()))
             running["grad_norm"].append(float(grad_norm))
 
             if step % int(cfg.get("log_every", 10)) == 0:
@@ -1164,7 +1164,7 @@ def train_lora_oracle_visual_projector(
                 ).square().mean().sqrt(),
             })
             for key, value in metrics.items():
-                running[key].append(float(value))
+                running[key].append(float(value.detach()))
             running["grad_norm"].append(float(grad_norm))
             if step % log_every == 0:
                 row = {
