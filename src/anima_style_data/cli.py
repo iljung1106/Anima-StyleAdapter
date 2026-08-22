@@ -93,6 +93,8 @@ def build_parser() -> argparse.ArgumentParser:
         ("lora-oracle-bootstrap-sample", "Render learned LoRA oracle codes directly"),
         ("lora-oracle-visual-bridge-smoke", "Smoke-test oracle-to-visual bridging"),
         ("lora-oracle-visual-bridge-train", "Bridge oracle codes to frozen visual Reader outputs"),
+        ("lora-oracle-visual-projector-smoke", "Smoke-test visual-to-oracle projection"),
+        ("lora-oracle-visual-projector-train", "Train compact visual-to-oracle projection"),
         ("style-train", "Train the multi-reference Anima style adapter"),
         ("style-token-cache", "Cache frozen production Resampler tokens"),
         ("style-smoke", "Run two real Anima style-adapter training steps"),
@@ -400,13 +402,17 @@ def main() -> None:
         "lora-oracle-bootstrap-sample",
         "lora-oracle-visual-bridge-smoke",
         "lora-oracle-visual-bridge-train",
+        "lora-oracle-visual-projector-smoke",
+        "lora-oracle-visual-projector-train",
     }:
         from .lora_oracle_bootstrap import (
             sample_lora_oracle_checkpoint,
             smoke_test_lora_oracle_bootstrap,
             smoke_test_lora_oracle_visual_bridge,
+            smoke_test_lora_oracle_visual_projector,
             train_lora_oracle_bootstrap,
             train_lora_oracle_visual_bridge,
+            train_lora_oracle_visual_projector,
         )
 
         stage = {
@@ -415,6 +421,8 @@ def main() -> None:
             "lora-oracle-bootstrap-sample": sample_lora_oracle_checkpoint,
             "lora-oracle-visual-bridge-smoke": smoke_test_lora_oracle_visual_bridge,
             "lora-oracle-visual-bridge-train": train_lora_oracle_visual_bridge,
+            "lora-oracle-visual-projector-smoke": smoke_test_lora_oracle_visual_projector,
+            "lora-oracle-visual-projector-train": train_lora_oracle_visual_projector,
         }[args.command]
         _run(stage, config, destination)
     elif args.command == "lora-reference-token-cache":

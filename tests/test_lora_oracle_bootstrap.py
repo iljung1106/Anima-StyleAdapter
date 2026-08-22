@@ -4,6 +4,8 @@ from anima_style_data.lora_oracle_bootstrap import (
     _FixedOracleCodeReader,
     _artist_centered_oracle_objective,
     _interpolate_oracle_visual,
+    _oracle_code_alignment_objective,
+    OracleVisualProjector,
 )
 
 
@@ -56,3 +58,29 @@ def test_oracle_visual_interpolation_reaches_both_endpoints():
 
     assert torch.equal(_interpolate_oracle_visual(oracle, visual, 0.0), oracle)
     assert torch.equal(_interpolate_oracle_visual(oracle, visual, 1.0), visual)
+
+
+def test_oracle_visual_projector_preserves_shape_and_initial_scale():
+    projector = OracleVisualProjector(
+        dim=32, slots=4, heads=4, ff_dim=64, bottleneck_dim=8
+    )
+    visual = torch.randn(3, 4, 32)
+    projected = projector(visual)
+
+    assert projected.shape == visual.shape
+    assert float((projected - visual).square().mean().sqrt()) < 0.01
+
+
+def test_oracle_code_alignment_prefers_oracle_codes():
+    oracle = torch.randn(8, 4, 16)
+    visual = oracle + 0.8 * torch.randn_like(oracle)
+    exact_loss, exact_metrics = _oracle_code_alignment_objective(
+        oracle, oracle, visual, {}
+    )
+    visual_loss, visual_metrics = _oracle_code_alignment_objective(
+        visual, oracle, visual, {}
+    )
+
+    assert float(exact_loss) < float(visual_loss)
+    assert float(exact_metrics["centered_cosine"]) > 0.999
+    assert float(visual_metrics["projected_to_oracle_rms"]) > 0.1
