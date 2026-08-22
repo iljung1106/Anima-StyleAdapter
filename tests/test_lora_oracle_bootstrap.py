@@ -6,9 +6,19 @@ from anima_style_data.lora_oracle_bootstrap import (
     _interpolate_oracle_visual,
     _oracle_code_alignment_objective,
     _materialize_reader_code_bank,
+    _piecewise_linear_value,
     OracleVisualProjector,
     _ProjectedReader,
 )
+
+
+def test_piecewise_linear_value_supports_a_plateau_then_ramp():
+    points = [[0, 0.0], [250, 0.5], [1000, 0.5], [1500, 1.0]]
+
+    assert _piecewise_linear_value(125, points) == 0.25
+    assert _piecewise_linear_value(750, points) == 0.5
+    assert _piecewise_linear_value(1250, points) == 0.75
+    assert _piecewise_linear_value(2000, points) == 1.0
 
 
 def test_oracle_objective_prefers_distinct_centered_effects():

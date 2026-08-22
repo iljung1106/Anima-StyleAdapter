@@ -478,12 +478,19 @@ lora_oracle_bootstrap:
       name: lora-oracle-bootstrap-v1
       id: lora-oracle-bootstrap-v1
   visual_bridge:
-    output_directory: lora_oracle_projected_bridge_v1
+    output_directory: lora_oracle_projected_bridge_v2_plateau
     source_checkpoint: lora_oracle_bootstrap_v1/training_state.pt
     projector_checkpoint: lora_oracle_visual_projector_v3_materialized/training_state.pt
+    initial_bridge_checkpoint: lora_oracle_projected_bridge_v1/checkpoints/step-0000250.pt
     steps: 1500
     batch_rows: 8
-    visual_fraction_ramp_steps: 500
+    # Preserve the well-separated half-visual regime long enough for the
+    # connector to align before removing the oracle code completely.
+    visual_fraction_points:
+      - [0, 0.0]
+      - [250, 0.5]
+      - [1000, 0.5]
+      - [1500, 1.0]
     materialized_reference_images: 8
     token_lru_shards: 512
     shared_learning_rate: 0.00003
@@ -491,7 +498,7 @@ lora_oracle_bootstrap:
     mix_learning_rate: 0.000015
     warmup_steps: 100
     checkpoint_every: 250
-    sample_every: 500
+    sample_every: 250
     log_every: 10
     max_grad_norm: 1.0
     fused_adamw: true
@@ -509,8 +516,8 @@ lora_oracle_bootstrap:
     wandb:
       enabled: true
       project: anima-style-adapter
-      name: lora-oracle-projected-bridge-v1
-      id: lora-oracle-projected-bridge-v1
+      name: lora-oracle-projected-bridge-v2-plateau
+      id: lora-oracle-projected-bridge-v2-plateau
   visual_projector:
     output_directory: lora_oracle_visual_projector_v3_materialized
     source_checkpoint: lora_oracle_bootstrap_v1/training_state.pt

@@ -790,6 +790,27 @@ def _save_visual_bridge_state(
     temporary.replace(path)
 
 
+def _piecewise_linear_value(
+    step: int, points: list[list[float]] | list[tuple[float, float]]
+) -> float:
+    """Interpolate a scalar curriculum from monotonically increasing steps."""
+
+    if not points:
+        raise ValueError("piecewise schedule needs at least one point")
+    normalized = [(int(point[0]), float(point[1])) for point in points]
+    if any(right[0] <= left[0] for left, right in zip(normalized, normalized[1:])):
+        raise ValueError("piecewise schedule steps must be strictly increasing")
+    if step <= normalized[0][0]:
+        return normalized[0][1]
+    for (left_step, left_value), (right_step, right_value) in zip(
+        normalized, normalized[1:]
+    ):
+        if step <= right_step:
+            fraction = (step - left_step) / max(1, right_step - left_step)
+            return left_value + fraction * (right_value - left_value)
+    return normalized[-1][1]
+
+
 def train_lora_oracle_visual_bridge(
     config: dict[str, Any],
     destination: Path,
@@ -846,6 +867,25 @@ def train_lora_oracle_visual_bridge(
     )
     projector.load_state_dict(projector_state["projector"], strict=True)
     projector.requires_grad_(False).eval()
+    output = destination / str(cfg["output_directory"])
+    checkpoints = output / "checkpoints"
+    state_path = output / "training_state.pt"
+    initial_state = None
+    if (
+        not state_path.exists()
+        and cfg.get("initial_bridge_checkpoint")
+    ):
+        initial_state = torch.load(
+            destination / str(cfg["initial_bridge_checkpoint"]),
+            map_location="cpu",
+            weights_only=False,
+        )
+        reader.load_state_dict(initial_state["reader"], strict=True)
+        adapter.load_state_dict(initial_state["adapter"], strict=True)
+        adapter.restore_timestep_strength_state()
+        adapter.set_bootstrap_phase("artist_only")
+        if "projector" in initial_state:
+            projector.load_state_dict(initial_state["projector"], strict=True)
     projected_reader = _ProjectedReader(reader, projector).eval()
 
     bank = FunctionalLoRATeacherBank(destination / str(root_cfg["teacher_cache"]))
@@ -918,10 +958,7 @@ def train_lora_oracle_visual_bridge(
         fused=bool(cfg.get("fused_adamw", True)),
     )
     base_lrs = {str(group["name"]): float(group["lr"]) for group in groups}
-    output = destination / str(cfg["output_directory"])
-    checkpoints = output / "checkpoints"
     checkpoints.mkdir(parents=True, exist_ok=True)
-    state_path = output / "training_state.pt"
     start_step = 0
     if bool(cfg.get("resume", True)) and state_path.exists():
         resume = torch.load(state_path, map_location="cpu", weights_only=False)
@@ -931,6 +968,9 @@ def train_lora_oracle_visual_bridge(
         adapter.set_bootstrap_phase("artist_only")
         optimizer.load_state_dict(resume["optimizer"])
         start_step = int(resume["step"])
+    elif initial_state is not None:
+        optimizer.load_state_dict(initial_state["optimizer"])
+        start_step = int(initial_state["step"])
 
     wandb_run = None
     wandb_cfg = dict(cfg.get("wandb", {}))
@@ -948,6 +988,13 @@ def train_lora_oracle_visual_bridge(
     batch_rows = int(cfg["batch_rows"])
     warmup = int(cfg.get("warmup_steps", 100))
     ramp_steps = int(cfg.get("visual_fraction_ramp_steps", 750))
+    fraction_points = cfg.get("visual_fraction_points")
+
+    def visual_fraction(step: int) -> float:
+        if fraction_points:
+            return _piecewise_linear_value(step, fraction_points)
+        return min(1.0, step / max(1, ramp_steps))
+
     running: dict[str, list[float]] = defaultdict(list)
     started = time.perf_counter()
     try:
@@ -970,7 +1017,7 @@ def train_lora_oracle_visual_bridge(
             visual_codes = visual_code_banks[
                 domain_index, position_index, view_index
             ]
-            fraction = min(1.0, step / max(1, ramp_steps))
+            fraction = visual_fraction(step)
             contexts = _interpolate_oracle_visual(
                 oracle_codes[position_index], visual_codes, fraction
             )
@@ -1059,7 +1106,7 @@ def train_lora_oracle_visual_bridge(
         "oracle_codes_frozen": True,
         "visual_projector_frozen": True,
         "common_frozen_and_bypassed": True,
-        "final_visual_fraction": min(1.0, steps / max(1, ramp_steps)),
+        "final_visual_fraction": visual_fraction(steps),
         "elapsed_s": time.perf_counter() - started,
     }
     write_json(output / "summary.json", summary)
@@ -1073,6 +1120,8 @@ def smoke_test_lora_oracle_visual_bridge(
     cfg = effective["lora_oracle_bootstrap"]["visual_bridge"]
     cfg["output_directory"] = "lora_oracle_visual_bridge_smoke"
     cfg["resume"] = False
+    cfg.pop("initial_bridge_checkpoint", None)
+    cfg.pop("visual_fraction_points", None)
     cfg["checkpoint_every"] = 1
     cfg["sample_every"] = 0
     cfg["wandb"]["enabled"] = False
