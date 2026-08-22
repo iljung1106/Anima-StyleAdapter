@@ -3830,7 +3830,7 @@ real_artist_teacher:
 # Detail-preserving typed-slot, separate-softmax Style Cross-Attention v1.
 # Contract: docs/detail_preserving_style_cross_attention_plan.md
 detail_preserving_style_cross_attention:
-  output_directory: detail_preserving_style_cross_attention_v32_strong_artist_residual
+  output_directory: detail_preserving_style_cross_attention_v33_human_functional_finetune
   seed: 20260819
   train_split: train
   validation_split: validation
@@ -3843,9 +3843,9 @@ detail_preserving_style_cross_attention:
   # v24 is an intentionally clean capacity test. The 86M Reader, shared K/V,
   # block deltas and slot mixer all start from their normal random initializers.
   reader_checkpoint: null
-  # v31 step 3500 has an explicit artist-null residual and markedly lower
-  # common-output ratio. Resume it with the empirically healthy 2x centered
-  # Artist gain while leaving the frozen Common scaffold unchanged.
+  # v31 step 3500 has the best pre-compensation artist-null residual. Start a
+  # fresh optimizer/step schedule from its weights and move from synthetic-only
+  # bootstrap to human flow plus disjoint-view functional separation.
   initial_checkpoint: detail_preserving_style_cross_attention_v31_artist_null_residual/checkpoints/step-0003500.pt
   reader_pretraining:
     output_directory: detail_style_reader_pretrain_v1
@@ -3968,10 +3968,9 @@ detail_preserving_style_cross_attention:
     # Artist K/V path. The null tokens use the same projections and attention
     # as a real reference, so only their residual reaches frozen Anima O/gate.
     artist_null_residual: true
-    # v31 Artist-only 2x preserved image quality while making line/face/value
-    # differences visible. Keep Common at 1x and strengthen only the centered
-    # reference-conditioned residual.
-    artist_residual_gain: 2.0
+    # Keep training at its natural scale. Strength sweeps are inference-only;
+    # putting 2x inside training made K/V shrink to compensate for the gain.
+    artist_residual_gain: 1.0
     null_tokens: 28
     null_init_std: 0.02
   strength_profile:
@@ -4030,11 +4029,11 @@ detail_preserving_style_cross_attention:
       - synthetic_teacher_additional_1500x6/dual_query_reference_tokens_v8_step10000
   training:
     device: cuda
-    steps: 5000
-    # v29 gates the phase transition on Common-only final velocity metrics.
-    # The full native bootstrap also stops only after stable Artist alignment.
+    steps: 3000
+    # v33 leaves bootstrap-only mode: every step now includes the human main
+    # flow objective, while synthetic teacher updates become an auxiliary.
     native_bootstrap:
-      enabled: true
+      enabled: false
       minimum_steps: 2000
       final_cosine: 0.28
       final_projection: 0.40
@@ -4053,29 +4052,30 @@ detail_preserving_style_cross_attention:
     block_delta_learning_rate: 0.00020
     base_mix_learning_rate: 0.00004
     artist_null_learning_rate: 0.00020
-    # v32 has the same parameter topology as v31, so preserve Adam moments and
-    # the scheduler while changing only the fixed centered-Artist scale.
-    resume_optimizer: true
+    # This is a weight bootstrap, not an optimizer continuation. Restart Adam
+    # moments and warmup for the human functional fine-tune.
+    resume_optimizer: false
     reset_artist_null_context_on_upgrade: true
     betas: [0.9, 0.95]
     adam_eps: 0.00000001
     weight_decay: 0.01
     warmup_steps: 100
-    lr_decay_start_step: 4000
+    lr_decay_start_step: 2500
     minimum_lr_ratio: 0.10
     max_grad_norm: 1.0
     reader_max_grad_norm: 1.0
     adapter_max_grad_norm: 1.0
-    # Phase A trains only the direct Common K/V bank. Phase B freezes it and
-    # trains the Reader plus Artist K/V. The combined mean target now supplies
-    # the otherwise missing radial gradient for the artist-null baseline.
+    # Component bootstrapping is complete in v31. Combined mode freezes Common
+    # and trains only Reader plus the null-centered Artist path.
     separated_component_bootstrap:
-      enabled: true
+      enabled: false
       common_steps: 500
       artist_steps: 1500
       common_objective_weight: 1.0
       artist_objective_weight: 1.0
-      artist_mean_weight: 0.50
+      # Frozen Common already represents the native global mean. Do not push
+      # that reference-independent direction back into Artist K/V.
+      artist_mean_weight: 0.0
       common_transition:
         enabled: true
         minimum_steps: 500
@@ -4102,8 +4102,8 @@ detail_preserving_style_cross_attention:
         magnitude_floor_start_step: 1
         magnitude_floor_end_step: 2500
         magnitude_floor_start: 0.25
-        magnitude_floor_end: 1.25
-        magnitude_upper: 2.25
+        magnitude_floor_end: 0.75
+        magnitude_upper: 1.50
         magnitude_upper_weight: 0.25
     gradient_accumulation_steps: 4
     fused_adamw: true
@@ -4202,9 +4202,9 @@ detail_preserving_style_cross_attention:
     # trained with centered multi-scale agreement plus all-wrong InfoNCE.
     artist_effect_domains: [anima]
     artist_effect_start_step: 250
-    artist_effect_full_step: 1000
-    artist_effect_every: 2
-    artist_effect_weight: 0.0
+    artist_effect_full_step: 750
+    artist_effect_every: 4
+    artist_effect_weight: 0.05
     artist_effect_teacher_view: disjoint_heldout
     # The primary loss is backwarded before the auxiliary heldout-reference
     # Anima pass, so two batch-four DiT graphs never coexist on an H100 80GB.
@@ -4215,8 +4215,8 @@ detail_preserving_style_cross_attention:
     # timestep native-teacher probe. Normalize only by the frozen native effect
     # scale; no cross-step EMA or student-derived denominator is used.
     common_output_start_step: 250
-    common_output_full_step: 750
-    common_output_weight: 0.0
+    common_output_full_step: 1000
+    common_output_weight: 0.02
     common_output_teacher: student_batch
     common_output_native_ratio_threshold: 0.60
     artist_energy_native_ratio_floor: 0.50
@@ -4233,10 +4233,10 @@ detail_preserving_style_cross_attention:
     main_common_output_native_ratio_threshold: 0.60
     main_artist_energy_native_ratio_floor: 0.50
     main_artist_energy_weight: 0.0
-    common_output_threshold_start_step: 1000
-    common_output_threshold_end_step: 4000
-    common_output_threshold_start: 0.90
-    common_output_threshold_end: 0.65
+    common_output_threshold_start_step: 250
+    common_output_threshold_end_step: 1500
+    common_output_threshold_start: 0.85
+    common_output_threshold_end: 0.60
     # Preserve only the artist component repeated by the other disjoint
     # heldout view. This deliberately avoids the complete target-minus-frozen
     # residual and its inaccessible content/noise components.
@@ -4245,7 +4245,7 @@ detail_preserving_style_cross_attention:
     artist_magnitude_full_step: 1000
     # Keep this band weak: it preserves a repeatable effect without making
     # magnitude more important than its direction or the main flow objective.
-    artist_magnitude_weight: 0.0
+    artist_magnitude_weight: 0.02
     artist_magnitude_lower_start_step: 250
     artist_magnitude_lower_end_step: 2000
     artist_magnitude_lower_start: 0.35
@@ -4268,20 +4268,18 @@ detail_preserving_style_cross_attention:
     teacher_batch_rows: 16
     teacher_microbatch_rows: 4
     teacher_references: 4
-    # The fixed-reference diagnostic uses one image, but abruptly changing 55%
-    # of controlled batches from four to one reference increased common-output
-    # ratio from 0.858 to 0.917. Keep calibration deterministic at four refs,
-    # then ramp 1/2-ref batches over 1k updates from the v29 step-3000 state.
+    # Keep the first teacher updates at four references, then continuously ramp
+    # toward the low-reference distribution used by the human curriculum.
     teacher_reference_count_weights: [0.0, 0.0, 0.0, 1.0]
     teacher_reference_count_curriculum:
-      start_step: 3001
-      end_step: 4000
+      start_step: 1
+      end_step: 1000
       before_weights: [0.0, 0.0, 0.0, 1.0]
-      start_weights: [0.10, 0.15, 0.0, 0.75]
+      start_weights: [0.0, 0.0, 0.0, 1.0]
       end_weights: [0.50, 0.30, 0.0, 0.20]
-    teacher_every_step_until: 4000
-    teacher_every_after_bootstrap: 1
-    teacher_end_step: 4000
+    teacher_every_step_until: 250
+    teacher_every_after_bootstrap: 4
+    teacher_end_step: 2000
     # Local block-output regression is intentionally disabled. Native tagged
     # contexts are used only to recover the final global common effect removed
     # by the pre-centered teacher cache.
@@ -4313,7 +4311,7 @@ detail_preserving_style_cross_attention:
     teacher_infonce_weight: 0.20
     # A single lossy view needs stronger discrimination from the frozen
     # sixteen-artist bank than a stable four-view estimate.
-    teacher_infonce_weight_by_reference_count: [0.35, 0.30, 0.25, 0.20]
+    teacher_infonce_weight_by_reference_count: [0.50, 0.40, 0.30, 0.25]
     teacher_infonce_temperature: 0.10
     # Legacy zero-common suppression is absent. One native tagged final forward
     # per cached content/timestep recovers the global common component exactly:
@@ -4396,9 +4394,8 @@ detail_preserving_style_cross_attention:
     checkpoint_every: 250
     sample_every: 500
     fixed_sample_every: 500
-    fixed_sample_strengths: [1.0]
-    # Diagnostic only: expose whether the frozen Common branch masks learned
-    # reference differences at the rejected v30 step-3500 checkpoint.
+    fixed_sample_strengths: [1.0, 2.0]
+    # Component backfill remains pointed at the preserved v32 diagnostic.
     fixed_sample_backfill_steps: [4000]
     fixed_sample_backfill_component_modes: [common_only, artist_only]
     fixed_sample_backfill_strengths: [1.0]
@@ -4406,8 +4403,8 @@ detail_preserving_style_cross_attention:
     wandb:
       enabled: true
       project: anima-style-adapter
-      name: detail-style-v32-strong-artist-residual
-      id: detail-style-v32-strong-artist-residual
+      name: detail-style-v33-human-functional-finetune
+      id: detail-style-v33-human-functional-finetune
   gradient_diagnostics:
     checkpoint_step: 1500
     teacher_batch_step: 1500

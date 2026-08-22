@@ -132,3 +132,23 @@ scale에 맞춘 centered residual이 style transfer에는 약하다는 뜻이다
   방향/InfoNCE 목표는 변경하지 않는다.
 - 4,000스텝 fixed-reference 1×(내부 Artist gain 2×)가 레퍼런스별 차이를
   유지하면서 망가지지 않는지 확인한다. 다시 공통 출력으로 모이면 중단한다.
+
+## v33 human functional fine-tune
+
+v32는 centered Artist gain을 학습 경로 안에서 2배로 만들었지만, 모델이 이후
+500스텝 동안 K/V와 Reader 출력을 줄여 gain을 상쇄했다. v31 Artist-only 외부
+2배에서는 레퍼런스별 차이가 분명했던 반면 v32 Artist-only는 다시 비슷해졌다.
+강도와 작가 분리는 같은 학습 목표로 해결할 수 없으므로 다음처럼 분리한다.
+
+- v31 step 3,500의 가중치에서 새 optimizer와 0-based schedule을 시작한다.
+- 내부 Artist gain은 1로 되돌리고, 2배 강도는 추론 진단으로만 사용한다.
+- 학습된 Common K/V는 동결한다. Artist 학습에는 native common/artist-mean
+  surrogate를 주지 않아 공통 방향이 Artist 경로로 재유입되지 않게 한다.
+- 0--250스텝은 human exact-self main flow와 매-step synthetic teacher를 함께
+  사용한다. 이후 synthetic teacher는 4스텝마다 사용하고 2,000에서 끝낸다.
+- human same-artist disjoint reference 두 세트는 같은 `x_t`, timestep, prompt,
+  frozen Anima Q에서 기능적 centered InfoNCE와 repeatability를 받는다. batch
+  common-output 억제와 약한 artist magnitude band를 같은 pass에서 적용한다.
+- 500스텝마다 7개 고정 레퍼런스의 1×/2× 결과를 생성한다. 기준 대비 변화량
+  증가만 보지 않고 pairwise RMS와 그 비율, 실제 얼굴·선화·명암 차이를 함께
+  본다. 서로 다른 레퍼런스가 같은 얼굴/질감으로 모이면 즉시 중단한다.
