@@ -559,7 +559,9 @@ lora_oracle_bootstrap:
     projector_checkpoint: lora_oracle_visual_projector_v3_materialized/training_state.pt
     steps: 2500
     native_pretrain_steps: 1500
-    native_materialize_chunk_size: 64
+    native_materialize_chunk_size: 128
+    native_preload_workers: 16
+    cpu_threads: 16
     batch_rows: 8
     materialized_reference_images: 8
     token_lru_shards: 512

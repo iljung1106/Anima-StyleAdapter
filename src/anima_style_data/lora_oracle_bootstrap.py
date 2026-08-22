@@ -1181,7 +1181,9 @@ def _materialize_reader_code_bank(
     materialized: torch.Tensor | None = None
     reader.eval()
     device_type = torch.device(device).type
-    for offset in range(0, len(style_ids), chunk_size):
+    chunk_offsets = list(range(0, len(style_ids), chunk_size))
+    materialize_started = time.perf_counter()
+    for chunk_index, offset in enumerate(chunk_offsets):
         chunk_ids = style_ids[offset : offset + chunk_size]
         loaded = loader.load_styles(
             chunk_ids,
@@ -1212,6 +1214,16 @@ def _materialize_reader_code_bank(
             )
         materialized[offset : offset + len(chunk_ids)].copy_(chunk_codes)
         del tokens, codes, chunk_codes
+        if len(chunk_offsets) > 1 and (
+            (chunk_index + 1) % 5 == 0 or chunk_index + 1 == len(chunk_offsets)
+        ):
+            elapsed = time.perf_counter() - materialize_started
+            print(
+                "materialized Reader codes "
+                f"{min(offset + chunk_size, len(style_ids))}/{len(style_ids)} "
+                f"styles ({elapsed:.1f}s)",
+                flush=True,
+            )
     if materialized is None:
         raise ValueError("Cannot materialize an empty style list")
     return materialized, reference_counts
@@ -1460,6 +1472,7 @@ def train_lora_oracle_functional_projector(
     torch.cuda.manual_seed_all(seed)
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.set_float32_matmul_precision("high")
+    torch.set_num_threads(int(cfg.get("cpu_threads", 16)))
 
     anima = _resolve_anima_model(config, destination, device).requires_grad_(False).eval()
     _optimize_frozen_anima(anima, low_precision_rmsnorm=True, fuse_attention_projections=True)
@@ -1577,6 +1590,8 @@ def train_lora_oracle_functional_projector(
             references=reference_images,
             seed=seed ^ 0x4E415449,
             token_lru_shards=int(cfg.get("token_lru_shards", 512)),
+            ram_resident_tokens=True,
+            ram_preload_workers=int(cfg.get("native_preload_workers", 16)),
             strict_style_ids=True,
         )
         native_visual_codes, native_reference_counts = _materialize_reader_code_bank(
@@ -1586,7 +1601,7 @@ def train_lora_oracle_functional_projector(
             reference_images=reference_images,
             seed=seed ^ 0x33333333,
             device=device,
-            style_chunk_size=int(cfg.get("native_materialize_chunk_size", 64)),
+            style_chunk_size=int(cfg.get("native_materialize_chunk_size", 128)),
         )
         if not torch.equal(reference_counts, native_reference_counts):
             raise RuntimeError("Native and LoRA Reader banks disagree on views")
