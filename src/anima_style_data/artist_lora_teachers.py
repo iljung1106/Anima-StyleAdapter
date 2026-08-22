@@ -925,7 +925,9 @@ def train_artist_lora_teachers(
                     optimizer.load_state_dict(resume["optimizer"])
                     start_step = int(resume["step"])
                     torch.set_rng_state(resume["torch_rng"].cpu())
-                    torch.cuda.set_rng_state_all(resume["cuda_rng"])
+                    torch.cuda.set_rng_state_all(
+                        [state.cpu() for state in resume["cuda_rng"]]
+                    )
 
             generator = torch.Generator(device=device).manual_seed(
                 reset_seed + start_step * 100_003
