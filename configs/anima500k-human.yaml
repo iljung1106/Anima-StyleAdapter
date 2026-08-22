@@ -159,7 +159,7 @@ style_features:
 # Adam state are reset between artists. Each artist reserves six images for a
 # held-out flow check. Artist identity is never present in cached prompts.
 artist_lora_teachers:
-  output_directory: artist_lora_teachers_rank16_64_b4_v2
+  output_directory: artist_lora_teachers_rank16_64_b4_compile_v3
   seed: 20260823
   artist_count: 64
   images_per_artist: 30
@@ -212,7 +212,7 @@ artist_lora_teachers:
     validation_batches: 4
     state_every: 125
     compile:
-      enabled: false
+      enabled: true
       backend: inductor
       mode: default
       dynamic: auto
@@ -221,11 +221,11 @@ artist_lora_teachers:
     wandb:
       enabled: true
       project: anima-style-adapter
-      name: artist-lora-teachers-r16-64-b4
-      id: artist-lora-teachers-r16-64-b4-v2
+      name: artist-lora-teachers-r16-64-b4-compile
+      id: artist-lora-teachers-r16-64-b4-compile-v3
   preview:
     enabled: true
-    every_artists: 1
+    every_artists: 8
     prompt_variant: full_quality
     steps: 20
     flow_shift: 3.0

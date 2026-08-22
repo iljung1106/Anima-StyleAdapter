@@ -40,10 +40,11 @@ state, preserving compiled graphs. One artist's complete latent and multimode
 text tensors are staged on GPU while the next artist is prefetched to host RAM.
 There is no VAE, text encoder, image decode or NFS read inside the 250-step
 loop. Gradient checkpointing, block swapping and CPU offload are disabled.
-The VAE is loaded lazily only for the post-artist qualitative panel. Per-block
-`torch.compile` is disabled because the measured persistent batch-2 path had
-the same steady-state step time while paying substantial first-shape compile
-cost.
+The VAE is loaded lazily only for qualitative panels. The first artist and
+then every eighth artist get a panel, limiting inference-graph and VAE cost.
+Per-block `torch.compile` remains enabled for the batch-4 production probe;
+the run is retained only if its measured image throughput matches or exceeds
+the earlier batch-2 compiled path.
 
 The trainer writes a single resumable active state at step 125 and removes it
 after the corresponding final safetensors and metric record are committed.
