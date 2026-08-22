@@ -90,6 +90,7 @@ def build_parser() -> argparse.ArgumentParser:
         ("lora-functional-distill-v2-train", "Train artist-centered LoRA distillation"),
         ("lora-oracle-bootstrap-smoke", "Smoke-test visual-anchored LoRA oracle codes"),
         ("lora-oracle-bootstrap-train", "Train visual-anchored LoRA oracle codes"),
+        ("lora-oracle-bootstrap-sample", "Render learned LoRA oracle codes directly"),
         ("style-train", "Train the multi-reference Anima style adapter"),
         ("style-token-cache", "Cache frozen production Resampler tokens"),
         ("style-smoke", "Run two real Anima style-adapter training steps"),
@@ -394,8 +395,10 @@ def main() -> None:
     elif args.command in {
         "lora-oracle-bootstrap-smoke",
         "lora-oracle-bootstrap-train",
+        "lora-oracle-bootstrap-sample",
     }:
         from .lora_oracle_bootstrap import (
+            sample_lora_oracle_checkpoint,
             smoke_test_lora_oracle_bootstrap,
             train_lora_oracle_bootstrap,
         )
@@ -403,6 +406,7 @@ def main() -> None:
         stage = {
             "lora-oracle-bootstrap-smoke": smoke_test_lora_oracle_bootstrap,
             "lora-oracle-bootstrap-train": train_lora_oracle_bootstrap,
+            "lora-oracle-bootstrap-sample": sample_lora_oracle_checkpoint,
         }[args.command]
         _run(stage, config, destination)
     elif args.command == "lora-reference-token-cache":

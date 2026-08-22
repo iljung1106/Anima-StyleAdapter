@@ -1,6 +1,7 @@
 import torch
 
 from anima_style_data.lora_oracle_bootstrap import (
+    _FixedOracleCodeReader,
     _artist_centered_oracle_objective,
 )
 
@@ -38,3 +39,11 @@ def test_oracle_objective_penalizes_artist_branch_batch_mean():
     assert float(centered_metrics["artist_common_zero_loss"]) < 1e-8
     assert float(shifted_metrics["artist_common_zero_loss"]) > 0.1
     assert float(shifted_loss) > float(centered_loss)
+
+
+def test_fixed_oracle_reader_returns_checkpoint_codes():
+    codes = torch.randn(7, 28, 16)
+    reader = _FixedOracleCodeReader(codes)
+    result = reader(torch.randn(7, 1, 84, 16), torch.ones(7, 1, dtype=torch.bool))
+
+    assert result.tokens.data_ptr() == codes.data_ptr()

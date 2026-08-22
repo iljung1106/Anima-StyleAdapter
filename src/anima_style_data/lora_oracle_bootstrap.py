@@ -6,6 +6,7 @@ import random
 import time
 from collections import defaultdict
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import torch
@@ -28,6 +29,28 @@ from .lora_functional_distillation import (
 )
 from .same_q_style_adapter import attach_same_q_style_adapter
 from .style_transfer import _optimize_frozen_anima, _resolve_anima_model
+
+
+class _FixedOracleCodeReader(torch.nn.Module):
+    """Expose learned oracle codes through the fixed-sample Reader contract."""
+
+    def __init__(self, tokens: torch.Tensor) -> None:
+        super().__init__()
+        self.register_buffer("tokens", tokens)
+
+    def forward(
+        self,
+        references: torch.Tensor,
+        reference_mask: torch.Tensor,
+        *,
+        reconstruct: bool = False,
+    ) -> SimpleNamespace:
+        del reference_mask, reconstruct
+        if references.shape[0] != self.tokens.shape[0]:
+            raise ValueError(
+                f"Expected {self.tokens.shape[0]} oracle rows, got {references.shape[0]}"
+            )
+        return SimpleNamespace(tokens=self.tokens)
 
 
 def _artist_centered_oracle_objective(
@@ -496,3 +519,69 @@ def smoke_test_lora_oracle_bootstrap(
     cfg["training"]["checkpoint_every"] = 1
     cfg["training"]["sample_every"] = 0
     return train_lora_oracle_bootstrap(effective, destination, steps_override=3)
+
+
+def sample_lora_oracle_checkpoint(
+    config: dict[str, Any], destination: Path
+) -> dict[str, Any]:
+    """Render learned oracle codes directly, bypassing the frozen visual Reader."""
+
+    cfg = copy.deepcopy(config["lora_oracle_bootstrap"])
+    training = dict(cfg["training"])
+    device = str(training.get("device", "cuda"))
+    output = destination / str(cfg["output_directory"])
+    checkpoint = output / "training_state.pt"
+    state = torch.load(checkpoint, map_location="cpu", weights_only=False)
+
+    anima = _resolve_anima_model(config, destination, device).requires_grad_(False).eval()
+    _optimize_frozen_anima(anima, low_precision_rmsnorm=True, fuse_attention_projections=True)
+    detail_cfg = copy.deepcopy(config["detail_preserving_style_cross_attention"])
+    adapter = _build_style_adapter(detail_cfg).to(device)
+    if not isinstance(adapter, SeparatedCommonArtistKVStyleCrossAttention):
+        raise TypeError("LoRA oracle sampling requires the separated adapter")
+    adapter.load_state_dict(state["adapter"], strict=True)
+    adapter.restore_timestep_strength_state()
+    adapter.set_bootstrap_phase("artist_only")
+    adapter.requires_grad_(False).eval()
+    attach_same_q_style_adapter(anima, adapter)
+
+    prepared = dict(load_dual_query_external_sample(config, destination))
+    rows = len(prepared["paths"])
+    codes = state["oracle_codes"][:rows].to(device=device, dtype=torch.bfloat16)
+    reader = _FixedOracleCodeReader(codes).to(device).eval()
+
+    reference_root = destination / str(cfg["synthetic_reference_cache"]) / "images"
+    paths = [
+        reference_root / f"artist-{index:03d}" / "content-00.webp"
+        for index in range(rows)
+    ]
+    missing = [str(path) for path in paths if not path.exists()]
+    if missing:
+        raise FileNotFoundError(f"Missing oracle reference previews: {missing[:3]}")
+    prepared["paths"] = paths
+
+    result = _generate_fixed_reference_sample(
+        prepared,
+        config,
+        destination,
+        anima,
+        reader,
+        adapter,
+        output,
+        device,
+        int(state["step"]),
+        component_mode="artist_only",
+        strengths_override=[1.0],
+        sample_group="oracle_code_samples",
+        sample_suffix="direct",
+    )
+    result.update({
+        "checkpoint": str(checkpoint),
+        "oracle_codes_direct": True,
+        "reader_bypassed": True,
+    })
+    write_json(
+        output / "oracle_code_samples" / f"step-{int(state['step']):07d}-summary.json",
+        result,
+    )
+    return result
