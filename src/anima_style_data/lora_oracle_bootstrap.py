@@ -590,3 +590,274 @@ def sample_lora_oracle_checkpoint(
         result,
     )
     return result
+
+
+def _interpolate_oracle_visual(
+    oracle: torch.Tensor, visual: torch.Tensor, fraction: float
+) -> torch.Tensor:
+    if oracle.shape != visual.shape:
+        raise ValueError("Oracle and visual contexts must have identical shapes")
+    if not 0.0 <= fraction <= 1.0:
+        raise ValueError("Visual interpolation fraction must be in [0, 1]")
+    return torch.lerp(oracle, visual, float(fraction))
+
+
+def _save_visual_bridge_state(
+    path: Path,
+    *,
+    step: int,
+    reader: DetailPreservingTypedSlotReader,
+    adapter: SeparatedCommonArtistKVStyleCrossAttention,
+    oracle_codes: torch.Tensor,
+    optimizer: torch.optim.Optimizer,
+    config: dict[str, Any],
+) -> None:
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    torch.save({
+        "step": int(step),
+        "reader": {key: value.detach().cpu() for key, value in reader.state_dict().items()},
+        "adapter": {key: value.detach().cpu() for key, value in adapter.state_dict().items()},
+        "oracle_codes": oracle_codes.detach().cpu(),
+        "optimizer": optimizer.state_dict(),
+        "config": config,
+        "python_rng": random.getstate(),
+        "torch_rng": torch.get_rng_state(),
+        "cuda_rng": torch.cuda.get_rng_state_all(),
+    }, temporary)
+    temporary.replace(path)
+
+
+def train_lora_oracle_visual_bridge(
+    config: dict[str, Any],
+    destination: Path,
+    *,
+    steps_override: int | None = None,
+) -> dict[str, Any]:
+    """Expand the oracle-trained connector onto frozen visual Reader outputs."""
+
+    root_cfg = copy.deepcopy(config["lora_oracle_bootstrap"])
+    cfg = dict(root_cfg["visual_bridge"])
+    steps = int(steps_override if steps_override is not None else cfg["steps"])
+    device = str(root_cfg["training"].get("device", "cuda"))
+    seed = int(root_cfg.get("seed", 20260823)) ^ 0x42524944
+    random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.set_float32_matmul_precision("high")
+
+    anima = _resolve_anima_model(config, destination, device).requires_grad_(False).eval()
+    _optimize_frozen_anima(anima, low_precision_rmsnorm=True, fuse_attention_projections=True)
+    detail_cfg = copy.deepcopy(config["detail_preserving_style_cross_attention"])
+    reader = DetailPreservingTypedSlotReader(**dict(detail_cfg["model"])).to(device)
+    adapter = _build_style_adapter(detail_cfg).to(device)
+    if not isinstance(adapter, SeparatedCommonArtistKVStyleCrossAttention):
+        raise TypeError("Oracle visual bridge requires the separated adapter")
+    attach_same_q_style_adapter(anima, adapter)
+
+    source = torch.load(
+        destination / str(cfg["source_checkpoint"]),
+        map_location="cpu",
+        weights_only=False,
+    )
+    reader.load_state_dict(source["reader"], strict=True)
+    adapter.load_state_dict(source["adapter"], strict=True)
+    adapter.restore_timestep_strength_state()
+    adapter.set_bootstrap_phase("artist_only")
+    reader.requires_grad_(False).eval()
+    for parameter in adapter.common_parameters():
+        parameter.requires_grad_(False)
+    oracle_codes = source["oracle_codes"].to(device=device, dtype=torch.bfloat16)
+
+    bank = FunctionalLoRATeacherBank(destination / str(root_cfg["teacher_cache"]))
+    single_ids = list(bank.by_kind["single"])
+    style_ids = [str(bank.mixtures[index]["style_ids"][0]) for index in single_ids]
+    loader_kwargs = {
+        "split": "train",
+        "style_ids": style_ids,
+        "batch_size": int(cfg["batch_rows"]),
+        "references": max(int(value) for value in cfg["reference_count_weights"]),
+        "token_lru_shards": int(root_cfg["training"].get("token_lru_shards", 8)),
+        "strict_style_ids": True,
+    }
+    human_loader = CachedTeacherReferenceLoader(
+        destination / str(root_cfg["human_reference_cache"]),
+        seed=seed ^ 0x48554D41,
+        **loader_kwargs,
+    )
+    synthetic_loader = CachedTeacherReferenceLoader(
+        destination / str(root_cfg["synthetic_reference_cache"]),
+        seed=seed ^ 0x53594E54,
+        **loader_kwargs,
+    )
+
+    groups = [
+        {"params": adapter.shared_parameters(), "lr": float(cfg["shared_learning_rate"]), "name": "shared_kv"},
+        {"params": adapter.delta_parameters(), "lr": float(cfg["delta_learning_rate"]), "name": "block_delta"},
+        {"params": adapter.mixing_parameters(), "lr": float(cfg["mix_learning_rate"]), "name": "base_mix", "weight_decay": 0.0},
+    ]
+    optimizer = torch.optim.AdamW(
+        groups,
+        betas=tuple(cfg.get("betas", [0.9, 0.95])),
+        eps=float(cfg.get("adam_eps", 1e-8)),
+        weight_decay=float(cfg.get("weight_decay", 0.01)),
+        fused=bool(cfg.get("fused_adamw", True)),
+    )
+    base_lrs = {str(group["name"]): float(group["lr"]) for group in groups}
+    output = destination / str(cfg["output_directory"])
+    checkpoints = output / "checkpoints"
+    checkpoints.mkdir(parents=True, exist_ok=True)
+    state_path = output / "training_state.pt"
+    start_step = 0
+    if bool(cfg.get("resume", True)) and state_path.exists():
+        resume = torch.load(state_path, map_location="cpu", weights_only=False)
+        reader.load_state_dict(resume["reader"], strict=True)
+        adapter.load_state_dict(resume["adapter"], strict=True)
+        adapter.restore_timestep_strength_state()
+        adapter.set_bootstrap_phase("artist_only")
+        optimizer.load_state_dict(resume["optimizer"])
+        start_step = int(resume["step"])
+
+    wandb_run = None
+    wandb_cfg = dict(cfg.get("wandb", {}))
+    if bool(wandb_cfg.get("enabled", True)):
+        import wandb
+        wandb_run = wandb.init(
+            project=str(wandb_cfg.get("project", "anima-style-adapter")),
+            name=str(wandb_cfg.get("name", "lora-oracle-visual-bridge-v1")),
+            id=str(wandb_cfg.get("id", "lora-oracle-visual-bridge-v1")),
+            resume="allow" if start_step else "never",
+            config={"lora_oracle_visual_bridge": cfg},
+        )
+
+    fixed = load_dual_query_external_sample(config, destination)
+    batch_rows = int(cfg["batch_rows"])
+    warmup = int(cfg.get("warmup_steps", 100))
+    ramp_steps = int(cfg.get("visual_fraction_ramp_steps", 750))
+    reference_choices = [int(value) for value in cfg["reference_count_weights"]]
+    running: dict[str, list[float]] = defaultdict(list)
+    started = time.perf_counter()
+    try:
+        for step in range(start_step + 1, steps + 1):
+            lr_scale = min(1.0, step / max(1, warmup))
+            for group in optimizer.param_groups:
+                group["lr"] = base_lrs[str(group["name"])] * lr_scale
+            optimizer.zero_grad(set_to_none=True)
+            rng = random.Random(seed + step * 1_000_003)
+            positions = rng.sample(range(len(single_ids)), batch_rows)
+            batch_style_ids = [style_ids[index] for index in positions]
+            references = rng.choice(reference_choices)
+            loader = human_loader if step % 2 else synthetic_loader
+            loaded = loader.load_styles(
+                batch_style_ids,
+                references_per_style=references,
+                seed=seed + step * 10_007,
+            )
+            reference_tokens = loaded["tokens"].to(
+                device=device, dtype=torch.bfloat16, non_blocking=True
+            )
+            reference_mask = torch.ones(
+                reference_tokens.shape[:2], device=device, dtype=torch.bool
+            )
+            with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
+                visual_codes = reader(reference_tokens, reference_mask).tokens
+            fraction = min(1.0, step / max(1, ramp_steps))
+            contexts = _interpolate_oracle_visual(
+                oracle_codes[positions], visual_codes, fraction
+            )
+
+            content_index = step % int(bank.base["noisy_inputs"].shape[0])
+            timestep_index = (step // int(bank.base["noisy_inputs"].shape[0])) % int(bank.base["noisy_inputs"].shape[1])
+            noisy = bank.base["noisy_inputs"][content_index, timestep_index].to(device=device, dtype=torch.bfloat16, non_blocking=True)
+            base = bank.base["base_predictions"][content_index, timestep_index].to(device=device, dtype=torch.float32, non_blocking=True)
+            context = bank.base["base_context"][content_index : content_index + 1].to(device=device, dtype=torch.bfloat16, non_blocking=True)
+            timestep = bank.base["timesteps"][timestep_index].to(device=device, dtype=torch.bfloat16)
+            teacher_indices = [single_ids[index] for index in positions]
+            teacher = bank.effects[teacher_indices, content_index, timestep_index].to(device=device, dtype=torch.float32, non_blocking=True)
+            student = _controlled_style_context_forward(
+                anima, adapter, contexts, noisy, base, context, timestep, device
+            )
+            loss, metrics = _artist_centered_oracle_objective(
+                student, teacher, dict(cfg.get("loss_weights", {}))
+            )
+            loss.backward()
+            parameters = [parameter for group in optimizer.param_groups for parameter in group["params"]]
+            grad_norm = torch.nn.utils.clip_grad_norm_(
+                parameters, float(cfg.get("max_grad_norm", 1.0)), foreach=True
+            )
+            optimizer.step()
+            visual_delta = (visual_codes.float() - oracle_codes[positions].float())
+            metrics.update({
+                "visual_fraction": torch.tensor(fraction, device=device),
+                "references": torch.tensor(float(references), device=device),
+                "visual_to_oracle_rms": visual_delta.square().mean().sqrt(),
+                "visual_to_oracle_cosine": F.cosine_similarity(
+                    visual_codes.float().flatten(1),
+                    oracle_codes[positions].float().flatten(1),
+                    dim=1,
+                ).mean(),
+            })
+            for key, value in metrics.items():
+                running[key].append(float(value))
+            running["grad_norm"].append(float(grad_norm))
+
+            if step % int(cfg.get("log_every", 10)) == 0:
+                row = {key: sum(values) / len(values) for key, values in running.items() if values}
+                row["learning_rate"] = float(optimizer.param_groups[0]["lr"])
+                print(f"LoRA visual bridge step={step}/{steps} {row}", flush=True)
+                if wandb_run is not None:
+                    wandb_run.log({f"train/{key}": value for key, value in row.items()}, step=step)
+                running.clear()
+            if step % int(cfg.get("checkpoint_every", 250)) == 0 or step == steps:
+                for path in (state_path, checkpoints / f"step-{step:07d}.pt"):
+                    _save_visual_bridge_state(
+                        path,
+                        step=step,
+                        reader=reader,
+                        adapter=adapter,
+                        oracle_codes=oracle_codes,
+                        optimizer=optimizer,
+                        config=cfg,
+                    )
+            if int(cfg.get("sample_every", 500)) > 0 and step % int(cfg["sample_every"]) == 0:
+                sample = _generate_fixed_reference_sample(
+                    fixed, config, destination, anima, reader, adapter, output,
+                    device, step, component_mode="artist_only",
+                    strengths_override=[1.0], sample_group="fixed_reference_samples",
+                )
+                if wandb_run is not None:
+                    import wandb
+                    wandb_run.log({
+                        "val/functional/fixed_reference": wandb.Image(
+                            sample["sheet"], caption=f"step {step}, visual={fraction:.2f}"
+                        )
+                    }, step=step)
+    finally:
+        adapter.clear_style_tokens()
+        if wandb_run is not None:
+            wandb_run.finish()
+    summary = {
+        "steps": steps,
+        "start_step": start_step,
+        "artists": len(style_ids),
+        "reader_frozen": True,
+        "oracle_codes_frozen": True,
+        "common_frozen_and_bypassed": True,
+        "final_visual_fraction": min(1.0, steps / max(1, ramp_steps)),
+        "elapsed_s": time.perf_counter() - started,
+    }
+    write_json(output / "summary.json", summary)
+    return summary
+
+
+def smoke_test_lora_oracle_visual_bridge(
+    config: dict[str, Any], destination: Path
+) -> dict[str, Any]:
+    effective = copy.deepcopy(config)
+    cfg = effective["lora_oracle_bootstrap"]["visual_bridge"]
+    cfg["output_directory"] = "lora_oracle_visual_bridge_smoke"
+    cfg["resume"] = False
+    cfg["checkpoint_every"] = 1
+    cfg["sample_every"] = 0
+    cfg["wandb"]["enabled"] = False
+    return train_lora_oracle_visual_bridge(effective, destination, steps_override=3)

@@ -3,6 +3,7 @@ import torch
 from anima_style_data.lora_oracle_bootstrap import (
     _FixedOracleCodeReader,
     _artist_centered_oracle_objective,
+    _interpolate_oracle_visual,
 )
 
 
@@ -47,3 +48,11 @@ def test_fixed_oracle_reader_returns_checkpoint_codes():
     result = reader(torch.randn(7, 1, 84, 16), torch.ones(7, 1, dtype=torch.bool))
 
     assert result.tokens.data_ptr() == codes.data_ptr()
+
+
+def test_oracle_visual_interpolation_reaches_both_endpoints():
+    oracle = torch.randn(2, 3, 4)
+    visual = torch.randn(2, 3, 4)
+
+    assert torch.equal(_interpolate_oracle_visual(oracle, visual, 0.0), oracle)
+    assert torch.equal(_interpolate_oracle_visual(oracle, visual, 1.0), visual)

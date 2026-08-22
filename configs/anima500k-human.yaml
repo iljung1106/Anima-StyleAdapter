@@ -477,6 +477,38 @@ lora_oracle_bootstrap:
       project: anima-style-adapter
       name: lora-oracle-bootstrap-v1
       id: lora-oracle-bootstrap-v1
+  visual_bridge:
+    output_directory: lora_oracle_visual_bridge_v1
+    source_checkpoint: lora_oracle_bootstrap_v1/training_state.pt
+    steps: 2000
+    batch_rows: 8
+    visual_fraction_ramp_steps: 750
+    reference_count_weights: [1, 1, 1, 2, 2, 3, 4]
+    shared_learning_rate: 0.00003
+    delta_learning_rate: 0.00006
+    mix_learning_rate: 0.000015
+    warmup_steps: 100
+    checkpoint_every: 250
+    sample_every: 500
+    log_every: 10
+    max_grad_norm: 1.0
+    fused_adamw: true
+    weight_decay: 0.01
+    betas: [0.9, 0.95]
+    adam_eps: 0.00000001
+    resume: true
+    loss_weights:
+      huber: 1.0
+      direction: 1.0
+      magnitude: 0.25
+      infonce: 0.5
+      zero_mean: 0.25
+      infonce_temperature: 0.10
+    wandb:
+      enabled: true
+      project: anima-style-adapter
+      name: lora-oracle-visual-bridge-v1
+      id: lora-oracle-visual-bridge-v1
 
 # B-prime per-reference encoder. C-RADIO spatial features and Qwen Image VAE
 # latents remain separate K/V banks; learned spatial/global queries read both.
