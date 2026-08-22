@@ -1919,6 +1919,43 @@ def _cross_view_artist_objective(
     }
 
 
+def _cross_view_functional_objective(
+    left: torch.Tensor,
+    right: torch.Tensor,
+    *,
+    temperature: float,
+    target_rms: torch.Tensor,
+    magnitude_weight: float,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Separate artists after the frozen Anima path, not only in token space.
+
+    The ordinary visual cross-view loss can be satisfied by projector
+    directions that the style connector ignores.  Here both views are measured
+    after the same controlled Anima forward.  A weak LoRA-derived magnitude
+    anchor prevents normalized InfoNCE from accepting an infinitesimal effect.
+    """
+
+    contrastive, metrics = _cross_view_artist_objective(
+        left, right, temperature=temperature
+    )
+    values = torch.cat((left.float(), right.float()), dim=0)
+    centered = values - values.mean(dim=0, keepdim=True)
+    reduce_dims = tuple(range(1, centered.ndim))
+    effect_rms = (centered.square().mean(dim=reduce_dims) + 1e-12).sqrt()
+    scale = target_rms.detach().float().clamp_min(1e-4)
+    magnitude = F.smooth_l1_loss(
+        (effect_rms / scale).clamp_min(1e-4).log().clamp(-4, 4),
+        torch.zeros_like(effect_rms),
+        beta=0.10,
+    )
+    total = contrastive + float(magnitude_weight) * magnitude
+    return total, {
+        **metrics,
+        "magnitude_loss": magnitude.detach(),
+        "effect_to_lora_teacher_rms": (effect_rms / scale).mean().detach(),
+    }
+
+
 def train_lora_oracle_joint_manifold(
     config: dict[str, Any],
     destination: Path,
@@ -2101,6 +2138,22 @@ def train_lora_oracle_joint_manifold(
     replay_weight = float(cfg.get("oracle_replay_weight", 0.5))
     code_weight = float(cfg.get("code_alignment_weight", 0.05))
     native_weight = float(cfg.get("native_cross_view_weight", 0.10))
+    native_functional_weight = float(
+        cfg.get("native_functional_cross_view_weight", 0.0)
+    )
+    native_functional_every = max(
+        1, int(cfg.get("native_functional_cross_view_every", 1))
+    )
+    native_functional_rows = int(
+        cfg.get("native_functional_cross_view_rows", native_batch_rows)
+    )
+    if not 2 <= native_functional_rows <= native_batch_rows:
+        raise ValueError(
+            "native_functional_cross_view_rows must be in [2, native_batch_rows]"
+        )
+    native_functional_magnitude_weight = float(
+        cfg.get("native_functional_magnitude_weight", 0.10)
+    )
     temperature = float(cfg.get("native_temperature", 0.10))
     loss_weights = dict(cfg.get("functional_loss_weights", {}))
     code_weights = dict(cfg.get("code_loss_weights", {}))
@@ -2192,6 +2245,44 @@ def train_lora_oracle_joint_manifold(
             )
             (native_weight * native_loss).backward()
 
+            native_functional_metrics: dict[str, torch.Tensor] = {}
+            if (
+                native_functional_weight > 0
+                and step % native_functional_every == 0
+            ):
+                functional_context = torch.cat((
+                    native_left[:native_functional_rows],
+                    native_right[:native_functional_rows],
+                ))
+                native_functional_student = _controlled_style_context_forward(
+                    anima,
+                    adapter,
+                    functional_context,
+                    noisy,
+                    base,
+                    context,
+                    timestep,
+                    device,
+                )
+                native_functional_left, native_functional_right = (
+                    native_functional_student.chunk(2)
+                )
+                teacher_centered = teacher - teacher.mean(dim=0, keepdim=True)
+                teacher_target_rms = (
+                    teacher_centered.square().mean().sqrt().clamp_min(1e-4)
+                )
+                native_functional_loss, native_functional_metrics = (
+                    _cross_view_functional_objective(
+                        native_functional_left,
+                        native_functional_right,
+                        temperature=temperature,
+                        target_rms=teacher_target_rms,
+                        magnitude_weight=native_functional_magnitude_weight,
+                    )
+                )
+                (native_functional_weight * native_functional_loss).backward()
+                del native_functional_student
+
             parameters = [
                 parameter for group in optimizer.param_groups for parameter in group["params"]
             ]
@@ -2213,6 +2304,10 @@ def train_lora_oracle_joint_manifold(
                 **{f"replay/{key}": value for key, value in replay_metrics.items()},
                 **{f"code/{key}": value for key, value in code_metrics.items()},
                 **{f"native/{key}": value for key, value in native_metrics.items()},
+                **{
+                    f"native_functional/{key}": value
+                    for key, value in native_functional_metrics.items()
+                },
             }
             for key, value in metrics.items():
                 running[key].append(float(value.detach()))

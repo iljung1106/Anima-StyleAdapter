@@ -1,6 +1,7 @@
 import torch
 
 from anima_style_data.lora_oracle_bootstrap import (
+    _cross_view_functional_objective,
     _FixedOracleCodeReader,
     _artist_centered_oracle_objective,
     _cross_view_artist_objective,
@@ -22,6 +23,33 @@ def test_cross_view_artist_objective_recognizes_matching_artists():
     assert torch.isfinite(loss)
     assert float(metrics["accuracy"]) == 1.0
     assert float(metrics["cosine_gap"]) > 0.5
+
+
+def test_cross_view_functional_objective_rejects_collapsed_effects():
+    left = torch.eye(8).reshape(8, 1, 8)
+    target_rms = (left - left.mean(dim=0, keepdim=True)).square().mean().sqrt()
+    exact_loss, exact_metrics = _cross_view_functional_objective(
+        left,
+        left.clone(),
+        temperature=0.10,
+        target_rms=target_rms,
+        magnitude_weight=0.10,
+    )
+    collapsed = (left * 1e-4).requires_grad_()
+    collapsed_loss, collapsed_metrics = _cross_view_functional_objective(
+        collapsed,
+        collapsed.clone(),
+        temperature=0.10,
+        target_rms=target_rms,
+        magnitude_weight=0.10,
+    )
+
+    assert float(exact_metrics["accuracy"]) == 1.0
+    assert float(exact_metrics["effect_to_lora_teacher_rms"]) > 0.9
+    assert float(collapsed_metrics["effect_to_lora_teacher_rms"]) < 1e-3
+    assert float(collapsed_loss) > float(exact_loss)
+    collapsed_loss.backward()
+    assert torch.isfinite(collapsed.grad).all()
 
 
 def test_piecewise_linear_value_supports_a_plateau_then_ramp():

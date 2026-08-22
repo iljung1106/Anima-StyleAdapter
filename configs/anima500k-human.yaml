@@ -618,6 +618,13 @@ lora_oracle_bootstrap:
     oracle_replay_weight: 0.50
     code_alignment_weight: 0.05
     native_cross_view_weight: 0.10
+    # Token-space separation alone can create directions that the frozen Anima
+    # connector ignores.  Every other step, verify a small native batch after
+    # the actual style path and keep its effect near the LoRA-teacher scale.
+    native_functional_cross_view_weight: 0.05
+    native_functional_cross_view_every: 2
+    native_functional_cross_view_rows: 4
+    native_functional_magnitude_weight: 0.10
     native_temperature: 0.10
     checkpoint_every: 250
     sample_every: 250
