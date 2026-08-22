@@ -3830,7 +3830,7 @@ real_artist_teacher:
 # Detail-preserving typed-slot, separate-softmax Style Cross-Attention v1.
 # Contract: docs/detail_preserving_style_cross_attention_plan.md
 detail_preserving_style_cross_attention:
-  output_directory: detail_preserving_style_cross_attention_v31_artist_null_residual
+  output_directory: detail_preserving_style_cross_attention_v32_strong_artist_residual
   seed: 20260819
   train_split: train
   validation_split: validation
@@ -3843,10 +3843,10 @@ detail_preserving_style_cross_attention:
   # v24 is an intentionally clean capacity test. The 86M Reader, shared K/V,
   # block deltas and slot mixer all start from their normal random initializers.
   reader_checkpoint: null
-  # v29 step 3000 is the best state before abruptly switching 55% of teacher
-  # batches to one reference drove the artist path back toward Common. Resume
-  # from it and introduce low-reference inputs continuously.
-  initial_checkpoint: detail_preserving_style_cross_attention_v29_clean_bootstrap/checkpoints/step-0003000.pt
+  # v31 step 3500 has an explicit artist-null residual and markedly lower
+  # common-output ratio. Resume it with the empirically healthy 2x centered
+  # Artist gain while leaving the frozen Common scaffold unchanged.
+  initial_checkpoint: detail_preserving_style_cross_attention_v31_artist_null_residual/checkpoints/step-0003500.pt
   reader_pretraining:
     output_directory: detail_style_reader_pretrain_v1
     device: cuda
@@ -3968,6 +3968,10 @@ detail_preserving_style_cross_attention:
     # Artist K/V path. The null tokens use the same projections and attention
     # as a real reference, so only their residual reaches frozen Anima O/gate.
     artist_null_residual: true
+    # v31 Artist-only 2x preserved image quality while making line/face/value
+    # differences visible. Keep Common at 1x and strengthen only the centered
+    # reference-conditioned residual.
+    artist_residual_gain: 2.0
     null_tokens: 28
     null_init_std: 0.02
   strength_profile:
@@ -4049,9 +4053,9 @@ detail_preserving_style_cross_attention:
     block_delta_learning_rate: 0.00020
     base_mix_learning_rate: 0.00004
     artist_null_learning_rate: 0.00020
-    # v31 adds a trainable artist-null parameter group, so the v29 model state
-    # is reused but its old optimizer topology cannot be loaded.
-    resume_optimizer: false
+    # v32 has the same parameter topology as v31, so preserve Adam moments and
+    # the scheduler while changing only the fixed centered-Artist scale.
+    resume_optimizer: true
     reset_artist_null_context_on_upgrade: true
     betas: [0.9, 0.95]
     adam_eps: 0.00000001
@@ -4098,8 +4102,8 @@ detail_preserving_style_cross_attention:
         magnitude_floor_start_step: 1
         magnitude_floor_end_step: 2500
         magnitude_floor_start: 0.25
-        magnitude_floor_end: 0.75
-        magnitude_upper: 1.50
+        magnitude_floor_end: 1.25
+        magnitude_upper: 2.25
         magnitude_upper_weight: 0.25
     gradient_accumulation_steps: 4
     fused_adamw: true
@@ -4402,8 +4406,8 @@ detail_preserving_style_cross_attention:
     wandb:
       enabled: true
       project: anima-style-adapter
-      name: detail-style-v31-artist-null-residual
-      id: detail-style-v31-artist-null-residual
+      name: detail-style-v32-strong-artist-residual
+      id: detail-style-v32-strong-artist-residual
   gradient_diagnostics:
     checkpoint_step: 1500
     teacher_batch_step: 1500

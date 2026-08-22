@@ -824,6 +824,7 @@ def test_separated_common_artist_bootstrap_routes_gradients_by_phase():
         delta_rank=3,
         common_tokens=3,
         artist_null_residual=True,
+        artist_residual_gain=2.0,
         null_tokens=3,
     )
     adapter.initialize_from_anima(anima)
@@ -863,12 +864,28 @@ def test_separated_common_artist_bootstrap_routes_gradients_by_phase():
 
     adapter.set_bootstrap_phase("artist_only")
     with torch.no_grad():
+        adapter.null_style_context.zero_()
+    adapter.set_style_context(style[:1])
+    adapter.artist_residual_gain = 1.0
+    artist_output_1x = adapter.merged_cross_attention(
+        0, hidden[:1], text[:1], anima.blocks[0].cross_attn, None
+    )
+    adapter.artist_residual_gain = 2.0
+    artist_output_2x = adapter.merged_cross_attention(
+        0, hidden[:1], text[:1], anima.blocks[0].cross_attn, None
+    )
+    native_output = anima.blocks[0].cross_attn(hidden[:1], None, text[:1])
+    torch.testing.assert_close(
+        artist_output_2x - native_output,
+        2.0 * (artist_output_1x - native_output),
+    )
+
+    with torch.no_grad():
         adapter.null_style_context.copy_(style[:1])
     adapter.set_style_context(style[:1])
     artist_null_output = adapter.merged_cross_attention(
         0, hidden[:1], text[:1], anima.blocks[0].cross_attn, None
     )
-    native_output = anima.blocks[0].cross_attn(hidden[:1], None, text[:1])
     torch.testing.assert_close(artist_null_output, native_output)
     assert _separated_bootstrap_phase(
         500, {"separated_component_bootstrap": {"enabled": True, "common_steps": 500}}

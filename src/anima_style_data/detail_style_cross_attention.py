@@ -2393,16 +2393,20 @@ class SeparatedCommonArtistKVStyleCrossAttention(
         *,
         common_tokens: int = 16,
         artist_null_residual: bool = False,
+        artist_residual_gain: float = 1.0,
         **kwargs: Any,
     ) -> None:
-        if common_tokens <= 0:
-            raise ValueError("common_tokens must be positive")
+        if common_tokens <= 0 or artist_residual_gain <= 0:
+            raise ValueError(
+                "common_tokens and artist_residual_gain must be positive"
+            )
         # The inherited null/gain tensors remain checkpoint-compatible but are
         # frozen and never participate in this architecture's forward path.
         kwargs.update(common_gain=1.0, artist_gain=1.0, gain_maximum=2.0)
         super().__init__(**kwargs)
         self.common_tokens = int(common_tokens)
         self.artist_null_residual = bool(artist_null_residual)
+        self.artist_residual_gain = float(artist_residual_gain)
         self.null_style_context.requires_grad_(self.artist_null_residual)
         self.log_common_gain.requires_grad_(False)
         self.log_artist_gain.requires_grad_(False)
@@ -2525,6 +2529,7 @@ class SeparatedCommonArtistKVStyleCrossAttention(
             if artist_null_attended is None:
                 raise RuntimeError("Artist null residual needs its baseline attention")
             artist_attended = style_attended - artist_null_attended
+        artist_attended = self.artist_residual_gain * artist_attended
         artist_component = (
             torch.zeros_like(artist_attended)
             if phase == "common_only" else artist_attended
@@ -2547,5 +2552,6 @@ class SeparatedCommonArtistKVStyleCrossAttention(
                 self._bootstrap_phase == "combined"
             ),
             "style_artist_null_residual": float(self.artist_null_residual),
+            "style_artist_residual_gain": self.artist_residual_gain,
         })
         return result

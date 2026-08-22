@@ -118,3 +118,17 @@ Artist-only는 `0.177`이었고 Artist-only 7개 결과도 거의 같았다. 따
   optimizer는 새로 초기화한다.
 - fixed-reference diversity와 단일-reference common-output ratio가 실제로
   감소하지 않으면 이 구조도 채택하지 않는다.
+
+## v32 centered Artist strength
+
+v31 step 3,500에서 Artist-only 1×는 fixed-reference diversity ratio `0.704`,
+2×는 `0.810`이었다. 2×에서는 이미지 붕괴 없이 선화, 얼굴 비율, 명암 차이가
+실제로 드러났다. 이는 Artist 방향이 완전히 소실된 것이 아니라 native artist-tag
+scale에 맞춘 centered residual이 style transfer에는 약하다는 뜻이다.
+
+- v31 `step-0003500.pt`의 모델과 optimizer 상태를 이어받는다.
+- frozen Common은 1×로 유지하고 null-centered Artist residual만 2×로 고정한다.
+- Artist magnitude band는 native-centered teacher의 `1.25–2.25×`로 넓힌다.
+  방향/InfoNCE 목표는 변경하지 않는다.
+- 4,000스텝 fixed-reference 1×(내부 Artist gain 2×)가 레퍼런스별 차이를
+  유지하면서 망가지지 않는지 확인한다. 다시 공통 출력으로 모이면 중단한다.
