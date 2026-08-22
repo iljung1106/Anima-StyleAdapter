@@ -26,8 +26,11 @@ content conditions.
 - default DiT Block LoRA targets: self-attention, cross-attention and MLP;
   modulation, norms, embedders and final layer remain excluded
 - rectified-flow MSE, shifted sigmoid timestep distribution with shift 3.0
-- 500 optimizer updates per artist, batch 2, fused AdamW, BF16 autocast
-- 50-step warmup followed by cosine decay to 10% of the peak LR
+- 250 optimizer updates per artist, batch 4, fused AdamW, BF16 autocast
+- the total remains 1,000 image exposures per artist; LR is linearly scaled to
+  `2e-4` and warmup is shortened to 25 updates
+- every completed LoRA logs a four-column W&B panel: VAE-decoded train cache,
+  held-out cache, matched Frozen Anima generation and matched LoRA generation
 
 ## Throughput design
 
@@ -35,10 +38,14 @@ Anima and one fixed-shape LoRA module graph remain on the H100 for all 64
 artists. Artist transitions reinitialize LoRA tensors in place and clear Adam
 state, preserving compiled graphs. One artist's complete latent and multimode
 text tensors are staged on GPU while the next artist is prefetched to host RAM.
-There is no VAE, text encoder, image decode or NFS read inside the 500-step
+There is no VAE, text encoder, image decode or NFS read inside the 250-step
 loop. Gradient checkpointing, block swapping and CPU offload are disabled.
+The VAE is loaded lazily only for the post-artist qualitative panel. Per-block
+`torch.compile` is disabled because the measured persistent batch-2 path had
+the same steady-state step time while paying substantial first-shape compile
+cost.
 
-The trainer writes a single resumable active state at step 250 and removes it
+The trainer writes a single resumable active state at step 125 and removes it
 after the corresponding final safetensors and metric record are committed.
 Finished artists are skipped on restart.
 

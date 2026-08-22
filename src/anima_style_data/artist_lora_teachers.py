@@ -518,6 +518,175 @@ def _evaluate(
     return float(torch.stack(losses).mean())
 
 
+def _preview_image(value):
+    from PIL import Image
+
+    value = value.detach().float().cpu()
+    if value.ndim == 5:
+        value = value[0]
+    if value.ndim == 4:
+        value = value[:, 0]
+    pixels = (
+        ((value.clamp(-1, 1) + 1.0) * 127.5)
+        .byte()
+        .permute(1, 2, 0)
+        .numpy()
+    )
+    return Image.fromarray(pixels)
+
+
+def _preview_panel(images: list[tuple[str, Any]], artist: str, tile_size: int):
+    from PIL import Image, ImageDraw, ImageOps
+
+    label_height = 28
+    panel = Image.new(
+        "RGB",
+        (tile_size * len(images), tile_size + label_height + 28),
+        "white",
+    )
+    draw = ImageDraw.Draw(panel)
+    for index, (label, image) in enumerate(images):
+        tile = Image.new("RGB", (tile_size, tile_size), (238, 238, 238))
+        contained = ImageOps.contain(
+            image.convert("RGB"),
+            (tile_size, tile_size),
+            method=Image.Resampling.LANCZOS,
+        )
+        tile.paste(
+            contained,
+            ((tile_size - contained.width) // 2, (tile_size - contained.height) // 2),
+        )
+        x = index * tile_size
+        panel.paste(tile, (x, label_height))
+        draw.text((x + 6, 7), label, fill="black")
+    draw.text((6, tile_size + label_height + 7), artist, fill="black")
+    return panel
+
+
+def _render_artist_lora_preview(
+    anima,
+    network,
+    train_buckets,
+    validation_buckets,
+    cache_index: _ArtistCacheIndex,
+    null_condition,
+    config: dict[str, Any],
+    destination: Path,
+    output: Path,
+    plan: ArtistLoRAPlan,
+    vae,
+):
+    """Render a train/held-out/base/LoRA panel with matched prompt and noise."""
+    import torch
+
+    from .style_transfer import _load_sampling_vae
+
+    preview_cfg = dict(config.get("preview", {}))
+    device = next(network.parameters()).device
+    train_bucket = max(train_buckets.values(), key=lambda value: len(value.image_ids))
+    validation_bucket = max(
+        validation_buckets.values(), key=lambda value: len(value.image_ids)
+    )
+    variant_name = str(preview_cfg.get("prompt_variant", "full_quality"))
+    try:
+        variant_index = cache_index.variant_names.index(variant_name)
+    except ValueError as error:
+        raise ValueError(f"Unknown preview prompt variant: {variant_name}") from error
+
+    positive = validation_bucket.conditions[0, variant_index][None]
+    negative = null_condition[None]
+    target = validation_bucket.latents[0:1].unsqueeze(2)
+    train_target = train_bucket.latents[0:1].unsqueeze(2)
+    latent_height, latent_width = target.shape[-2:]
+    seed = int(preview_cfg.get("seed", 20260823)) + plan.index * 1009
+    generator = torch.Generator(device="cpu").manual_seed(seed)
+    initial_noise = torch.randn(
+        target.shape, generator=generator, dtype=torch.float32
+    ).to(device=device, dtype=torch.bfloat16)
+    steps = int(preview_cfg.get("steps", 20))
+    sigmas = torch.linspace(
+        1.0, 0.0, steps + 1, device=device, dtype=torch.float32
+    )
+    shift = float(preview_cfg.get("flow_shift", 3.0))
+    sigmas = (sigmas * shift) / (1.0 + (shift - 1.0) * sigmas)
+    text_cfg = float(preview_cfg.get("text_cfg", 4.0))
+    padding = torch.zeros(
+        2, 1, latent_height, latent_width, device=device, dtype=torch.bfloat16
+    )
+    context = torch.cat((negative, positive), dim=0)
+
+    def denoise(multiplier: float):
+        network.set_multiplier(multiplier)
+        value = initial_noise.clone()
+        for index in range(steps):
+            timestep = sigmas[index].to(torch.bfloat16).expand(2)
+            model_input = torch.cat((value, value), dim=0)
+            velocity = anima(
+                model_input,
+                timestep,
+                context=context,
+                padding_mask=padding,
+                target_input_ids=None,
+            ).float()
+            unconditioned, conditioned = velocity.chunk(2)
+            guided = unconditioned + text_cfg * (conditioned - unconditioned)
+            value = (
+                value.float()
+                + guided * (sigmas[index + 1] - sigmas[index])
+            ).to(torch.bfloat16)
+        return value
+
+    anima.eval()
+    network.eval()
+    try:
+        with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
+            base_latent = denoise(0.0)
+            lora_latent = denoise(1.0)
+            if vae is None:
+                vae = _load_sampling_vae(config, destination).to(
+                    device=device, dtype=torch.bfloat16
+                )
+            generated = vae.decode_to_pixels(
+                torch.cat((base_latent, lora_latent), dim=0)
+            )
+            heldout_image = vae.decode_to_pixels(target)
+            train_image = vae.decode_to_pixels(train_target)
+    finally:
+        network.set_multiplier(1.0)
+        network.train()
+        anima.train()
+
+    panel = _preview_panel(
+        [
+            ("train cache", _preview_image(train_image)),
+            ("held-out cache", _preview_image(heldout_image)),
+            ("Frozen Anima", _preview_image(generated[0:1])),
+            ("rank-16 LoRA", _preview_image(generated[1:2])),
+        ],
+        plan.artist,
+        int(preview_cfg.get("tile_size", 320)),
+    )
+    preview_dir = output / "previews"
+    preview_dir.mkdir(parents=True, exist_ok=True)
+    preview_path = preview_dir / f"artist-{plan.index:03d}.png"
+    temporary = preview_path.with_suffix(".tmp.png")
+    panel.save(temporary)
+    temporary.replace(preview_path)
+    difference = (lora_latent.float() - base_latent.float()).square().mean().sqrt()
+    base_rms = base_latent.float().square().mean().sqrt()
+    metrics = {
+        "preview_latent_delta_rms": float(difference),
+        "preview_latent_delta_to_base_ratio": float(
+            difference / base_rms.clamp_min(1e-8)
+        ),
+        "preview_seed": seed,
+        "preview_steps": steps,
+        "preview_prompt_variant": variant_name,
+        "preview_path": str(preview_path),
+    }
+    return preview_path, vae, metrics
+
+
 def _snapshot_training_state(
     path: Path,
     network,
@@ -709,6 +878,8 @@ def train_artist_lora_teachers(
         )
 
     summaries = []
+    preview_cfg = dict(cfg.get("preview", {}))
+    preview_vae = None
     prefetch = ThreadPoolExecutor(max_workers=1)
     pending: Future | None = None
     started_all = time.perf_counter()
@@ -872,6 +1043,41 @@ def train_artist_lora_teachers(
             )
             network.save_weights(str(temporary_weight_path), torch.float16, metadata)
             temporary_weight_path.replace(weight_path)
+            preview_metrics: dict[str, Any] = {}
+            preview_path = None
+            preview_every = max(1, int(preview_cfg.get("every_artists", 1)))
+            if bool(preview_cfg.get("enabled", False)) and (
+                (plan.index + 1) % preview_every == 0 or plan.index == 0
+            ):
+                preview_path, preview_vae, preview_metrics = _render_artist_lora_preview(
+                    anima,
+                    network,
+                    train_buckets,
+                    validation_buckets,
+                    cache_index,
+                    null_condition,
+                    cfg,
+                    destination,
+                    output,
+                    plan,
+                    preview_vae,
+                )
+                if wandb_run is not None:
+                    wandb_run.log(
+                        {
+                            "qualitative/artist_panel": wandb.Image(
+                                str(preview_path), caption=plan.artist
+                            ),
+                            "qualitative/latent_delta_rms": preview_metrics[
+                                "preview_latent_delta_rms"
+                            ],
+                            "qualitative/latent_delta_to_base_ratio": preview_metrics[
+                                "preview_latent_delta_to_base_ratio"
+                            ],
+                            "progress/artist_index": plan.index,
+                        },
+                        step=plan.index * steps + steps,
+                    )
             artist_summary = {
                 "index": plan.index,
                 "style_id": plan.style_id,
@@ -887,6 +1093,7 @@ def train_artist_lora_teachers(
                 "cache_transfer_seconds": transfer_seconds,
                 "cache_bytes": cpu_pack.bytes_loaded,
                 "weight_path": str(weight_path),
+                **preview_metrics,
             }
             write_json(metrics_dir / f"artist-{plan.index:03d}.json", artist_summary)
             summaries.append(artist_summary)
@@ -939,5 +1146,7 @@ def smoke_test_artist_lora_teachers(
     cfg["training"]["state_every"] = 2
     cfg["training"]["compile"]["enabled"] = False
     cfg["training"]["wandb"]["enabled"] = False
+    cfg["preview"]["enabled"] = True
+    cfg["preview"]["steps"] = 2
     cfg["force_replan"] = True
     return train_artist_lora_teachers(effective, destination)
