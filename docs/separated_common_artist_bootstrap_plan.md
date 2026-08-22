@@ -152,3 +152,29 @@ v32는 centered Artist gain을 학습 경로 안에서 2배로 만들었지만, 
 - 500스텝마다 7개 고정 레퍼런스의 1×/2× 결과를 생성한다. 기준 대비 변화량
   증가만 보지 않고 pairwise RMS와 그 비율, 실제 얼굴·선화·명암 차이를 함께
   본다. 서로 다른 레퍼런스가 같은 얼굴/질감으로 모이면 즉시 중단한다.
+
+## v34 anti-common functional fine-tune
+
+v33은 500스텝 1× 출력부터 일곱 레퍼런스의 얼굴과 선화가 거의 같았고,
+1,000스텝에는 controlled common-output ratio가 `0.894`까지 상승했다. 같은 시점의
+weighted common loss는 `7.95e-4`뿐이었다. Centered InfoNCE와 repeatability는
+작가 배치 평균을 제거한 뒤 계산되므로, 공통 변형 위에 작은 작가별 차이를 얹는
+해를 직접 막지 못했다. 픽셀 pairwise 차이도 `0.715`였지만 실제 차이의 상당 부분은
+스타일보다 포즈ㆍ의상ㆍ피부색 누출이었다. v33은 step 1,000 체크포인트를 보존하고
+중단한다.
+
+v34는 v31 step 3,500에서 다시 시작하며 다음만 바꾼다.
+
+- human disjoint-reference functional objective를 4스텝마다가 아니라 2스텝마다
+  계산하고 weight를 `0.05 -> 0.08`, repeatability 비중을 `0.25 -> 0.50`으로
+  올린다.
+- raw Artist residual의 batch-common penalty를 `0.02 -> 0.10`으로 올리고
+  500스텝에 full weight가 되게 한다. threshold는 250--1,500스텝 동안
+  `0.80 -> 0.55`로 낮춘다. 일반 human controlled-flow 배치에도 weight `0.05`로
+  같은 제약을 건다.
+- exact-self는 250스텝까지만 유지하고, target 포함률은 250--1,000스텝에
+  `1.0 -> 0.5`로 낮춘다. Synthetic artist-tag teacher는 250스텝 뒤 매 8스텝으로
+  줄여 human reference separation이 주 신호가 되게 한다.
+- 500스텝마다 동일한 일곱 reference를 1×/2×로 생성한다. 계속 여부는 출력 RMS가
+  아니라 얼굴 비례, 눈 형태, 선 굵기, 명암 경계와 색 조합의 reference별 분리,
+  같은 작가 disjoint-view repeatability, common-output ratio를 함께 보고 결정한다.
