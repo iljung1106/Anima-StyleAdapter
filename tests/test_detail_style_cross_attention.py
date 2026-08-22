@@ -21,6 +21,7 @@ from anima_style_data.detail_style_training import (  # noqa: E402
     _audit_student_prompts,
     _backward_adapter_only,
     _centered_native_magnitude_band,
+    _checkpoint_has_artist_null_residual,
     _common_native_teacher_objective,
     _compose_separate_text_style_guidance,
     _configure_separated_bootstrap_trainability,
@@ -62,6 +63,16 @@ def test_teacher_domains_follow_weighted_schedule_with_local_indices():
         (0, 0), (0, 1), (0, 2), (1, 0),
         (0, 3), (0, 4), (0, 5), (1, 1),
     ]
+
+
+def test_loaded_checkpoint_preserves_existing_artist_null_baseline():
+    assert _checkpoint_has_artist_null_residual({
+        "config": {"adapter": {"artist_null_residual": True}}
+    })
+    assert not _checkpoint_has_artist_null_residual({
+        "config": {"adapter": {"artist_null_residual": False}}
+    })
+    assert not _checkpoint_has_artist_null_residual(None)
 
 
 def test_teacher_domain_schedule_rejects_invalid_updates():

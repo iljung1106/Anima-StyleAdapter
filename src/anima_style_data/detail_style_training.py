@@ -145,6 +145,17 @@ def _teacher_infonce_weight(
     return weights[int(reference_count) - 1]
 
 
+def _checkpoint_has_artist_null_residual(
+    state: dict[str, Any] | None,
+) -> bool:
+    """Whether the actually loaded checkpoint already owns the null baseline."""
+
+    if state is None:
+        return False
+    config = dict(state.get("config", {}))
+    return bool(dict(config.get("adapter", {})).get("artist_null_residual", False))
+
+
 def _delayed_learning_rate_multiplier(
     step: int,
     total_steps: int,
@@ -3573,8 +3584,10 @@ def train_detail_style_cross_attention(
     state_path = output / "training_state.pt"
     start_step = 0
     resume = None
+    loaded_checkpoint_state = None
     if bool(training.get("resume", True)) and state_path.exists():
         resume = torch.load(state_path, map_location="cpu", weights_only=False)
+        loaded_checkpoint_state = resume
         reader.load_state_dict(resume["reader"], strict=True)
         adapter.load_state_dict(resume["adapter"], strict=True)
         adapter.restore_timestep_strength_state()
@@ -3587,6 +3600,7 @@ def train_detail_style_cross_attention(
                 map_location="cpu",
                 weights_only=False,
             )
+            loaded_checkpoint_state = initial_state
             reader.load_state_dict(initial_state["reader"], strict=True)
             adapter.load_state_dict(initial_state["adapter"], strict=True)
             adapter.restore_timestep_strength_state()
@@ -3681,10 +3695,7 @@ def train_detail_style_cross_attention(
         and adapter.artist_null_residual
         and bool(training.get("reset_artist_null_context_on_upgrade", False))
     ):
-        previous_adapter_cfg = dict(
-            dict((resume or {}).get("config", {})).get("adapter", {})
-        )
-        if not bool(previous_adapter_cfg.get("artist_null_residual", False)):
+        if not _checkpoint_has_artist_null_residual(loaded_checkpoint_state):
             with torch.no_grad():
                 adapter.null_style_context.zero_()
             print(
