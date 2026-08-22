@@ -4384,7 +4384,10 @@ detail_preserving_style_cross_attention:
     sample_every: 500
     fixed_sample_every: 500
     fixed_sample_strengths: [1.0]
-    fixed_sample_backfill_steps: []
+    # Diagnostic only: expose whether the frozen Common branch masks learned
+    # reference differences at the rejected v30 step-3500 checkpoint.
+    fixed_sample_backfill_steps: [3500]
+    fixed_sample_backfill_component_modes: [common_only, artist_only]
     resume: true
     wandb:
       enabled: true

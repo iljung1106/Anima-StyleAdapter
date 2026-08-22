@@ -3168,6 +3168,8 @@ def _generate_fixed_reference_sample(
     output: Path,
     device: str,
     step: int,
+    *,
+    component_mode: str | None = None,
 ) -> dict[str, Any]:
     """Render the fixed TestSample1--7 contract through the style branch."""
 
@@ -3184,6 +3186,18 @@ def _generate_fixed_reference_sample(
     mask = torch.ones(references.shape[:2], device=device, dtype=torch.bool)
     reader_was_training = reader.training
     adapter_was_training = adapter.training
+    previous_component_mode = None
+    if component_mode is not None:
+        if not isinstance(
+            adapter, SeparatedCommonArtistKVStyleCrossAttention
+        ):
+            raise ValueError(
+                "fixed sample component_mode requires the separated adapter"
+            )
+        if component_mode not in adapter._VALID_PHASES:
+            raise ValueError(f"Unsupported fixed sample component mode {component_mode}")
+        previous_component_mode = adapter.bootstrap_phase
+        adapter.set_bootstrap_phase(component_mode)
     reader.eval()
     adapter.eval()
     anima.eval()
@@ -3287,6 +3301,8 @@ def _generate_fixed_reference_sample(
             styled_latents_by_strength[strength] = torch.cat(styled_parts)
     finally:
         adapter.clear_style_tokens()
+        if previous_component_mode is not None:
+            adapter.set_bootstrap_phase(previous_component_mode)
         if reader_was_training:
             reader.train()
         if adapter_was_training:
@@ -3305,7 +3321,10 @@ def _generate_fixed_reference_sample(
         int(cfg.get("vae_batch_size", 4)),
     )
     base = decoded["base"][0]
-    sample_dir = output / "external_reference_samples" / f"step-{step:07d}"
+    sample_name = f"step-{step:07d}"
+    if component_mode is not None:
+        sample_name += f"-{component_mode}"
+    sample_dir = output / "external_reference_samples" / sample_name
     generated_dir = sample_dir / "generated"
     generated_dir.mkdir(parents=True, exist_ok=True)
     base.save(generated_dir / "no-style.png")
@@ -3322,7 +3341,11 @@ def _generate_fixed_reference_sample(
             )
         sheet = _make_sheet(
             prepared["paths"], base, None, styled, size,
-            current_label=f"STYLE CROSS-ATTENTION {label}",
+            current_label=(
+                f"STYLE CROSS-ATTENTION {label}"
+                if component_mode is None
+                else f"STYLE {component_mode.upper()} {label}"
+            ),
         )
         sheet_path = sample_dir / f"detail-style-fixed-reference-{label}.png"
         sheet.save(sheet_path, compress_level=4)
@@ -3351,6 +3374,7 @@ def _generate_fixed_reference_sample(
     primary_label = "1x" if "1x" in sheets else f"{strengths[0]:g}x"
     summary = {
         "step": int(step),
+        "component_mode": component_mode or "combined",
         "sheet": sheets[primary_label],
         "sheets": sheets,
         "strengths": strengths,
@@ -5013,6 +5037,12 @@ def backfill_detail_style_fixed_samples(
         ]
     if not checkpoints:
         raise FileNotFoundError(f"No {every}-step checkpoints in {checkpoint_dir}")
+    configured_modes = training.get("fixed_sample_backfill_component_modes")
+    component_modes: list[str | None] = (
+        [None]
+        if configured_modes is None
+        else [str(value) for value in configured_modes]
+    )
 
     anima = _resolve_anima_model(config, destination, device).requires_grad_(False).eval()
     _optimize_frozen_anima(
@@ -5029,28 +5059,37 @@ def backfill_detail_style_fixed_samples(
     reused = []
     for checkpoint in checkpoints:
         step = int(checkpoint.stem.removeprefix("step-"))
-        summary_path = (
-            output / "external_reference_samples"
-            / f"step-{step:07d}" / "summary.json"
-        )
-        if _fixed_sample_complete(summary_path, strengths):
-            reused.append(step)
-            continue
         state = torch.load(checkpoint, map_location="cpu", weights_only=False)
         reader.load_state_dict(state["reader"], strict=True)
         adapter.load_state_dict(state["adapter"], strict=True)
         adapter.restore_timestep_strength_state()
         del state
-        result = _generate_fixed_reference_sample(
-            prepared, config, destination, anima, reader, adapter,
-            output, device, step,
-        )
-        generated.append({"step": step, "sheet": result["sheet"]})
-        print(
-            f"detail-style fixed-reference backfill step={step} "
-            f"sheet={result['sheet']}",
-            flush=True,
-        )
+        for component_mode in component_modes:
+            sample_name = f"step-{step:07d}"
+            if component_mode is not None:
+                sample_name += f"-{component_mode}"
+            summary_path = (
+                output / "external_reference_samples"
+                / sample_name / "summary.json"
+            )
+            if _fixed_sample_complete(summary_path, strengths):
+                reused.append({"step": step, "component_mode": component_mode})
+                continue
+            result = _generate_fixed_reference_sample(
+                prepared, config, destination, anima, reader, adapter,
+                output, device, step, component_mode=component_mode,
+            )
+            generated.append({
+                "step": step,
+                "component_mode": component_mode or "combined",
+                "sheet": result["sheet"],
+            })
+            print(
+                f"detail-style fixed-reference backfill step={step} "
+                f"component={component_mode or 'combined'} "
+                f"sheet={result['sheet']}",
+                flush=True,
+            )
     summary = {
         "checkpoint_count": len(checkpoints),
         "generated": generated,
