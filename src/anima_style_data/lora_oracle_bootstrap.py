@@ -436,7 +436,7 @@ def train_lora_oracle_bootstrap(
             project=str(wandb_cfg.get("project", "anima-style-adapter")),
             name=str(wandb_cfg.get("name", "lora-oracle-bootstrap-v1")),
             id=str(wandb_cfg.get("id", "lora-oracle-bootstrap-v1")),
-            resume="allow" if start_step else "never",
+            resume="allow",
             config={"lora_oracle_bootstrap": cfg},
         )
     fixed = load_dual_query_external_sample(config, destination)
@@ -862,7 +862,7 @@ def train_lora_oracle_visual_bridge(
             project=str(wandb_cfg.get("project", "anima-style-adapter")),
             name=str(wandb_cfg.get("name", "lora-oracle-visual-bridge-v1")),
             id=str(wandb_cfg.get("id", "lora-oracle-visual-bridge-v1")),
-            resume="allow" if start_step else "never",
+            resume="allow",
             config={"lora_oracle_visual_bridge": cfg},
         )
 
@@ -1115,7 +1115,7 @@ def train_lora_oracle_visual_projector(
             project=str(wandb_cfg.get("project", "anima-style-adapter")),
             name=str(wandb_cfg.get("name", "lora-oracle-visual-projector-v1")),
             id=str(wandb_cfg.get("id", "lora-oracle-visual-projector-v1")),
-            resume="allow" if start_step else "never",
+            resume="allow",
             config={"lora_oracle_visual_projector": cfg},
         )
 
