@@ -3670,6 +3670,22 @@ def train_detail_style_cross_attention(
                     "block_to_base": adapter.block_to_base.detach().cpu().tolist(),
                 })
 
+    if (
+        isinstance(adapter, SeparatedCommonArtistKVStyleCrossAttention)
+        and adapter.artist_null_residual
+        and bool(training.get("reset_artist_null_context_on_upgrade", False))
+    ):
+        previous_adapter_cfg = dict(
+            dict((resume or {}).get("config", {})).get("adapter", {})
+        )
+        if not bool(previous_adapter_cfg.get("artist_null_residual", False)):
+            with torch.no_grad():
+                adapter.null_style_context.zero_()
+            print(
+                "detail-style initialized the new artist-null baseline at zero",
+                flush=True,
+            )
+
     reader_parameters = [value for value in reader.parameters() if value.requires_grad]
     kv_parameters = adapter.kv_parameters()
     null_parameter_ids = {id(value) for value in adapter.null_parameters()}
@@ -3710,6 +3726,15 @@ def train_detail_style_cross_attention(
                 "weight_decay": 0.0,
             },
         ])
+        if adapter.null_parameters():
+            optimizer_groups.append({
+                "params": adapter.null_parameters(),
+                "lr": float(
+                    training.get("artist_null_learning_rate", 1e-4)
+                ),
+                "name": "artist_null_context",
+                "weight_decay": 0.0,
+            })
     elif isinstance(adapter, SharedBaseKVStyleCrossAttention):
         optimizer_groups.extend([
             {
@@ -3759,7 +3784,14 @@ def train_detail_style_cross_attention(
         fused=bool(training.get("fused_adamw", True) and device.startswith("cuda")),
     )
     if resume is not None:
-        optimizer.load_state_dict(resume["optimizer"])
+        if bool(training.get("resume_optimizer", True)):
+            optimizer.load_state_dict(resume["optimizer"])
+        else:
+            print(
+                "detail-style initialized a fresh optimizer for the resumed "
+                "model state",
+                flush=True,
+            )
         random.setstate(resume["python_rng"])
         np.random.set_state(resume["numpy_rng"])
         torch.set_rng_state(resume["torch_rng"])

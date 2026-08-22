@@ -100,3 +100,21 @@ output ratio는 `0.858→0.910`으로 증가했다. 따라서 이 구간은 채�
 - 동일 prompt/seed의 fixed-reference 7개 출력에 대해 pairwise pixel RMS와
   baseline 변형량 대비 diversity ratio를 기록한다. 출력 크기가 있어도
   reference별 결과가 같으면 실패로 판정한다.
+
+## v31 artist-null residual correction
+
+v30 step 3,500의 component ablation에서 Common-only 변형 RMS는 `0.045`,
+Artist-only는 `0.177`이었고 Artist-only 7개 결과도 거의 같았다. 따라서
+명시적 Common branch가 Artist 차이를 덮은 것이 아니라, raw Artist attention
+자체의 reference-independent 성분이 centered loss의 사각지대에 남은 것이다.
+
+- Artist K/V에 28개 trainable null token을 같은 projection/softmax로 통과시킨다.
+- 최종 Artist 성분은 `attention(reference) - attention(artist_null)`로 정의한다.
+  초기 null token은 0이라 v29 step-3000 동작을 보존한다.
+- frozen Common은 유지하며 `Common + mean(Artist)`가 frozen native common을
+  맞추는 objective를 0.5배로 켠다. 이 항이 artist-null에 직접 gradient를 주어
+  Artist 평균을 제거하고, centered direction/InfoNCE는 작가별 차이를 보존한다.
+- 아키텍처에 새 optimizer group이 추가되므로 v29 모델 상태만 가져오고
+  optimizer는 새로 초기화한다.
+- fixed-reference diversity와 단일-reference common-output ratio가 실제로
+  감소하지 않으면 이 구조도 채택하지 않는다.

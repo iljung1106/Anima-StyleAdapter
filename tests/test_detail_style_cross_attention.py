@@ -823,6 +823,8 @@ def test_separated_common_artist_bootstrap_routes_gradients_by_phase():
         block_to_base=(0, 1),
         delta_rank=3,
         common_tokens=3,
+        artist_null_residual=True,
+        null_tokens=3,
     )
     adapter.initialize_from_anima(anima)
     style = torch.randn(2, 3, 6)
@@ -856,7 +858,18 @@ def test_separated_common_artist_bootstrap_routes_gradients_by_phase():
     combined_output.square().mean().backward()
     assert all(parameter.grad is None for parameter in adapter.common_parameters())
     assert any(parameter.grad is not None for parameter in adapter.artist_parameters())
+    assert adapter.null_style_context.grad is not None
     assert all(parameter.requires_grad for parameter in reader.parameters())
+
+    adapter.set_bootstrap_phase("artist_only")
+    with torch.no_grad():
+        adapter.null_style_context.copy_(style[:1])
+    adapter.set_style_context(style[:1])
+    artist_null_output = adapter.merged_cross_attention(
+        0, hidden[:1], text[:1], anima.blocks[0].cross_attn, None
+    )
+    native_output = anima.blocks[0].cross_attn(hidden[:1], None, text[:1])
+    torch.testing.assert_close(artist_null_output, native_output)
     assert _separated_bootstrap_phase(
         500, {"separated_component_bootstrap": {"enabled": True, "common_steps": 500}}
     ) == "common_only"

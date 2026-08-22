@@ -1301,6 +1301,7 @@ class FreshKVStyleCrossAttention(nn.Module):
         self,
         style_attended: torch.Tensor,
         common_attended: torch.Tensor,
+        artist_null_attended: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Return effective, common, and artist attention-space components.
 
@@ -1310,7 +1311,11 @@ class FreshKVStyleCrossAttention(nn.Module):
         native-Q/O attention plumbing below.
         """
 
-        artist_attended = style_attended - common_attended.detach()
+        artist_baseline = (
+            common_attended
+            if artist_null_attended is None else artist_null_attended
+        )
+        artist_attended = style_attended - artist_baseline.detach()
         common_gain, artist_gain = self._component_gains()
         artist_component = artist_gain.to(
             device=artist_attended.device, dtype=artist_attended.dtype
@@ -1319,6 +1324,13 @@ class FreshKVStyleCrossAttention(nn.Module):
             device=artist_attended.device, dtype=artist_attended.dtype
         ) * common_attended
         return artist_component + common_component, common_component, artist_component
+
+    def _artist_null_style_kv(
+        self, index: int, cross_attention: nn.Module, batch: int
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        """Optional reference-independent baseline for the artist branch."""
+
+        return None
 
     def merged_cross_attention(
         self,
@@ -1344,6 +1356,9 @@ class FreshKVStyleCrossAttention(nn.Module):
         )
         null_key = null_key.to(style_key.dtype)
         null_value = null_value.to(style_value.dtype)
+        artist_null_kv = self._artist_null_style_kv(
+            block_index, cross_attention, style_key.shape[0]
+        )
         text_attended = _run_attention(
             cross_attention, query, text_key, text_value, attn_params
         )
@@ -1353,8 +1368,20 @@ class FreshKVStyleCrossAttention(nn.Module):
         null_attended = _run_attention(
             cross_attention, query, null_key, null_value, attn_params
         )
+        artist_null_attended = None
+        if artist_null_kv is not None:
+            artist_null_key, artist_null_value = artist_null_kv
+            artist_null_attended = _run_attention(
+                cross_attention,
+                query,
+                artist_null_key.to(style_key.dtype),
+                artist_null_value.to(style_value.dtype),
+                attn_params,
+            )
         effective_attended, common_component, artist_component = (
-            self._combine_style_components(style_attended, null_attended)
+            self._combine_style_components(
+                style_attended, null_attended, artist_null_attended
+            )
         )
         if self._style_enabled is not None:
             effective_attended = effective_attended * self._style_enabled.to(
@@ -2365,6 +2392,7 @@ class SeparatedCommonArtistKVStyleCrossAttention(
         self,
         *,
         common_tokens: int = 16,
+        artist_null_residual: bool = False,
         **kwargs: Any,
     ) -> None:
         if common_tokens <= 0:
@@ -2374,7 +2402,8 @@ class SeparatedCommonArtistKVStyleCrossAttention(
         kwargs.update(common_gain=1.0, artist_gain=1.0, gain_maximum=2.0)
         super().__init__(**kwargs)
         self.common_tokens = int(common_tokens)
-        self.null_style_context.requires_grad_(False)
+        self.artist_null_residual = bool(artist_null_residual)
+        self.null_style_context.requires_grad_(self.artist_null_residual)
         self.log_common_gain.requires_grad_(False)
         self.log_artist_gain.requires_grad_(False)
         self.common_k = nn.ParameterList()
@@ -2432,10 +2461,11 @@ class SeparatedCommonArtistKVStyleCrossAttention(
             self.shared_parameters()
             + self.delta_parameters()
             + self.mixing_parameters()
+            + self.null_parameters()
         )
 
     def null_parameters(self) -> list[nn.Parameter]:
-        return []
+        return [self.null_style_context] if self.artist_null_residual else []
 
     def gain_parameters(self) -> list[nn.Parameter]:
         return []
@@ -2472,19 +2502,32 @@ class SeparatedCommonArtistKVStyleCrossAttention(
             cross_attention.v_norm(value).expand(batch, -1, -1, -1),
         )
 
+    def _artist_null_style_kv(
+        self, index: int, cross_attention: nn.Module, batch: int
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        if not self.artist_null_residual:
+            return None
+        return super()._null_style_kv(index, cross_attention, batch)
+
     def _combine_style_components(
         self,
         style_attended: torch.Tensor,
         common_attended: torch.Tensor,
+        artist_null_attended: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         phase = self._bootstrap_phase
         common_component = (
             torch.zeros_like(common_attended)
             if phase == "artist_only" else common_attended
         )
+        artist_attended = style_attended
+        if self.artist_null_residual:
+            if artist_null_attended is None:
+                raise RuntimeError("Artist null residual needs its baseline attention")
+            artist_attended = style_attended - artist_null_attended
         artist_component = (
-            torch.zeros_like(style_attended)
-            if phase == "common_only" else style_attended
+            torch.zeros_like(artist_attended)
+            if phase == "common_only" else artist_attended
         )
         return common_component + artist_component, common_component, artist_component
 
@@ -2503,5 +2546,6 @@ class SeparatedCommonArtistKVStyleCrossAttention(
             "style_bootstrap_combined": float(
                 self._bootstrap_phase == "combined"
             ),
+            "style_artist_null_residual": float(self.artist_null_residual),
         })
         return result

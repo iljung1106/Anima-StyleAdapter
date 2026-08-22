@@ -3830,7 +3830,7 @@ real_artist_teacher:
 # Detail-preserving typed-slot, separate-softmax Style Cross-Attention v1.
 # Contract: docs/detail_preserving_style_cross_attention_plan.md
 detail_preserving_style_cross_attention:
-  output_directory: detail_preserving_style_cross_attention_v30_reference_curriculum
+  output_directory: detail_preserving_style_cross_attention_v31_artist_null_residual
   seed: 20260819
   train_split: train
   validation_split: validation
@@ -3964,6 +3964,10 @@ detail_preserving_style_cross_attention:
     # reference-conditioned artist residuals; neither path has a trainable
     # scalar gain.
     common_tokens: 16
+    # Explicitly remove the reference-independent component produced by the
+    # Artist K/V path. The null tokens use the same projections and attention
+    # as a real reference, so only their residual reaches frozen Anima O/gate.
+    artist_null_residual: true
     null_tokens: 28
     null_init_std: 0.02
   strength_profile:
@@ -4044,6 +4048,11 @@ detail_preserving_style_cross_attention:
     shared_kv_learning_rate: 0.00010
     block_delta_learning_rate: 0.00020
     base_mix_learning_rate: 0.00004
+    artist_null_learning_rate: 0.00020
+    # v31 adds a trainable artist-null parameter group, so the v29 model state
+    # is reused but its old optimizer topology cannot be loaded.
+    resume_optimizer: false
+    reset_artist_null_context_on_upgrade: true
     betas: [0.9, 0.95]
     adam_eps: 0.00000001
     weight_decay: 0.01
@@ -4054,15 +4063,15 @@ detail_preserving_style_cross_attention:
     reader_max_grad_norm: 1.0
     adapter_max_grad_norm: 1.0
     # Phase A trains only the direct Common K/V bank. Phase B freezes it and
-    # trains the Reader plus Artist K/V. No Artist-mean correction is allowed:
-    # Common must satisfy its own target before Artist receives gradients.
+    # trains the Reader plus Artist K/V. The combined mean target now supplies
+    # the otherwise missing radial gradient for the artist-null baseline.
     separated_component_bootstrap:
       enabled: true
       common_steps: 500
       artist_steps: 1500
       common_objective_weight: 1.0
       artist_objective_weight: 1.0
-      artist_mean_weight: 0.0
+      artist_mean_weight: 0.50
       common_transition:
         enabled: true
         minimum_steps: 500
@@ -4392,8 +4401,8 @@ detail_preserving_style_cross_attention:
     wandb:
       enabled: true
       project: anima-style-adapter
-      name: detail-style-v30-reference-curriculum
-      id: detail-style-v30-reference-curriculum
+      name: detail-style-v31-artist-null-residual
+      id: detail-style-v31-artist-null-residual
   gradient_diagnostics:
     checkpoint_step: 1500
     teacher_batch_step: 1500
