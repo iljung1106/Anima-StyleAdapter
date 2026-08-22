@@ -4052,9 +4052,10 @@ detail_preserving_style_cross_attention:
     block_delta_learning_rate: 0.00020
     base_mix_learning_rate: 0.00004
     artist_null_learning_rate: 0.00020
-    # This is a weight bootstrap, not an optimizer continuation. Restart Adam
-    # moments and warmup for the human functional fine-tune.
-    resume_optimizer: false
+    # v35 is a loss-only continuation from the v34 step-500 state. Preserve
+    # Adam moments as well as model/data position so the comparison isolates
+    # the adjusted functional loss balance.
+    resume_optimizer: true
     reset_artist_null_context_on_upgrade: true
     betas: [0.9, 0.95]
     adam_eps: 0.00000001
