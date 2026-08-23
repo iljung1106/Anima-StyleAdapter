@@ -15,9 +15,19 @@ from anima_style_data.kv_mixture_analysis import (
     _knn_coefficients,
 )
 from anima_style_data.kv_generalizing_modulator import (
+    _stratified_view_indices,
     build_mixed_activation_batch,
 )
 from anima_style_data.few_shot_kv_adapter import FewShotNativeKVStyleAdapter
+
+
+def test_generalizing_validation_samples_every_reference_count():
+    counts = torch.tensor([1, 1, 1, 1, 2, 2, 4], dtype=torch.float32)
+
+    selected = _stratified_view_indices(counts, views_per_count=2)
+
+    assert selected.tolist() == [0, 3, 4, 5, 6]
+    assert counts[selected].tolist() == [1.0, 1.0, 2.0, 2.0, 4.0]
 
 
 def test_apply_kv_factors_matches_explicit_low_rank_linears():

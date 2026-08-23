@@ -117,6 +117,25 @@ def _teacher_image_split(
     return train_ids, validation_ids
 
 
+def _stratified_view_indices(
+    reference_counts: torch.Tensor,
+    views_per_count: int,
+) -> torch.Tensor:
+    if reference_counts.ndim != 1 or views_per_count <= 0:
+        raise ValueError("Reference counts must be 1-D and views positive")
+    selected = []
+    for count in reference_counts.unique(sorted=True):
+        candidates = torch.nonzero(reference_counts == count).flatten()
+        positions = torch.linspace(
+            0,
+            len(candidates) - 1,
+            min(views_per_count, len(candidates)),
+            device=reference_counts.device,
+        ).round().long().unique()
+        selected.append(candidates[positions])
+    return torch.cat(selected)
+
+
 def build_mixed_activation_batch(
     sampled_contexts: torch.Tensor,
     predicted_down: torch.Tensor,
@@ -193,10 +212,7 @@ def _validate(
 ) -> dict[str, float]:
     model.eval()
     rows: dict[str, list[float]] = defaultdict(list)
-    view_indices = torch.linspace(
-        0, code_bank.shape[1] - 1, min(views, code_bank.shape[1]),
-        device=code_bank.device,
-    ).round().long().unique()
+    view_indices = _stratified_view_indices(reference_counts, views)
     token_indices = torch.linspace(
         0, contexts.shape[1] - 1, min(tokens, contexts.shape[1]),
         device=contexts.device,
@@ -208,6 +224,7 @@ def _validate(
     ).round().long().unique()
     sampled_contexts = contexts[:, token_indices]
     for view in view_indices.tolist():
+        reference_count = int(reference_counts[view].item())
         codes = code_bank[artist_indices, view]
         for block in range(model.blocks):
             with torch.autocast("cuda", dtype=torch.bfloat16):
@@ -244,18 +261,34 @@ def _validate(
                 )
                 for key, value in raw_metrics.items():
                     rows[f"raw_{key}"].append(float(value))
+                    rows[f"{reference_count}ref_raw_{key}"].append(float(value))
                 for key, value in centered_metrics.items():
                     rows[f"centered_{key}"].append(float(value))
+                    rows[f"{reference_count}ref_centered_{key}"].append(
+                        float(value)
+                    )
                 student_common = student.float().mean(dim=0)
                 teacher_common = teacher.float().mean(dim=0)
-                rows["student_common_to_centered_ratio"].append(float(
+                student_common_ratio = float(
                     student_common.square().mean().sqrt()
                     / student_centered.square().mean().sqrt().clamp_min(1e-8)
-                ))
-                rows["teacher_common_to_centered_ratio"].append(float(
+                )
+                teacher_common_ratio = float(
                     teacher_common.square().mean().sqrt()
                     / teacher_centered.square().mean().sqrt().clamp_min(1e-8)
-                ))
+                )
+                rows["student_common_to_centered_ratio"].append(
+                    student_common_ratio
+                )
+                rows["teacher_common_to_centered_ratio"].append(
+                    teacher_common_ratio
+                )
+                rows[
+                    f"{reference_count}ref_student_common_to_centered_ratio"
+                ].append(student_common_ratio)
+                rows[
+                    f"{reference_count}ref_teacher_common_to_centered_ratio"
+                ].append(teacher_common_ratio)
                 rows["student_raw_rms"].append(float(
                     student.float().square().mean().sqrt()
                 ))
