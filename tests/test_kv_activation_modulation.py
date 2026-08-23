@@ -17,6 +17,7 @@ from anima_style_data.kv_mixture_analysis import (
 from anima_style_data.kv_generalizing_modulator import (
     build_mixed_activation_batch,
 )
+from anima_style_data.few_shot_kv_adapter import FewShotNativeKVStyleAdapter
 
 
 def test_apply_kv_factors_matches_explicit_low_rank_linears():
@@ -303,3 +304,46 @@ def test_generalizing_batch_builds_exact_weighted_teacher_activation():
                 torch.einsum("g,gkno->kno", weights[artist], group_rows)
             )
     torch.testing.assert_close(target, torch.stack(expected_rows))
+
+
+class _DummyReader(torch.nn.Module):
+    def __init__(self, style_dim: int):
+        super().__init__()
+        self.scale = torch.nn.Parameter(torch.ones(style_dim))
+
+    def forward(self, tokens, mask):
+        del mask
+        return type("ReaderOutput", (), {"tokens": tokens * self.scale})()
+
+
+def test_few_shot_adapter_activates_and_rescales_native_kv_hook():
+    torch.manual_seed(41)
+    anima = _DummyAnima(blocks=2, context_dim=6, output_dim=8)
+    reader = _DummyReader(style_dim=12)
+    modulator = NativeKVFactorModulator(
+        style_dim=12,
+        blocks=2,
+        rank=2,
+        context_dim=6,
+        output_dim=8,
+        hidden_dim=16,
+        heads=4,
+        layers=1,
+        ff_dim=32,
+    )
+    adapter = FewShotNativeKVStyleAdapter(
+        reader=reader, modulator=modulator, anima=anima
+    )
+    context = torch.randn(1, 5, 6)
+    baseline = anima.blocks[0].cross_attn.kv_proj(context)
+
+    codes = adapter.set_references(torch.randn(1, 4, 12), strength=0.5)
+    styled_half = anima.blocks[0].cross_attn.kv_proj(context)
+    adapter.set_strength(1.0)
+    styled_full = anima.blocks[0].cross_attn.kv_proj(context)
+
+    assert codes.shape == (1, 4, 12)
+    torch.testing.assert_close(styled_full - baseline, 2 * (styled_half - baseline))
+    adapter.disable()
+    torch.testing.assert_close(anima.blocks[0].cross_attn.kv_proj(context), baseline)
+    adapter.close()

@@ -56,6 +56,13 @@ def _save_state(
         "model": {
             key: value.detach().cpu() for key, value in model.state_dict().items()
         },
+        "architecture": {
+            "style_dim": int(model.style_norm.normalized_shape[0]),
+            "blocks": int(model.blocks),
+            "rank": int(model.rank),
+            "context_dim": int(model.context_dim),
+            "output_dim": int(model.output_dim),
+        },
         "optimizer": optimizer.state_dict(),
         "config": cfg,
         "train_indices": train_indices,
