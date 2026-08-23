@@ -69,6 +69,69 @@ _ORACLE_STRENGTH_STATE_KEYS = frozenset(
 )
 
 
+def _oracle_detail_config(
+    config: dict[str, Any], oracle_cfg: dict[str, Any]
+) -> dict[str, Any]:
+    """Build the connector config, allowing an oracle-only adapter ablation."""
+
+    detail = copy.deepcopy(config["detail_preserving_style_cross_attention"])
+    override = oracle_cfg.get("adapter_override")
+    if override is not None:
+        if not isinstance(override, dict):
+            raise TypeError("lora_oracle_bootstrap.adapter_override must be a mapping")
+        detail["adapter"].update(copy.deepcopy(override))
+    return detail
+
+
+def _weighted_timestep_index(
+    *, step: int, seed: int, count: int, weights: list[float] | None
+) -> int:
+    """Choose a reproducible timestep without coupling it to content order."""
+
+    if count <= 0:
+        raise ValueError("Timestep count must be positive")
+    if weights is None:
+        return ((step - 1) // 12) % count
+    if len(weights) != count or any(float(value) <= 0 for value in weights):
+        raise ValueError("timestep_sampling_weights must be positive per timestep")
+    rng = random.Random(int(seed) ^ (int(step) * 0x9E3779B1))
+    return int(rng.choices(range(count), weights=weights, k=1)[0])
+
+
+def _timestep_objective_weights(
+    base: dict[str, float],
+    *,
+    timestep_index: int,
+    direction_multipliers: list[float] | None,
+    common_multipliers: list[float] | None,
+) -> dict[str, float]:
+    """Emphasize hard-timestep direction learning without amplifying output."""
+
+    result = dict(base)
+    if direction_multipliers is not None:
+        if (
+            timestep_index < 0
+            or timestep_index >= len(direction_multipliers)
+            or any(float(value) <= 0 for value in direction_multipliers)
+        ):
+            raise ValueError("Invalid timestep_direction_multipliers")
+        multiplier = float(direction_multipliers[timestep_index])
+        for key in ("full_direction", "low_direction", "global_direction", "infonce"):
+            if key in result:
+                result[key] = float(result[key]) * multiplier
+    if common_multipliers is not None:
+        if (
+            timestep_index < 0
+            or timestep_index >= len(common_multipliers)
+            or any(float(value) <= 0 for value in common_multipliers)
+        ):
+            raise ValueError("Invalid timestep_common_multipliers")
+        result["zero_mean"] = float(result.get("zero_mean", 0.10)) * float(
+            common_multipliers[timestep_index]
+        )
+    return result
+
+
 def _oracle_adapter_initial_state(
     fresh_state: dict[str, torch.Tensor],
     checkpoint_state: dict[str, torch.Tensor],
@@ -454,7 +517,7 @@ def train_lora_oracle_bootstrap(
 
     anima = _resolve_anima_model(config, destination, device).requires_grad_(False).eval()
     _optimize_frozen_anima(anima, low_precision_rmsnorm=True, fuse_attention_projections=True)
-    detail_cfg = copy.deepcopy(config["detail_preserving_style_cross_attention"])
+    detail_cfg = _oracle_detail_config(config, cfg)
     reader = DetailPreservingTypedSlotReader(**dict(detail_cfg["model"])).to(device)
     adapter = _build_style_adapter(detail_cfg).to(device)
     if not isinstance(adapter, SeparatedCommonArtistKVStyleCrossAttention):
@@ -568,6 +631,11 @@ def train_lora_oracle_bootstrap(
             "name": "artist_null",
             "weight_decay": 0.0,
         })
+    groups = [
+        group
+        for group in groups
+        if group["params"] and float(group["lr"]) > 0.0
+    ]
     optimizer = torch.optim.AdamW(
         groups,
         betas=tuple(training.get("betas", [0.9, 0.95])),
@@ -614,6 +682,25 @@ def train_lora_oracle_bootstrap(
     sample_every = int(training.get("sample_every", 500))
     max_grad_norm = float(training.get("max_grad_norm", 1.0))
     anchor_weight = float(training.get("oracle_anchor_weight", 0.01))
+    timestep_count = int(bank.base["timesteps"].shape[0])
+    timestep_sampling_weights = training.get("timestep_sampling_weights")
+    if timestep_sampling_weights is not None:
+        timestep_sampling_weights = [
+            float(value) for value in timestep_sampling_weights
+        ]
+    timestep_direction_multipliers = training.get(
+        "timestep_direction_multipliers"
+    )
+    if timestep_direction_multipliers is not None:
+        timestep_direction_multipliers = [
+            float(value) for value in timestep_direction_multipliers
+        ]
+    timestep_common_multipliers = training.get("timestep_common_multipliers")
+    if timestep_common_multipliers is not None:
+        timestep_common_multipliers = [
+            float(value) for value in timestep_common_multipliers
+        ]
+    groupwise_grad_clip = bool(training.get("groupwise_grad_clip", False))
     running: dict[str, list[float]] = defaultdict(list)
     started = time.perf_counter()
     try:
@@ -625,9 +712,12 @@ def train_lora_oracle_bootstrap(
             rng = random.Random(seed + step * 1_000_003)
             positions = rng.sample(range(len(single_ids)), batch_rows)
             teacher_indices = [single_ids[index] for index in positions]
-            content_index = step % int(bank.base["noisy_inputs"].shape[0])
-            timestep_index = (step // int(bank.base["noisy_inputs"].shape[0])) % int(
-                bank.base["noisy_inputs"].shape[1]
+            content_index = (step - 1) % int(bank.base["noisy_inputs"].shape[0])
+            timestep_index = _weighted_timestep_index(
+                step=step,
+                seed=seed,
+                count=timestep_count,
+                weights=timestep_sampling_weights,
             )
             noisy = bank.base["noisy_inputs"][content_index, timestep_index].to(
                 device=device, dtype=torch.bfloat16, non_blocking=True
@@ -648,28 +738,50 @@ def train_lora_oracle_bootstrap(
             student = _controlled_style_context_forward(
                 anima, adapter, codes, noisy, base, context, timestep, device
             )
+            objective_weights = _timestep_objective_weights(
+                dict(training.get("loss_weights", {})),
+                timestep_index=timestep_index,
+                direction_multipliers=timestep_direction_multipliers,
+                common_multipliers=timestep_common_multipliers,
+            )
             loss, metrics = _artist_centered_oracle_objective(
-                student, teacher, dict(training.get("loss_weights", {}))
+                student, teacher, objective_weights
             )
             anchor_loss = F.smooth_l1_loss(
                 codes.float(), oracle_anchor[positions].float(), beta=0.10
             )
             total = loss + anchor_weight * anchor_loss
             total.backward()
-            parameters = [
-                parameter
-                for group in optimizer.param_groups
-                for parameter in group["params"]
-            ]
-            grad_norm = torch.nn.utils.clip_grad_norm_(
-                parameters, max_grad_norm, foreach=True
-            )
+            if groupwise_grad_clip:
+                group_grad_norms = {
+                    str(group["name"]): torch.nn.utils.clip_grad_norm_(
+                        group["params"], max_grad_norm, foreach=True
+                    )
+                    for group in optimizer.param_groups
+                }
+                grad_norm = torch.stack(
+                    [value.float().square() for value in group_grad_norms.values()]
+                ).sum().sqrt()
+            else:
+                parameters = [
+                    parameter
+                    for group in optimizer.param_groups
+                    for parameter in group["params"]
+                ]
+                grad_norm = torch.nn.utils.clip_grad_norm_(
+                    parameters, max_grad_norm, foreach=True
+                )
+                group_grad_norms = {}
             optimizer.step()
             metrics.update({
                 "oracle_anchor_loss": anchor_loss.detach(),
                 "oracle_anchor_weighted_loss": (anchor_weight * anchor_loss).detach(),
                 "oracle_code_rms": oracle_codes.detach().square().mean().sqrt(),
                 "timestep": timestep.detach().float(),
+                **{
+                    f"grad_norm_{name}": value.detach()
+                    for name, value in group_grad_norms.items()
+                },
             })
             for key, value in metrics.items():
                 running[key].append(float(value.detach()))
@@ -771,7 +883,7 @@ def sample_lora_oracle_checkpoint(
 
     anima = _resolve_anima_model(config, destination, device).requires_grad_(False).eval()
     _optimize_frozen_anima(anima, low_precision_rmsnorm=True, fuse_attention_projections=True)
-    detail_cfg = copy.deepcopy(config["detail_preserving_style_cross_attention"])
+    detail_cfg = _oracle_detail_config(config, cfg)
     adapter = _build_style_adapter(detail_cfg).to(device)
     if not isinstance(adapter, SeparatedCommonArtistKVStyleCrossAttention):
         raise TypeError("LoRA oracle sampling requires the separated adapter")
@@ -981,7 +1093,7 @@ def train_lora_oracle_visual_bridge(
 
     anima = _resolve_anima_model(config, destination, device).requires_grad_(False).eval()
     _optimize_frozen_anima(anima, low_precision_rmsnorm=True, fuse_attention_projections=True)
-    detail_cfg = copy.deepcopy(config["detail_preserving_style_cross_attention"])
+    detail_cfg = _oracle_detail_config(config, cfg)
     reader = DetailPreservingTypedSlotReader(**dict(detail_cfg["model"])).to(device)
     adapter = _build_style_adapter(detail_cfg).to(device)
     if not isinstance(adapter, SeparatedCommonArtistKVStyleCrossAttention):
@@ -1396,7 +1508,7 @@ def train_lora_oracle_visual_projector(
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.set_float32_matmul_precision("high")
 
-    detail_cfg = copy.deepcopy(config["detail_preserving_style_cross_attention"])
+    detail_cfg = _oracle_detail_config(config, cfg)
     reader = DetailPreservingTypedSlotReader(**dict(detail_cfg["model"])).to(device)
     source = torch.load(
         destination / str(cfg["source_checkpoint"]),
@@ -1624,7 +1736,7 @@ def train_lora_oracle_functional_projector(
 
     anima = _resolve_anima_model(config, destination, device).requires_grad_(False).eval()
     _optimize_frozen_anima(anima, low_precision_rmsnorm=True, fuse_attention_projections=True)
-    detail_cfg = copy.deepcopy(config["detail_preserving_style_cross_attention"])
+    detail_cfg = _oracle_detail_config(config, cfg)
     reader = DetailPreservingTypedSlotReader(**dict(detail_cfg["model"])).to(device)
     adapter = _build_style_adapter(detail_cfg).to(device)
     if not isinstance(adapter, SeparatedCommonArtistKVStyleCrossAttention):
@@ -2181,7 +2293,7 @@ def train_lora_oracle_joint_manifold(
 
     anima = _resolve_anima_model(config, destination, device).requires_grad_(False).eval()
     _optimize_frozen_anima(anima, low_precision_rmsnorm=True, fuse_attention_projections=True)
-    detail_cfg = copy.deepcopy(config["detail_preserving_style_cross_attention"])
+    detail_cfg = _oracle_detail_config(config, cfg)
     reader = DetailPreservingTypedSlotReader(**dict(detail_cfg["model"])).to(device)
     adapter = _build_style_adapter(detail_cfg).to(device)
     if not isinstance(adapter, SeparatedCommonArtistKVStyleCrossAttention):

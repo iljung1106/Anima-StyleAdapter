@@ -12,10 +12,50 @@ from anima_style_data.lora_oracle_bootstrap import (
     _materialize_reader_code_bank,
     _oracle_adapter_initial_state,
     _sample_diverse_functional_batch,
+    _timestep_objective_weights,
+    _weighted_timestep_index,
     _piecewise_linear_value,
     OracleVisualProjector,
     _ProjectedReader,
 )
+
+
+def test_weighted_timestep_sampling_emphasizes_hard_bins_reproducibly():
+    weights = [2.0, 2.0, 1.0, 1.0]
+    first = [
+        _weighted_timestep_index(step=step, seed=17, count=4, weights=weights)
+        for step in range(1, 4001)
+    ]
+    second = [
+        _weighted_timestep_index(step=step, seed=17, count=4, weights=weights)
+        for step in range(1, 4001)
+    ]
+
+    assert first == second
+    assert first.count(0) > 1.7 * first.count(2)
+    assert first.count(1) > 1.7 * first.count(3)
+
+
+def test_timestep_multiplier_changes_direction_not_magnitude():
+    base = {
+        "low_direction": 2.0,
+        "global_direction": 1.5,
+        "infonce": 0.75,
+        "low_magnitude": 0.10,
+        "zero_mean": 1.0,
+    }
+    result = _timestep_objective_weights(
+        base,
+        timestep_index=0,
+        direction_multipliers=[1.75, 1.0],
+        common_multipliers=[1.5, 1.0],
+    )
+
+    assert result["low_direction"] == 3.5
+    assert result["global_direction"] == 2.625
+    assert result["infonce"] == 1.3125
+    assert result["low_magnitude"] == 0.10
+    assert result["zero_mean"] == 1.5
 
 
 def test_cross_view_artist_objective_recognizes_matching_artists():

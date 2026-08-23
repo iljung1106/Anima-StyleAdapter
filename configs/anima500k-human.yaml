@@ -453,16 +453,29 @@ lora_functional_distillation_v2:
 # frozen.  This first proves and learns the effect subspace available to the
 # actual artist-only style cross-attention; the Reader is distilled afterward.
 lora_oracle_bootstrap:
-  output_directory: lora_oracle_bootstrap_v4_256_broad12x6_clean
+  output_directory: lora_oracle_bootstrap_v5_256_independent_kv_hard_timestep
   seed: 20260823
   initial_checkpoint: detail_preserving_style_cross_attention_v34_anti_common_functional/checkpoints/step-0000500.pt
   adapter_initialization: fresh_kv_checkpoint_strength
+  # Representability ablation: each Anima block owns a genuinely independent
+  # full-rank Xavier K/V base.  A unique near-one-hot assignment replaces the
+  # four shared directions; low-rank deltas and base mixing are frozen so the
+  # result tests the full per-block connector rather than another shared basis.
+  adapter_override:
+    shared_bases: 28
+    medoid_blocks: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13,
+                    14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27]
+    block_to_base: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13,
+                    14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27]
+    mix_logit_scale: 32.0
+    delta_k_init_scale: 0.0001
+    delta_v_init_scale: 0.0001
   teacher_cache: lora_functional_teacher_bank_rank16_256_v3_broad12x6
   human_reference_cache: dual_query_reference_tokens_v8_step10000
   synthetic_reference_cache: lora_teacher_references_rank16_256x8_v2/dual_query_reference_tokens_v8_step10000
   training:
     device: cuda
-    steps: 4000
+    steps: 3000
     # 128x96 Qwen latents use ~79.1 GB at batch 8. Batch 6 preserves a useful
     # six-artist centered/InfoNCE set while leaving H100 activation headroom.
     batch_rows: 6
@@ -470,8 +483,8 @@ lora_oracle_bootstrap:
     initialization_batch_size: 8
     oracle_learning_rate: 0.00050
     shared_learning_rate: 0.00010
-    delta_learning_rate: 0.00020
-    mix_learning_rate: 0.00005
+    delta_learning_rate: 0.0
+    mix_learning_rate: 0.0
     null_learning_rate: 0.00050
     oracle_anchor_weight: 0.01
     warmup_steps: 100
@@ -479,23 +492,30 @@ lora_oracle_bootstrap:
     adam_eps: 0.00000001
     weight_decay: 0.01
     max_grad_norm: 1.0
+    groupwise_grad_clip: true
     fused_adamw: true
     token_lru_shards: 8
+    # Low-timestep detail stages are the measured bottleneck.  Increase their
+    # exposure and direction supervision, but do not amplify style alpha while
+    # those residuals are still mostly orthogonal to the LoRA teacher.
+    timestep_sampling_weights: [2.0, 2.0, 1.5, 1.5, 1.5, 1.5]
+    timestep_direction_multipliers: [1.75, 1.50, 1.25, 1.00, 1.00, 1.00]
+    timestep_common_multipliers: [1.50, 1.35, 1.15, 1.00, 1.00, 1.00]
     loss_weights:
       # Full-resolution LoRA velocity effects are dominated by content/noise.
       # Keep them as weak detail supervision and optimize the repeatable
       # low-frequency artist effect as the primary oracle target.
-      full_huber: 0.10
-      full_direction: 0.10
-      full_magnitude: 0.05
+      full_huber: 0.00
+      full_direction: 0.00
+      full_magnitude: 0.00
       low_frequency_factors: [8, 16]
       low_huber: 1.00
-      low_direction: 1.50
-      low_magnitude: 0.25
+      low_direction: 2.00
+      low_magnitude: 0.10
       global_huber: 0.50
-      global_direction: 1.00
-      global_magnitude: 0.10
-      infonce: 0.50
+      global_direction: 1.50
+      global_magnitude: 0.05
+      infonce: 0.75
       infonce_temperature: 0.10
       zero_mean: 1.00
     log_every: 10
@@ -505,8 +525,8 @@ lora_oracle_bootstrap:
     wandb:
       enabled: true
       project: anima-style-adapter
-      name: lora-oracle-bootstrap-v4-256-broad12x6-clean
-      id: lora-oracle-bootstrap-v4-256-broad12x6-clean
+      name: lora-oracle-bootstrap-v5-256-independent-kv-hard-timestep
+      id: lora-oracle-bootstrap-v5-256-independent-kv-hard-timestep
   visual_bridge:
     output_directory: lora_oracle_projected_bridge_v2_plateau
     source_checkpoint: lora_oracle_bootstrap_v1/training_state.pt
@@ -549,8 +569,8 @@ lora_oracle_bootstrap:
       name: lora-oracle-projected-bridge-v2-plateau
       id: lora-oracle-projected-bridge-v2-plateau
   visual_projector:
-    output_directory: lora_oracle_visual_projector_v6_256_broad12x6_clean
-    source_checkpoint: lora_oracle_bootstrap_v4_256_broad12x6_clean/training_state.pt
+    output_directory: lora_oracle_visual_projector_v7_256_independent_kv
+    source_checkpoint: lora_oracle_bootstrap_v5_256_independent_kv_hard_timestep/training_state.pt
     steps: 1500
     batch_rows: 64
     token_lru_shards: 512
@@ -629,8 +649,8 @@ lora_oracle_bootstrap:
       name: lora-oracle-functional-projector-v2-native-pretrain
       id: lora-oracle-functional-projector-v2-native-pretrain
   joint_manifold:
-    output_directory: lora_oracle_joint_manifold_v4_256_broad12x6_clean
-    source_checkpoint: lora_oracle_bootstrap_v4_256_broad12x6_clean/training_state.pt
+    output_directory: lora_oracle_joint_manifold_v5_256_independent_kv
+    source_checkpoint: lora_oracle_bootstrap_v5_256_independent_kv_hard_timestep/training_state.pt
     projector_checkpoint: lora_oracle_visual_projector_v6_256_broad12x6_clean/training_state.pt
     steps: 2000
     cpu_threads: 16
