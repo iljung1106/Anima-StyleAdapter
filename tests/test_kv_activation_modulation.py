@@ -361,3 +361,25 @@ def test_few_shot_adapter_activates_and_rescales_native_kv_hook():
     adapter.disable()
     torch.testing.assert_close(anima.blocks[0].cross_attn.kv_proj(context), baseline)
     adapter.close()
+
+
+def test_native_kv_injector_repeats_style_rows_in_cfg_branch_order():
+    torch.manual_seed(43)
+    anima = _DummyAnima(blocks=1, context_dim=6, output_dim=8)
+    injector = NativeKVFactorInjector(anima)
+    down = torch.randn(2, 1, 2, 2, 6)
+    up = torch.randn(2, 1, 2, 8, 2)
+    # _sample_anima_batch concatenates all negative rows followed by all
+    # positive rows, so both CFG branches must see the same [A, B] order.
+    context = torch.randn(4, 5, 6)
+    baseline = anima.blocks[0].cross_attn.kv_proj(context)
+
+    injector.set_factors(down, up)
+    actual = anima.blocks[0].cross_attn.kv_proj(context)
+
+    repeated_down = torch.cat((down[:, 0], down[:, 0]), dim=0)
+    repeated_up = torch.cat((up[:, 0], up[:, 0]), dim=0)
+    delta = apply_kv_factors(context, repeated_down, repeated_up)
+    expected = baseline + torch.cat((delta[:, 0], delta[:, 1]), dim=-1)
+    torch.testing.assert_close(actual, expected)
+    injector.close()
