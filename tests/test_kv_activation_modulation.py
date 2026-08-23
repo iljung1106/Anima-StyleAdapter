@@ -10,6 +10,10 @@ from anima_style_data.kv_activation_modulation import (
     kv_factor_objective,
 )
 from anima_style_data.kv_activation_sampling import NativeKVFactorInjector
+from anima_style_data.kv_mixture_analysis import (
+    _activation_from_coefficients,
+    _knn_coefficients,
+)
 
 
 def test_apply_kv_factors_matches_explicit_low_rank_linears():
@@ -214,3 +218,22 @@ def test_native_kv_factor_injector_matches_exact_low_rank_delta_with_cfg_rows():
         anima.blocks[1].cross_attn.kv_proj(context), native
     )
     injector.close()
+
+
+def test_convex_activation_mixture_uses_visual_neighbor_weights():
+    train_codes = torch.tensor([[1.0, 0.0], [0.0, 1.0], [-1.0, 0.0]])
+    query = torch.tensor([[0.9, 0.1]])
+    weights = _knn_coefficients(
+        train_codes, query, neighbors=2, temperature=0.05
+    )
+    activations = torch.arange(3 * 2 * 1 * 1).reshape(3, 2, 1, 1).float()
+    mixed = _activation_from_coefficients(
+        activations, weights, affine_centered=False
+    )
+
+    torch.testing.assert_close(weights.sum(dim=-1), torch.ones(1))
+    assert torch.count_nonzero(weights) == 2
+    torch.testing.assert_close(
+        mixed,
+        torch.einsum("va,akno->vkno", weights, activations),
+    )

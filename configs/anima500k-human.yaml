@@ -661,6 +661,28 @@ kv_activation_visual_projector:
       name: kv-activation-visual-projector-v1-48train-16heldout
       id: kv-activation-visual-projector-v1-48train-16heldout
 
+# Decide whether multi-artist LoRA mixtures provide genuine unseen-artist
+# supervision.  Visual kNN/ridge coefficients are compared with an oracle
+# activation-span upper bound on separate text contexts.  Only gauge-invariant
+# native text K/V activations are mixed; rank-factor coordinates are not.
+kv_activation_mixture_analysis:
+  output_directory: kv_activation_mixture_generalization_v1_48train_16heldout
+  modulator_checkpoint: kv_activation_modulator_v4_64_block_specific_200m/checkpoints/step-0005000.pt
+  device: cuda
+  seed: 20260824
+  validation_artists: 16
+  materialized_reference_images: 8
+  materialization_artist_chunk: 16
+  token_lru_shards: 8
+  contexts: 4
+  token_stride: 8
+  output_stride: 8
+  mixture_neighbors: [2, 4, 8]
+  knn_temperature: 0.1
+  visual_ridge: 0.05
+  oracle_ridge: 0.01
+  canonicalization_chunk_size: 64
+
 # Offline functional teacher and clean continuation runner. Teacher updates
 # cycle @artist : individual LoRA : mixed LoRA at 1:1:1 after an individual
 # LoRA bootstrap. LoRA steps alternate human and LoRA-generated references.

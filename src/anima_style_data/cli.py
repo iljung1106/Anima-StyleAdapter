@@ -99,6 +99,7 @@ def build_parser() -> argparse.ArgumentParser:
         ("kv-activation-reference-eval", "Evaluate fresh Human and Synthetic reference codes"),
         ("kv-activation-visual-projector-smoke", "Smoke-test fresh-reference projection into K/V anchor space"),
         ("kv-activation-visual-projector-train", "Train fresh-reference projection into frozen K/V modulation"),
+        ("kv-activation-mixture-analyze", "Measure held-out signal in multi-artist K/V mixtures"),
         ("lora-functional-distill-smoke", "Smoke-test LoRA functional distillation"),
         ("lora-functional-distill-train", "Distill artist-tag, LoRA and mixed-LoRA teachers"),
         ("lora-functional-distill-v2-smoke", "Smoke-test artist-centered LoRA distillation"),
@@ -545,6 +546,7 @@ def main() -> None:
         "kv-activation-reference-eval",
         "kv-activation-visual-projector-smoke",
         "kv-activation-visual-projector-train",
+        "kv-activation-mixture-analyze",
     }:
         from .kv_activation_modulation import (
             smoke_test_kv_activation_modulator,
@@ -558,6 +560,7 @@ def main() -> None:
             smoke_test_kv_activation_visual_projector,
             train_kv_activation_visual_projector,
         )
+        from .kv_mixture_analysis import analyze_kv_lora_mixture_generalization
 
         stage = {
             "kv-activation-modulator-smoke": smoke_test_kv_activation_modulator,
@@ -566,6 +569,7 @@ def main() -> None:
             "kv-activation-reference-eval": evaluate_kv_activation_reference_generalization,
             "kv-activation-visual-projector-smoke": smoke_test_kv_activation_visual_projector,
             "kv-activation-visual-projector-train": train_kv_activation_visual_projector,
+            "kv-activation-mixture-analyze": analyze_kv_lora_mixture_generalization,
         }[args.command]
         _run(stage, config, destination)
     elif args.command in {
