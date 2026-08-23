@@ -123,14 +123,38 @@ def _validate(
                     teacher_down[artist_indices, block],
                     teacher_up[artist_indices, block][:, :, output_indices],
                 )
-                _, metrics = kv_activation_objective(
+                _, raw_metrics = kv_activation_objective(
                     student,
                     teacher,
                     direction_weight=direction_weight,
                     magnitude_weight=magnitude_weight,
                 )
-                for key, value in metrics.items():
-                    rows[key].append(float(value))
+                student_centered = student.float() - student.float().mean(
+                    dim=0, keepdim=True
+                )
+                teacher_centered = teacher.float() - teacher.float().mean(
+                    dim=0, keepdim=True
+                )
+                _, centered_metrics = kv_activation_objective(
+                    student_centered,
+                    teacher_centered,
+                    direction_weight=direction_weight,
+                    magnitude_weight=magnitude_weight,
+                )
+                for key, value in raw_metrics.items():
+                    rows[f"raw_{key}"].append(float(value))
+                for key, value in centered_metrics.items():
+                    rows[f"centered_{key}"].append(float(value))
+                student_common = student.float().mean(dim=0)
+                teacher_common = teacher.float().mean(dim=0)
+                rows["student_common_to_centered_ratio"].append(float(
+                    student_common.square().mean().sqrt()
+                    / student_centered.square().mean().sqrt().clamp_min(1e-8)
+                ))
+                rows["teacher_common_to_centered_ratio"].append(float(
+                    teacher_common.square().mean().sqrt()
+                    / teacher_centered.square().mean().sqrt().clamp_min(1e-8)
+                ))
     model.train()
     result = {key: sum(values) / len(values) for key, values in rows.items()}
     result["mean_references"] = float(reference_counts[view_indices].float().mean())
@@ -278,6 +302,10 @@ def train_generalizing_kv_activation_modulator(
     channels_per_step = int(training.get("output_channels_per_step", 256))
     direction_weight = float(training.get("direction_weight", 1.0))
     magnitude_weight = float(training.get("magnitude_weight", 0.2))
+    raw_function_weight = float(training.get("raw_function_weight", 0.25))
+    centered_function_weight = float(
+        training.get("centered_function_weight", 1.0)
+    )
     base_lr = float(training.get("learning_rate", 3e-4))
     warmup = int(training.get("warmup_steps", 100))
     max_grad_norm = float(training.get("max_grad_norm", 2.0))
@@ -405,11 +433,33 @@ def train_generalizing_kv_activation_modulator(
                 target = (
                     teacher * mixture_weights[:, None, :, None, None, None]
                 ).sum(dim=2).reshape_as(student)
-            loss, metrics = kv_activation_objective(
+            raw_loss, raw_metrics = kv_activation_objective(
                 student,
                 target,
                 direction_weight=direction_weight,
                 magnitude_weight=magnitude_weight,
+            )
+            student_by_artist = student.reshape(
+                batch_artists, contexts_per_step, *student.shape[1:]
+            ).float()
+            target_by_artist = target.reshape(
+                batch_artists, contexts_per_step, *target.shape[1:]
+            ).float()
+            student_centered = student_by_artist - student_by_artist.mean(
+                dim=0, keepdim=True
+            )
+            target_centered = target_by_artist - target_by_artist.mean(
+                dim=0, keepdim=True
+            )
+            centered_loss, centered_metrics = kv_activation_objective(
+                student_centered.flatten(0, 1),
+                target_centered.flatten(0, 1),
+                direction_weight=direction_weight,
+                magnitude_weight=magnitude_weight,
+            )
+            loss = (
+                raw_function_weight * raw_loss
+                + centered_function_weight * centered_loss
             )
             loss.backward()
             grad_norm = torch.nn.utils.clip_grad_norm_(
@@ -417,7 +467,22 @@ def train_generalizing_kv_activation_modulator(
             )
             optimizer.step()
             row_metrics = {
-                **metrics,
+                "loss": loss.detach(),
+                "raw_loss": raw_loss.detach(),
+                "centered_loss": centered_loss.detach(),
+                **{f"raw_{key}": value for key, value in raw_metrics.items()},
+                **{
+                    f"centered_{key}": value
+                    for key, value in centered_metrics.items()
+                },
+                "student_common_to_centered_ratio": (
+                    student_by_artist.mean(dim=0).square().mean().sqrt()
+                    / student_centered.square().mean().sqrt().clamp_min(1e-8)
+                ).detach(),
+                "target_common_to_centered_ratio": (
+                    target_by_artist.mean(dim=0).square().mean().sqrt()
+                    / target_centered.square().mean().sqrt().clamp_min(1e-8)
+                ).detach(),
                 "grad_norm": grad_norm.detach(),
                 "learning_rate": torch.tensor(learning_rate),
                 "mixture": torch.tensor(float(is_mixture)),
@@ -520,4 +585,3 @@ def smoke_test_generalizing_kv_activation_modulator(
     return train_generalizing_kv_activation_modulator(
         effective, destination, steps_override=2
     )
-

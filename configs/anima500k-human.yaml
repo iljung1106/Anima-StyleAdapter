@@ -730,6 +730,8 @@ kv_activation_generalizing_modulator:
     max_grad_norm: 2.0
     direction_weight: 1.0
     magnitude_weight: 0.2
+    raw_function_weight: 0.25
+    centered_function_weight: 1.0
     fused_adamw: true
     log_every: 10
     validation_every: 250
