@@ -14,6 +14,9 @@ from anima_style_data.kv_mixture_analysis import (
     _activation_from_coefficients,
     _knn_coefficients,
 )
+from anima_style_data.kv_generalizing_modulator import (
+    build_mixed_activation_batch,
+)
 
 
 def test_apply_kv_factors_matches_explicit_low_rank_linears():
@@ -262,3 +265,41 @@ def test_convex_activation_mixture_uses_visual_neighbor_weights():
         mixed,
         torch.einsum("va,akno->vkno", weights, activations),
     )
+
+
+def test_generalizing_batch_builds_exact_weighted_teacher_activation():
+    torch.manual_seed(37)
+    batch, contexts, groups = 2, 2, 3
+    tokens, context_dim, output_dim, rank = 5, 7, 11, 3
+    sampled_contexts = torch.randn(contexts, tokens, context_dim)
+    predicted_down = torch.randn(batch, 2, rank, context_dim)
+    predicted_up = torch.randn(batch, 2, output_dim, rank)
+    group_down = torch.randn(batch, groups, 2, rank, context_dim)
+    group_up = torch.randn(batch, groups, 2, output_dim, rank)
+    weights = torch.rand(batch, groups)
+    weights /= weights.sum(dim=-1, keepdim=True)
+    output_indices = torch.tensor([1, 4, 8])
+
+    student, target = build_mixed_activation_batch(
+        sampled_contexts,
+        predicted_down,
+        predicted_up,
+        group_down,
+        group_up,
+        weights,
+        output_indices,
+    )
+
+    assert student.shape == (batch * contexts, 2, tokens, 3)
+    expected_rows = []
+    for artist in range(batch):
+        for context in sampled_contexts:
+            group_rows = apply_kv_factors(
+                context.expand(groups, -1, -1),
+                group_down[artist],
+                group_up[artist].index_select(2, output_indices),
+            )
+            expected_rows.append(
+                torch.einsum("g,gkno->kno", weights[artist], group_rows)
+            )
+    torch.testing.assert_close(target, torch.stack(expected_rows))

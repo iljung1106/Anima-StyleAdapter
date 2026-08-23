@@ -74,6 +74,64 @@ def _view_probabilities(
     return values / values.sum()
 
 
+def build_mixed_activation_batch(
+    sampled_contexts: torch.Tensor,
+    predicted_down: torch.Tensor,
+    predicted_up: torch.Tensor,
+    group_down: torch.Tensor,
+    group_up: torch.Tensor,
+    mixture_weights: torch.Tensor,
+    output_indices: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Apply student factors and the exact convex teacher function mixture."""
+
+    batch, group_size = group_down.shape[:2]
+    context_count, tokens, context_dim = sampled_contexts.shape
+    context_bc = sampled_contexts[None].expand(
+        batch, -1, -1, -1
+    ).reshape(batch * context_count, tokens, context_dim)
+    student = apply_kv_factors(
+        context_bc,
+        predicted_down[:, None].expand(
+            -1, context_count, -1, -1, -1
+        ).reshape(batch * context_count, *predicted_down.shape[1:]),
+        predicted_up.index_select(2, output_indices)[:, None].expand(
+            -1, context_count, -1, -1, -1
+        ).reshape(
+            batch * context_count,
+            2,
+            len(output_indices),
+            predicted_up.shape[-1],
+        ),
+    )
+    context_bcg = context_bc[:, None].expand(
+        -1, group_size, -1, -1
+    ).reshape(batch * context_count * group_size, tokens, context_dim)
+    selected_group_up = group_up.index_select(3, output_indices)
+    teacher = apply_kv_factors(
+        context_bcg,
+        group_down[:, None].expand(
+            -1, context_count, -1, -1, -1, -1
+        ).reshape(
+            batch * context_count * group_size,
+            *group_down.shape[2:],
+        ),
+        selected_group_up[:, None].expand(
+            -1, context_count, -1, -1, -1, -1
+        ).reshape(
+            batch * context_count * group_size,
+            *selected_group_up.shape[2:],
+        ),
+    ).reshape(
+        batch, context_count, group_size,
+        2, tokens, len(output_indices),
+    )
+    target = (
+        teacher * mixture_weights[:, None, :, None, None, None]
+    ).sum(dim=2).reshape_as(student)
+    return student, target
+
+
 @torch.no_grad()
 def _validate(
     model: NativeKVFactorModulator,
@@ -382,57 +440,17 @@ def train_generalizing_kv_activation_modulator(
             optimizer.zero_grad(set_to_none=True)
             with torch.autocast("cuda", dtype=torch.bfloat16):
                 predicted_down, predicted_up = model(visual, block)
-                context_bc = sampled_contexts[None].expand(
-                    batch_artists, -1, -1, -1
-                ).reshape(
-                    batch_artists * contexts_per_step,
-                    sampled_contexts.shape[1],
-                    sampled_contexts.shape[2],
-                )
-                student = apply_kv_factors(
-                    context_bc,
-                    predicted_down[:, None].expand(
-                        -1, contexts_per_step, -1, -1, -1
-                    ).reshape(batch_artists * contexts_per_step, *predicted_down.shape[1:]),
-                    predicted_up[:, None, :, output_indices].expand(
-                        -1, contexts_per_step, -1, -1, -1
-                    ).reshape(
-                        batch_artists * contexts_per_step,
-                        2,
-                        len(output_indices),
-                        predicted_up.shape[-1],
-                    ),
-                )
-                context_bcg = context_bc[:, None].expand(
-                    -1, group_size, -1, -1
-                ).reshape(
-                    batch_artists * contexts_per_step * group_size,
-                    context_bc.shape[1],
-                    context_bc.shape[2],
-                )
                 group_down = teacher_down[artist_groups, block]
-                group_up = teacher_up[artist_groups, block][:, :, :, output_indices]
-                teacher = apply_kv_factors(
-                    context_bcg,
-                    group_down[:, None].expand(
-                        -1, contexts_per_step, -1, -1, -1, -1
-                    ).reshape(
-                        batch_artists * contexts_per_step * group_size,
-                        *group_down.shape[2:],
-                    ),
-                    group_up[:, None].expand(
-                        -1, contexts_per_step, -1, -1, -1, -1
-                    ).reshape(
-                        batch_artists * contexts_per_step * group_size,
-                        *group_up.shape[2:],
-                    ),
-                ).reshape(
-                    batch_artists, contexts_per_step, group_size,
-                    2, context_bc.shape[1], len(output_indices),
+                group_up = teacher_up[artist_groups, block]
+                student, target = build_mixed_activation_batch(
+                    sampled_contexts,
+                    predicted_down,
+                    predicted_up,
+                    group_down,
+                    group_up,
+                    mixture_weights,
+                    output_indices,
                 )
-                target = (
-                    teacher * mixture_weights[:, None, :, None, None, None]
-                ).sum(dim=2).reshape_as(student)
             raw_loss, raw_metrics = kv_activation_objective(
                 student,
                 target,
