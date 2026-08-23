@@ -231,10 +231,14 @@ def _validate(
                 predicted_down, predicted_up = model(codes, block)
             for context in sampled_contexts:
                 expanded = context.expand(codes.shape[0], -1, -1)
+                # Autocast does not guarantee that the factor model's final
+                # normalized products remain BF16. Match the cached context
+                # explicitly before the validation einsum, as the training
+                # path already does under its enclosing autocast region.
                 student = apply_kv_factors(
                     expanded,
-                    predicted_down,
-                    predicted_up[:, :, output_indices],
+                    predicted_down.to(expanded.dtype),
+                    predicted_up[:, :, output_indices].to(expanded.dtype),
                 )
                 teacher = apply_kv_factors(
                     expanded,
