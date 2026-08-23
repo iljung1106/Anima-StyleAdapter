@@ -85,6 +85,34 @@ def test_modulator_emits_independent_kv_factors_and_backpropagates():
     assert model.up_head.weight.grad is not None
 
 
+def test_modulator_applies_block_rank_scales_without_losing_gradients():
+    model = NativeKVFactorModulator(
+        style_dim=12,
+        blocks=4,
+        rank=2,
+        context_dim=6,
+        output_dim=8,
+        hidden_dim=16,
+        heads=4,
+        layers=1,
+        ff_dim=32,
+    )
+    down_scale = torch.full((4, 2, 2), 0.02)
+    up_scale = torch.full((4, 2, 2), 0.003)
+    model.set_factor_scales(down_scale, up_scale)
+
+    down, up = model(torch.randn(3, 5, 12), 1)
+    down_rms = down.square().mean(dim=-1).sqrt()
+    up_rms = up.transpose(-1, -2).square().mean(dim=-1).sqrt()
+
+    torch.testing.assert_close(
+        down_rms, torch.full_like(down_rms, 0.02), atol=1e-5, rtol=1e-5
+    )
+    torch.testing.assert_close(
+        up_rms, torch.full_like(up_rms, 0.003), atol=1e-5, rtol=1e-5
+    )
+
+
 def test_activation_objective_prefers_exact_teacher_delta():
     teacher = torch.randn(4, 2, 7, 8)
     exact_loss, exact = kv_activation_objective(

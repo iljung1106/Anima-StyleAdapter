@@ -14,6 +14,7 @@ nor optimizes a noisy final-flow proxy.
 
 from __future__ import annotations
 
+import math
 import random
 import re
 import time
@@ -57,6 +58,12 @@ def canonicalize_lora_factors(
     root = singular.clamp_min(0).sqrt()
     canonical_up = (q_up @ left) * root[None]
     canonical_down = root[:, None] * (right_h @ q_down.t())
+    pivot = canonical_down.gather(
+        -1, canonical_down.abs().argmax(dim=-1, keepdim=True)
+    ).squeeze(-1)
+    sign = torch.where(pivot < 0, -torch.ones_like(pivot), torch.ones_like(pivot))
+    canonical_down = canonical_down * sign[:, None]
+    canonical_up = canonical_up * sign[None]
     return canonical_down, canonical_up
 
 
@@ -87,10 +94,19 @@ def canonicalize_lora_factor_bank(
             r_up @ r_down.transpose(-1, -2), full_matrices=False
         )
         root = singular.clamp_min(0).sqrt()
-        canonical_up.append((q_up @ left) * root.unsqueeze(-2))
-        canonical_down.append(
-            root.unsqueeze(-1) * (right_h @ q_down.transpose(-1, -2))
+        canonical_up_chunk = (q_up @ left) * root.unsqueeze(-2)
+        canonical_down_chunk = root.unsqueeze(-1) * (
+            right_h @ q_down.transpose(-1, -2)
         )
+        pivot = canonical_down_chunk.gather(
+            -1,
+            canonical_down_chunk.abs().argmax(dim=-1, keepdim=True),
+        ).squeeze(-1)
+        sign = torch.where(
+            pivot < 0, -torch.ones_like(pivot), torch.ones_like(pivot)
+        )
+        canonical_down.append(canonical_down_chunk * sign.unsqueeze(-1))
+        canonical_up.append(canonical_up_chunk * sign.unsqueeze(-2))
     return (
         torch.cat(canonical_down).reshape(*leading, *down.shape[-2:]),
         torch.cat(canonical_up).reshape(*leading, *up.shape[-2:]),
@@ -225,9 +241,32 @@ class NativeKVFactorModulator(nn.Module):
         self.down_head = nn.Linear(hidden_dim, context_dim, bias=False)
         self.up_head = nn.Linear(hidden_dim, output_dim, bias=False)
         nn.init.xavier_uniform_(self.down_head.weight)
-        # A small nonzero start lets both heads receive gradients immediately
-        # without injecting the destructive scale of two full Xavier factors.
-        nn.init.xavier_uniform_(self.up_head.weight, gain=1e-2)
+        nn.init.xavier_uniform_(self.up_head.weight)
+        self.down_log_scale = nn.Linear(hidden_dim, 1)
+        self.up_log_scale = nn.Linear(hidden_dim, 1)
+        nn.init.zeros_(self.down_log_scale.weight)
+        nn.init.zeros_(self.down_log_scale.bias)
+        nn.init.zeros_(self.up_log_scale.weight)
+        nn.init.zeros_(self.up_log_scale.bias)
+        self.register_buffer(
+            "down_output_scale", torch.ones(blocks, 2, rank), persistent=True
+        )
+        self.register_buffer(
+            "up_output_scale", torch.ones(blocks, 2, rank), persistent=True
+        )
+
+    def set_factor_scales(
+        self,
+        down: torch.Tensor,
+        up: torch.Tensor,
+    ) -> None:
+        if down.shape != self.down_output_scale.shape:
+            raise ValueError("Down factor-scale shape does not match the model")
+        if up.shape != self.up_output_scale.shape:
+            raise ValueError("Up factor-scale shape does not match the model")
+        with torch.no_grad():
+            self.down_output_scale.copy_(down.to(self.down_output_scale))
+            self.up_output_scale.copy_(up.to(self.up_output_scale))
 
     def forward(
         self,
@@ -258,8 +297,25 @@ class NativeKVFactorModulator(nn.Module):
         factors = self.output_norm(
             self.factor_mixer(queries + attended)
         ).reshape(batch, 2, self.rank, -1)
-        down = self.down_head(factors)
-        up = self.up_head(factors).transpose(-1, -2)
+        down_direction = F.normalize(
+            self.down_head(factors).float(), dim=-1
+        ).to(factors.dtype) * math.sqrt(self.context_dim)
+        up_direction = F.normalize(
+            self.up_head(factors).float(), dim=-1
+        ).to(factors.dtype) * math.sqrt(self.output_dim)
+        down_scale = self.down_output_scale[block_index].to(factors.dtype)
+        up_scale = self.up_output_scale[block_index].to(factors.dtype)
+        # The canonical bank supplies the absolute scale.  A bounded learned
+        # correction captures real per-artist singular-value variation without
+        # reopening the reciprocal A/B scale shortcut.
+        down_scale = down_scale * torch.exp(
+            0.5 * torch.tanh(self.down_log_scale(factors).squeeze(-1))
+        )
+        up_scale = up_scale * torch.exp(
+            0.5 * torch.tanh(self.up_log_scale(factors).squeeze(-1))
+        )
+        down = down_direction * down_scale.unsqueeze(-1)
+        up = (up_direction * up_scale.unsqueeze(-1)).transpose(-1, -2)
         return down, up
 
 
@@ -486,6 +542,10 @@ def train_kv_activation_modulator(
     )
     teacher_down = teacher_down.to(dtype=torch.bfloat16)
     teacher_up = teacher_up.to(dtype=torch.bfloat16)
+    model.set_factor_scales(
+        teacher_down.float().square().mean(dim=-1).sqrt().mean(dim=0),
+        teacher_up.float().transpose(-1, -2).square().mean(dim=-1).sqrt().mean(dim=0),
+    )
     output = destination / str(cfg["output_directory"])
     checkpoints = output / "checkpoints"
     checkpoints.mkdir(parents=True, exist_ok=True)
