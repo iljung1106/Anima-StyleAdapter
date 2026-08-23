@@ -90,6 +90,8 @@ def build_parser() -> argparse.ArgumentParser:
         ("kv-lora-reference-token-cache", "Cache Resampler tokens for K/V-only LoRA images"),
         ("lora-functional-teacher-cache", "Cache single and mixed LoRA functional effects"),
         ("kv-lora-functional-teacher-cache", "Cache K/V-only LoRA effects"),
+        ("kv-lora-oracle-bootstrap-smoke", "Smoke-test K/V-only LoRA oracle capacity"),
+        ("kv-lora-oracle-bootstrap-train", "Train K/V-only LoRA oracle capacity"),
         ("lora-functional-distill-smoke", "Smoke-test LoRA functional distillation"),
         ("lora-functional-distill-train", "Distill artist-tag, LoRA and mixed-LoRA teachers"),
         ("lora-functional-distill-v2-smoke", "Smoke-test artist-centered LoRA distillation"),
@@ -510,6 +512,20 @@ def main() -> None:
         stage = {
             "lora-reference-token-cache": cache_lora_teacher_dual_query_tokens,
             "kv-lora-reference-token-cache": cache_kv_lora_teacher_dual_query_tokens,
+        }[args.command]
+        _run(stage, config, destination)
+    elif args.command in {
+        "kv-lora-oracle-bootstrap-smoke",
+        "kv-lora-oracle-bootstrap-train",
+    }:
+        from .lora_oracle_bootstrap import (
+            smoke_test_kv_lora_oracle_bootstrap,
+            train_kv_lora_oracle_bootstrap,
+        )
+
+        stage = {
+            "kv-lora-oracle-bootstrap-smoke": smoke_test_kv_lora_oracle_bootstrap,
+            "kv-lora-oracle-bootstrap-train": train_kv_lora_oracle_bootstrap,
         }[args.command]
         _run(stage, config, destination)
     elif args.command in {

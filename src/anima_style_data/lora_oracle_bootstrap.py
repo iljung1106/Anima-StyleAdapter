@@ -501,8 +501,9 @@ def train_lora_oracle_bootstrap(
     destination: Path,
     *,
     steps_override: int | None = None,
+    config_key: str = "lora_oracle_bootstrap",
 ) -> dict[str, Any]:
-    cfg = copy.deepcopy(config["lora_oracle_bootstrap"])
+    cfg = copy.deepcopy(config[config_key])
     training = dict(cfg["training"])
     if steps_override is not None:
         training["steps"] = int(steps_override)
@@ -657,7 +658,7 @@ def train_lora_oracle_bootstrap(
             name=str(wandb_cfg.get("name", "lora-oracle-bootstrap-v1")),
             id=str(wandb_cfg.get("id", "lora-oracle-bootstrap-v1")),
             resume="allow",
-            config={"lora_oracle_bootstrap": cfg},
+            config={config_key: cfg},
         )
     fixed = dict(load_dual_query_external_sample(config, destination))
     fixed_rows = len(fixed["paths"])
@@ -867,6 +868,32 @@ def smoke_test_lora_oracle_bootstrap(
     cfg["training"]["checkpoint_every"] = 1
     cfg["training"]["sample_every"] = 0
     return train_lora_oracle_bootstrap(effective, destination, steps_override=3)
+
+
+def train_kv_lora_oracle_bootstrap(
+    config: dict[str, Any], destination: Path
+) -> dict[str, Any]:
+    return train_lora_oracle_bootstrap(
+        config, destination, config_key="kv_lora_oracle_bootstrap"
+    )
+
+
+def smoke_test_kv_lora_oracle_bootstrap(
+    config: dict[str, Any], destination: Path
+) -> dict[str, Any]:
+    effective = copy.deepcopy(config)
+    cfg = effective["kv_lora_oracle_bootstrap"]
+    cfg["output_directory"] = "kv_lora_oracle_bootstrap_smoke"
+    cfg["training"]["wandb"]["enabled"] = False
+    cfg["training"]["resume"] = False
+    cfg["training"]["checkpoint_every"] = 1
+    cfg["training"]["sample_every"] = 0
+    return train_lora_oracle_bootstrap(
+        effective,
+        destination,
+        steps_override=3,
+        config_key="kv_lora_oracle_bootstrap",
+    )
 
 
 def sample_lora_oracle_checkpoint(
