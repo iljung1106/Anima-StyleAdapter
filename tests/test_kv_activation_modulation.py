@@ -312,8 +312,12 @@ class _DummyReader(torch.nn.Module):
         self.scale = torch.nn.Parameter(torch.ones(style_dim))
 
     def forward(self, tokens, mask):
-        del mask
-        return type("ReaderOutput", (), {"tokens": tokens * self.scale})()
+        if tokens.ndim != 4:
+            raise ValueError("Expected real [batch,references,tokens,dim] contract")
+        weights = mask.to(tokens.dtype)
+        pooled = (tokens * weights[:, :, None, None]).sum(dim=1)
+        pooled = pooled / weights.sum(dim=1).clamp_min(1)[:, None, None]
+        return type("ReaderOutput", (), {"tokens": pooled * self.scale})()
 
 
 def test_few_shot_adapter_activates_and_rescales_native_kv_hook():
@@ -337,12 +341,12 @@ def test_few_shot_adapter_activates_and_rescales_native_kv_hook():
     context = torch.randn(1, 5, 6)
     baseline = anima.blocks[0].cross_attn.kv_proj(context)
 
-    codes = adapter.set_references(torch.randn(1, 4, 12), strength=0.5)
+    codes = adapter.set_references(torch.randn(1, 4, 5, 12), strength=0.5)
     styled_half = anima.blocks[0].cross_attn.kv_proj(context)
     adapter.set_strength(1.0)
     styled_full = anima.blocks[0].cross_attn.kv_proj(context)
 
-    assert codes.shape == (1, 4, 12)
+    assert codes.shape == (1, 5, 12)
     torch.testing.assert_close(styled_full - baseline, 2 * (styled_half - baseline))
     adapter.disable()
     torch.testing.assert_close(anima.blocks[0].cross_attn.kv_proj(context), baseline)

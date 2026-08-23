@@ -9,6 +9,7 @@ import torch
 from torch import nn
 
 from .detail_style_cross_attention import DetailPreservingTypedSlotReader
+from .dual_query_external_samples import encode_dual_query_reference_images
 from .kv_activation_modulation import NativeKVFactorModulator
 from .kv_activation_sampling import NativeKVFactorInjector
 from .lora_oracle_bootstrap import _oracle_detail_config
@@ -103,6 +104,35 @@ class FewShotNativeKVStyleAdapter(nn.Module):
         self.active_strength = float(strength)
         return style_codes
 
+    @torch.no_grad()
+    def encode_raw_reference_images(
+        self,
+        config: dict[str, Any],
+        destination: Path,
+        paths: list[Path],
+    ) -> torch.Tensor:
+        """Run raw images through the exact frozen production feature path."""
+        encoded = encode_dual_query_reference_images(
+            config,
+            destination,
+            paths,
+            device=str(self.device),
+        )
+        return encoded["tokens"].unsqueeze(0)
+
+    @torch.no_grad()
+    def set_raw_references(
+        self,
+        config: dict[str, Any],
+        destination: Path,
+        paths: list[Path],
+        *,
+        strength: float = 1.0,
+    ) -> torch.Tensor:
+        """Encode raw images and immediately activate their native-K/V style."""
+        tokens = self.encode_raw_reference_images(config, destination, paths)
+        return self.set_references(tokens, strength=strength)
+
     def set_strength(self, strength: float) -> None:
         if self.injector.down is None or self.injector.up is None:
             raise RuntimeError("References must be encoded before setting strength")
@@ -150,4 +180,3 @@ class FewShotNativeKVStyleAdapter(nn.Module):
         reader.to(device=device, dtype=torch.bfloat16)
         modulator.to(device=device, dtype=torch.bfloat16)
         return cls(reader=reader, modulator=modulator, anima=anima)
-

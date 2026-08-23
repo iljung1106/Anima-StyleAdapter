@@ -57,44 +57,22 @@ def _signature(
     }
 
 
-def cache_dual_query_external_references(
-    config: dict[str, Any], destination: Path
+def encode_dual_query_reference_images(
+    config: dict[str, Any],
+    destination: Path,
+    paths: list[Path],
+    *,
+    device: str = "cuda",
 ) -> dict[str, Any]:
-    sheet_cfg, _, paths, output = _paths_and_config(config, destination)
-    device = str(
-        config["dual_query_style_tokenizer"]["fixed_reference_sampling"].get(
-            "device", "cuda"
-        )
-    )
-    checkpoint = destination / str(
-        config["dual_query_style_tokenizer"]["resampler_checkpoint"]
-    )
-    signature = _signature(paths, checkpoint, config)
-    tokens_path = output / "reference_tokens.pt"
-    metadata_path = output / "reference_tokens.json"
-    if tokens_path.exists() and metadata_path.exists():
-        recorded = json.loads(metadata_path.read_text(encoding="utf-8"))
-        tokens = torch.load(tokens_path, map_location="cpu", weights_only=True)
-        if recorded == signature and tuple(tokens.shape) == (7, 84, 1024):
-            positive, negative, length = _encode_text_conditions(
-                config, destination, sheet_cfg, output, device
-            )
-            return {
-                "references": 7,
-                "tokens": list(tokens.shape),
-                "reused": True,
-                "text_length": length,
-                "cache_directory": str(output),
-            }
+    """Encode arbitrary images with the production C-RADIO/VAE/Resampler path."""
+    if not paths:
+        raise ValueError("At least one reference image is required")
 
     feature_cfg = dict(config["style_features"])
-    radio_cfg = {
-        **config["cradio"],
-        **feature_cfg.get("preprocess", {}),
-    }
+    radio_cfg = {**config["cradio"], **feature_cfg.get("preprocess", {})}
     cradio, _ = _load_cradio(radio_cfg, destination / "cradio_model_cache")
-    semantic_features = []
-    semantic_shapes = []
+    semantic_features: list[dict[int, torch.Tensor]] = []
+    semantic_shapes: list[tuple[int, int]] = []
     with torch.inference_mode():
         for index, path in enumerate(paths, start=1):
             with Image.open(path) as image:
@@ -130,7 +108,7 @@ def cache_dual_query_external_references(
             semantic_shapes.append(
                 (int(geometry.target_height) // 16, int(geometry.target_width) // 16)
             )
-            print(f"external C-RADIO {index}/7", flush=True)
+            print(f"reference C-RADIO {index}/{len(paths)}", flush=True)
     del cradio
     gc.collect()
     if device.startswith("cuda"):
@@ -141,8 +119,8 @@ def cache_dual_query_external_references(
     vae = _load_sampling_vae(config, destination).to(
         device=device, dtype=torch.bfloat16
     )
-    latent_values = []
-    image_sizes = []
+    latent_values: list[torch.Tensor] = []
+    image_sizes: list[tuple[int, int]] = []
     preprocess = dict(config["anima_cache"]["latents"]["preprocess"])
     with torch.inference_mode():
         for index, path in enumerate(paths, start=1):
@@ -158,12 +136,15 @@ def cache_dual_query_external_references(
                 latent = latent.squeeze(2)
             latent_values.append(latent[0].to("cpu", dtype=torch.float16))
             image_sizes.append((geometry.target_height, geometry.target_width))
-            print(f"external Qwen VAE {index}/7", flush=True)
+            print(f"reference Qwen VAE {index}/{len(paths)}", flush=True)
     del vae
     gc.collect()
     if device.startswith("cuda"):
         torch.cuda.empty_cache()
 
+    checkpoint = destination / str(
+        config["dual_query_style_tokenizer"]["resampler_checkpoint"]
+    )
     semantic_dim = int(semantic_features[0][18].shape[-1])
     vae_channels = int(latent_values[0].shape[0])
     resampler, checkpoint_step = _load_resampler(
@@ -174,7 +155,7 @@ def cache_dual_query_external_references(
         vae_channels,
         device,
     )
-    encoded_tokens = []
+    encoded_tokens: list[torch.Tensor] = []
     with torch.inference_mode(), torch.autocast(
         "cuda", dtype=torch.bfloat16, enabled=device.startswith("cuda")
     ):
@@ -184,13 +165,15 @@ def cache_dual_query_external_references(
         ):
             count = int(features[18].shape[0])
             encoded = resampler.encode(
-                {layer: value.unsqueeze(0).to(device) for layer, value in features.items()},
+                {
+                    layer: value.unsqueeze(0).to(device)
+                    for layer, value in features.items()
+                },
                 torch.ones(1, count, device=device, dtype=torch.bool),
                 torch.tensor([semantic_shape], device=device),
                 latent.unsqueeze(0).to(device),
                 torch.tensor(
-                    [[int(latent.shape[-2]), int(latent.shape[-1])]],
-                    device=device,
+                    [[int(latent.shape[-2]), int(latent.shape[-1])]], device=device
                 ),
                 torch.tensor([image_size], device=device),
                 reconstruct=False,
@@ -200,10 +183,54 @@ def cache_dual_query_external_references(
                     "cpu", dtype=torch.bfloat16
                 )
             )
-            print(f"external Dual-query Resampler {index}/7", flush=True)
+            print(f"reference Resampler {index}/{len(paths)}", flush=True)
     tokens = torch.stack(encoded_tokens).contiguous()
-    if tuple(tokens.shape) != (7, 84, 1024) or not torch.isfinite(tokens).all():
-        raise RuntimeError(f"Invalid external dual-query tokens {tuple(tokens.shape)}")
+    expected = (len(paths), 84, 1024)
+    if tuple(tokens.shape) != expected or not torch.isfinite(tokens).all():
+        raise RuntimeError(f"Invalid dual-query tokens {tuple(tokens.shape)}")
+    return {
+        "tokens": tokens,
+        "checkpoint_step": int(checkpoint_step),
+        "paths": paths,
+        "image_sizes": image_sizes,
+    }
+
+
+def cache_dual_query_external_references(
+    config: dict[str, Any], destination: Path
+) -> dict[str, Any]:
+    sheet_cfg, _, paths, output = _paths_and_config(config, destination)
+    device = str(
+        config["dual_query_style_tokenizer"]["fixed_reference_sampling"].get(
+            "device", "cuda"
+        )
+    )
+    checkpoint = destination / str(
+        config["dual_query_style_tokenizer"]["resampler_checkpoint"]
+    )
+    signature = _signature(paths, checkpoint, config)
+    tokens_path = output / "reference_tokens.pt"
+    metadata_path = output / "reference_tokens.json"
+    if tokens_path.exists() and metadata_path.exists():
+        recorded = json.loads(metadata_path.read_text(encoding="utf-8"))
+        tokens = torch.load(tokens_path, map_location="cpu", weights_only=True)
+        if recorded == signature and tuple(tokens.shape) == (7, 84, 1024):
+            positive, negative, length = _encode_text_conditions(
+                config, destination, sheet_cfg, output, device
+            )
+            return {
+                "references": 7,
+                "tokens": list(tokens.shape),
+                "reused": True,
+                "text_length": length,
+                "cache_directory": str(output),
+            }
+
+    encoded = encode_dual_query_reference_images(
+        config, destination, paths, device=device
+    )
+    tokens = encoded["tokens"]
+    checkpoint_step = int(encoded["checkpoint_step"])
     torch.save(tokens, tokens_path)
     metadata_path.write_text(
         json.dumps(signature, ensure_ascii=False, indent=2), encoding="utf-8"
