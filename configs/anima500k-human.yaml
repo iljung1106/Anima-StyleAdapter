@@ -536,7 +536,7 @@ kv_lora_oracle_bootstrap:
 # text K/V activations before Anima's K/V normalization.  The target factors
 # are applied online; no high-dimensional activation cache is duplicated.
 kv_activation_modulator:
-  output_directory: kv_activation_modulator_v1b_64_visual_anchor
+  output_directory: kv_activation_modulator_v2_64_canonical_factors
   seed: 20260824
   blocks: 28
   lora_directory: artist_kv_lora_teachers_rank16_64_b2_v1
@@ -563,6 +563,13 @@ kv_activation_modulator:
     max_grad_norm: 1.0
     direction_weight: 0.5
     magnitude_weight: 0.1
+    factor_direction_weight: 0.5
+    factor_magnitude_weight: 0.1
+    down_factor_weight: 1.0
+    up_factor_weight: 1.0
+    activation_weight: 0.1
+    activation_start_step: 500
+    activation_ramp_steps: 500
     fused_adamw: true
     log_every: 10
     validation_every: 250
@@ -571,8 +578,8 @@ kv_activation_modulator:
     wandb:
       enabled: true
       project: anima-style-adapter
-      name: kv-activation-modulator-v1b-64-visual-anchor
-      id: kv-activation-modulator-v1b-64-visual-anchor
+      name: kv-activation-modulator-v2-64-canonical-factors
+      id: kv-activation-modulator-v2-64-canonical-factors
 
 # Offline functional teacher and clean continuation runner. Teacher updates
 # cycle @artist : individual LoRA : mixed LoRA at 1:1:1 after an individual

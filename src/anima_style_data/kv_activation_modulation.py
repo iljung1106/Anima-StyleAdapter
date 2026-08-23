@@ -36,6 +36,30 @@ _LORA_KEY = re.compile(
 )
 
 
+def canonicalize_lora_factors(
+    down: torch.Tensor,
+    up: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return ordered, balanced factors with the exact same weight delta.
+
+    Independent LoRA training leaves rank permutation, sign, and reciprocal
+    scale arbitrary.  Directly supervising those coordinates would force a
+    visual model to predict training accidents rather than the represented
+    function.  Thin QR decompositions reduce the expensive SVD to the small
+    rank-by-rank core and produce singular-value ordered canonical factors.
+    """
+
+    q_up, r_up = torch.linalg.qr(up.float(), mode="reduced")
+    q_down, r_down = torch.linalg.qr(down.float().t(), mode="reduced")
+    left, singular, right_h = torch.linalg.svd(
+        r_up @ r_down.t(), full_matrices=False
+    )
+    root = singular.clamp_min(0).sqrt()
+    canonical_up = (q_up @ left) * root[None]
+    canonical_down = root[:, None] * (right_h @ q_down.t())
+    return canonical_down, canonical_up
+
+
 def load_kv_lora_factor_bank(
     root: Path,
     *,
@@ -83,8 +107,9 @@ def load_kv_lora_factor_bank(
                     expected = (rank, int(down.shape[1]), int(up.shape[0]))
                 if (rank, int(down.shape[1]), int(up.shape[0])) != expected:
                     raise RuntimeError("K/V-only LoRA factor dimensions disagree")
+                down, up = canonicalize_lora_factors(down, up * scale)
                 block_down.append(down)
-                block_up.append(up * scale)
+                block_up.append(up)
             artist_down.append(torch.stack(block_down))
             artist_up.append(torch.stack(block_up))
         all_down.append(torch.stack(artist_down))
@@ -253,6 +278,49 @@ def kv_activation_objective(
     }
 
 
+def kv_factor_objective(
+    student: torch.Tensor,
+    teacher: torch.Tensor,
+    *,
+    direction_weight: float,
+    magnitude_weight: float,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Regress canonical K/V LoRA factors without bilinear scale ambiguity."""
+
+    student_f = student.float()
+    teacher_f = teacher.float()
+    teacher_rms = (
+        teacher_f.square().mean(dim=(-2, -1), keepdim=True) + 1e-12
+    ).sqrt()
+    student_rms = (
+        student_f.square().mean(dim=(-2, -1), keepdim=True) + 1e-12
+    ).sqrt()
+    scale = teacher_rms.detach().clamp_min(1e-7)
+    regression = F.smooth_l1_loss(
+        student_f / scale,
+        teacher_f / scale,
+        beta=0.10,
+    )
+    cosine = F.cosine_similarity(
+        student_f.flatten(2), teacher_f.flatten(2), dim=-1
+    )
+    direction = (1.0 - cosine).mean()
+    magnitude = (
+        student_rms.clamp_min(1e-8).log() - scale.log()
+    ).abs().mean()
+    loss = regression + float(direction_weight) * direction + float(
+        magnitude_weight
+    ) * magnitude
+    return loss, {
+        "loss": loss.detach(),
+        "normalized_huber": regression.detach(),
+        "direction_loss": direction.detach(),
+        "cosine": cosine.mean().detach(),
+        "magnitude_log_error": magnitude.detach(),
+        "student_to_teacher_rms": (student_rms / scale).mean().detach(),
+    }
+
+
 def _save_state(
     path: Path,
     *,
@@ -401,6 +469,17 @@ def train_kv_activation_modulator(
     warmup = int(training.get("warmup_steps", 100))
     direction_weight = float(training.get("direction_weight", 0.5))
     magnitude_weight = float(training.get("magnitude_weight", 0.1))
+    factor_direction_weight = float(
+        training.get("factor_direction_weight", 0.5)
+    )
+    factor_magnitude_weight = float(
+        training.get("factor_magnitude_weight", 0.1)
+    )
+    down_factor_weight = float(training.get("down_factor_weight", 1.0))
+    up_factor_weight = float(training.get("up_factor_weight", 1.0))
+    activation_weight = float(training.get("activation_weight", 0.1))
+    activation_start = int(training.get("activation_start_step", 500))
+    activation_ramp = int(training.get("activation_ramp_steps", 500))
     log_every = int(training.get("log_every", 10))
     validation_every = int(training.get("validation_every", 250))
     checkpoint_every = int(training.get("checkpoint_every", 250))
@@ -448,24 +527,76 @@ def train_kv_activation_modulator(
                 enabled=device.startswith("cuda"),
             ):
                 predicted_down, predicted_up = model(style_codes[artists], block)
-                student = apply_kv_factors(context, predicted_down, predicted_up)
-                teacher = apply_kv_factors(
-                    context,
-                    teacher_down[artists, block],
-                    teacher_up[artists, block],
+            target_down = teacher_down[artists, block]
+            target_up = teacher_up[artists, block]
+            down_loss, down_metrics = kv_factor_objective(
+                predicted_down,
+                target_down,
+                direction_weight=factor_direction_weight,
+                magnitude_weight=factor_magnitude_weight,
+            )
+            up_loss, up_metrics = kv_factor_objective(
+                predicted_up,
+                target_up,
+                direction_weight=factor_direction_weight,
+                magnitude_weight=factor_magnitude_weight,
+            )
+            active_activation_weight = activation_weight * max(
+                0.0,
+                min(1.0, (step - activation_start) / max(1, activation_ramp)),
+            )
+            if active_activation_weight > 0:
+                with torch.autocast(
+                    device_type="cuda", dtype=torch.bfloat16,
+                    enabled=device.startswith("cuda"),
+                ):
+                    student = apply_kv_factors(
+                        context, predicted_down, predicted_up
+                    )
+                    teacher = apply_kv_factors(context, target_down, target_up)
+                activation_loss, activation_metrics = kv_activation_objective(
+                    student,
+                    teacher,
+                    direction_weight=direction_weight,
+                    magnitude_weight=magnitude_weight,
                 )
-            loss, metrics = kv_activation_objective(
-                student,
-                teacher,
-                direction_weight=direction_weight,
-                magnitude_weight=magnitude_weight,
+            else:
+                activation_loss = down_loss.new_zeros(())
+                activation_metrics = {
+                    key: down_loss.new_zeros(())
+                    for key in (
+                        "loss", "normalized_huber", "direction_loss", "cosine",
+                        "magnitude_log_error", "student_to_teacher_rms",
+                        "relative_rms_error", "k_cosine", "v_cosine",
+                    )
+                }
+            loss = (
+                down_factor_weight * down_loss
+                + up_factor_weight * up_loss
+                + active_activation_weight * activation_loss
             )
             loss.backward()
             grad_norm = torch.nn.utils.clip_grad_norm_(
                 model.parameters(), max_grad_norm, foreach=True
             )
             optimizer.step()
+            metrics = {
+                "loss": loss.detach(),
+                **{
+                    f"factor_down_{key}": value
+                    for key, value in down_metrics.items()
+                },
+                **{
+                    f"factor_up_{key}": value
+                    for key, value in up_metrics.items()
+                },
+                **{
+                    f"activation_{key}": value
+                    for key, value in activation_metrics.items()
+                },
+            }
             metrics.update({
+                "activation_weight": torch.tensor(active_activation_weight),
                 "grad_norm": grad_norm.detach(),
                 "learning_rate": torch.tensor(learning_rate),
                 "block": torch.tensor(float(block)),
