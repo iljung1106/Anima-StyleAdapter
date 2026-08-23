@@ -453,7 +453,7 @@ lora_functional_distillation_v2:
 # Training against their rectified-flow x0 target avoids asking a style-only
 # cross-attention branch to regress full-DiT LoRA internals it cannot represent.
 lora_image_flow_oracle:
-  output_directory: lora_image_flow_oracle_v2_centered_artist
+  output_directory: lora_image_flow_oracle_v3_centered_artist_high_t
   target_cache: lora_image_flow_targets_rank16_256x8_v1
   source_directory: lora_teacher_references_rank16_256x8_v2
   seed: 20260823
@@ -489,13 +489,14 @@ lora_image_flow_oracle:
     null_learning_rate: 0.00100
     oracle_anchor_weight: 0.001
     warmup_steps: 50
-    # Low-noise timesteps were the weakest region in the measured functional
-    # oracle sweep. Sample them more often; only the normalized artist-centered
-    # objective is weighted, while raw flow/common terms and inference strength
-    # remain unchanged to avoid amplifying off-direction texture artifacts.
+    # In the direct x0-target run, fixed validation showed the opposite of the
+    # internal functional oracle: near-noise timesteps had the weakest centered
+    # cosine and the highest common-output ratio. Sample them more often; only
+    # the normalized artist-centered objective is weighted, while raw flow/
+    # common terms and inference strength remain unchanged.
     timestep_bin_edges: [0.0, 0.20, 0.45, 0.75, 1.0]
-    timestep_sampling_weights: [2.0, 1.5, 1.0, 1.0]
-    timestep_artist_loss_multipliers: [1.25, 1.10, 1.0, 1.0]
+    timestep_sampling_weights: [1.0, 1.0, 1.5, 2.0]
+    timestep_artist_loss_multipliers: [1.0, 1.0, 1.10, 1.25]
     betas: [0.9, 0.95]
     adam_eps: 0.00000001
     weight_decay: 0.01
@@ -519,8 +520,8 @@ lora_image_flow_oracle:
     wandb:
       enabled: true
       project: anima-style-adapter
-      name: lora-image-flow-oracle-v2-centered-artist
-      id: lora-image-flow-oracle-v2-centered-artist
+      name: lora-image-flow-oracle-v3-centered-artist-high-t
+      id: lora-image-flow-oracle-v3-centered-artist-high-t
 
 
 # Representability bootstrap.  A visual-anchored 28x1024 oracle code is learned
