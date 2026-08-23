@@ -781,6 +781,20 @@ kv_activation_generalizing_sample:
   token_lru_shards: 8
   panel_tile_width: 416
 
+kv_activation_knn_mixture_sample:
+  checkpoint: kv_activation_generalizing_modulator_v5_256_artist_holdout/best.pt
+  output_directory: kv_activation_generalizing_modulator_v5_256_artist_holdout/heldout_knn8_mixture_samples
+  device: cuda
+  seed: 20260824
+  artists: 7
+  reference_counts: [1, 4]
+  neighbors: 8
+  temperature: 0.1
+  predicted_strengths: [0.5, 1.0, 1.5]
+  batch_size: 4
+  panel_tile_width: 416
+  canonicalization_chunk_size: 64
+
 # Offline functional teacher and clean continuation runner. Teacher updates
 # cycle @artist : individual LoRA : mixed LoRA at 1:1:1 after an individual
 # LoRA bootstrap. LoRA steps alternate human and LoRA-generated references.

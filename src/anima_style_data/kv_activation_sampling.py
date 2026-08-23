@@ -149,8 +149,6 @@ def _load_predicted_and_teacher_factors(
         map_location="cpu",
         weights_only=False,
     )
-    model_cfg = dict(checkpoint["config"]["model"])
-    style_codes = checkpoint["style_codes"]
     artist_ids, teacher_down, teacher_up = load_kv_lora_factor_bank(
         destination / str(checkpoint["config"]["lora_directory"]),
         blocks=int(checkpoint["config"].get("blocks", 28)),
@@ -164,6 +162,35 @@ def _load_predicted_and_teacher_factors(
         teacher_up,
         chunk_size=int(cfg.get("canonicalization_chunk_size", 64)),
     )
+    if "predicted_down" in checkpoint or "predicted_up" in checkpoint:
+        if not {"predicted_down", "predicted_up"}.issubset(checkpoint):
+            raise RuntimeError("Precomputed K/V checkpoint has only one factor bank")
+        global_indices = [
+            int(value)
+            for value in checkpoint.get("predicted_artist_indices", indices)
+        ]
+        row_by_artist = {
+            artist_index: row for row, artist_index in enumerate(global_indices)
+        }
+        missing = [index for index in indices if index not in row_by_artist]
+        if missing:
+            raise RuntimeError(
+                f"Precomputed K/V checkpoint is missing artist indices {missing}"
+            )
+        rows = torch.tensor(
+            [row_by_artist[index] for index in indices], dtype=torch.long
+        )
+        predicted_down = checkpoint["predicted_down"].index_select(0, rows)
+        predicted_up = checkpoint["predicted_up"].index_select(0, rows)
+        return (
+            [artist_ids[index] for index in indices],
+            teacher_down.to(device=device, dtype=torch.bfloat16),
+            teacher_up.to(device=device, dtype=torch.bfloat16),
+            predicted_down.to(device=device, dtype=torch.bfloat16),
+            predicted_up.to(device=device, dtype=torch.bfloat16),
+        )
+    model_cfg = dict(checkpoint["config"]["model"])
+    style_codes = checkpoint["style_codes"]
     rank = int(teacher_down.shape[-2])
     model = NativeKVFactorModulator(
         style_dim=int(style_codes.shape[-1]),

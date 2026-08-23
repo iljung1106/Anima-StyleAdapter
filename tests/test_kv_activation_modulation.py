@@ -22,6 +22,7 @@ from anima_style_data.kv_mixture_analysis import (
 from anima_style_data.kv_generalizing_modulator import (
     _stratified_view_indices,
     build_mixed_activation_batch,
+    concatenate_weighted_lora_factors,
 )
 from anima_style_data.few_shot_kv_adapter import FewShotNativeKVStyleAdapter
 
@@ -51,6 +52,37 @@ def test_apply_kv_factors_matches_explicit_low_rank_linears():
     ])
 
     torch.testing.assert_close(actual, expected)
+
+
+def test_concatenated_lora_factors_are_the_exact_weighted_function_sum():
+    torch.manual_seed(17)
+    batch, neighbors, blocks, kinds, rank = 2, 3, 2, 2, 2
+    context_dim, output_dim, tokens = 5, 7, 4
+    down = torch.randn(
+        batch, neighbors, blocks, kinds, rank, context_dim
+    )
+    up = torch.randn(
+        batch, neighbors, blocks, kinds, output_dim, rank
+    )
+    weights = torch.rand(batch, neighbors)
+    weights /= weights.sum(dim=-1, keepdim=True)
+    mixed_down, mixed_up = concatenate_weighted_lora_factors(
+        down, up, weights
+    )
+    context = torch.randn(batch, tokens, context_dim)
+
+    for block in range(blocks):
+        actual = apply_kv_factors(
+            context, mixed_down[:, block], mixed_up[:, block]
+        )
+        expected = sum(
+            weights[:, neighbor, None, None, None]
+            * apply_kv_factors(
+                context, down[:, neighbor, block], up[:, neighbor, block]
+            )
+            for neighbor in range(neighbors)
+        )
+        torch.testing.assert_close(actual, expected)
 
 
 def test_factor_bank_consolidates_and_reuses_the_single_file_cache(tmp_path):

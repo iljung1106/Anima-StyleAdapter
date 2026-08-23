@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any
 
 import torch
+import torch.nn.functional as F
 from safetensors.torch import load_file
 
 from .detail_style_cross_attention import DetailPreservingTypedSlotReader
@@ -134,6 +135,55 @@ def _stratified_view_indices(
         ).round().long().unique()
         selected.append(candidates[positions])
     return torch.cat(selected)
+
+
+def _visual_knn_coefficients(
+    train: torch.Tensor,
+    query: torch.Tensor,
+    *,
+    neighbors: int,
+    temperature: float,
+) -> torch.Tensor:
+    """Return sparse convex coefficients from centered Reader-code cosine."""
+
+    common = train.float().mean(dim=0, keepdim=True)
+    similarity = F.normalize(query.float() - common, dim=-1) @ F.normalize(
+        train.float() - common, dim=-1
+    ).t()
+    values, indices = similarity.topk(min(int(neighbors), train.shape[0]), dim=-1)
+    local = F.softmax(values / float(temperature), dim=-1)
+    return torch.zeros_like(similarity).scatter(-1, indices, local)
+
+
+def concatenate_weighted_lora_factors(
+    down: torch.Tensor,
+    up: torch.Tensor,
+    weights: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Represent an exact LoRA convex sum by concatenating its rank factors.
+
+    Args:
+        down: ``[batch, neighbor, block, K/V, rank, input]``.
+        up: ``[batch, neighbor, block, K/V, output, rank]``.
+        weights: ``[batch, neighbor]``.
+    """
+
+    if down.ndim != 6 or up.ndim != 6 or weights.ndim != 2:
+        raise ValueError("Unexpected weighted LoRA factor shapes")
+    if down.shape[:4] != up.shape[:4] or down.shape[:2] != weights.shape:
+        raise ValueError("Weighted LoRA factor dimensions disagree")
+    if down.shape[-2] != up.shape[-1]:
+        raise ValueError("Weighted LoRA ranks disagree")
+    batch, neighbors, blocks, kinds, rank, input_dim = down.shape
+    output_dim = int(up.shape[-2])
+    mixed_down = down.permute(0, 2, 3, 1, 4, 5).reshape(
+        batch, blocks, kinds, neighbors * rank, input_dim
+    )
+    weighted_up = up * weights[:, :, None, None, None, None].to(up)
+    mixed_up = weighted_up.permute(0, 2, 3, 4, 1, 5).reshape(
+        batch, blocks, kinds, output_dim, neighbors * rank
+    )
+    return mixed_down, mixed_up
 
 
 def build_mixed_activation_batch(
@@ -942,6 +992,189 @@ def sample_generalizing_kv_activation_modulator(
         "checkpoint": str(checkpoint_path),
         "artists": selected_ids,
         "artist_indices": selected_indices,
+        "results": summaries,
+    }
+    write_json(output / "summary.json", summary)
+    return summary
+
+
+@torch.no_grad()
+def sample_knn_kv_mixture_generalization(
+    config: dict[str, Any], destination: Path
+) -> dict[str, Any]:
+    """Render held-out styles as exact sparse mixtures of train-artist LoRAs."""
+
+    from .kv_activation_sampling import sample_kv_activation_modulator
+
+    sample_cfg = dict(config["kv_activation_knn_mixture_sample"])
+    checkpoint_path = destination / str(sample_cfg["checkpoint"])
+    checkpoint = torch.load(
+        checkpoint_path, map_location="cpu", weights_only=False
+    )
+    cfg = dict(checkpoint["config"])
+    training = dict(cfg["training"])
+    device = str(sample_cfg.get("device", "cuda"))
+    seed = int(sample_cfg.get("seed", 20260824))
+    neighbors = int(sample_cfg.get("neighbors", 8))
+    temperature = float(sample_cfg.get("temperature", 0.1))
+    artist_ids, teacher_down, teacher_up = load_kv_lora_factor_bank(
+        destination / str(cfg["lora_directory"]),
+        blocks=int(cfg.get("blocks", 28)),
+    )
+    teacher_down, teacher_up = canonicalize_lora_factor_bank(
+        teacher_down.to(device),
+        teacher_up.to(device),
+        chunk_size=int(sample_cfg.get("canonicalization_chunk_size", 64)),
+    )
+    train_indices = torch.tensor(
+        [int(value) for value in checkpoint["train_indices"]], device=device
+    )
+    validation_indices = [
+        int(value) for value in checkpoint["validation_indices"]
+    ]
+    artist_count = min(
+        int(sample_cfg.get("artists", 7)), len(validation_indices)
+    )
+    selected_positions = torch.linspace(
+        0, len(validation_indices) - 1, artist_count
+    ).round().long().unique()
+    selected_indices = [
+        validation_indices[int(position)] for position in selected_positions
+    ]
+    selected_ids = [artist_ids[index] for index in selected_indices]
+
+    reader_state = torch.load(
+        destination / str(cfg["reader_checkpoint"]),
+        map_location="cpu",
+        weights_only=False,
+    )
+    oracle_cfg = dict(config["kv_lora_oracle_bootstrap"])
+    detail_cfg = _oracle_detail_config(config, oracle_cfg)
+    reader = DetailPreservingTypedSlotReader(**dict(detail_cfg["model"])).to(
+        device=device, dtype=torch.bfloat16
+    )
+    reader.load_state_dict(reader_state["reader"], strict=True)
+    reader.requires_grad_(False).eval()
+    del reader_state
+
+    teacher_train_ids, teacher_validation_ids = _teacher_image_split(
+        destination / str(cfg["lora_directory"]), artist_ids
+    )
+    train_reference_images = int(training.get("materialized_reference_images", 8))
+    train_loader = CachedTeacherReferenceLoader(
+        destination / str(cfg["human_reference_cache"]),
+        split="train",
+        style_ids=artist_ids,
+        batch_size=int(training.get("materialization_artist_chunk", 16)),
+        references=train_reference_images,
+        seed=seed,
+        token_lru_shards=int(training.get("token_lru_shards", 8)),
+        strict_style_ids=True,
+        allowed_image_ids=teacher_train_ids,
+    )
+    train_codes, train_counts = _materialize_reader_code_bank(
+        reader,
+        train_loader,
+        artist_ids,
+        reference_images=train_reference_images,
+        seed=seed ^ 0x4B4E4E54,
+        device=device,
+        style_chunk_size=int(training.get("materialization_artist_chunk", 16)),
+    )
+    validation_loader = CachedTeacherReferenceLoader(
+        destination / str(cfg["human_reference_cache"]),
+        split="train",
+        style_ids=selected_ids,
+        batch_size=artist_count,
+        references=max(
+            int(value) for value in sample_cfg.get("reference_counts", [1, 4])
+        ),
+        seed=seed,
+        token_lru_shards=int(training.get("token_lru_shards", 8)),
+        strict_style_ids=True,
+        allowed_image_ids=teacher_validation_ids,
+    )
+    output = destination / str(sample_cfg["output_directory"])
+    output.mkdir(parents=True, exist_ok=True)
+    summaries: dict[str, Any] = {}
+    for reference_count in sample_cfg.get("reference_counts", [1, 4]):
+        count = int(reference_count)
+        train_views = torch.nonzero(train_counts == count).flatten()
+        if not len(train_views):
+            raise RuntimeError(f"No {count}-reference train Reader views")
+        train_anchor = (
+            train_codes[:, train_views].float().mean(dim=1).flatten(1)[train_indices.cpu()]
+        )
+        loaded = validation_loader.load_styles(
+            selected_ids,
+            references_per_style=count,
+            seed=seed + count * 1_000_003,
+        )
+        tokens = loaded["tokens"].to(
+            device=device, dtype=torch.bfloat16, non_blocking=True
+        )
+        mask = torch.ones(tokens.shape[:2], device=device, dtype=torch.bool)
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            query_codes = reader(tokens, mask).tokens
+        coefficients = _visual_knn_coefficients(
+            train_anchor.to(device),
+            query_codes.float().flatten(1),
+            neighbors=neighbors,
+            temperature=temperature,
+        )
+        local_weights, local_indices = coefficients.topk(neighbors, dim=-1)
+        global_neighbors = train_indices[local_indices]
+        predicted_down, predicted_up = concatenate_weighted_lora_factors(
+            teacher_down[global_neighbors],
+            teacher_up[global_neighbors],
+            local_weights,
+        )
+        compatibility = {
+            "predicted_down": predicted_down.cpu().to(torch.bfloat16),
+            "predicted_up": predicted_up.cpu().to(torch.bfloat16),
+            "predicted_artist_indices": selected_indices,
+            "config": {
+                "lora_directory": cfg["lora_directory"],
+                "blocks": int(cfg.get("blocks", 28)),
+            },
+        }
+        compatibility_path = output / f"reference-{count}-knn{neighbors}.pt"
+        torch.save(compatibility, compatibility_path)
+        effective = copy.deepcopy(config)
+        effective_sample = dict(effective["kv_activation_modulator_sample"])
+        effective_sample.update({
+            "checkpoint": str(compatibility_path.relative_to(destination)),
+            "output_directory": str(
+                (output / f"reference-{count}").relative_to(destination)
+            ),
+            "device": device,
+            "artist_indices": selected_indices,
+            "predicted_strengths": [
+                float(value)
+                for value in sample_cfg.get("predicted_strengths", [0.5, 1.0, 1.5])
+            ],
+            "batch_size": int(sample_cfg.get("batch_size", 4)),
+            "panel_tile_width": int(sample_cfg.get("panel_tile_width", 416)),
+        })
+        effective["kv_activation_modulator_sample"] = effective_sample
+        rendered = sample_kv_activation_modulator(effective, destination)
+        rendered["reference_ids"] = [list(rows) for rows in loaded["ids"]]
+        rendered["neighbor_ids"] = [
+            [artist_ids[int(index)] for index in row]
+            for row in global_neighbors.cpu().tolist()
+        ]
+        rendered["neighbor_weights"] = local_weights.cpu().tolist()
+        summaries[f"{count}ref"] = rendered
+        del compatibility, predicted_down, predicted_up
+        compatibility_path.unlink(missing_ok=True)
+    del reader, checkpoint, teacher_down, teacher_up, train_codes
+    torch.cuda.empty_cache()
+    summary = {
+        "checkpoint": str(checkpoint_path),
+        "artists": selected_ids,
+        "artist_indices": selected_indices,
+        "neighbors": neighbors,
+        "temperature": temperature,
         "results": summaries,
     }
     write_json(output / "summary.json", summary)
