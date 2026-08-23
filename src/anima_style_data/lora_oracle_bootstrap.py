@@ -2320,9 +2320,9 @@ def train_lora_oracle_joint_manifold(
             native_loss, native_metrics = _cross_view_artist_objective(
                 native_left, native_right, temperature=temperature
             )
-            (native_weight * native_loss).backward()
 
             native_functional_metrics: dict[str, torch.Tensor] = {}
+            native_total_loss = native_weight * native_loss
             if (
                 native_functional_weight > 0
                 and step % native_functional_every == 0
@@ -2357,8 +2357,16 @@ def train_lora_oracle_joint_manifold(
                         magnitude_weight=native_functional_magnitude_weight,
                     )
                 )
-                (native_functional_weight * native_functional_loss).backward()
+                # The functional branch consumes ``native_left/right`` from the
+                # same projector graph as the token-space native objective.
+                # Backpropagate their sum once so the shared graph is not freed
+                # before the functional gradients reach the projector.
+                native_total_loss = (
+                    native_total_loss
+                    + native_functional_weight * native_functional_loss
+                )
                 del native_functional_student
+            native_total_loss.backward()
 
             parameters = [
                 parameter for group in optimizer.param_groups for parameter in group["params"]
