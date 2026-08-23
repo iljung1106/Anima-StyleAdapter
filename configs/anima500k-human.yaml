@@ -749,6 +749,20 @@ kv_activation_generalizing_modulator:
       name: kv-activation-generalizing-modulator-v5-256
       id: kv-activation-generalizing-modulator-v5-256-artist-holdout
 
+kv_activation_generalizing_signal_analysis:
+  output_directory: kv_activation_generalizing_signal_v2_224train_32heldout
+  device: cuda
+  seed: 20260824
+  reference_counts: [1, 4]
+  contexts: 4
+  token_stride: 8
+  output_stride: 8
+  mixture_neighbors: [2, 4, 8]
+  knn_temperature: 0.1
+  visual_ridge: 0.05
+  oracle_ridge: 0.01
+  canonicalization_chunk_size: 64
+
 kv_activation_generalizing_sample:
   checkpoint: kv_activation_generalizing_modulator_v5_256_artist_holdout/best.pt
   output_directory: kv_activation_generalizing_modulator_v5_256_artist_holdout/heldout_visual_samples

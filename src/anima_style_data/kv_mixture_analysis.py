@@ -355,3 +355,259 @@ def analyze_kv_lora_mixture_generalization(
     output.mkdir(parents=True, exist_ok=True)
     write_json(output / "summary.json", summary)
     return summary
+
+
+@torch.no_grad()
+def analyze_generalizing_kv_mixture_signal(
+    config: dict[str, Any], destination: Path
+) -> dict[str, Any]:
+    """Measure genuine visual-to-LoRA signal with disjoint artist/image splits."""
+
+    from .kv_generalizing_modulator import _teacher_image_split
+
+    cfg = dict(config["kv_activation_generalizing_signal_analysis"])
+    general_cfg = dict(config["kv_activation_generalizing_modulator"])
+    training = dict(general_cfg["training"])
+    device = str(cfg.get("device", "cuda"))
+    seed = int(cfg.get("seed", 20260824))
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cuda.matmul.allow_tf32 = True
+
+    lora_directory = destination / str(general_cfg["lora_directory"])
+    artist_ids, teacher_down, teacher_up = load_kv_lora_factor_bank(
+        lora_directory, blocks=int(general_cfg.get("blocks", 28))
+    )
+    teacher_down, teacher_up = canonicalize_lora_factor_bank(
+        teacher_down.to(device),
+        teacher_up.to(device),
+        chunk_size=int(cfg.get("canonicalization_chunk_size", 64)),
+    )
+    teacher_down = teacher_down.to(dtype=torch.bfloat16)
+    teacher_up = teacher_up.to(dtype=torch.bfloat16)
+
+    reader_state = torch.load(
+        destination / str(general_cfg["reader_checkpoint"]),
+        map_location="cpu",
+        weights_only=False,
+    )
+    oracle_cfg = dict(config["kv_lora_oracle_bootstrap"])
+    detail_cfg = _oracle_detail_config(config, oracle_cfg)
+    reader = DetailPreservingTypedSlotReader(**dict(detail_cfg["model"])).to(
+        device=device, dtype=torch.bfloat16
+    )
+    reader.load_state_dict(reader_state["reader"], strict=True)
+    reader.requires_grad_(False).eval()
+    del reader_state
+
+    teacher_train_ids, teacher_validation_ids = _teacher_image_split(
+        lora_directory, artist_ids
+    )
+    common_loader = {
+        "split": "train",
+        "style_ids": artist_ids,
+        "batch_size": int(training.get("materialization_artist_chunk", 16)),
+        "seed": seed,
+        "token_lru_shards": int(training.get("token_lru_shards", 8)),
+        "strict_style_ids": True,
+    }
+    train_images = int(training.get("materialized_reference_images", 8))
+    validation_images = int(training.get("validation_reference_images", 4))
+    train_loader = CachedTeacherReferenceLoader(
+        destination / str(general_cfg["human_reference_cache"]),
+        references=train_images,
+        allowed_image_ids=teacher_train_ids,
+        **common_loader,
+    )
+    validation_loader = CachedTeacherReferenceLoader(
+        destination / str(general_cfg["human_reference_cache"]),
+        references=validation_images,
+        allowed_image_ids=teacher_validation_ids,
+        **common_loader,
+    )
+    train_codes, train_counts = _materialize_reader_code_bank(
+        reader,
+        train_loader,
+        artist_ids,
+        reference_images=train_images,
+        seed=seed ^ 0x54524149,
+        device=device,
+        style_chunk_size=int(training.get("materialization_artist_chunk", 16)),
+    )
+    validation_codes, validation_counts = _materialize_reader_code_bank(
+        reader,
+        validation_loader,
+        artist_ids,
+        reference_images=validation_images,
+        seed=seed ^ 0x56414C49,
+        device=device,
+        style_chunk_size=int(training.get("materialization_artist_chunk", 16)),
+    )
+    del reader
+    torch.cuda.empty_cache()
+
+    validation_count = int(training.get("validation_artists", 32))
+    validation_list = [
+        int(value)
+        for value in torch.linspace(0, len(artist_ids) - 1, validation_count)
+        .round()
+        .long()
+        .unique()
+    ]
+    validation_set = set(validation_list)
+    train_list = [
+        index for index in range(len(artist_ids)) if index not in validation_set
+    ]
+    train_indices = torch.tensor(train_list, device=device)
+    validation_indices = torch.tensor(validation_list, device=device)
+
+    coefficient_methods: dict[str, tuple[torch.Tensor, bool]] = {}
+    code_metrics: dict[str, dict[str, float]] = {}
+    for reference_count in tuple(int(value) for value in cfg.get("reference_counts", [1, 4])):
+        train_views = torch.nonzero(train_counts == reference_count).flatten()
+        validation_views = torch.nonzero(
+            validation_counts == reference_count
+        ).flatten()
+        if not len(train_views) or not len(validation_views):
+            raise RuntimeError(f"Missing {reference_count}-reference Reader views")
+        train_visual = train_codes[:, train_views].float().mean(dim=1).flatten(1)
+        validation_visual = (
+            validation_codes[:, validation_views].float().mean(dim=1).flatten(1)
+        )
+        train_anchor = train_visual[train_indices]
+        query = validation_visual[validation_indices]
+        ridge = _ridge_coefficients(
+            train_anchor, query, ridge=float(cfg.get("visual_ridge", 0.05))
+        )
+        coefficient_methods[f"{reference_count}ref_visual_ridge"] = (ridge, True)
+        for neighbors in cfg.get("mixture_neighbors", [2, 4, 8]):
+            coefficient_methods[
+                f"{reference_count}ref_visual_knn_{int(neighbors)}"
+            ] = (
+                _knn_coefficients(
+                    train_anchor,
+                    query,
+                    neighbors=int(neighbors),
+                    temperature=float(cfg.get("knn_temperature", 0.1)),
+                ),
+                False,
+            )
+        common = train_anchor.mean(dim=0, keepdim=True)
+        reconstructed = common + ridge @ (train_anchor - common)
+        query_centered = query - common
+        reconstructed_centered = reconstructed - common
+        code_metrics[f"{reference_count}ref"] = {
+            "ridge_code_cosine": float(
+                F.cosine_similarity(reconstructed, query, dim=-1).mean()
+            ),
+            "ridge_centered_code_cosine": float(
+                F.cosine_similarity(
+                    reconstructed_centered, query_centered, dim=-1
+                ).mean()
+            ),
+            "ridge_centered_relative_rms_error": float(
+                (reconstructed_centered - query_centered)
+                .square()
+                .mean(dim=-1)
+                .sqrt()
+                .div(
+                    query_centered.square()
+                    .mean(dim=-1)
+                    .sqrt()
+                    .clamp_min(1e-8)
+                )
+                .mean()
+            ),
+        }
+
+    contexts_all = load_file(
+        destination / str(general_cfg["text_context_cache"]) / "base.safetensors",
+        device="cpu",
+    )["base_context"]
+    heldout_contexts = int(training.get("heldout_contexts", 32))
+    contexts_all = contexts_all[-heldout_contexts:]
+    context_indices = torch.linspace(
+        0,
+        heldout_contexts - 1,
+        int(cfg.get("contexts", 4)),
+    ).round().long().unique()
+    contexts = contexts_all[context_indices].to(
+        device=device, dtype=torch.bfloat16
+    )[:, :: int(cfg.get("token_stride", 8))]
+    teacher_up_sampled = teacher_up[..., :: int(cfg.get("output_stride", 8)), :]
+
+    train_count = len(train_list)
+    validation_count = len(validation_list)
+    gram = torch.zeros(train_count, train_count, device=device)
+    cross = torch.zeros(validation_count, train_count, device=device)
+    fit_context = contexts[0].expand(len(artist_ids), -1, -1)
+    for block in range(teacher_down.shape[1]):
+        activation = apply_kv_factors(
+            fit_context,
+            teacher_down[:, block],
+            teacher_up_sampled[:, block],
+        ).float()
+        train_activation = activation[train_indices]
+        common = train_activation.mean(dim=0, keepdim=True)
+        train_centered = (train_activation - common).flatten(1)
+        validation_centered = (activation[validation_indices] - common).flatten(1)
+        dimensions = train_centered.shape[1]
+        gram.add_(train_centered @ train_centered.t() / dimensions)
+        cross.add_(validation_centered @ train_centered.t() / dimensions)
+    ridge_scale = gram.diagonal().mean().clamp_min(1e-8)
+    oracle_coefficients = torch.linalg.solve(
+        gram
+        + float(cfg.get("oracle_ridge", 0.01))
+        * ridge_scale
+        * torch.eye(train_count, device=device),
+        cross.t(),
+    ).t()
+
+    rows: dict[str, dict[str, list[float]]] = defaultdict(
+        lambda: defaultdict(list)
+    )
+    evaluation_contexts = contexts[1:] if contexts.shape[0] > 1 else contexts
+    for context in evaluation_contexts:
+        expanded = context.expand(len(artist_ids), -1, -1)
+        for block in range(teacher_down.shape[1]):
+            activation = apply_kv_factors(
+                expanded,
+                teacher_down[:, block],
+                teacher_up_sampled[:, block],
+            )
+            train_activation = activation[train_indices]
+            target = activation[validation_indices]
+            methods = {
+                "oracle_activation_ridge": (oracle_coefficients, True),
+                **coefficient_methods,
+            }
+            for method, (coefficients, affine_centered) in methods.items():
+                prediction = _activation_from_coefficients(
+                    train_activation,
+                    coefficients,
+                    affine_centered=affine_centered,
+                )
+                for key, value in _effect_metrics(prediction, target).items():
+                    rows[method][key].append(value)
+
+    activation_metrics = {
+        method: {
+            key: sum(values) / len(values) for key, values in metrics.items()
+        }
+        for method, metrics in rows.items()
+    }
+    summary = {
+        "train_artists": len(train_list),
+        "validation_artists": len(validation_list),
+        "teacher_reference_images_disjoint": True,
+        "evaluation_contexts": int(evaluation_contexts.shape[0]),
+        "blocks": int(teacher_down.shape[1]),
+        "sampled_tokens": int(contexts.shape[1]),
+        "sampled_output_channels": int(teacher_up_sampled.shape[-2]),
+        "code_metrics": code_metrics,
+        "activation_metrics": activation_metrics,
+    }
+    output = destination / str(cfg["output_directory"])
+    output.mkdir(parents=True, exist_ok=True)
+    write_json(output / "summary.json", summary)
+    return summary
