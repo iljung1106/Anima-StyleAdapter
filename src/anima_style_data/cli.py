@@ -90,6 +90,7 @@ def build_parser() -> argparse.ArgumentParser:
         ("kv-lora-reference-token-cache", "Cache Resampler tokens for K/V-only LoRA images"),
         ("lora-functional-teacher-cache", "Cache single and mixed LoRA functional effects"),
         ("kv-lora-functional-teacher-cache", "Cache K/V-only LoRA effects"),
+        ("kv-lora-fixed-teacher-compare", "Compare K/V LoRAs on one prompt and seed"),
         ("kv-lora-oracle-bootstrap-smoke", "Smoke-test K/V-only LoRA oracle capacity"),
         ("kv-lora-oracle-bootstrap-train", "Train K/V-only LoRA oracle capacity"),
         ("lora-functional-distill-smoke", "Smoke-test LoRA functional distillation"),
@@ -448,15 +449,18 @@ def main() -> None:
     elif args.command in {
         "kv-lora-reference-generate",
         "kv-lora-functional-teacher-cache",
+        "kv-lora-fixed-teacher-compare",
     }:
         from .lora_functional_distillation import (
             cache_kv_lora_functional_teacher,
+            compare_kv_lora_fixed_prompt,
             generate_kv_lora_teacher_references,
         )
 
         stage = {
             "kv-lora-reference-generate": generate_kv_lora_teacher_references,
             "kv-lora-functional-teacher-cache": cache_kv_lora_functional_teacher,
+            "kv-lora-fixed-teacher-compare": compare_kv_lora_fixed_prompt,
         }[args.command]
         _run(stage, config, destination)
     elif args.command in {

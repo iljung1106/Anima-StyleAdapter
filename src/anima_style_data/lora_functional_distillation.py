@@ -15,7 +15,7 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 import pyarrow.parquet as pq
-from PIL import Image
+from PIL import Image, ImageDraw
 from safetensors.torch import load_file, save_file
 
 from .artist_lora_teachers import ArtistLoRAPlan
@@ -721,6 +721,126 @@ def cache_kv_lora_functional_teacher(
     return cache_lora_functional_teacher(
         config, destination, config_key="kv_lora_functional_teacher"
     )
+
+
+@torch.no_grad()
+def compare_kv_lora_fixed_prompt(
+    config: dict[str, Any], destination: Path
+) -> dict[str, Any]:
+    """Render K/V-LoRA teachers on the exact fixed prompt, seed and trajectory."""
+
+    from .dual_query_external_samples import load_dual_query_external_sample
+
+    cfg = dict(config["kv_lora_teacher_references"])
+    prepared = load_dual_query_external_sample(config, destination)
+    sample_cfg = dict(prepared["cfg"])
+    device = str(cfg.get("device", "cuda"))
+    output = destination / str(cfg["output_directory"]) / "fixed_teacher_compare"
+    output.mkdir(parents=True, exist_ok=True)
+    lora_root = destination / str(cfg["lora_directory"])
+    plans = _load_lora_plan(lora_root)[:7]
+    weights = _weight_paths(lora_root, plans)
+
+    anima = _resolve_anima_model(config, destination, device).requires_grad_(False).eval()
+    _optimize_frozen_anima(
+        anima, low_precision_rmsnorm=True, fuse_attention_projections=False
+    )
+    network = _create_lora_networks(
+        config, anima, 1, device, dict(cfg.get("network_selection", {}))
+    )[0]
+    vae = _load_sampling_vae(config, destination).to(
+        device=device, dtype=torch.bfloat16
+    )
+    vae.requires_grad_(False).eval()
+
+    width = int(sample_cfg["width"])
+    height = int(sample_cfg["height"])
+    seed = int(sample_cfg["seed"])
+    steps = int(sample_cfg["steps"])
+    shift = float(sample_cfg.get("flow_shift", 3.0))
+    text_cfg = float(sample_cfg["cfg"])
+    positive = prepared["positive"].to(device=device, dtype=torch.bfloat16)
+    negative = prepared["negative"].to(device=device, dtype=torch.bfloat16)
+    if positive.ndim == 2:
+        positive = positive[None]
+    if negative.ndim == 2:
+        negative = negative[None]
+    noise = torch.randn(
+        1,
+        16,
+        1,
+        height // 8,
+        width // 8,
+        generator=torch.Generator(device="cpu").manual_seed(seed),
+        dtype=torch.float32,
+    ).to(device=device, dtype=torch.bfloat16)
+    sigmas = torch.linspace(1.0, 0.0, steps + 1, device=device, dtype=torch.float32)
+    sigmas = sigmas * shift / (1 + (shift - 1) * sigmas)
+
+    latents = []
+    labels = ["Frozen Anima"]
+    network.set_multiplier(0.0)
+    with torch.autocast("cuda", dtype=torch.bfloat16):
+        latents.append(
+            _sample_anima_batch(
+                anima,
+                noise,
+                positive,
+                negative,
+                sigmas,
+                text_cfg=text_cfg,
+                speed=None,
+                generation_seeds=[seed],
+            )
+        )
+    for plan, weight_path in zip(plans, weights, strict=True):
+        info = network.load_weights(str(weight_path))
+        if info.missing_keys or info.unexpected_keys:
+            raise RuntimeError(f"K/V LoRA key mismatch: {info}")
+        network.set_multiplier(1.0)
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            latents.append(
+                _sample_anima_batch(
+                    anima,
+                    noise,
+                    positive,
+                    negative,
+                    sigmas,
+                    text_cfg=text_cfg,
+                    speed=None,
+                    generation_seeds=[seed],
+                )
+            )
+        labels.append(plan.artist)
+
+    latent_batch = torch.cat(latents)
+    with torch.autocast("cuda", dtype=torch.bfloat16):
+        images = _preview_pixels(vae.decode_to_pixels(latent_batch))
+    label_height = 36
+    sheet = Image.new(
+        "RGB", (width * len(images), height + label_height), "white"
+    )
+    draw = ImageDraw.Draw(sheet)
+    for index, (label, image) in enumerate(zip(labels, images, strict=True)):
+        x = index * width
+        sheet.paste(image, (x, label_height))
+        draw.text((x + 8, 10), label, fill="black")
+        image.save(output / f"{index:02d}-{label.replace('/', '_')}.webp", "WEBP", quality=95)
+    sheet_path = output / "same-prompt-seed-kv-lora-teachers.png"
+    sheet.save(sheet_path)
+    summary = {
+        "artists": [plan.artist for plan in plans],
+        "prompt": str(sample_cfg["prompt"]),
+        "negative_prompt": str(sample_cfg["negative_prompt"]),
+        "seed": seed,
+        "steps": steps,
+        "text_cfg": text_cfg,
+        "width": width,
+        "height": height,
+        "sheet": str(sheet_path),
+    }
+    write_json(output / "summary.json", summary)
+    return summary
 
 
 class FunctionalLoRATeacherBank:
