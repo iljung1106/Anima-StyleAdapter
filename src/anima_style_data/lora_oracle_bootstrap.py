@@ -466,7 +466,22 @@ def train_lora_oracle_bootstrap(
             resume="allow",
             config={"lora_oracle_bootstrap": cfg},
         )
-    fixed = load_dual_query_external_sample(config, destination)
+    fixed = dict(load_dual_query_external_sample(config, destination))
+    fixed_rows = len(fixed["paths"])
+    reference_cache = destination / str(cfg["synthetic_reference_cache"])
+    reference_root = reference_cache / "images"
+    if not reference_root.is_dir() and (reference_cache.parent / "images").is_dir():
+        reference_root = reference_cache.parent / "images"
+    oracle_preview_paths = [
+        reference_root / f"artist-{index:03d}" / "content-00.webp"
+        for index in range(fixed_rows)
+    ]
+    missing_preview = [str(path) for path in oracle_preview_paths if not path.exists()]
+    if missing_preview:
+        raise FileNotFoundError(
+            f"Missing oracle reference previews: {missing_preview[:3]}"
+        )
+    fixed["paths"] = oracle_preview_paths
     batch_rows = int(training.get("batch_rows", 8))
     warmup = int(training.get("warmup_steps", 100))
     log_every = int(training.get("log_every", 10))
@@ -558,25 +573,32 @@ def train_lora_oracle_bootstrap(
                         cfg=cfg,
                     )
             if sample_every > 0 and step % sample_every == 0:
+                # The regular visual Reader is intentionally frozen during
+                # bootstrap, so sampling through it says nothing about the
+                # learned oracle codes.  Render those codes directly instead.
+                direct_reader = _FixedOracleCodeReader(
+                    oracle_codes[:fixed_rows].detach()
+                ).to(device).eval()
                 sample = _generate_fixed_reference_sample(
                     fixed,
                     config,
                     destination,
                     anima,
-                    reader,
+                    direct_reader,
                     adapter,
                     output,
                     device,
                     step,
                     component_mode="artist_only",
                     strengths_override=[1.0],
-                    sample_group="fixed_reference_samples",
+                    sample_group="oracle_code_samples",
+                    sample_suffix="direct",
                 )
                 if wandb_run is not None:
                     import wandb
 
                     wandb_run.log({
-                        "val/functional/fixed_reference": wandb.Image(
+                        "val/oracle/direct_code_fixed_reference": wandb.Image(
                             sample["sheet"], caption=f"step {step}"
                         )
                     }, step=step)
