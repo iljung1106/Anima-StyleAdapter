@@ -13,6 +13,7 @@ import gc
 import copy
 import random
 import time
+import json
 from collections import defaultdict
 from pathlib import Path
 from typing import Any
@@ -46,6 +47,8 @@ def _save_state(
     train_indices: list[int],
     validation_indices: list[int],
     best_heldout_centered_cosine: float,
+    best_step: int,
+    best_validation: dict[str, float] | None,
 ) -> None:
     temporary = path.with_suffix(path.suffix + ".tmp")
     torch.save({
@@ -58,6 +61,8 @@ def _save_state(
         "train_indices": train_indices,
         "validation_indices": validation_indices,
         "best_heldout_centered_cosine": float(best_heldout_centered_cosine),
+        "best_step": int(best_step),
+        "best_validation": best_validation,
         "python_rng": random.getstate(),
         "torch_rng": torch.get_rng_state(),
         "cuda_rng": torch.cuda.get_rng_state_all(),
@@ -357,8 +362,16 @@ def train_generalizing_kv_activation_modulator(
     checkpoints = output / "checkpoints"
     checkpoints.mkdir(parents=True, exist_ok=True)
     state_path = output / "training_state.pt"
+    validation_history_path = output / "validation_history.json"
     start_step = 0
     best_heldout_centered_cosine = float("-inf")
+    best_step = 0
+    best_validation: dict[str, float] | None = None
+    validation_history: list[dict[str, Any]] = []
+    if validation_history_path.exists():
+        validation_history = json.loads(
+            validation_history_path.read_text(encoding="utf-8")
+        )
     if bool(training.get("resume", True)) and state_path.exists():
         state = torch.load(state_path, map_location="cpu", weights_only=False)
         model.load_state_dict(state["model"], strict=True)
@@ -367,6 +380,8 @@ def train_generalizing_kv_activation_modulator(
         best_heldout_centered_cosine = float(
             state.get("best_heldout_centered_cosine", float("-inf"))
         )
+        best_step = int(state.get("best_step", 0))
+        best_validation = state.get("best_validation")
         random.setstate(state["python_rng"])
         torch.set_rng_state(state["torch_rng"])
         torch.cuda.set_rng_state_all(state["cuda_rng"])
@@ -573,11 +588,19 @@ def train_generalizing_kv_activation_modulator(
                     f"heldout={validation} train={train_validation}",
                     flush=True,
                 )
+                validation_history.append({
+                    "step": step,
+                    "heldout": validation,
+                    "train": train_validation,
+                })
+                write_json(validation_history_path, validation_history)
                 heldout_centered_cosine = float(
                     validation["centered_cosine"]
                 )
                 if heldout_centered_cosine > best_heldout_centered_cosine:
                     best_heldout_centered_cosine = heldout_centered_cosine
+                    best_step = step
+                    best_validation = dict(validation)
                     _save_state(
                         output / "best.pt",
                         step=step,
@@ -587,6 +610,8 @@ def train_generalizing_kv_activation_modulator(
                         train_indices=train_list,
                         validation_indices=validation_list,
                         best_heldout_centered_cosine=best_heldout_centered_cosine,
+                        best_step=best_step,
+                        best_validation=best_validation,
                     )
                 if wandb_run is not None:
                     wandb_run.log({
@@ -604,11 +629,45 @@ def train_generalizing_kv_activation_modulator(
                         train_indices=train_list,
                         validation_indices=validation_list,
                         best_heldout_centered_cosine=best_heldout_centered_cosine,
+                        best_step=best_step,
+                        best_validation=best_validation,
                     )
     finally:
         if wandb_run is not None:
             wandb_run.finish()
 
+    acceptance_cfg = dict(training.get("acceptance", {}))
+    accepted = False
+    acceptance_checks: dict[str, bool] = {}
+    if best_validation is not None:
+        centered_cosine_minimum = float(
+            acceptance_cfg.get("centered_cosine_minimum", 0.20)
+        )
+        centered_rms_minimum = float(
+            acceptance_cfg.get("centered_rms_ratio_minimum", 0.60)
+        )
+        centered_rms_maximum = float(
+            acceptance_cfg.get("centered_rms_ratio_maximum", 1.50)
+        )
+        common_ratio_multiplier = float(
+            acceptance_cfg.get("common_ratio_maximum_teacher_multiplier", 1.50)
+        )
+        centered_rms_ratio = float(
+            best_validation["centered_student_to_teacher_rms"]
+        )
+        acceptance_checks = {
+            "centered_cosine": float(best_validation["centered_cosine"])
+            >= centered_cosine_minimum,
+            "centered_rms_ratio": centered_rms_minimum
+            <= centered_rms_ratio <= centered_rms_maximum,
+            "common_to_centered_ratio": float(
+                best_validation["student_common_to_centered_ratio"]
+            ) <= common_ratio_multiplier * max(
+                float(best_validation["teacher_common_to_centered_ratio"]),
+                1e-8,
+            ),
+        }
+        accepted = all(acceptance_checks.values())
     summary = {
         "steps": steps,
         "start_step": start_step,
@@ -621,6 +680,10 @@ def train_generalizing_kv_activation_modulator(
         ),
         "reader_frozen": True,
         "best_heldout_centered_cosine": best_heldout_centered_cosine,
+        "best_step": best_step,
+        "best_validation": best_validation,
+        "acceptance_checks": acceptance_checks,
+        "accepted_for_visual_evaluation": accepted,
         "elapsed_seconds": time.perf_counter() - started,
         "checkpoint": str(state_path),
     }

@@ -737,6 +737,11 @@ kv_activation_generalizing_modulator:
     validation_every: 250
     checkpoint_every: 250
     resume: true
+    acceptance:
+      centered_cosine_minimum: 0.20
+      centered_rms_ratio_minimum: 0.60
+      centered_rms_ratio_maximum: 1.50
+      common_ratio_maximum_teacher_multiplier: 1.50
     wandb:
       enabled: true
       project: anima-style-adapter
