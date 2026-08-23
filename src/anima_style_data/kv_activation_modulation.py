@@ -301,13 +301,18 @@ def _validate(
         for content_index in content_indices.tolist():
             codes = style_codes[artist_indices]
             context = contexts[content_index].expand(codes.shape[0], -1, -1)
-            predicted_down, predicted_up = model(codes, block)
-            student = apply_kv_factors(context, predicted_down, predicted_up)
-            teacher = apply_kv_factors(
-                context,
-                teacher_down[artist_indices, block],
-                teacher_up[artist_indices, block],
-            )
+            with torch.autocast(
+                device_type="cuda",
+                dtype=torch.bfloat16,
+                enabled=style_codes.device.type == "cuda",
+            ):
+                predicted_down, predicted_up = model(codes, block)
+                student = apply_kv_factors(context, predicted_down, predicted_up)
+                teacher = apply_kv_factors(
+                    context,
+                    teacher_down[artist_indices, block],
+                    teacher_up[artist_indices, block],
+                )
             _, metrics = kv_activation_objective(
                 student,
                 teacher,
