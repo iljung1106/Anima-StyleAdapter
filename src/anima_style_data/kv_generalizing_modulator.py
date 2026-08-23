@@ -213,6 +213,18 @@ def _validate(
                     teacher_common.square().mean().sqrt()
                     / teacher_centered.square().mean().sqrt().clamp_min(1e-8)
                 ))
+                rows["student_raw_rms"].append(float(
+                    student.float().square().mean().sqrt()
+                ))
+                rows["teacher_raw_rms"].append(float(
+                    teacher.float().square().mean().sqrt()
+                ))
+                rows["student_centered_rms"].append(float(
+                    student_centered.square().mean().sqrt()
+                ))
+                rows["teacher_centered_rms"].append(float(
+                    teacher_centered.square().mean().sqrt()
+                ))
     model.train()
     result = {key: sum(values) / len(values) for key, values in rows.items()}
     result["mean_references"] = float(reference_counts[view_indices].float().mean())
@@ -501,6 +513,10 @@ def train_generalizing_kv_activation_modulator(
                     target_by_artist.mean(dim=0).square().mean().sqrt()
                     / target_centered.square().mean().sqrt().clamp_min(1e-8)
                 ).detach(),
+                "student_raw_rms": student_by_artist.square().mean().sqrt().detach(),
+                "target_raw_rms": target_by_artist.square().mean().sqrt().detach(),
+                "student_centered_rms": student_centered.square().mean().sqrt().detach(),
+                "target_centered_rms": target_centered.square().mean().sqrt().detach(),
                 "grad_norm": grad_norm.detach(),
                 "learning_rate": torch.tensor(learning_rate),
                 "mixture": torch.tensor(float(is_mixture)),
