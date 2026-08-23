@@ -10,6 +10,7 @@ regularizer, never a replacement for real single-artist examples.
 from __future__ import annotations
 
 import gc
+import copy
 import random
 import time
 from collections import defaultdict
@@ -642,3 +643,121 @@ def smoke_test_generalizing_kv_activation_modulator(
     return train_generalizing_kv_activation_modulator(
         effective, destination, steps_override=2
     )
+
+
+@torch.no_grad()
+def sample_generalizing_kv_activation_modulator(
+    config: dict[str, Any], destination: Path
+) -> dict[str, Any]:
+    """Render unseen artists from fresh 1/4-reference visual codes."""
+
+    from .kv_activation_sampling import sample_kv_activation_modulator
+
+    sample_cfg = dict(config["kv_activation_generalizing_sample"])
+    checkpoint_path = destination / str(sample_cfg["checkpoint"])
+    checkpoint = torch.load(
+        checkpoint_path, map_location="cpu", weights_only=False
+    )
+    cfg = dict(checkpoint["config"])
+    device = str(sample_cfg.get("device", "cuda"))
+    artist_ids, _, _ = load_kv_lora_factor_bank(
+        destination / str(cfg["lora_directory"]),
+        blocks=int(cfg.get("blocks", 28)),
+    )
+    validation_indices = [int(value) for value in checkpoint["validation_indices"]]
+    artist_count = min(
+        int(sample_cfg.get("artists", 7)), len(validation_indices)
+    )
+    selected_positions = torch.linspace(
+        0, len(validation_indices) - 1, artist_count
+    ).round().long().unique()
+    selected_indices = [
+        validation_indices[int(position)] for position in selected_positions
+    ]
+    selected_ids = [artist_ids[index] for index in selected_indices]
+
+    reader_state = torch.load(
+        destination / str(cfg["reader_checkpoint"]),
+        map_location="cpu",
+        weights_only=False,
+    )
+    oracle_cfg = dict(config["kv_lora_oracle_bootstrap"])
+    detail_cfg = _oracle_detail_config(config, oracle_cfg)
+    reader = DetailPreservingTypedSlotReader(**dict(detail_cfg["model"])).to(
+        device=device, dtype=torch.bfloat16
+    )
+    reader.load_state_dict(reader_state["reader"], strict=True)
+    reader.requires_grad_(False).eval()
+    del reader_state
+
+    loader = CachedTeacherReferenceLoader(
+        destination / str(cfg["human_reference_cache"]),
+        split="train",
+        style_ids=selected_ids,
+        batch_size=artist_count,
+        references=max(int(value) for value in sample_cfg.get("reference_counts", [1, 4])),
+        seed=int(sample_cfg.get("seed", 20260824)),
+        token_lru_shards=int(sample_cfg.get("token_lru_shards", 8)),
+        strict_style_ids=True,
+    )
+    output = destination / str(sample_cfg["output_directory"])
+    output.mkdir(parents=True, exist_ok=True)
+    summaries = {}
+    for reference_count in sample_cfg.get("reference_counts", [1, 4]):
+        loaded = loader.load_styles(
+            selected_ids,
+            references_per_style=int(reference_count),
+            seed=int(sample_cfg.get("seed", 20260824)) + int(reference_count) * 1_000_003,
+        )
+        tokens = loaded["tokens"].to(
+            device=device, dtype=torch.bfloat16, non_blocking=True
+        )
+        mask = torch.ones(tokens.shape[:2], device=device, dtype=torch.bool)
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            codes = reader(tokens, mask).tokens.cpu()
+        style_codes = torch.zeros(
+            len(artist_ids), *codes.shape[1:], dtype=codes.dtype
+        )
+        style_codes[selected_indices] = codes
+        compatibility = {
+            "model": checkpoint["model"],
+            "style_codes": style_codes,
+            "config": {
+                "model": cfg["model"],
+                "lora_directory": cfg["lora_directory"],
+                "blocks": int(cfg.get("blocks", 28)),
+            },
+        }
+        compatibility_path = output / f"reference-{int(reference_count)}-codes.pt"
+        torch.save(compatibility, compatibility_path)
+        effective = copy.deepcopy(config)
+        effective_sample = dict(effective["kv_activation_modulator_sample"])
+        effective_sample.update({
+            "checkpoint": str(compatibility_path.relative_to(destination)),
+            "output_directory": str(
+                (output / f"reference-{int(reference_count)}").relative_to(destination)
+            ),
+            "device": device,
+            "artist_indices": selected_indices,
+            "predicted_strengths": [
+                float(value) for value in sample_cfg.get(
+                    "predicted_strengths", [0.5, 1.0, 1.5]
+                )
+            ],
+            "batch_size": int(sample_cfg.get("batch_size", 4)),
+            "panel_tile_width": int(sample_cfg.get("panel_tile_width", 416)),
+        })
+        effective["kv_activation_modulator_sample"] = effective_sample
+        rendered = sample_kv_activation_modulator(effective, destination)
+        rendered["reference_ids"] = [list(rows) for rows in loaded["ids"]]
+        summaries[f"{int(reference_count)}ref"] = rendered
+    del reader, checkpoint
+    torch.cuda.empty_cache()
+    summary = {
+        "checkpoint": str(checkpoint_path),
+        "artists": selected_ids,
+        "artist_indices": selected_indices,
+        "results": summaries,
+    }
+    write_json(output / "summary.json", summary)
+    return summary

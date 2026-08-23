@@ -102,6 +102,7 @@ def build_parser() -> argparse.ArgumentParser:
         ("kv-activation-mixture-analyze", "Measure held-out signal in multi-artist K/V mixtures"),
         ("kv-activation-generalize-smoke", "Smoke-test artist-disjoint visual K/V modulation"),
         ("kv-activation-generalize-train", "Train artist-disjoint visual K/V modulation"),
+        ("kv-activation-generalize-sample", "Render fresh-reference heldout K/V modulation"),
         ("lora-functional-distill-smoke", "Smoke-test LoRA functional distillation"),
         ("lora-functional-distill-train", "Distill artist-tag, LoRA and mixed-LoRA teachers"),
         ("lora-functional-distill-v2-smoke", "Smoke-test artist-centered LoRA distillation"),
@@ -551,6 +552,7 @@ def main() -> None:
         "kv-activation-mixture-analyze",
         "kv-activation-generalize-smoke",
         "kv-activation-generalize-train",
+        "kv-activation-generalize-sample",
     }:
         from .kv_activation_modulation import (
             smoke_test_kv_activation_modulator,
@@ -568,6 +570,7 @@ def main() -> None:
         from .kv_generalizing_modulator import (
             smoke_test_generalizing_kv_activation_modulator,
             train_generalizing_kv_activation_modulator,
+            sample_generalizing_kv_activation_modulator,
         )
 
         stage = {
@@ -580,6 +583,7 @@ def main() -> None:
             "kv-activation-mixture-analyze": analyze_kv_lora_mixture_generalization,
             "kv-activation-generalize-smoke": smoke_test_generalizing_kv_activation_modulator,
             "kv-activation-generalize-train": train_generalizing_kv_activation_modulator,
+            "kv-activation-generalize-sample": sample_generalizing_kv_activation_modulator,
         }[args.command]
         _run(stage, config, destination)
     elif args.command in {
