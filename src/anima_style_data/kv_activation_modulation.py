@@ -60,6 +60,43 @@ def canonicalize_lora_factors(
     return canonical_down, canonical_up
 
 
+def canonicalize_lora_factor_bank(
+    down: torch.Tensor,
+    up: torch.Tensor,
+    *,
+    chunk_size: int = 64,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Batched canonicalization for the complete artist/block/KV bank."""
+
+    leading = down.shape[:-2]
+    if up.shape[:-2] != leading or down.shape[-2] != up.shape[-1]:
+        raise ValueError("LoRA factor-bank shapes disagree")
+    flat_down = down.reshape(-1, *down.shape[-2:])
+    flat_up = up.reshape(-1, *up.shape[-2:])
+    canonical_down: list[torch.Tensor] = []
+    canonical_up: list[torch.Tensor] = []
+    for start in range(0, flat_down.shape[0], chunk_size):
+        stop = min(flat_down.shape[0], start + chunk_size)
+        down_chunk = flat_down[start:stop].float()
+        up_chunk = flat_up[start:stop].float()
+        q_up, r_up = torch.linalg.qr(up_chunk, mode="reduced")
+        q_down, r_down = torch.linalg.qr(
+            down_chunk.transpose(-1, -2), mode="reduced"
+        )
+        left, singular, right_h = torch.linalg.svd(
+            r_up @ r_down.transpose(-1, -2), full_matrices=False
+        )
+        root = singular.clamp_min(0).sqrt()
+        canonical_up.append((q_up @ left) * root.unsqueeze(-2))
+        canonical_down.append(
+            root.unsqueeze(-1) * (right_h @ q_down.transpose(-1, -2))
+        )
+    return (
+        torch.cat(canonical_down).reshape(*leading, *down.shape[-2:]),
+        torch.cat(canonical_up).reshape(*leading, *up.shape[-2:]),
+    )
+
+
 def load_kv_lora_factor_bank(
     root: Path,
     *,
@@ -107,9 +144,8 @@ def load_kv_lora_factor_bank(
                     expected = (rank, int(down.shape[1]), int(up.shape[0]))
                 if (rank, int(down.shape[1]), int(up.shape[0])) != expected:
                     raise RuntimeError("K/V-only LoRA factor dimensions disagree")
-                down, up = canonicalize_lora_factors(down, up * scale)
                 block_down.append(down)
-                block_up.append(up)
+                block_up.append(up * scale)
             artist_down.append(torch.stack(block_down))
             artist_up.append(torch.stack(block_up))
         all_down.append(torch.stack(artist_down))
@@ -441,8 +477,15 @@ def train_kv_activation_modulator(
     ).to(device)
     style_codes = style_codes.to(device=device, dtype=torch.bfloat16)
     contexts = contexts.to(device=device, dtype=torch.bfloat16)
-    teacher_down = teacher_down.to(device=device, dtype=torch.bfloat16)
-    teacher_up = teacher_up.to(device=device, dtype=torch.bfloat16)
+    teacher_down = teacher_down.to(device=device, dtype=torch.float32)
+    teacher_up = teacher_up.to(device=device, dtype=torch.float32)
+    teacher_down, teacher_up = canonicalize_lora_factor_bank(
+        teacher_down,
+        teacher_up,
+        chunk_size=int(training.get("canonicalization_chunk_size", 64)),
+    )
+    teacher_down = teacher_down.to(dtype=torch.bfloat16)
+    teacher_up = teacher_up.to(dtype=torch.bfloat16)
     output = destination / str(cfg["output_directory"])
     checkpoints = output / "checkpoints"
     checkpoints.mkdir(parents=True, exist_ok=True)

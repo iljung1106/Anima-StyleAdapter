@@ -552,6 +552,7 @@ kv_activation_modulator:
     device: cuda
     steps: 3000
     batch_artists: 16
+    canonicalization_chunk_size: 64
     heldout_contexts: 32
     validation_artists: 8
     validation_contexts: 4

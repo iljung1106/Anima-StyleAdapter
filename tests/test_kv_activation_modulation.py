@@ -3,6 +3,7 @@ import torch
 from anima_style_data.kv_activation_modulation import (
     NativeKVFactorModulator,
     apply_kv_factors,
+    canonicalize_lora_factor_bank,
     canonicalize_lora_factors,
     kv_activation_objective,
     kv_factor_objective,
@@ -33,6 +34,23 @@ def test_canonical_factors_preserve_the_exact_weight_delta():
     up = torch.randn(9, 3)
 
     canonical_down, canonical_up = canonicalize_lora_factors(down, up)
+
+    torch.testing.assert_close(
+        canonical_up @ canonical_down,
+        up @ down,
+        atol=1e-5,
+        rtol=1e-5,
+    )
+
+
+def test_batched_canonicalization_preserves_every_weight_delta():
+    torch.manual_seed(13)
+    down = torch.randn(2, 3, 2, 7)
+    up = torch.randn(2, 3, 9, 2)
+
+    canonical_down, canonical_up = canonicalize_lora_factor_bank(
+        down, up, chunk_size=4
+    )
 
     torch.testing.assert_close(
         canonical_up @ canonical_down,
