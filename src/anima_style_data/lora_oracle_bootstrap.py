@@ -55,6 +55,42 @@ class _FixedOracleCodeReader(torch.nn.Module):
         return SimpleNamespace(tokens=self.tokens)
 
 
+_ORACLE_STRENGTH_STATE_KEYS = frozenset(
+    {
+        "alpha",
+        "strength_timestep_centers",
+        "alpha_by_timestep",
+        "native_lower_by_timestep",
+        "native_upper_by_timestep",
+        "native_fixed_output_by_timestep",
+        "timestep_strength_enabled",
+        "fixed_output_strength_enabled",
+    }
+)
+
+
+def _oracle_adapter_initial_state(
+    fresh_state: dict[str, torch.Tensor],
+    checkpoint_state: dict[str, torch.Tensor],
+    mode: str,
+) -> dict[str, torch.Tensor]:
+    """Choose checkpoint K/V or fresh K/V with checkpoint strength calibration."""
+
+    mode = str(mode)
+    if mode == "checkpoint":
+        return checkpoint_state
+    if mode != "fresh_kv_checkpoint_strength":
+        raise ValueError(f"Unsupported oracle adapter initialization: {mode}")
+    merged = dict(fresh_state)
+    for key in _ORACLE_STRENGTH_STATE_KEYS:
+        if key not in checkpoint_state or key not in merged:
+            raise KeyError(f"Missing strength calibration state: {key}")
+        if checkpoint_state[key].shape != merged[key].shape:
+            raise ValueError(f"Strength calibration shape mismatch for {key}")
+        merged[key] = checkpoint_state[key]
+    return merged
+
+
 class OracleVisualProjector(torch.nn.Module):
     """Low-capacity residual map from content-bearing Reader codes to oracle codes."""
 
@@ -430,7 +466,14 @@ def train_lora_oracle_bootstrap(
         weights_only=False,
     )
     reader.load_state_dict(initial["reader"], strict=True)
-    adapter.load_state_dict(initial["adapter"], strict=True)
+    adapter.load_state_dict(
+        _oracle_adapter_initial_state(
+            adapter.state_dict(),
+            initial["adapter"],
+            str(cfg.get("adapter_initialization", "checkpoint")),
+        ),
+        strict=True,
+    )
     adapter.restore_timestep_strength_state()
     adapter.set_bootstrap_phase("artist_only")
     reader.requires_grad_(False).eval()
@@ -518,6 +561,13 @@ def train_lora_oracle_bootstrap(
             "weight_decay": 0.0,
         },
     ]
+    if adapter.null_parameters():
+        groups.append({
+            "params": adapter.null_parameters(),
+            "lr": float(training.get("null_learning_rate", 5e-4)),
+            "name": "artist_null",
+            "weight_decay": 0.0,
+        })
     optimizer = torch.optim.AdamW(
         groups,
         betas=tuple(training.get("betas", [0.9, 0.95])),

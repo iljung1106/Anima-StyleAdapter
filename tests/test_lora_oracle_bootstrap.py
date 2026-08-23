@@ -10,6 +10,7 @@ from anima_style_data.lora_oracle_bootstrap import (
     _interpolate_oracle_visual,
     _oracle_code_alignment_objective,
     _materialize_reader_code_bank,
+    _oracle_adapter_initial_state,
     _sample_diverse_functional_batch,
     _piecewise_linear_value,
     OracleVisualProjector,
@@ -146,6 +147,34 @@ def test_fixed_oracle_reader_returns_checkpoint_codes():
     result = reader(torch.randn(7, 1, 84, 16), torch.ones(7, 1, dtype=torch.bool))
 
     assert result.tokens.data_ptr() == codes.data_ptr()
+
+
+def test_fresh_oracle_adapter_keeps_kv_and_copies_only_strength_state():
+    fresh = {
+        "base_k.0.weight": torch.tensor([1.0]),
+        "alpha": torch.tensor([1.0]),
+        "strength_timestep_centers": torch.tensor([0.2]),
+        "alpha_by_timestep": torch.tensor([[1.0]]),
+        "native_lower_by_timestep": torch.tensor([[1.0]]),
+        "native_upper_by_timestep": torch.tensor([[2.0]]),
+        "native_fixed_output_by_timestep": torch.tensor([[1.5]]),
+        "timestep_strength_enabled": torch.tensor(False),
+        "fixed_output_strength_enabled": torch.tensor(False),
+    }
+    checkpoint = {
+        key: value + 10 if value.dtype != torch.bool else ~value
+        for key, value in fresh.items()
+    }
+    merged = _oracle_adapter_initial_state(
+        fresh, checkpoint, "fresh_kv_checkpoint_strength"
+    )
+
+    assert torch.equal(merged["base_k.0.weight"], fresh["base_k.0.weight"])
+    assert torch.equal(merged["alpha"], checkpoint["alpha"])
+    assert torch.equal(
+        merged["native_fixed_output_by_timestep"],
+        checkpoint["native_fixed_output_by_timestep"],
+    )
 
 
 def test_oracle_visual_interpolation_reaches_both_endpoints():

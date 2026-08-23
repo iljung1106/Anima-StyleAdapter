@@ -453,9 +453,10 @@ lora_functional_distillation_v2:
 # frozen.  This first proves and learns the effect subspace available to the
 # actual artist-only style cross-attention; the Reader is distilled afterward.
 lora_oracle_bootstrap:
-  output_directory: lora_oracle_bootstrap_v3_256_broad12x6
+  output_directory: lora_oracle_bootstrap_v4_256_broad12x6_clean
   seed: 20260823
   initial_checkpoint: detail_preserving_style_cross_attention_v34_anti_common_functional/checkpoints/step-0000500.pt
+  adapter_initialization: fresh_kv_checkpoint_strength
   teacher_cache: lora_functional_teacher_bank_rank16_256_v3_broad12x6
   human_reference_cache: dual_query_reference_tokens_v8_step10000
   synthetic_reference_cache: lora_teacher_references_rank16_256x8_v2/dual_query_reference_tokens_v8_step10000
@@ -468,9 +469,10 @@ lora_oracle_bootstrap:
     initialization_references: 4
     initialization_batch_size: 8
     oracle_learning_rate: 0.00050
-    shared_learning_rate: 0.00005
-    delta_learning_rate: 0.00010
-    mix_learning_rate: 0.00002
+    shared_learning_rate: 0.00010
+    delta_learning_rate: 0.00020
+    mix_learning_rate: 0.00005
+    null_learning_rate: 0.00050
     oracle_anchor_weight: 0.01
     warmup_steps: 100
     betas: [0.9, 0.95]
@@ -495,7 +497,7 @@ lora_oracle_bootstrap:
       global_magnitude: 0.10
       infonce: 0.50
       infonce_temperature: 0.10
-      zero_mean: 0.10
+      zero_mean: 1.00
     log_every: 10
     checkpoint_every: 250
     sample_every: 500
@@ -503,8 +505,8 @@ lora_oracle_bootstrap:
     wandb:
       enabled: true
       project: anima-style-adapter
-      name: lora-oracle-bootstrap-v3-256-broad12x6
-      id: lora-oracle-bootstrap-v3-256-broad12x6
+      name: lora-oracle-bootstrap-v4-256-broad12x6-clean
+      id: lora-oracle-bootstrap-v4-256-broad12x6-clean
   visual_bridge:
     output_directory: lora_oracle_projected_bridge_v2_plateau
     source_checkpoint: lora_oracle_bootstrap_v1/training_state.pt
@@ -547,8 +549,8 @@ lora_oracle_bootstrap:
       name: lora-oracle-projected-bridge-v2-plateau
       id: lora-oracle-projected-bridge-v2-plateau
   visual_projector:
-    output_directory: lora_oracle_visual_projector_v5_256_broad12x6
-    source_checkpoint: lora_oracle_bootstrap_v3_256_broad12x6/training_state.pt
+    output_directory: lora_oracle_visual_projector_v6_256_broad12x6_clean
+    source_checkpoint: lora_oracle_bootstrap_v4_256_broad12x6_clean/training_state.pt
     steps: 1500
     batch_rows: 64
     token_lru_shards: 512
@@ -579,8 +581,8 @@ lora_oracle_bootstrap:
     wandb:
       enabled: true
       project: anima-style-adapter
-      name: lora-oracle-visual-projector-v5-256-broad12x6
-      id: lora-oracle-visual-projector-v5-256-broad12x6
+      name: lora-oracle-visual-projector-v6-256-broad12x6-clean
+      id: lora-oracle-visual-projector-v6-256-broad12x6-clean
   functional_projector:
     output_directory: lora_oracle_functional_projector_v2_native_pretrain
     source_checkpoint: lora_oracle_bootstrap_v1/training_state.pt
@@ -627,9 +629,9 @@ lora_oracle_bootstrap:
       name: lora-oracle-functional-projector-v2-native-pretrain
       id: lora-oracle-functional-projector-v2-native-pretrain
   joint_manifold:
-    output_directory: lora_oracle_joint_manifold_v3_256_broad12x6
-    source_checkpoint: lora_oracle_bootstrap_v3_256_broad12x6/training_state.pt
-    projector_checkpoint: lora_oracle_visual_projector_v5_256_broad12x6/training_state.pt
+    output_directory: lora_oracle_joint_manifold_v4_256_broad12x6_clean
+    source_checkpoint: lora_oracle_bootstrap_v4_256_broad12x6_clean/training_state.pt
+    projector_checkpoint: lora_oracle_visual_projector_v6_256_broad12x6_clean/training_state.pt
     steps: 2000
     cpu_threads: 16
     batch_rows: 8
@@ -685,8 +687,8 @@ lora_oracle_bootstrap:
     wandb:
       enabled: true
       project: anima-style-adapter
-      name: lora-oracle-joint-manifold-v3-256-broad12x6
-      id: lora-oracle-joint-manifold-v3-256-broad12x6
+      name: lora-oracle-joint-manifold-v4-256-broad12x6-clean
+      id: lora-oracle-joint-manifold-v4-256-broad12x6-clean
 
 # B-prime per-reference encoder. C-RADIO spatial features and Qwen Image VAE
 # latents remain separate K/V banks; learned spatial/global queries read both.
