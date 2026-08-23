@@ -683,6 +683,64 @@ kv_activation_mixture_analysis:
   oracle_ridge: 0.01
   canonicalization_chunk_size: 64
 
+# Honest visual generalization experiment.  The Reader is frozen; 32 artists
+# are never shown to the modulator.  Training targets are native text K/V
+# activations on multiple contexts, not arbitrary LoRA factor coordinates.
+# Convex 2/3-artist mixtures are a 25% auxiliary linearity regularizer.
+kv_activation_generalizing_modulator:
+  output_directory: kv_activation_generalizing_modulator_v5_256_artist_holdout
+  lora_directory: artist_kv_lora_teachers_rank16_256_b2_v2
+  reader_checkpoint: kv_lora_oracle_bootstrap_v3_64_broad256x4/checkpoints/step-0001750.pt
+  human_reference_cache: dual_query_reference_tokens_v8_step10000
+  text_context_cache: kv_lora_functional_teacher_bank_rank16_64_v2_broad256x4
+  blocks: 28
+  seed: 20260824
+  model:
+    hidden_dim: 512
+    heads: 8
+    layers: 2
+    ff_dim: 2048
+    block_specific_heads: false
+    block_delta_rank: 32
+  training:
+    device: cuda
+    steps: 8000
+    batch_artists: 16
+    validation_artists: 32
+    materialized_reference_images: 8
+    materialization_artist_chunk: 16
+    token_lru_shards: 8
+    reference_count_weights: {"1": 0.50, "2": 0.30, "4": 0.20}
+    mixture_probability: 0.25
+    mixture_sizes: [2, 3]
+    contexts_per_step: 2
+    tokens_per_step: 64
+    output_channels_per_step: 256
+    heldout_contexts: 32
+    validation_contexts: 3
+    validation_views: 2
+    validation_tokens: 64
+    validation_output_channels: 256
+    canonicalization_chunk_size: 64
+    learning_rate: 0.0003
+    warmup_steps: 100
+    betas: [0.9, 0.95]
+    adam_eps: 0.00000001
+    weight_decay: 0.01
+    max_grad_norm: 2.0
+    direction_weight: 1.0
+    magnitude_weight: 0.2
+    fused_adamw: true
+    log_every: 10
+    validation_every: 250
+    checkpoint_every: 250
+    resume: true
+    wandb:
+      enabled: true
+      project: anima-style-adapter
+      name: kv-activation-generalizing-modulator-v5-256
+      id: kv-activation-generalizing-modulator-v5-256-artist-holdout
+
 # Offline functional teacher and clean continuation runner. Teacher updates
 # cycle @artist : individual LoRA : mixed LoRA at 1:1:1 after an individual
 # LoRA bootstrap. LoRA steps alternate human and LoRA-generated references.

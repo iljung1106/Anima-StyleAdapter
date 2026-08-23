@@ -210,6 +210,7 @@ class NativeKVFactorModulator(nn.Module):
         layers: int = 2,
         ff_dim: int = 2048,
         block_specific_heads: bool = False,
+        block_delta_rank: int = 0,
     ) -> None:
         super().__init__()
         if hidden_dim % heads:
@@ -219,6 +220,11 @@ class NativeKVFactorModulator(nn.Module):
         self.context_dim = int(context_dim)
         self.output_dim = int(output_dim)
         self.block_specific_heads = bool(block_specific_heads)
+        self.block_delta_rank = int(block_delta_rank)
+        if self.block_specific_heads and self.block_delta_rank:
+            raise ValueError(
+                "block_delta_rank is only valid with shared output heads"
+            )
         self.style_norm = nn.LayerNorm(style_dim)
         self.style_projection = nn.Linear(style_dim, hidden_dim, bias=False)
         self.block_embedding = nn.Embedding(blocks, hidden_dim)
@@ -256,6 +262,24 @@ class NativeKVFactorModulator(nn.Module):
             self.up_head = nn.Linear(hidden_dim, output_dim, bias=False)
             nn.init.xavier_uniform_(self.down_head.weight)
             nn.init.xavier_uniform_(self.up_head.weight)
+            if self.block_delta_rank:
+                delta = self.block_delta_rank
+                self.down_delta_a = nn.Parameter(
+                    torch.empty(blocks, 2, delta, hidden_dim)
+                )
+                self.down_delta_b = nn.Parameter(
+                    torch.empty(blocks, 2, context_dim, delta)
+                )
+                self.up_delta_a = nn.Parameter(
+                    torch.empty(blocks, 2, delta, hidden_dim)
+                )
+                self.up_delta_b = nn.Parameter(
+                    torch.empty(blocks, 2, output_dim, delta)
+                )
+                nn.init.xavier_uniform_(self.down_delta_a)
+                nn.init.xavier_uniform_(self.up_delta_a)
+                nn.init.normal_(self.down_delta_b, std=1e-4)
+                nn.init.normal_(self.up_delta_b, std=1e-4)
         self.down_log_scale = nn.Linear(hidden_dim, 1)
         self.up_log_scale = nn.Linear(hidden_dim, 1)
         nn.init.zeros_(self.down_log_scale.weight)
@@ -329,6 +353,27 @@ class NativeKVFactorModulator(nn.Module):
         else:
             down_raw = self.down_head(factors)
             up_raw = self.up_head(factors)
+            if self.block_delta_rank:
+                down_hidden = torch.einsum(
+                    "btrh,btdh->btrd",
+                    factors,
+                    self.down_delta_a[block_index],
+                )
+                down_raw = down_raw + torch.einsum(
+                    "btrd,btod->btro",
+                    down_hidden,
+                    self.down_delta_b[block_index],
+                )
+                up_hidden = torch.einsum(
+                    "btrh,btdh->btrd",
+                    factors,
+                    self.up_delta_a[block_index],
+                )
+                up_raw = up_raw + torch.einsum(
+                    "btrd,btod->btro",
+                    up_hidden,
+                    self.up_delta_b[block_index],
+                )
         down_direction = F.normalize(
             down_raw.float(), dim=-1
         ).to(factors.dtype) * math.sqrt(self.context_dim)
