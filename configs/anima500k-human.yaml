@@ -448,6 +448,61 @@ lora_functional_distillation_v2:
       id: detail-style-lora-functional-distill-v2-artist-centered
 
 
+# Direct image-distribution representability test.  The eight LoRA-generated
+# targets per artist are a complete 256x8 grid with artist-free content prompts.
+# Training against their rectified-flow x0 target avoids asking a style-only
+# cross-attention branch to regress full-DiT LoRA internals it cannot represent.
+lora_image_flow_oracle:
+  output_directory: lora_image_flow_oracle_v1_256_independent_kv
+  target_cache: lora_image_flow_targets_rank16_256x8_v1
+  source_directory: lora_teacher_references_rank16_256x8_v2
+  seed: 20260823
+  initial_checkpoint: detail_preserving_style_cross_attention_v34_anti_common_functional/checkpoints/step-0000500.pt
+  adapter_initialization: fresh_kv_checkpoint_strength
+  human_reference_cache: dual_query_reference_tokens_v8_step10000
+  synthetic_reference_cache: lora_teacher_references_rank16_256x8_v2/dual_query_reference_tokens_v8_step10000
+  cache_device: cuda
+  text_batch_size: 8
+  adapter_override:
+    shared_bases: 28
+    medoid_blocks: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13,
+                    14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27]
+    block_to_base: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13,
+                    14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27]
+    mix_logit_scale: 32.0
+    delta_k_init_scale: 0.0001
+    delta_v_init_scale: 0.0001
+  training:
+    device: cuda
+    steps: 2000
+    batch_size: 16
+    initialization_references: 4
+    initialization_batch_size: 8
+    oracle_learning_rate: 0.00050
+    shared_learning_rate: 0.00020
+    delta_learning_rate: 0.0
+    mix_learning_rate: 0.0
+    null_learning_rate: 0.00050
+    oracle_anchor_weight: 0.001
+    warmup_steps: 100
+    betas: [0.9, 0.95]
+    adam_eps: 0.00000001
+    weight_decay: 0.01
+    max_grad_norm: 1.0
+    fused_adamw: true
+    token_lru_shards: 8
+    log_every: 10
+    validation_every: 250
+    checkpoint_every: 250
+    sample_every: 500
+    resume: true
+    wandb:
+      enabled: true
+      project: anima-style-adapter
+      name: lora-image-flow-oracle-v1-256-independent-kv
+      id: lora-image-flow-oracle-v1-256-independent-kv
+
+
 # Representability bootstrap.  A visual-anchored 28x1024 oracle code is learned
 # for each of the 256 LoRA teachers while the Reader and Common branch remain
 # frozen.  This first proves and learns the effect subspace available to the

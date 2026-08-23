@@ -88,6 +88,9 @@ def build_parser() -> argparse.ArgumentParser:
         ("lora-functional-distill-train", "Distill artist-tag, LoRA and mixed-LoRA teachers"),
         ("lora-functional-distill-v2-smoke", "Smoke-test artist-centered LoRA distillation"),
         ("lora-functional-distill-v2-train", "Train artist-centered LoRA distillation"),
+        ("lora-image-flow-cache", "Cache LoRA-generated x0 latents and text contexts"),
+        ("lora-image-flow-oracle-smoke", "Smoke-test direct LoRA image-flow oracle"),
+        ("lora-image-flow-oracle-train", "Train direct LoRA image-flow oracle"),
         ("lora-oracle-bootstrap-smoke", "Smoke-test visual-anchored LoRA oracle codes"),
         ("lora-oracle-bootstrap-train", "Train visual-anchored LoRA oracle codes"),
         ("lora-oracle-bootstrap-sample", "Render learned LoRA oracle codes directly"),
@@ -357,6 +360,23 @@ def main() -> None:
         _run(cache_all_anima_inputs, config, destination)
     elif args.command == "anima-cache-validate":
         _run(validate_anima_caches, config, destination)
+    elif args.command in {
+        "lora-image-flow-cache",
+        "lora-image-flow-oracle-smoke",
+        "lora-image-flow-oracle-train",
+    }:
+        from .lora_image_flow_oracle import (
+            cache_lora_image_flow_targets,
+            smoke_test_lora_image_flow_oracle,
+            train_lora_image_flow_oracle,
+        )
+
+        stage = {
+            "lora-image-flow-cache": cache_lora_image_flow_targets,
+            "lora-image-flow-oracle-smoke": smoke_test_lora_image_flow_oracle,
+            "lora-image-flow-oracle-train": train_lora_image_flow_oracle,
+        }[args.command]
+        _run(stage, config, destination)
     elif args.command in {
         "artist-lora-plan",
         "artist-lora-smoke",
