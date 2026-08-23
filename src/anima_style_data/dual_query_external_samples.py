@@ -69,7 +69,11 @@ def encode_dual_query_reference_images(
         raise ValueError("At least one reference image is required")
 
     feature_cfg = dict(config["style_features"])
-    radio_cfg = {**config["cradio"], **feature_cfg.get("preprocess", {})}
+    radio_cfg = {
+        **config["cradio"],
+        **feature_cfg.get("preprocess", {}),
+        "device": device,
+    }
     cradio, _ = _load_cradio(radio_cfg, destination / "cradio_model_cache")
     semantic_features: list[dict[int, torch.Tensor]] = []
     semantic_shapes: list[tuple[int, int]] = []
@@ -185,12 +189,17 @@ def encode_dual_query_reference_images(
             )
             print(f"reference Resampler {index}/{len(paths)}", flush=True)
     tokens = torch.stack(encoded_tokens).contiguous()
+    checkpoint_step = int(checkpoint_step)
     expected = (len(paths), 84, 1024)
     if tuple(tokens.shape) != expected or not torch.isfinite(tokens).all():
         raise RuntimeError(f"Invalid dual-query tokens {tuple(tokens.shape)}")
+    del resampler, semantic_features, latent_values, encoded_tokens
+    gc.collect()
+    if device.startswith("cuda"):
+        torch.cuda.empty_cache()
     return {
         "tokens": tokens,
-        "checkpoint_step": int(checkpoint_step),
+        "checkpoint_step": checkpoint_step,
         "paths": paths,
         "image_sizes": image_sizes,
     }

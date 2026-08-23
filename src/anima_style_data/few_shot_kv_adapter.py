@@ -28,6 +28,21 @@ def _architecture_from_state(state: dict[str, Any]) -> dict[str, int]:
     }
 
 
+@torch.no_grad()
+def prepare_reference_tokens(
+    config: dict[str, Any],
+    destination: Path,
+    paths: list[Path],
+    *,
+    device: str = "cuda",
+) -> torch.Tensor:
+    """Tokenize raw references before loading Anima to minimize peak VRAM."""
+    encoded = encode_dual_query_reference_images(
+        config, destination, paths, device=device
+    )
+    return encoded["tokens"].unsqueeze(0)
+
+
 class FewShotNativeKVStyleAdapter(nn.Module):
     """Convert frozen per-reference tokens into live Anima K/V deltas.
 
@@ -112,13 +127,9 @@ class FewShotNativeKVStyleAdapter(nn.Module):
         paths: list[Path],
     ) -> torch.Tensor:
         """Run raw images through the exact frozen production feature path."""
-        encoded = encode_dual_query_reference_images(
-            config,
-            destination,
-            paths,
-            device=str(self.device),
+        return prepare_reference_tokens(
+            config, destination, paths, device=str(self.device)
         )
-        return encoded["tokens"].unsqueeze(0)
 
     @torch.no_grad()
     def set_raw_references(
