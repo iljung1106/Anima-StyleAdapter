@@ -108,6 +108,85 @@ def _effect_metrics(
     }
 
 
+def _mixture_rank_energy_retention(
+    down: torch.Tensor,
+    up: torch.Tensor,
+    weights: torch.Tensor,
+    *,
+    target_rank: int,
+) -> float:
+    """Return the Frobenius energy retained by the best target-rank mixture.
+
+    ``sum_g weight_g * up_g @ down_g`` can have ``groups * teacher_rank``
+    non-zero singular values. Computing the large dense delta is unnecessary:
+    thin QR decompositions reduce its singular spectrum to a small core matrix.
+    """
+
+    if down.ndim != 3 or up.ndim != 3:
+        raise ValueError("Expected [groups, rank, input] and [groups, output, rank]")
+    if down.shape[0] != up.shape[0] or down.shape[0] != weights.numel():
+        raise ValueError("Mixture group dimensions do not match")
+    groups, rank, _ = down.shape
+    if up.shape[-1] != rank:
+        raise ValueError("LoRA down/up ranks do not match")
+
+    left = (
+        up.float() * weights.float()[:, None, None]
+    ).permute(1, 0, 2).reshape(up.shape[1], groups * rank)
+    right_t = down.float().reshape(groups * rank, down.shape[-1]).t()
+    _, left_r = torch.linalg.qr(left, mode="reduced")
+    _, right_r = torch.linalg.qr(right_t, mode="reduced")
+    singular = torch.linalg.svdvals(left_r @ right_r.t())
+    energy = singular.square()
+    keep = min(int(target_rank), int(energy.numel()))
+    return float(energy[:keep].sum() / energy.sum().clamp_min(1e-12))
+
+
+def _measure_mixture_rank_retention(
+    teacher_down: torch.Tensor,
+    teacher_up: torch.Tensor,
+    train_indices: torch.Tensor,
+    *,
+    seed: int,
+    config: dict[str, Any],
+) -> dict[str, dict[str, float]]:
+    generator = torch.Generator().manual_seed(seed ^ 0x52414E4B)
+    blocks = tuple(
+        min(max(0, int(value)), int(teacher_down.shape[1]) - 1)
+        for value in config.get("mixture_rank_blocks", [0, 7, 14, 21, 27])
+    )
+    samples = int(config.get("mixture_rank_samples", 4))
+    result: dict[str, dict[str, float]] = {}
+    for group_size in tuple(
+        int(value) for value in config.get("mixture_rank_sizes", [2, 3])
+    ):
+        values: list[float] = []
+        for _ in range(samples):
+            local = torch.randperm(
+                int(train_indices.numel()), generator=generator
+            )[:group_size]
+            artists = train_indices[local.to(train_indices.device)]
+            weights = -torch.rand(
+                group_size, generator=generator
+            ).clamp_min(1e-6).log().to(train_indices.device)
+            weights /= weights.sum()
+            for block in blocks:
+                for kind in range(2):
+                    values.append(_mixture_rank_energy_retention(
+                        teacher_down[artists, block, kind],
+                        teacher_up[artists, block, kind],
+                        weights,
+                        target_rank=int(teacher_down.shape[-2]),
+                    ))
+        ordered = sorted(values)
+        result[str(group_size)] = {
+            "mean": float(sum(values) / len(values)),
+            "minimum": float(ordered[0]),
+            "p10": float(ordered[int(0.10 * (len(ordered) - 1))]),
+        }
+    return result
+
+
 @torch.no_grad()
 def analyze_kv_lora_mixture_generalization(
     config: dict[str, Any], destination: Path
@@ -168,6 +247,17 @@ def analyze_kv_lora_mixture_generalization(
     ]
     train_indices = torch.tensor(train_list, device=device)
     validation_indices = torch.tensor(validation_list, device=device)
+
+    # A convex mixture of two/three rank-R teachers can have rank 2R/3R,
+    # while the current student emits rank R. Measure the best possible rank-R
+    # compression before interpreting mixture-training loss.
+    rank_retention = _measure_mixture_rank_retention(
+        teacher_down,
+        teacher_up,
+        train_indices,
+        seed=seed,
+        config=cfg,
+    )
 
     reference_images = int(cfg.get("materialized_reference_images", 8))
     loader_kwargs = {
@@ -348,6 +438,8 @@ def analyze_kv_lora_mixture_generalization(
         "blocks": int(teacher_down.shape[1]),
         "sampled_tokens": int(contexts.shape[1]),
         "sampled_output_channels": int(teacher_up_sampled.shape[-2]),
+        "student_rank": int(teacher_down.shape[-2]),
+        "mixture_rank_energy_retention": rank_retention,
         "code_metrics": code_metrics,
         "activation_metrics": results,
     }
@@ -460,6 +552,13 @@ def analyze_generalizing_kv_mixture_signal(
     ]
     train_indices = torch.tensor(train_list, device=device)
     validation_indices = torch.tensor(validation_list, device=device)
+    rank_retention = _measure_mixture_rank_retention(
+        teacher_down,
+        teacher_up,
+        train_indices,
+        seed=seed,
+        config=cfg,
+    )
 
     coefficient_methods: dict[str, tuple[torch.Tensor, bool]] = {}
     code_metrics: dict[str, dict[str, float]] = {}
@@ -604,6 +703,8 @@ def analyze_generalizing_kv_mixture_signal(
         "blocks": int(teacher_down.shape[1]),
         "sampled_tokens": int(contexts.shape[1]),
         "sampled_output_channels": int(teacher_up_sampled.shape[-2]),
+        "student_rank": int(teacher_down.shape[-2]),
+        "mixture_rank_energy_retention": rank_retention,
         "code_metrics": code_metrics,
         "activation_metrics": activation_metrics,
     }

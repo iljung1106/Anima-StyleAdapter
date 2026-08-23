@@ -13,6 +13,7 @@ from anima_style_data.kv_activation_sampling import NativeKVFactorInjector
 from anima_style_data.kv_mixture_analysis import (
     _activation_from_coefficients,
     _knn_coefficients,
+    _mixture_rank_energy_retention,
 )
 from anima_style_data.kv_generalizing_modulator import (
     _stratified_view_indices,
@@ -46,6 +47,24 @@ def test_apply_kv_factors_matches_explicit_low_rank_linears():
     ])
 
     torch.testing.assert_close(actual, expected)
+
+
+def test_mixture_rank_retention_reports_the_irreducible_rank_bottleneck():
+    # Three orthogonal rank-one deltas have equal singular energy. A rank-one
+    # student can retain exactly one third; rank two retains two thirds.
+    down = torch.eye(3).reshape(3, 1, 3)
+    up = torch.eye(3).t().reshape(3, 3, 1)
+    weights = torch.ones(3) / 3
+
+    rank_one = _mixture_rank_energy_retention(
+        down, up, weights, target_rank=1
+    )
+    rank_two = _mixture_rank_energy_retention(
+        down, up, weights, target_rank=2
+    )
+
+    assert abs(rank_one - 1 / 3) < 1e-6
+    assert abs(rank_two - 2 / 3) < 1e-6
 
 
 def test_canonical_factors_preserve_the_exact_weight_delta():

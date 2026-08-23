@@ -682,6 +682,9 @@ kv_activation_mixture_analysis:
   visual_ridge: 0.05
   oracle_ridge: 0.01
   canonicalization_chunk_size: 64
+  mixture_rank_sizes: [2, 3]
+  mixture_rank_samples: 4
+  mixture_rank_blocks: [0, 7, 14, 21, 27]
 
 # Honest visual generalization experiment.  The Reader is frozen; 32 artists
 # are never shown to the modulator.  Training targets are native text K/V
@@ -762,6 +765,9 @@ kv_activation_generalizing_signal_analysis:
   visual_ridge: 0.05
   oracle_ridge: 0.01
   canonicalization_chunk_size: 64
+  mixture_rank_sizes: [2, 3]
+  mixture_rank_samples: 4
+  mixture_rank_blocks: [0, 7, 14, 21, 27]
 
 kv_activation_generalizing_sample:
   checkpoint: kv_activation_generalizing_modulator_v5_256_artist_holdout/best.pt
