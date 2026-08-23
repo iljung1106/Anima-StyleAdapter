@@ -24,7 +24,7 @@ from typing import Any
 
 import torch
 import torch.nn.functional as F
-from safetensors.torch import load_file
+from safetensors.torch import load_file, save_file
 from torch import nn
 
 from .io import write_json
@@ -126,8 +126,22 @@ def load_kv_lora_factor_bank(
     """
 
     plans = _load_lora_plan(root)
-    paths = _weight_paths(root, plans)
     artist_ids = [plan.style_id for plan in plans]
+    cache_path = root / f"factor_bank_{len(plans)}x{int(blocks)}_fp16.safetensors"
+    if cache_path.exists():
+        cached = load_file(cache_path, device="cpu")
+        down = cached["down"]
+        up = cached["up"]
+        if (
+            down.shape[0] != len(plans)
+            or up.shape[0] != len(plans)
+            or down.shape[1] != blocks
+            or up.shape[1] != blocks
+        ):
+            raise RuntimeError(f"Consolidated K/V factor bank shape is stale: {cache_path}")
+        return artist_ids, down.float(), up.float()
+
+    paths = _weight_paths(root, plans)
     all_down: list[torch.Tensor] = []
     all_up: list[torch.Tensor] = []
     expected: tuple[int, int, int] | None = None
@@ -166,7 +180,18 @@ def load_kv_lora_factor_bank(
             artist_up.append(torch.stack(block_up))
         all_down.append(torch.stack(artist_down))
         all_up.append(torch.stack(artist_up))
-    return artist_ids, torch.stack(all_down), torch.stack(all_up)
+    down_bank = torch.stack(all_down)
+    up_bank = torch.stack(all_up)
+    temporary = cache_path.with_suffix(cache_path.suffix + ".tmp")
+    save_file(
+        {
+            "down": down_bank.half().contiguous(),
+            "up": up_bank.half().contiguous(),
+        },
+        temporary,
+    )
+    temporary.replace(cache_path)
+    return artist_ids, down_bank, up_bank
 
 
 def apply_kv_factors(

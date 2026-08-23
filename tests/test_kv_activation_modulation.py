@@ -1,5 +1,8 @@
+import json
+
 import torch
 import torch.nn.functional as F
+from safetensors.torch import save_file
 
 from anima_style_data.kv_activation_modulation import (
     NativeKVFactorModulator,
@@ -8,6 +11,7 @@ from anima_style_data.kv_activation_modulation import (
     canonicalize_lora_factors,
     kv_activation_objective,
     kv_factor_objective,
+    load_kv_lora_factor_bank,
 )
 from anima_style_data.kv_activation_sampling import NativeKVFactorInjector
 from anima_style_data.kv_mixture_analysis import (
@@ -47,6 +51,38 @@ def test_apply_kv_factors_matches_explicit_low_rank_linears():
     ])
 
     torch.testing.assert_close(actual, expected)
+
+
+def test_factor_bank_consolidates_and_reuses_the_single_file_cache(tmp_path):
+    root = tmp_path / "teachers"
+    weights = root / "weights"
+    weights.mkdir(parents=True)
+    (root / "plan.json").write_text(json.dumps({"artists": [{
+        "index": 0,
+        "style_id": "artist-zero",
+        "artist": "artist_zero",
+        "train_ids": [1],
+        "validation_ids": [2],
+    }]}), encoding="utf-8")
+    source = weights / "artist-000-test.safetensors"
+    tensors = {}
+    for kind in ("k", "v"):
+        prefix = f"lora_unet_blocks_0_cross_attn_{kind}_proj."
+        tensors[prefix + "lora_down.weight"] = torch.randn(2, 3)
+        tensors[prefix + "lora_up.weight"] = torch.randn(4, 2)
+        tensors[prefix + "alpha"] = torch.tensor(2.0)
+    save_file(tensors, source)
+
+    artist_ids, first_down, first_up = load_kv_lora_factor_bank(root, blocks=1)
+    cache = root / "factor_bank_1x1_fp16.safetensors"
+    assert cache.exists()
+    assert artist_ids == ["artist-zero"]
+
+    source.unlink()
+    cached_ids, cached_down, cached_up = load_kv_lora_factor_bank(root, blocks=1)
+    assert cached_ids == artist_ids
+    torch.testing.assert_close(cached_down, first_down, atol=1e-3, rtol=1e-3)
+    torch.testing.assert_close(cached_up, first_up, atol=1e-3, rtol=1e-3)
 
 
 def test_mixture_rank_retention_reports_the_irreducible_rank_bottleneck():
