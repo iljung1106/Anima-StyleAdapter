@@ -462,7 +462,9 @@ lora_oracle_bootstrap:
   training:
     device: cuda
     steps: 4000
-    batch_rows: 8
+    # 128x96 Qwen latents use ~79.1 GB at batch 8. Batch 6 preserves a useful
+    # six-artist centered/InfoNCE set while leaving H100 activation headroom.
+    batch_rows: 6
     initialization_references: 4
     initialization_batch_size: 8
     oracle_learning_rate: 0.00050
