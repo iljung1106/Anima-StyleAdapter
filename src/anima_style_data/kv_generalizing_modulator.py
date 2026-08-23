@@ -44,6 +44,7 @@ def _save_state(
     cfg: dict[str, Any],
     train_indices: list[int],
     validation_indices: list[int],
+    best_heldout_centered_cosine: float,
 ) -> None:
     temporary = path.with_suffix(path.suffix + ".tmp")
     torch.save({
@@ -55,6 +56,7 @@ def _save_state(
         "config": cfg,
         "train_indices": train_indices,
         "validation_indices": validation_indices,
+        "best_heldout_centered_cosine": float(best_heldout_centered_cosine),
         "python_rng": random.getstate(),
         "torch_rng": torch.get_rng_state(),
         "cuda_rng": torch.cuda.get_rng_state_all(),
@@ -355,11 +357,15 @@ def train_generalizing_kv_activation_modulator(
     checkpoints.mkdir(parents=True, exist_ok=True)
     state_path = output / "training_state.pt"
     start_step = 0
+    best_heldout_centered_cosine = float("-inf")
     if bool(training.get("resume", True)) and state_path.exists():
         state = torch.load(state_path, map_location="cpu", weights_only=False)
         model.load_state_dict(state["model"], strict=True)
         optimizer.load_state_dict(state["optimizer"])
         start_step = int(state["step"])
+        best_heldout_centered_cosine = float(
+            state.get("best_heldout_centered_cosine", float("-inf"))
+        )
         random.setstate(state["python_rng"])
         torch.set_rng_state(state["torch_rng"])
         torch.cuda.set_rng_state_all(state["cuda_rng"])
@@ -566,6 +572,21 @@ def train_generalizing_kv_activation_modulator(
                     f"heldout={validation} train={train_validation}",
                     flush=True,
                 )
+                heldout_centered_cosine = float(
+                    validation["centered_cosine"]
+                )
+                if heldout_centered_cosine > best_heldout_centered_cosine:
+                    best_heldout_centered_cosine = heldout_centered_cosine
+                    _save_state(
+                        output / "best.pt",
+                        step=step,
+                        model=model,
+                        optimizer=optimizer,
+                        cfg=cfg,
+                        train_indices=train_list,
+                        validation_indices=validation_list,
+                        best_heldout_centered_cosine=best_heldout_centered_cosine,
+                    )
                 if wandb_run is not None:
                     wandb_run.log({
                         **{f"val/heldout_kv/{key}": value for key, value in validation.items()},
@@ -581,6 +602,7 @@ def train_generalizing_kv_activation_modulator(
                         cfg=cfg,
                         train_indices=train_list,
                         validation_indices=validation_list,
+                        best_heldout_centered_cosine=best_heldout_centered_cosine,
                     )
     finally:
         if wandb_run is not None:
@@ -597,6 +619,7 @@ def train_generalizing_kv_activation_modulator(
             if parameter.requires_grad
         ),
         "reader_frozen": True,
+        "best_heldout_centered_cosine": best_heldout_centered_cosine,
         "elapsed_seconds": time.perf_counter() - started,
         "checkpoint": str(state_path),
     }
