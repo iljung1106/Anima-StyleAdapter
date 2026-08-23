@@ -1,12 +1,15 @@
 import torch
+from safetensors.torch import save_file
 
 from anima_style_data.lora_functional_distillation import (
+    _cached_training_probe_bank,
     _teacher_decomposed_functional_objective,
     build_mixture_specs,
     decompose_teacher_effects,
     teacher_category,
     teacher_category_v2,
 )
+from anima_style_data.io import write_records
 
 
 def test_teacher_schedule_becomes_exact_three_way_cycle():
@@ -83,3 +86,68 @@ def test_functional_infonce_identifies_matching_centered_teacher():
     )
     assert float(metrics["functional_infonce_accuracy"]) == 1.0
     assert float(metrics["functional_infonce_cosine_gap"]) > 1.0
+
+
+def test_cached_probe_preserves_exact_latent_shape_and_values(tmp_path):
+    destination = tmp_path
+    latent_root = destination / "latents"
+    text_root = destination / "text"
+    latent_root.mkdir()
+    text_root.mkdir()
+    first = torch.arange(24, dtype=torch.float16).reshape(2, 3, 4)
+    second = first + 100
+    save_file({"latents": torch.stack([first, second])}, latent_root / "part.safetensors")
+    write_records(
+        latent_root / "manifest.parquet",
+        [
+            {
+                "id": index + 1,
+                "artist": f"artist_{index}",
+                "style_id": f"style_{index}",
+                "split": "train",
+                "latent_height": 3,
+                "latent_width": 4,
+                "row_index": index,
+                "cache_shard": "part.safetensors",
+            }
+            for index in range(2)
+        ],
+    )
+    conditioning = torch.arange(40, dtype=torch.float16).reshape(5, 8)
+    save_file({"conditioning": conditioning}, text_root / "part.safetensors")
+    write_records(
+        text_root / "manifest.parquet",
+        [
+            {
+                "id": index + 1,
+                "artist": f"artist_{index}",
+                "style_id": f"style_{index}",
+                "variant_name": "full",
+                "caption": f"caption {index}",
+                "token_offset": index * 2,
+                "token_length": 2,
+                "cache_shard": "part.safetensors",
+            }
+            for index in range(2)
+        ],
+    )
+    latents, contexts, rows = _cached_training_probe_bank(
+        destination,
+        {
+            "latent_cache_directory": "latents",
+            "text_cache_directory": "text",
+            "probe_latent_shape": [3, 4],
+            "content_variants": ["full"],
+            "text_conditioning_length": 3,
+            "seed": 4,
+        },
+        2,
+    )
+
+    assert latents.shape == (2, 2, 3, 4)
+    assert {tuple(value.flatten().tolist()) for value in latents} == {
+        tuple(first.flatten().tolist()),
+        tuple(second.flatten().tolist()),
+    }
+    assert contexts.shape == (2, 3, 8)
+    assert all(row["latent_transform"] == "none" for row in rows)

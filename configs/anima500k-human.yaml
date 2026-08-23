@@ -281,14 +281,28 @@ lora_functional_distillation:
   human_reference_cache: dual_query_reference_tokens_v8_step10000
   synthetic_reference_cache: lora_teacher_references_rank16_256x8_v2/dual_query_reference_tokens_v8_step10000
   teacher_cache:
-    output_directory: lora_functional_teacher_bank_rank16_256_v2
-    content_source_directory: synthetic_teacher_500x16
+    output_directory: lora_functional_teacher_bank_rank16_256_v3_broad12x6
+    content_source_mode: cached_training
+    latent_cache_directory: anima_latent_cache_qwen_2d
+    text_cache_directory: anima_text_cache_post_llm_multimode_v1
     device: cuda
     seed: 20260823
-    contents: 4
-    timesteps: [0.20, 0.45, 0.70, 0.90]
-    pair_mixtures: 256
-    triple_mixtures: 256
+    contents: 12
+    content_variants:
+      - full
+      - full_quality
+      - tag_dropout
+      - tag_dropout_quality
+      - short
+      - short_quality
+    # Keep the original Qwen latent untouched. This exact bucket has 14,428
+    # cached training images, so no crop or interpolation is necessary.
+    probe_latent_shape: [128, 96]
+    text_conditioning_length: 512
+    condition_batch_rows: 64
+    timesteps: [0.10, 0.25, 0.45, 0.65, 0.82, 0.95]
+    pair_mixtures: 64
+    triple_mixtures: 64
     shard_mixtures: 16
   native_teacher:
     bank_config_key: dual_domain_native_teacher
@@ -437,10 +451,10 @@ lora_functional_distillation_v2:
 # frozen.  This first proves and learns the effect subspace available to the
 # actual artist-only style cross-attention; the Reader is distilled afterward.
 lora_oracle_bootstrap:
-  output_directory: lora_oracle_bootstrap_v2_256
+  output_directory: lora_oracle_bootstrap_v3_256_broad12x6
   seed: 20260823
   initial_checkpoint: detail_preserving_style_cross_attention_v34_anti_common_functional/checkpoints/step-0000500.pt
-  teacher_cache: lora_functional_teacher_bank_rank16_256_v2
+  teacher_cache: lora_functional_teacher_bank_rank16_256_v3_broad12x6
   human_reference_cache: dual_query_reference_tokens_v8_step10000
   synthetic_reference_cache: lora_teacher_references_rank16_256x8_v2/dual_query_reference_tokens_v8_step10000
   training:
@@ -475,8 +489,8 @@ lora_oracle_bootstrap:
     wandb:
       enabled: true
       project: anima-style-adapter
-      name: lora-oracle-bootstrap-v2-256
-      id: lora-oracle-bootstrap-v2-256
+      name: lora-oracle-bootstrap-v3-256-broad12x6
+      id: lora-oracle-bootstrap-v3-256-broad12x6
   visual_bridge:
     output_directory: lora_oracle_projected_bridge_v2_plateau
     source_checkpoint: lora_oracle_bootstrap_v1/training_state.pt
@@ -519,8 +533,8 @@ lora_oracle_bootstrap:
       name: lora-oracle-projected-bridge-v2-plateau
       id: lora-oracle-projected-bridge-v2-plateau
   visual_projector:
-    output_directory: lora_oracle_visual_projector_v4_256
-    source_checkpoint: lora_oracle_bootstrap_v2_256/training_state.pt
+    output_directory: lora_oracle_visual_projector_v5_256_broad12x6
+    source_checkpoint: lora_oracle_bootstrap_v3_256_broad12x6/training_state.pt
     steps: 1500
     batch_rows: 64
     token_lru_shards: 512
@@ -551,8 +565,8 @@ lora_oracle_bootstrap:
     wandb:
       enabled: true
       project: anima-style-adapter
-      name: lora-oracle-visual-projector-v4-256
-      id: lora-oracle-visual-projector-v4-256
+      name: lora-oracle-visual-projector-v5-256-broad12x6
+      id: lora-oracle-visual-projector-v5-256-broad12x6
   functional_projector:
     output_directory: lora_oracle_functional_projector_v2_native_pretrain
     source_checkpoint: lora_oracle_bootstrap_v1/training_state.pt
@@ -599,9 +613,9 @@ lora_oracle_bootstrap:
       name: lora-oracle-functional-projector-v2-native-pretrain
       id: lora-oracle-functional-projector-v2-native-pretrain
   joint_manifold:
-    output_directory: lora_oracle_joint_manifold_v2_256
-    source_checkpoint: lora_oracle_bootstrap_v2_256/training_state.pt
-    projector_checkpoint: lora_oracle_visual_projector_v4_256/training_state.pt
+    output_directory: lora_oracle_joint_manifold_v3_256_broad12x6
+    source_checkpoint: lora_oracle_bootstrap_v3_256_broad12x6/training_state.pt
+    projector_checkpoint: lora_oracle_visual_projector_v5_256_broad12x6/training_state.pt
     steps: 2000
     cpu_threads: 16
     batch_rows: 8
@@ -657,8 +671,8 @@ lora_oracle_bootstrap:
     wandb:
       enabled: true
       project: anima-style-adapter
-      name: lora-oracle-joint-manifold-v2-256
-      id: lora-oracle-joint-manifold-v2-256
+      name: lora-oracle-joint-manifold-v3-256-broad12x6
+      id: lora-oracle-joint-manifold-v3-256-broad12x6
 
 # B-prime per-reference encoder. C-RADIO spatial features and Qwen Image VAE
 # latents remain separate K/V banks; learned spatial/global queries read both.

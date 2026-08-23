@@ -3,7 +3,7 @@
 ## Purpose
 
 Native `@artist` conditioning is consistent but too weak to define the final
-style-adapter ceiling. Train 64 independent rank-16 Anima LoRAs as stronger
+style-adapter ceiling. Train 256 independent rank-16 Anima LoRAs as stronger
 functional teachers. These weights are not a shared linear basis. The student
 will later observe the final nonlinear velocity effect of each complete LoRA,
 and optional weighted LoRA combinations, under controlled noise, timestep and
@@ -11,7 +11,7 @@ content conditions.
 
 ## Data
 
-- deterministic 64-artist subset of the human train split
+- deterministic 256-artist subset of the human train split
 - 30 cached images per artist: 24 train and 6 held out
 - only the 32 most frequent exact latent shapes are eligible
 - post-LLM prompts must not contain the artist name
@@ -33,7 +33,7 @@ content conditions.
 
 ## Throughput design
 
-Anima and one fixed-shape LoRA module graph remain on the H100 for all 64
+Anima and one fixed-shape LoRA module graph remain on the H100 for all 256
 artists. Artist transitions reinitialize LoRA tensors in place and clear Adam
 state, preserving compiled graphs. One artist's complete latent and multimode
 text tensors are staged on GPU while the next artist is prefetched to host RAM.
@@ -65,3 +65,12 @@ teacher remains valid as
 
 Mixtures are secondary augmentation after the student reproduces individual
 teachers; they do not assume that all styles lie in one shared weight basis.
+
+The first 4-content x 4-timestep functional cache made teacher effects almost
+orthogonal across unseen content and produced an oracle that changed content
+more readily than rendering style. The replacement bank therefore uses 12
+distinct cached training conditions and 6 timesteps. It selects only the
+well-populated Qwen latent bucket `(H, W) = (128, 96)` and preserves every
+latent exactly. Cropping or interpolation is forbidden here because it breaks
+the cached caption/latent alignment and injects a second, artificial source of
+teacher residual noise.

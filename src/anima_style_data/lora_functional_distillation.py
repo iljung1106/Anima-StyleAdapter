@@ -14,6 +14,7 @@ from typing import Any
 
 import torch
 import torch.nn.functional as F
+import pyarrow.parquet as pq
 from PIL import Image
 from safetensors.torch import load_file, save_file
 
@@ -353,6 +354,188 @@ def _source_probe_bank(
     return torch.stack(values), selected
 
 
+def _cached_training_probe_bank(
+    destination: Path,
+    cfg: dict[str, Any],
+    contents: int,
+) -> tuple[torch.Tensor, torch.Tensor, list[dict[str, Any]]]:
+    """Load diverse cached image/text pairs without running VAE or Qwen again."""
+
+    latent_root = destination / str(cfg["latent_cache_directory"])
+    text_root = destination / str(cfg["text_cache_directory"])
+    latent_rows = [
+        row
+        for row in pq.read_table(
+            latent_root / "manifest.parquet",
+            columns=[
+                "id",
+                "artist",
+                "style_id",
+                "split",
+                "latent_height",
+                "latent_width",
+                "row_index",
+                "cache_shard",
+            ],
+        ).to_pylist()
+        if str(row.get("split", "train")) == "train"
+    ]
+    requested_shape = tuple(int(value) for value in cfg["probe_latent_shape"])
+    if len(requested_shape) != 2:
+        raise ValueError("probe_latent_shape must contain [height, width]")
+    rng = random.Random(int(cfg.get("seed", 20260823)) ^ 0x434F4E54)
+    rng.shuffle(latent_rows)
+    candidate_rows: list[dict[str, Any]] = []
+    candidate_styles: set[str] = set()
+    candidate_limit = max(contents * 16, 256)
+    for row in latent_rows:
+        height = int(row["latent_height"])
+        width = int(row["latent_width"])
+        if (height, width) != requested_shape:
+            continue
+        style_id = str(row.get("style_id", row.get("artist", "")))
+        if style_id in candidate_styles:
+            continue
+        candidate_rows.append(row)
+        candidate_styles.add(style_id)
+        if len(candidate_rows) >= candidate_limit:
+            break
+    candidate_ids = {int(row["id"]) for row in candidate_rows}
+    variants = [
+        str(value)
+        for value in cfg.get(
+            "content_variants",
+            [
+                "full",
+                "full_quality",
+                "tag_dropout",
+                "tag_dropout_quality",
+                "short",
+                "short_quality",
+            ],
+        )
+    ]
+    text_by_key = {
+        (int(row["id"]), str(row["variant_name"])): row
+        for row in pq.read_table(
+            text_root / "manifest.parquet",
+            columns=[
+                "id",
+                "artist",
+                "style_id",
+                "variant_name",
+                "caption",
+                "token_offset",
+                "token_length",
+                "cache_shard",
+            ],
+            filters=[("id", "in", sorted(candidate_ids))],
+        ).to_pylist()
+        if int(row["id"]) in candidate_ids
+    }
+    selected: list[tuple[dict[str, Any], dict[str, Any]]] = []
+    for latent_row in candidate_rows:
+        variant = variants[len(selected) % len(variants)]
+        text_row = text_by_key.get((int(latent_row["id"]), variant))
+        if text_row is None:
+            continue
+        selected.append((latent_row, text_row))
+        if len(selected) == contents:
+            break
+    if len(selected) != contents:
+        raise RuntimeError(
+            f"Cached training probes provide {len(selected)}/{contents} rows"
+        )
+
+    latent_values: list[torch.Tensor | None] = [None] * contents
+    latent_groups: dict[str, list[tuple[int, dict[str, Any]]]] = defaultdict(list)
+    for index, (latent_row, _) in enumerate(selected):
+        latent_groups[str(latent_row["cache_shard"])].append((index, latent_row))
+    for shard_name, rows in latent_groups.items():
+        shard = load_file(latent_root / shard_name, device="cpu")["latents"]
+        for index, row in rows:
+            value = shard[int(row["row_index"])]
+            if tuple(value.shape[-2:]) != requested_shape:
+                raise RuntimeError(
+                    f"Latent shape mismatch for id={row['id']}: "
+                    f"manifest={requested_shape}, tensor={tuple(value.shape[-2:])}"
+                )
+            latent_values[index] = value.to(torch.float16)
+        del shard
+
+    text_values: list[torch.Tensor | None] = [None] * contents
+    text_groups: dict[str, list[tuple[int, dict[str, Any]]]] = defaultdict(list)
+    for index, (_, text_row) in enumerate(selected):
+        text_groups[str(text_row["cache_shard"])].append((index, text_row))
+    conditioning_length = int(cfg.get("text_conditioning_length", 512))
+    for shard_name, rows in text_groups.items():
+        shard = load_file(text_root / shard_name, device="cpu")["conditioning"]
+        for index, row in rows:
+            start = int(row["token_offset"])
+            length = min(int(row["token_length"]), conditioning_length)
+            value = torch.zeros(
+                conditioning_length, shard.shape[-1], dtype=shard.dtype
+            )
+            value[:length].copy_(shard[start : start + length])
+            text_values[index] = value
+        del shard
+
+    if any(value is None for value in latent_values + text_values):
+        raise RuntimeError("Failed to materialize cached training probe tensors")
+    records = [
+        {
+            "content_index": index,
+            "id": int(latent_row["id"]),
+            "style_id": str(latent_row.get("style_id", "")),
+            "artist": str(latent_row.get("artist", "")),
+            "variant_name": str(text_row["variant_name"]),
+            "caption": str(text_row.get("caption", "")),
+            "latent_height": int(latent_row["latent_height"]),
+            "latent_width": int(latent_row["latent_width"]),
+            "latent_transform": "none",
+        }
+        for index, (latent_row, text_row) in enumerate(selected)
+    ]
+    return (
+        torch.stack([value for value in latent_values if value is not None]),
+        torch.stack([value for value in text_values if value is not None]),
+        records,
+    )
+
+
+def _predict_frozen_anima_in_chunks(
+    anima: torch.nn.Module,
+    noisy: torch.Tensor,
+    contexts: torch.Tensor,
+    timesteps: torch.Tensor,
+    *,
+    batch_rows: int,
+) -> torch.Tensor:
+    values = []
+    for offset in range(0, len(noisy), batch_rows):
+        part_noisy = noisy[offset : offset + batch_rows]
+        part_context = contexts[offset : offset + batch_rows]
+        part_timestep = timesteps[offset : offset + batch_rows]
+        padding = torch.zeros(
+            len(part_noisy),
+            1,
+            part_noisy.shape[-2],
+            part_noisy.shape[-1],
+            device=part_noisy.device,
+            dtype=part_noisy.dtype,
+        )
+        with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
+            prediction = anima(
+                part_noisy.unsqueeze(2),
+                part_timestep,
+                context=part_context,
+                padding_mask=padding,
+                target_input_ids=None,
+            ).squeeze(2)
+        values.append(prediction.to("cpu", dtype=torch.float32))
+    return torch.cat(values)
+
+
 def cache_lora_functional_teacher(
     config: dict[str, Any], destination: Path
 ) -> dict[str, Any]:
@@ -384,12 +567,21 @@ def cache_lora_functional_teacher(
         }
         for spec in specs
     ])
-    source = destination / str(cache_cfg["content_source_directory"])
     contents = int(cache_cfg.get("contents", 4))
     timesteps = [float(value) for value in cache_cfg.get("timesteps", [0.2, 0.45, 0.7, 0.9])]
-    latents, _ = _source_probe_bank(source, contents)
-    _, contexts, _ = _load_content_conditions(source)
-    contexts = contexts[:contents]
+    source_mode = str(cache_cfg.get("content_source_mode", "synthetic_teacher"))
+    if source_mode == "cached_training":
+        latents, contexts, content_rows = _cached_training_probe_bank(
+            destination, cache_cfg, contents
+        )
+    elif source_mode == "synthetic_teacher":
+        source = destination / str(cache_cfg["content_source_directory"])
+        latents, content_rows = _source_probe_bank(source, contents)
+        _, contexts, _ = _load_content_conditions(source)
+        contexts = contexts[:contents]
+    else:
+        raise ValueError(f"Unsupported functional content source: {source_mode}")
+    write_records(output / "content_manifest.parquet", content_rows)
     device = str(cache_cfg.get("device", "cuda"))
     anima = _resolve_anima_model(config, destination, device).requires_grad_(False).eval()
     _optimize_frozen_anima(anima, low_precision_rmsnorm=True, fuse_attention_projections=False)
@@ -415,21 +607,20 @@ def cache_lora_functional_teacher(
     noisy_flat = torch.stack(noisy_rows)
     context_flat = torch.stack(context_rows)
     timestep_flat = torch.tensor(timestep_rows, device=device, dtype=torch.bfloat16)
-    padding = torch.zeros(
-        len(noisy_flat), 1, noisy_flat.shape[-2], noisy_flat.shape[-1],
-        device=device, dtype=torch.bfloat16,
-    )
     for network in networks:
         network.set_multiplier(0.0)
-    with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
-        base = anima(
-            noisy_flat.unsqueeze(2), timestep_flat, context=context_flat,
-            padding_mask=padding, target_input_ids=None,
-        ).squeeze(2).float()
+    condition_batch_rows = int(cache_cfg.get("condition_batch_rows", 64))
+    base = _predict_frozen_anima_in_chunks(
+        anima,
+        noisy_flat,
+        context_flat,
+        timestep_flat,
+        batch_rows=condition_batch_rows,
+    )
     save_file({
         "base_context": contexts[:contents].to(torch.float16),
         "noisy_inputs": noisy_flat.reshape(contents, len(timesteps), *noisy_flat.shape[1:]).to("cpu", dtype=torch.float16),
-        "base_predictions": base.reshape(contents, len(timesteps), *base.shape[1:]).to("cpu", dtype=torch.float16),
+        "base_predictions": base.reshape(contents, len(timesteps), *base.shape[1:]).to(dtype=torch.float16),
         "timesteps": torch.tensor(timesteps, dtype=torch.float32),
     }, output / "base.safetensors")
     shard_rows = int(cache_cfg.get("shard_mixtures", 16))
@@ -451,15 +642,17 @@ def cache_lora_functional_teacher(
                     network.set_multiplier(float(spec.weights[slot]))
                 else:
                     network.set_multiplier(0.0)
-            with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
-                prediction = anima(
-                    noisy_flat.unsqueeze(2), timestep_flat, context=context_flat,
-                    padding_mask=padding, target_input_ids=None,
-                ).squeeze(2).float()
+            prediction = _predict_frozen_anima_in_chunks(
+                anima,
+                noisy_flat,
+                context_flat,
+                timestep_flat,
+                batch_rows=condition_batch_rows,
+            )
             effect_rows.append(
                 (prediction - base).reshape(
                     contents, len(timesteps), *base.shape[1:]
-                ).to("cpu", dtype=torch.bfloat16)
+                ).to(dtype=torch.bfloat16)
             )
         save_file({
             "effects": torch.stack(effect_rows),
@@ -478,6 +671,8 @@ def cache_lora_functional_teacher(
         "triples": sum(spec.kind == "triple" for spec in specs),
         "contents": contents,
         "timesteps": timesteps,
+        "content_source_mode": source_mode,
+        "condition_batch_rows": condition_batch_rows,
         "complete_mixtures": completed,
         "actual_merged_lora_forward": True,
         "elapsed_s": time.perf_counter() - started,
