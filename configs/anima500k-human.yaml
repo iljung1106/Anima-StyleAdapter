@@ -708,6 +708,7 @@ kv_activation_generalizing_modulator:
     batch_artists: 16
     validation_artists: 32
     materialized_reference_images: 8
+    validation_reference_images: 4
     materialization_artist_chunk: 16
     token_lru_shards: 8
     reference_count_weights: {"1": 0.50, "2": 0.30, "4": 0.20}

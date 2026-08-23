@@ -123,6 +123,38 @@ def test_teacher_reference_loader_can_use_available_style_intersection(tmp_path)
         )
 
 
+def test_teacher_reference_loader_filters_disjoint_image_ids(tmp_path):
+    rows = [
+        {
+            "id": index,
+            "style_id": "human:artist",
+            "split": "train",
+            "token_shard": "part-00000.safetensors",
+            "token_row": index,
+        }
+        for index in range(6)
+    ]
+    write_records(tmp_path / "manifest.parquet", rows)
+    save_file(
+        {"tokens": torch.arange(6).reshape(6, 1, 1).float()},
+        tmp_path / "part-00000.safetensors",
+    )
+    loader = CachedTeacherReferenceLoader(
+        tmp_path,
+        split="train",
+        style_ids=["human:artist"],
+        batch_size=1,
+        references=2,
+        seed=13,
+        allowed_image_ids={4, 5},
+    )
+
+    batch = loader.load_step(0)
+
+    assert set(batch["episodes"][0].reference_ids) == {4, 5}
+    assert set(batch["cached_reference_tokens"].flatten().tolist()) == {4.0, 5.0}
+
+
 def test_teacher_reference_loader_combines_disjoint_cache_roots(tmp_path):
     roots = [tmp_path / "old", tmp_path / "additional"]
     styles = ["human:old", "human:new"]

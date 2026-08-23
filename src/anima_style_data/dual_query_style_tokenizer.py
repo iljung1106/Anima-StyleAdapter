@@ -590,6 +590,7 @@ class CachedTeacherReferenceLoader:
         ram_resident_tokens: bool = False,
         ram_preload_workers: int = 8,
         strict_style_ids: bool = True,
+        allowed_image_ids: set[int] | None = None,
     ) -> None:
         token_roots = (
             [Path(token_root)]
@@ -629,7 +630,15 @@ class CachedTeacherReferenceLoader:
         for root_index, root in enumerate(token_roots):
             for row in read_records(root / "manifest.parquet"):
                 style_id = str(row["style_id"])
-                if str(row.get("split", "train")) == split and style_id in allowed:
+                image_id = int(row["id"])
+                if (
+                    str(row.get("split", "train")) == split
+                    and style_id in allowed
+                    and (
+                        allowed_image_ids is None
+                        or image_id in allowed_image_ids
+                    )
+                ):
                     grouped[style_id].append(
                         {**row, "_token_root_index": root_index}
                     )

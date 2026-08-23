@@ -89,6 +89,34 @@ def _view_probabilities(
     return values / values.sum()
 
 
+def _teacher_image_split(
+    lora_directory: Path,
+    artist_ids: list[str],
+) -> tuple[set[int], set[int]]:
+    plan_path = lora_directory / "plan.json"
+    plan = json.loads(plan_path.read_text(encoding="utf-8"))
+    by_style = {str(row["style_id"]): row for row in plan["artists"]}
+    missing = sorted(set(artist_ids) - set(by_style))
+    if missing:
+        raise RuntimeError(f"Teacher plan is missing styles {missing[:4]}")
+    train_ids = {
+        int(image_id)
+        for style_id in artist_ids
+        for image_id in by_style[style_id]["train_ids"]
+    }
+    validation_ids = {
+        int(image_id)
+        for style_id in artist_ids
+        for image_id in by_style[style_id]["validation_ids"]
+    }
+    overlap = train_ids & validation_ids
+    if overlap:
+        raise RuntimeError(
+            f"Teacher image split contains {len(overlap)} overlapping IDs"
+        )
+    return train_ids, validation_ids
+
+
 def build_mixed_activation_batch(
     sampled_contexts: torch.Tensor,
     predicted_down: torch.Tensor,
@@ -291,7 +319,11 @@ def train_generalizing_kv_activation_modulator(
     gc.collect()
 
     reference_images = int(training.get("materialized_reference_images", 8))
-    loader = CachedTeacherReferenceLoader(
+    lora_directory = destination / str(cfg["lora_directory"])
+    teacher_train_ids, teacher_validation_ids = _teacher_image_split(
+        lora_directory, artist_ids
+    )
+    train_loader = CachedTeacherReferenceLoader(
         destination / str(cfg["human_reference_cache"]),
         split="train",
         style_ids=artist_ids,
@@ -300,15 +332,43 @@ def train_generalizing_kv_activation_modulator(
         seed=seed ^ 0x48554D41,
         token_lru_shards=int(training.get("token_lru_shards", 8)),
         strict_style_ids=True,
+        allowed_image_ids=teacher_train_ids,
     )
     code_bank, reference_counts = _materialize_reader_code_bank(
         reader,
-        loader,
+        train_loader,
         artist_ids,
         reference_images=reference_images,
         seed=seed ^ 0x11111111,
         device=device,
         style_chunk_size=int(training.get("materialization_artist_chunk", 16)),
+    )
+    validation_reference_images = int(
+        training.get("validation_reference_images", 4)
+    )
+    validation_loader = CachedTeacherReferenceLoader(
+        destination / str(cfg["human_reference_cache"]),
+        split="train",
+        style_ids=artist_ids,
+        batch_size=int(training.get("materialization_artist_chunk", 16)),
+        references=validation_reference_images,
+        seed=seed ^ 0x56414C49,
+        token_lru_shards=int(training.get("token_lru_shards", 8)),
+        strict_style_ids=True,
+        allowed_image_ids=teacher_validation_ids,
+    )
+    validation_code_bank, validation_reference_counts = (
+        _materialize_reader_code_bank(
+            reader,
+            validation_loader,
+            artist_ids,
+            reference_images=validation_reference_images,
+            seed=seed ^ 0x22222222,
+            device=device,
+            style_chunk_size=int(
+                training.get("materialization_artist_chunk", 16)
+            ),
+        )
     )
     del reader
     torch.cuda.empty_cache()
@@ -581,8 +641,8 @@ def train_generalizing_kv_activation_modulator(
                 running.clear()
             if validation_every > 0 and step % validation_every == 0:
                 common_kwargs = {
-                    "code_bank": code_bank,
-                    "reference_counts": reference_counts,
+                    "code_bank": validation_code_bank,
+                    "reference_counts": validation_reference_counts,
                     "contexts": validation_contexts,
                     "teacher_down": teacher_down,
                     "teacher_up": teacher_up,
@@ -699,6 +759,7 @@ def train_generalizing_kv_activation_modulator(
             if parameter.requires_grad
         ),
         "reader_frozen": True,
+        "teacher_reference_images_disjoint": True,
         "best_heldout_centered_cosine": best_heldout_centered_cosine,
         "best_step": best_step,
         "best_validation": best_validation,
@@ -758,6 +819,9 @@ def sample_generalizing_kv_activation_modulator(
         validation_indices[int(position)] for position in selected_positions
     ]
     selected_ids = [artist_ids[index] for index in selected_indices]
+    _, teacher_validation_ids = _teacher_image_split(
+        destination / str(cfg["lora_directory"]), artist_ids
+    )
 
     reader_state = torch.load(
         destination / str(cfg["reader_checkpoint"]),
@@ -782,6 +846,7 @@ def sample_generalizing_kv_activation_modulator(
         seed=int(sample_cfg.get("seed", 20260824)),
         token_lru_shards=int(sample_cfg.get("token_lru_shards", 8)),
         strict_style_ids=True,
+        allowed_image_ids=teacher_validation_ids,
     )
     output = destination / str(sample_cfg["output_directory"])
     output.mkdir(parents=True, exist_ok=True)
