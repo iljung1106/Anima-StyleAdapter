@@ -6,6 +6,8 @@ from anima_style_data.lora_oracle_bootstrap import (
     _functional_effect_fingerprints,
     _FixedOracleCodeReader,
     _artist_centered_oracle_objective,
+    _common_artist_oracle_objective,
+    _oracle_component_regression_objective,
     _cross_view_artist_objective,
     _interpolate_oracle_visual,
     _oracle_code_alignment_objective,
@@ -156,6 +158,39 @@ def test_oracle_objective_penalizes_artist_branch_batch_mean():
     assert float(centered_metrics["artist_common_zero_loss"]) < 1e-8
     assert float(shifted_metrics["artist_common_zero_loss"]) > 0.1
     assert float(shifted_loss) > float(centered_loss)
+
+
+def test_component_regression_preserves_nonzero_teacher_mean():
+    teacher = torch.ones(4, 2, 8) * 0.75
+    exact_loss, exact_metrics = _oracle_component_regression_objective(
+        teacher.clone(), teacher, {}
+    )
+    zero_loss, zero_metrics = _oracle_component_regression_objective(
+        torch.zeros_like(teacher), teacher, {}
+    )
+
+    assert float(exact_loss) < 1e-6
+    assert float(exact_metrics["cosine"]) > 0.999
+    assert float(zero_loss) > float(exact_loss) + 1.0
+    assert float(zero_metrics["student_to_teacher_rms"]) < 1e-5
+
+
+def test_combined_objective_requires_common_and_artist_components():
+    common = torch.ones(1, 1, 8) * 0.5
+    artist = torch.eye(4, 8).reshape(4, 1, 8)
+    teacher = common + artist
+    exact_loss, exact_metrics = _common_artist_oracle_objective(
+        teacher.clone(), common.clone(), teacher, common, {}
+    )
+    centered_only = artist - artist.mean(dim=0, keepdim=True)
+    incomplete_loss, incomplete_metrics = _common_artist_oracle_objective(
+        centered_only, torch.zeros_like(common), teacher, common, {}
+    )
+
+    assert float(exact_metrics["full_cosine"]) > 0.999
+    assert float(exact_metrics["common_cosine"]) > 0.999
+    assert float(incomplete_loss) > float(exact_loss) + 0.1
+    assert float(incomplete_metrics["common_student_to_teacher_rms"]) < 1e-5
 
 
 def test_oracle_objective_prefers_repeatable_low_frequency_artist_effect():

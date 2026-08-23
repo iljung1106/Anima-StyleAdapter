@@ -393,6 +393,101 @@ def _artist_centered_oracle_objective(
     }
 
 
+def _oracle_component_regression_objective(
+    student: torch.Tensor,
+    teacher: torch.Tensor,
+    weights: dict[str, float],
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Regress a complete functional component without removing its mean.
+
+    The artist-only oracle objective deliberately discards the teacher mean.
+    That is correct for an Artist residual, but wrong for the separated Common
+    branch and for the final combined effect.  This objective keeps direction
+    and absolute magnitude while normalizing only by each teacher row's RMS.
+    """
+
+    student = student.float()
+    teacher = teacher.detach().float()
+    if student.shape != teacher.shape:
+        raise ValueError("Oracle component supervision needs matching tensors")
+    reduce_dims = tuple(range(1, student.ndim))
+    row_shape = (-1,) + (1,) * (student.ndim - 1)
+    teacher_rms = teacher.square().mean(dim=reduce_dims).sqrt().clamp_min(1e-4)
+    student_rms = (student.square().mean(dim=reduce_dims) + 1e-12).sqrt()
+    scale = teacher_rms.reshape(row_shape)
+    huber = F.smooth_l1_loss(student / scale, teacher / scale, beta=0.10)
+    cosine = F.cosine_similarity(
+        student.flatten(1), teacher.flatten(1), dim=1
+    ).mean()
+    magnitude = F.smooth_l1_loss(
+        (student_rms / teacher_rms).clamp_min(1e-4).log().clamp(-4, 4),
+        torch.zeros_like(student_rms),
+        beta=0.10,
+    )
+    total = (
+        float(weights.get("huber", 1.0)) * huber
+        + float(weights.get("direction", 1.0)) * (1 - cosine)
+        + float(weights.get("magnitude", 0.25)) * magnitude
+    )
+    return total, {
+        "loss": total.detach(),
+        "huber": huber.detach(),
+        "cosine": cosine.detach(),
+        "magnitude_loss": magnitude.detach(),
+        "student_to_teacher_rms": (student_rms / teacher_rms).mean().detach(),
+    }
+
+
+def _common_artist_oracle_objective(
+    student_total: torch.Tensor,
+    student_common: torch.Tensor,
+    teacher_total: torch.Tensor,
+    teacher_common: torch.Tensor,
+    weights: dict[str, Any],
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Supervise Common, centered Artist residual, and their actual sum.
+
+    ``teacher_common`` is the exact mean over the complete single-LoRA bank for
+    one controlled Q/timestep, not the noisy mean of the sampled mini-batch.
+    The Artist branch therefore cannot replace Common, while the full-effect
+    term prevents the two individually plausible components from cancelling.
+    """
+
+    if student_common.shape[0] == 1 and student_total.shape[0] > 1:
+        student_common = student_common.expand_as(student_total)
+    if teacher_common.shape[0] == 1 and teacher_total.shape[0] > 1:
+        teacher_common = teacher_common.expand_as(teacher_total)
+    if not (
+        student_total.shape
+        == student_common.shape
+        == teacher_total.shape
+        == teacher_common.shape
+    ):
+        raise ValueError("Combined oracle components must have matching shapes")
+
+    full_loss, full_metrics = _oracle_component_regression_objective(
+        student_total, teacher_total, dict(weights.get("full", {}))
+    )
+    common_loss, common_metrics = _oracle_component_regression_objective(
+        student_common, teacher_common, dict(weights.get("common", {}))
+    )
+    artist_student = student_total - student_common
+    artist_teacher = teacher_total - teacher_common
+    artist_loss, artist_metrics = _artist_centered_oracle_objective(
+        artist_student, artist_teacher, dict(weights.get("artist", {}))
+    )
+    total = (
+        float(weights.get("full_weight", 1.0)) * full_loss
+        + float(weights.get("common_weight", 0.25)) * common_loss
+        + float(weights.get("artist_weight", 1.0)) * artist_loss
+    )
+    metrics = {f"full_{key}": value for key, value in full_metrics.items()}
+    metrics.update({f"common_{key}": value for key, value in common_metrics.items()})
+    metrics.update({f"artist_{key}": value for key, value in artist_metrics.items()})
+    metrics["loss"] = total.detach()
+    return total, metrics
+
+
 def _controlled_style_context_forward(
     anima: torch.nn.Module,
     adapter: SeparatedCommonArtistKVStyleCrossAttention,
@@ -524,14 +619,21 @@ def train_lora_oracle_bootstrap(
     if not isinstance(adapter, SeparatedCommonArtistKVStyleCrossAttention):
         raise TypeError("LoRA oracle bootstrap requires the separated adapter")
     attach_same_q_style_adapter(anima, adapter)
+    source_oracle_checkpoint = cfg.get("source_oracle_checkpoint")
     initial = torch.load(
-        destination / str(cfg["initial_checkpoint"]),
+        destination / str(
+            source_oracle_checkpoint
+            if source_oracle_checkpoint
+            else cfg["initial_checkpoint"]
+        ),
         map_location="cpu",
         weights_only=False,
     )
     reader.load_state_dict(initial["reader"], strict=True)
     adapter.load_state_dict(
-        _oracle_adapter_initial_state(
+        initial["adapter"]
+        if source_oracle_checkpoint
+        else _oracle_adapter_initial_state(
             adapter.state_dict(),
             initial["adapter"],
             str(cfg.get("adapter_initialization", "checkpoint")),
@@ -539,15 +641,24 @@ def train_lora_oracle_bootstrap(
         strict=True,
     )
     adapter.restore_timestep_strength_state()
-    adapter.set_bootstrap_phase("artist_only")
+    preserve_teacher_common = bool(training.get("preserve_teacher_common", False))
+    adapter.set_bootstrap_phase(
+        "common_only" if preserve_teacher_common else "artist_only"
+    )
     reader.requires_grad_(False).eval()
     for parameter in adapter.common_parameters():
-        parameter.requires_grad_(False)
+        parameter.requires_grad_(preserve_teacher_common)
 
     bank = FunctionalLoRATeacherBank(
         destination / str(cfg["teacher_cache"])
     )
     single_ids = list(bank.by_kind["single"])
+    # The Common target is defined over the complete artist bank.  Materialize
+    # it once; repeatedly gathering all 64 high-dimensional effects inside the
+    # training loop is both slower and more memory-bandwidth intensive.
+    single_teacher_common = bank.effects[single_ids].float().mean(dim=0).to(
+        dtype=bank.effects.dtype
+    )
     style_ids = [str(bank.mixtures[index]["style_ids"][0]) for index in single_ids]
     references = int(training.get("initialization_references", 4))
     human_loader = CachedTeacherReferenceLoader(
@@ -579,7 +690,11 @@ def train_lora_oracle_bootstrap(
         if bool(training.get("resume", True)) and state_path.exists()
         else None
     )
-    if resume_state is None:
+    if resume_state is None and source_oracle_checkpoint:
+        oracle_anchor = initial["oracle_anchor"].to(device)
+        oracle_codes = torch.nn.Parameter(initial["oracle_codes"].to(device))
+        start_step = 0
+    elif resume_state is None:
         oracle_anchor = _initialize_oracle_codes(
             reader,
             human_loader,
@@ -596,7 +711,12 @@ def train_lora_oracle_bootstrap(
         reader.load_state_dict(resume_state["reader"], strict=True)
         adapter.load_state_dict(resume_state["adapter"], strict=True)
         adapter.restore_timestep_strength_state()
-        adapter.set_bootstrap_phase("artist_only")
+        common_bootstrap_steps = int(training.get("common_bootstrap_steps", 0))
+        adapter.set_bootstrap_phase(
+            "common_only"
+            if preserve_teacher_common and start_step < common_bootstrap_steps
+            else ("combined" if preserve_teacher_common else "artist_only")
+        )
         oracle_anchor = resume_state["oracle_anchor"].to(device)
         oracle_codes = torch.nn.Parameter(resume_state["oracle_codes"].to(device))
         start_step = int(resume_state["step"])
@@ -625,6 +745,13 @@ def train_lora_oracle_bootstrap(
             "weight_decay": 0.0,
         },
     ]
+    if preserve_teacher_common:
+        groups.insert(1, {
+            "params": adapter.common_parameters(),
+            "lr": float(training.get("common_learning_rate", 2e-4)),
+            "name": "common_kv",
+            "weight_decay": 0.0,
+        })
     if adapter.null_parameters():
         groups.append({
             "params": adapter.null_parameters(),
@@ -683,6 +810,7 @@ def train_lora_oracle_bootstrap(
     sample_every = int(training.get("sample_every", 500))
     max_grad_norm = float(training.get("max_grad_norm", 1.0))
     anchor_weight = float(training.get("oracle_anchor_weight", 0.01))
+    common_bootstrap_steps = int(training.get("common_bootstrap_steps", 0))
     timestep_count = int(bank.base["timesteps"].shape[0])
     timestep_sampling_weights = training.get("timestep_sampling_weights")
     if timestep_sampling_weights is not None:
@@ -706,6 +834,17 @@ def train_lora_oracle_bootstrap(
     started = time.perf_counter()
     try:
         for step in range(start_step + 1, steps + 1):
+            common_only = preserve_teacher_common and step <= common_bootstrap_steps
+            adapter.set_bootstrap_phase(
+                "common_only" if common_only else (
+                    "combined" if preserve_teacher_common else "artist_only"
+                )
+            )
+            oracle_codes.requires_grad_(not common_only)
+            for parameter in adapter.common_parameters():
+                parameter.requires_grad_(preserve_teacher_common)
+            for parameter in adapter.artist_parameters():
+                parameter.requires_grad_(not common_only)
             lr_scale = min(1.0, step / max(1, warmup))
             for group in optimizer.param_groups:
                 group["lr"] = base_lrs[str(group["name"])] * lr_scale
@@ -735,23 +874,56 @@ def train_lora_oracle_bootstrap(
             teacher = bank.effects[
                 teacher_indices, content_index, timestep_index
             ].to(device=device, dtype=torch.float32, non_blocking=True)
-            codes = oracle_codes[positions]
-            student = _controlled_style_context_forward(
-                anima, adapter, codes, noisy, base, context, timestep, device
+            teacher_common = single_teacher_common[
+                content_index, timestep_index
+            ].unsqueeze(0).to(
+                device=device, dtype=torch.float32, non_blocking=True
             )
+            codes = oracle_codes[positions]
             objective_weights = _timestep_objective_weights(
                 dict(training.get("loss_weights", {})),
                 timestep_index=timestep_index,
                 direction_multipliers=timestep_direction_multipliers,
                 common_multipliers=timestep_common_multipliers,
             )
-            loss, metrics = _artist_centered_oracle_objective(
-                student, teacher, objective_weights
-            )
+            if common_only:
+                student_common = _controlled_style_context_forward(
+                    anima, adapter, codes[:1], noisy, base, context, timestep, device
+                )
+                loss, metrics = _oracle_component_regression_objective(
+                    student_common,
+                    teacher_common,
+                    dict(training.get("common_loss_weights", {})),
+                )
+                metrics = {f"common_{key}": value for key, value in metrics.items()}
+            elif preserve_teacher_common:
+                student = _controlled_style_context_forward(
+                    anima, adapter, codes, noisy, base, context, timestep, device
+                )
+                adapter.set_bootstrap_phase("common_only")
+                student_common = _controlled_style_context_forward(
+                    anima, adapter, codes[:1], noisy, base, context, timestep, device
+                )
+                adapter.set_bootstrap_phase("combined")
+                loss, metrics = _common_artist_oracle_objective(
+                    student,
+                    student_common,
+                    teacher,
+                    teacher_common,
+                    dict(training.get("combined_loss_weights", {})),
+                )
+            else:
+                student = _controlled_style_context_forward(
+                    anima, adapter, codes, noisy, base, context, timestep, device
+                )
+                loss, metrics = _artist_centered_oracle_objective(
+                    student, teacher, objective_weights
+                )
             anchor_loss = F.smooth_l1_loss(
                 codes.float(), oracle_anchor[positions].float(), beta=0.10
             )
-            total = loss + anchor_weight * anchor_loss
+            active_anchor_weight = 0.0 if common_only else anchor_weight
+            total = loss + active_anchor_weight * anchor_loss
             total.backward()
             if groupwise_grad_clip:
                 group_grad_norms = {
@@ -776,9 +948,12 @@ def train_lora_oracle_bootstrap(
             optimizer.step()
             metrics.update({
                 "oracle_anchor_loss": anchor_loss.detach(),
-                "oracle_anchor_weighted_loss": (anchor_weight * anchor_loss).detach(),
+                "oracle_anchor_weighted_loss": (
+                    active_anchor_weight * anchor_loss
+                ).detach(),
                 "oracle_code_rms": oracle_codes.detach().square().mean().sqrt(),
                 "timestep": timestep.detach().float(),
+                "phase_common_only": torch.tensor(float(common_only), device=device),
                 **{
                     f"grad_norm_{name}": value.detach()
                     for name, value in group_grad_norms.items()
@@ -827,7 +1002,9 @@ def train_lora_oracle_bootstrap(
                     output,
                     device,
                     step,
-                    component_mode="artist_only",
+                    component_mode=(
+                        "combined" if preserve_teacher_common else "artist_only"
+                    ),
                     strengths_override=[1.0],
                     sample_group="oracle_code_samples",
                     sample_suffix="direct",
@@ -848,9 +1025,10 @@ def train_lora_oracle_bootstrap(
         "steps": steps,
         "start_step": start_step,
         "artists": len(style_ids),
-        "component_mode": "artist_only",
+        "component_mode": "combined" if preserve_teacher_common else "artist_only",
         "reader_frozen": True,
-        "common_frozen_and_bypassed": True,
+        "common_frozen_and_bypassed": not preserve_teacher_common,
+        "common_bootstrap_steps": common_bootstrap_steps,
         "elapsed_s": time.perf_counter() - started,
     }
     write_json(output / "summary.json", summary)

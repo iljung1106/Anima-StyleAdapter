@@ -431,8 +431,9 @@ kv_lora_functional_teacher:
 # codes remove visual encoding from the problem; success here is required
 # before attempting to distill the same effects from frozen visual tokens.
 kv_lora_oracle_bootstrap:
-  output_directory: kv_lora_oracle_bootstrap_v1_64_independent_kv
+  output_directory: kv_lora_oracle_bootstrap_v2_64_common_artist
   seed: 20260823
+  source_oracle_checkpoint: kv_lora_oracle_bootstrap_v1_64_independent_kv/training_state.pt
   initial_checkpoint: detail_preserving_style_cross_attention_v34_anti_common_functional/checkpoints/step-0000500.pt
   adapter_initialization: fresh_kv_checkpoint_strength
   adapter_override:
@@ -449,16 +450,19 @@ kv_lora_oracle_bootstrap:
   synthetic_reference_cache: kv_lora_teacher_references_rank16_64x8_v1/dual_query_reference_tokens_v8_step10000
   training:
     device: cuda
-    steps: 2000
+    steps: 2250
     batch_rows: 6
     initialization_references: 4
     initialization_batch_size: 8
-    oracle_learning_rate: 0.00050
-    shared_learning_rate: 0.00010
+    preserve_teacher_common: true
+    common_bootstrap_steps: 750
+    common_learning_rate: 0.00020
+    oracle_learning_rate: 0.00025
+    shared_learning_rate: 0.00005
     delta_learning_rate: 0.0
     mix_learning_rate: 0.0
     null_learning_rate: 0.00050
-    oracle_anchor_weight: 0.01
+    oracle_anchor_weight: 0.002
     warmup_steps: 100
     betas: [0.9, 0.95]
     adam_eps: 0.00000001
@@ -484,6 +488,36 @@ kv_lora_oracle_bootstrap:
       infonce: 0.75
       infonce_temperature: 0.10
       zero_mean: 1.00
+    common_loss_weights:
+      huber: 1.00
+      direction: 1.00
+      magnitude: 0.35
+    combined_loss_weights:
+      full_weight: 1.00
+      common_weight: 0.35
+      artist_weight: 1.00
+      full:
+        huber: 1.00
+        direction: 1.00
+        magnitude: 0.25
+      common:
+        huber: 1.00
+        direction: 0.75
+        magnitude: 0.25
+      artist:
+        full_huber: 0.10
+        full_direction: 0.25
+        full_magnitude: 0.05
+        low_frequency_factors: [8, 16]
+        low_huber: 1.00
+        low_direction: 2.00
+        low_magnitude: 0.10
+        global_huber: 0.50
+        global_direction: 1.50
+        global_magnitude: 0.05
+        infonce: 0.75
+        infonce_temperature: 0.10
+        zero_mean: 0.50
     log_every: 10
     checkpoint_every: 250
     sample_every: 500
@@ -491,8 +525,8 @@ kv_lora_oracle_bootstrap:
     wandb:
       enabled: true
       project: anima-style-adapter
-      name: kv-lora-oracle-bootstrap-v1-64-independent-kv
-      id: kv-lora-oracle-bootstrap-v1-64-independent-kv
+      name: kv-lora-oracle-bootstrap-v2-64-common-artist
+      id: kv-lora-oracle-bootstrap-v2-64-common-artist
 
 # Offline functional teacher and clean continuation runner. Teacher updates
 # cycle @artist : individual LoRA : mixed LoRA at 1:1:1 after an individual
