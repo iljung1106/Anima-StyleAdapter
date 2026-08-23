@@ -15,6 +15,40 @@ from typing import Any
 from .io import read_records, write_json
 
 
+def _serialize_lora_patterns(value: Any) -> str | None:
+    """Match sd-scripts' string-valued network-argument contract."""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return value
+    return repr([str(pattern) for pattern in value])
+
+
+def _selected_lora_modules(network, training: dict[str, Any]) -> tuple[str, ...]:
+    names = tuple(
+        str(lora.original_name)
+        for lora in network.unet_loras
+        if hasattr(lora, "original_name")
+    )
+    expected_count = training.get("expected_module_count")
+    if expected_count is not None and len(names) != int(expected_count):
+        raise RuntimeError(
+            f"Selected {len(names)} LoRA modules, expected {int(expected_count)}"
+        )
+    allowed = tuple(
+        re.compile(str(pattern))
+        for pattern in training.get("required_module_patterns", ())
+    )
+    invalid = [
+        name
+        for name in names
+        if allowed and not any(pattern.fullmatch(name) for pattern in allowed)
+    ]
+    if invalid:
+        raise RuntimeError(f"Unexpected LoRA modules selected: {invalid[:8]}")
+    return names
+
+
 @dataclass(frozen=True)
 class ArtistLoRAPlan:
     index: int
@@ -720,9 +754,12 @@ def _snapshot_training_state(
 
 
 def prepare_artist_lora_teachers(
-    config: dict[str, Any], destination: Path
+    config: dict[str, Any],
+    destination: Path,
+    *,
+    config_key: str = "artist_lora_teachers",
 ) -> dict[str, Any]:
-    cfg = config["artist_lora_teachers"]
+    cfg = config[config_key]
     output = destination / str(cfg["output_directory"])
     output.mkdir(parents=True, exist_ok=True)
     signature = _selection_signature(cfg)
@@ -768,16 +805,19 @@ def _safe_artist_filename(plan: ArtistLoRAPlan) -> str:
 
 
 def train_artist_lora_teachers(
-    config: dict[str, Any], destination: Path
+    config: dict[str, Any],
+    destination: Path,
+    *,
+    config_key: str = "artist_lora_teachers",
 ) -> dict[str, Any]:
     import torch
 
-    cfg = config["artist_lora_teachers"]
+    cfg = config[config_key]
     training = dict(cfg["training"])
     device = str(training.get("device", "cuda"))
     if not device.startswith("cuda"):
         raise RuntimeError("The persistent Anima LoRA trainer requires CUDA")
-    prepare_artist_lora_teachers(config, destination)
+    prepare_artist_lora_teachers(config, destination, config_key=config_key)
     output = destination / str(cfg["output_directory"])
     plan_signature, plans = _load_plan(output)
     weights_dir = output / "weights"
@@ -823,8 +863,14 @@ def train_artist_lora_teachers(
         unet=anima,
         neuron_dropout=None,
         train_llm_adapter="false",
-        include_patterns=training.get("include_patterns"),
-        exclude_patterns=training.get("exclude_patterns"),
+        include_patterns=_serialize_lora_patterns(training.get("include_patterns")),
+        exclude_patterns=_serialize_lora_patterns(training.get("exclude_patterns")),
+    )
+    selected_modules = _selected_lora_modules(network, training)
+    print(
+        f"artist-lora selected_modules={len(selected_modules)} "
+        f"first={selected_modules[:4]}",
+        flush=True,
     )
     network.apply_to([], anima, apply_text_encoder=False, apply_unet=True)
     network.to(device=device)
@@ -874,9 +920,10 @@ def train_artist_lora_teachers(
             id=str(wandb_cfg.get("id", "artist-lora-teachers-r16-64-v1")),
             resume="allow",
             config={
-                "artist_lora_teachers": cfg,
+                config_key: cfg,
                 "parameter_count": parameter_count,
                 "plan_signature": plan_signature,
+                "selected_modules": selected_modules,
             },
         )
 
@@ -1042,6 +1089,8 @@ def train_artist_lora_teachers(
                 "anima_style_id": plan.style_id,
                 "anima_style_steps": str(steps),
                 "anima_style_plan_signature": plan_signature,
+                "anima_style_lora_config": config_key,
+                "anima_style_lora_modules": str(len(selected_modules)),
             }
             temporary_weight_path = weight_path.with_name(
                 weight_path.stem + ".tmp.safetensors"
@@ -1122,6 +1171,8 @@ def train_artist_lora_teachers(
         "rank": rank,
         "alpha": alpha,
         "parameters": parameter_count,
+        "selected_module_count": len(selected_modules),
+        "selected_modules": list(selected_modules),
         "optimizer_steps": len(all_metrics) * steps,
         "image_exposures": len(all_metrics) * steps * batch_size,
         "elapsed_seconds_this_run": time.perf_counter() - started_all,
@@ -1133,12 +1184,15 @@ def train_artist_lora_teachers(
 
 
 def smoke_test_artist_lora_teachers(
-    config: dict[str, Any], destination: Path
+    config: dict[str, Any],
+    destination: Path,
+    *,
+    config_key: str = "artist_lora_teachers",
 ) -> dict[str, Any]:
     import copy
 
     effective = copy.deepcopy(config)
-    cfg = effective["artist_lora_teachers"]
+    cfg = effective[config_key]
     cfg["output_directory"] = str(cfg["output_directory"]) + "_smoke"
     cfg["artist_count"] = 1
     cfg["images_per_artist"] = min(4, int(cfg.get("images_per_artist", 30)))
@@ -1155,4 +1209,30 @@ def smoke_test_artist_lora_teachers(
     cfg["preview"]["enabled"] = True
     cfg["preview"]["steps"] = 2
     cfg["force_replan"] = True
-    return train_artist_lora_teachers(effective, destination)
+    return train_artist_lora_teachers(
+        effective, destination, config_key=config_key
+    )
+
+
+def prepare_artist_kv_lora_teachers(
+    config: dict[str, Any], destination: Path
+) -> dict[str, Any]:
+    return prepare_artist_lora_teachers(
+        config, destination, config_key="artist_kv_lora_teachers"
+    )
+
+
+def train_artist_kv_lora_teachers(
+    config: dict[str, Any], destination: Path
+) -> dict[str, Any]:
+    return train_artist_lora_teachers(
+        config, destination, config_key="artist_kv_lora_teachers"
+    )
+
+
+def smoke_test_artist_kv_lora_teachers(
+    config: dict[str, Any], destination: Path
+) -> dict[str, Any]:
+    return smoke_test_artist_lora_teachers(
+        config, destination, config_key="artist_kv_lora_teachers"
+    )

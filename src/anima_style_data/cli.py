@@ -81,6 +81,9 @@ def build_parser() -> argparse.ArgumentParser:
         ("artist-lora-plan", "Select the 64 persistent Anima LoRA teacher artists"),
         ("artist-lora-smoke", "Run two real persistent Anima LoRA teacher steps"),
         ("artist-lora-train", "Train independent persistent Anima LoRA teachers"),
+        ("artist-kv-lora-plan", "Select the K/V-only LoRA pilot artists"),
+        ("artist-kv-lora-smoke", "Smoke-test a K/V-only artist LoRA"),
+        ("artist-kv-lora-train", "Train K/V-only artist LoRA teachers"),
         ("lora-reference-generate", "Generate image references from the 64 LoRA teachers"),
         ("lora-reference-token-cache", "Cache frozen Resampler tokens for LoRA images"),
         ("lora-functional-teacher-cache", "Cache single and mixed LoRA functional effects"),
@@ -392,6 +395,23 @@ def main() -> None:
             "artist-lora-plan": prepare_artist_lora_teachers,
             "artist-lora-smoke": smoke_test_artist_lora_teachers,
             "artist-lora-train": train_artist_lora_teachers,
+        }[args.command]
+        _run(stage, config, destination)
+    elif args.command in {
+        "artist-kv-lora-plan",
+        "artist-kv-lora-smoke",
+        "artist-kv-lora-train",
+    }:
+        from .artist_lora_teachers import (
+            prepare_artist_kv_lora_teachers,
+            smoke_test_artist_kv_lora_teachers,
+            train_artist_kv_lora_teachers,
+        )
+
+        stage = {
+            "artist-kv-lora-plan": prepare_artist_kv_lora_teachers,
+            "artist-kv-lora-smoke": smoke_test_artist_kv_lora_teachers,
+            "artist-kv-lora-train": train_artist_kv_lora_teachers,
         }[args.command]
         _run(stage, config, destination)
     elif args.command in {

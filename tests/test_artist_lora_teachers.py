@@ -6,6 +6,8 @@ import torch
 from anima_style_data.artist_lora_teachers import (
     _prompt_probabilities,
     _reset_lora_network,
+    _selected_lora_modules,
+    _serialize_lora_patterns,
     select_artist_lora_plans,
 )
 
@@ -108,3 +110,27 @@ def test_lora_reset_changes_down_and_zeros_up():
     _reset_lora_network(network, 11)
     assert not torch.equal(before, network.item.lora_down.weight)
     assert torch.count_nonzero(network.item.lora_up.weight) == 0
+
+
+def test_kv_only_lora_selection_contract():
+    class Item:
+        def __init__(self, name: str):
+            self.original_name = name
+
+    class Network:
+        unet_loras = [
+            Item(f"blocks.{block}.cross_attn.{projection}")
+            for block in range(28)
+            for projection in ("k_proj", "v_proj")
+        ]
+
+    pattern = r"blocks\.\d+\.cross_attn\.(k_proj|v_proj)"
+    names = _selected_lora_modules(
+        Network(),
+        {
+            "expected_module_count": 56,
+            "required_module_patterns": [pattern],
+        },
+    )
+    assert len(names) == 56
+    assert _serialize_lora_patterns([pattern]) == repr([pattern])
