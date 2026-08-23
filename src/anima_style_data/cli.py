@@ -93,6 +93,8 @@ def build_parser() -> argparse.ArgumentParser:
         ("kv-lora-fixed-teacher-compare", "Compare K/V LoRAs on one prompt and seed"),
         ("kv-lora-oracle-bootstrap-smoke", "Smoke-test K/V-only LoRA oracle capacity"),
         ("kv-lora-oracle-bootstrap-train", "Train K/V-only LoRA oracle capacity"),
+        ("kv-activation-modulator-smoke", "Smoke-test direct native text K/V modulation"),
+        ("kv-activation-modulator-train", "Distill K/V-only LoRAs into native text K/V deltas"),
         ("lora-functional-distill-smoke", "Smoke-test LoRA functional distillation"),
         ("lora-functional-distill-train", "Distill artist-tag, LoRA and mixed-LoRA teachers"),
         ("lora-functional-distill-v2-smoke", "Smoke-test artist-centered LoRA distillation"),
@@ -530,6 +532,20 @@ def main() -> None:
         stage = {
             "kv-lora-oracle-bootstrap-smoke": smoke_test_kv_lora_oracle_bootstrap,
             "kv-lora-oracle-bootstrap-train": train_kv_lora_oracle_bootstrap,
+        }[args.command]
+        _run(stage, config, destination)
+    elif args.command in {
+        "kv-activation-modulator-smoke",
+        "kv-activation-modulator-train",
+    }:
+        from .kv_activation_modulation import (
+            smoke_test_kv_activation_modulator,
+            train_kv_activation_modulator,
+        )
+
+        stage = {
+            "kv-activation-modulator-smoke": smoke_test_kv_activation_modulator,
+            "kv-activation-modulator-train": train_kv_activation_modulator,
         }[args.command]
         _run(stage, config, destination)
     elif args.command in {

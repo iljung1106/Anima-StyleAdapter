@@ -531,6 +531,49 @@ kv_lora_oracle_bootstrap:
       name: kv-lora-oracle-bootstrap-v3-64-broad256x4
       id: kv-lora-oracle-bootstrap-v3-64-broad256x4
 
+# Capacity gate aligned to the teacher's real function class.  Frozen visual
+# Reader anchors predict rank-16 factors which modulate the native 512-token
+# text K/V activations before Anima's K/V normalization.  The target factors
+# are applied online; no high-dimensional activation cache is duplicated.
+kv_activation_modulator:
+  output_directory: kv_activation_modulator_v1_64_visual_anchor
+  seed: 20260824
+  blocks: 28
+  lora_directory: artist_kv_lora_teachers_rank16_64_b2_v1
+  style_code_checkpoint: kv_lora_oracle_bootstrap_v3_64_broad256x4/checkpoints/step-0001750.pt
+  style_code_key: oracle_anchor
+  text_context_cache: kv_lora_functional_teacher_bank_rank16_64_v2_broad256x4
+  model:
+    hidden_dim: 512
+    heads: 8
+    layers: 2
+    ff_dim: 2048
+  training:
+    device: cuda
+    steps: 3000
+    batch_artists: 16
+    heldout_contexts: 32
+    validation_artists: 8
+    validation_contexts: 4
+    learning_rate: 0.0002
+    warmup_steps: 100
+    betas: [0.9, 0.95]
+    adam_eps: 0.00000001
+    weight_decay: 0.01
+    max_grad_norm: 1.0
+    direction_weight: 0.5
+    magnitude_weight: 0.1
+    fused_adamw: true
+    log_every: 10
+    validation_every: 250
+    checkpoint_every: 250
+    resume: true
+    wandb:
+      enabled: true
+      project: anima-style-adapter
+      name: kv-activation-modulator-v1-64-visual-anchor
+      id: kv-activation-modulator-v1-64-visual-anchor
+
 # Offline functional teacher and clean continuation runner. Teacher updates
 # cycle @artist : individual LoRA : mixed LoRA at 1:1:1 after an individual
 # LoRA bootstrap. LoRA steps alternate human and LoRA-generated references.
