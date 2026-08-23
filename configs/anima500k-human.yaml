@@ -625,6 +625,10 @@ lora_oracle_bootstrap:
     native_functional_cross_view_every: 2
     native_functional_cross_view_rows: 4
     native_functional_magnitude_weight: 0.10
+    # Draw a random pool, then greedily spread the batch using the cached
+    # Frozen-Anima LoRA effects.  This keeps InfoNCE informative without
+    # repeatedly selecting only a fixed set of extreme artists.
+    functional_diverse_sampling_pool: 64
     native_temperature: 0.10
     checkpoint_every: 250
     sample_every: 250

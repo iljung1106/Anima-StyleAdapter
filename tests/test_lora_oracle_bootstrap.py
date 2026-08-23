@@ -2,12 +2,14 @@ import torch
 
 from anima_style_data.lora_oracle_bootstrap import (
     _cross_view_functional_objective,
+    _functional_effect_fingerprints,
     _FixedOracleCodeReader,
     _artist_centered_oracle_objective,
     _cross_view_artist_objective,
     _interpolate_oracle_visual,
     _oracle_code_alignment_objective,
     _materialize_reader_code_bank,
+    _sample_diverse_functional_batch,
     _piecewise_linear_value,
     OracleVisualProjector,
     _ProjectedReader,
@@ -50,6 +52,24 @@ def test_cross_view_functional_objective_rejects_collapsed_effects():
     assert float(collapsed_loss) > float(exact_loss)
     collapsed_loss.backward()
     assert torch.isfinite(collapsed.grad).all()
+
+
+def test_functional_sampler_spreads_a_random_candidate_pool():
+    effects = torch.zeros(6, 1, 1, 4, 8, 8)
+    effects[:3, ..., 0, :, :] = 1
+    effects[3:, ..., 1, :, :] = 1
+    fingerprints = _functional_effect_fingerprints(effects)
+    similarity = fingerprints @ fingerprints.t()
+    selected, mean_similarity = _sample_diverse_functional_batch(
+        list(range(6)),
+        similarity,
+        2,
+        rng=__import__("random").Random(7),
+        pool_size=6,
+    )
+
+    assert (selected[0] < 3) != (selected[1] < 3)
+    assert mean_similarity < 0
 
 
 def test_piecewise_linear_value_supports_a_plateau_then_ramp():

@@ -1956,6 +1956,62 @@ def _cross_view_functional_objective(
     }
 
 
+def _functional_effect_fingerprints(effects: torch.Tensor) -> torch.Tensor:
+    """Build compact cosine fingerprints from cached functional effects."""
+
+    if effects.ndim < 3 or effects.shape[0] < 2:
+        raise ValueError("Functional fingerprints need at least two effects")
+    values = effects.float()
+    if values.ndim >= 5:
+        prefix = values.shape[:-3]
+        channels, height, width = values.shape[-3:]
+        values = F.adaptive_avg_pool2d(
+            values.reshape(-1, channels, height, width), (4, 4)
+        ).reshape(*prefix, channels, 4, 4)
+    values = values.flatten(1)
+    values = values - values.mean(dim=0, keepdim=True)
+    return F.normalize(values, dim=1)
+
+
+def _sample_diverse_functional_batch(
+    candidates: list[int],
+    similarity: torch.Tensor,
+    batch_rows: int,
+    *,
+    rng: random.Random,
+    pool_size: int,
+) -> tuple[list[int], float]:
+    """Greedily spread a random candidate pool in cached effect space."""
+
+    if similarity.shape != (len(candidates), len(candidates)):
+        raise ValueError("Similarity matrix does not match candidate list")
+    if not 1 <= batch_rows <= len(candidates):
+        raise ValueError("batch_rows must fit the candidate list")
+    pool_count = min(len(candidates), max(batch_rows, int(pool_size)))
+    pool = rng.sample(range(len(candidates)), pool_count)
+    selected = [pool.pop(rng.randrange(len(pool)))]
+    while len(selected) < batch_rows:
+        selected_tensor = torch.tensor(selected, dtype=torch.long)
+        best_position = min(
+            pool,
+            key=lambda position: float(
+                similarity[position].index_select(0, selected_tensor).max()
+            ),
+        )
+        selected.append(best_position)
+        pool.remove(best_position)
+    selected_tensor = torch.tensor(selected, dtype=torch.long)
+    selected_similarity = similarity.index_select(
+        0, selected_tensor
+    ).index_select(1, selected_tensor)
+    if batch_rows > 1:
+        mask = ~torch.eye(batch_rows, dtype=torch.bool)
+        mean_similarity = float(selected_similarity[mask].mean())
+    else:
+        mean_similarity = 1.0
+    return [candidates[position] for position in selected], mean_similarity
+
+
 def train_lora_oracle_joint_manifold(
     config: dict[str, Any],
     destination: Path,
@@ -2158,6 +2214,15 @@ def train_lora_oracle_joint_manifold(
     loss_weights = dict(cfg.get("functional_loss_weights", {}))
     code_weights = dict(cfg.get("code_loss_weights", {}))
     categories = ("single", "pair", "triple")
+    diverse_pool_size = int(cfg.get("functional_diverse_sampling_pool", 0))
+    functional_similarities: dict[str, torch.Tensor] = {}
+    if diverse_pool_size > 0:
+        for category in categories:
+            category_indices = bank.by_kind[category]
+            fingerprints = _functional_effect_fingerprints(
+                bank.effects[category_indices]
+            )
+            functional_similarities[category] = fingerprints @ fingerprints.t()
     running: dict[str, list[float]] = defaultdict(list)
     started = time.perf_counter()
     try:
@@ -2169,7 +2234,19 @@ def train_lora_oracle_joint_manifold(
             rng = random.Random(seed + step * 1_000_003)
             category = categories[(step - 1) % len(categories)]
             candidates = bank.by_kind[category]
-            mixture_indices = rng.sample(candidates, batch_rows)
+            if diverse_pool_size > 0:
+                mixture_indices, teacher_batch_similarity = (
+                    _sample_diverse_functional_batch(
+                        candidates,
+                        functional_similarities[category],
+                        batch_rows,
+                        rng=rng,
+                        pool_size=diverse_pool_size,
+                    )
+                )
+            else:
+                mixture_indices = rng.sample(candidates, batch_rows)
+                teacher_batch_similarity = float("nan")
             mixture_rows = [bank.mixtures[index] for index in mixture_indices]
             domain_index = step % 2
             visual_context, oracle_context, raw_context, component_counts = (
@@ -2300,6 +2377,9 @@ def train_lora_oracle_joint_manifold(
                 "category": torch.tensor(float(categories.index(category)), device=device),
                 "domain_is_human": torch.tensor(float(domain_index == 0), device=device),
                 "mixture_components": component_counts.mean(),
+                "teacher_batch_effect_cosine": torch.tensor(
+                    teacher_batch_similarity, device=device
+                ),
                 **{f"visual/{key}": value for key, value in visual_metrics.items()},
                 **{f"replay/{key}": value for key, value in replay_metrics.items()},
                 **{f"code/{key}": value for key, value in code_metrics.items()},
