@@ -474,9 +474,9 @@ kv_lora_oracle_bootstrap:
     groupwise_grad_clip: true
     fused_adamw: true
     token_lru_shards: 8
-    timestep_sampling_weights: [1.5, 1.5, 1.25, 1.0, 1.0, 1.0]
-    timestep_direction_multipliers: [1.5, 1.35, 1.15, 1.0, 1.0, 1.0]
-    timestep_common_multipliers: [1.25, 1.15, 1.0, 1.0, 1.0, 1.0]
+    timestep_sampling_weights: [1.50, 1.25, 1.00, 1.00]
+    timestep_direction_multipliers: [1.50, 1.15, 1.00, 1.00]
+    timestep_common_multipliers: [1.25, 1.00, 1.00, 1.00]
     loss_weights:
       full_huber: 0.10
       full_direction: 0.25
