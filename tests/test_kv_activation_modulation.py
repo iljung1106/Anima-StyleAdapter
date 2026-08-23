@@ -113,6 +113,29 @@ def test_modulator_applies_block_rank_scales_without_losing_gradients():
     )
 
 
+def test_block_specific_heads_only_update_the_selected_block():
+    model = NativeKVFactorModulator(
+        style_dim=12,
+        blocks=3,
+        rank=2,
+        context_dim=6,
+        output_dim=8,
+        hidden_dim=16,
+        heads=4,
+        layers=1,
+        ff_dim=32,
+        block_specific_heads=True,
+    )
+
+    down, up = model(torch.randn(2, 5, 12), 1)
+    (down.square().mean() + up.square().mean()).backward()
+
+    assert model.down_head[2].weight.grad is not None
+    assert model.up_head[3].weight.grad is not None
+    assert model.down_head[0].weight.grad is None
+    assert model.up_head[5].weight.grad is None
+
+
 def test_activation_objective_prefers_exact_teacher_delta():
     teacher = torch.randn(4, 2, 7, 8)
     exact_loss, exact = kv_activation_objective(

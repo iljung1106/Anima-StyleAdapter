@@ -209,6 +209,7 @@ class NativeKVFactorModulator(nn.Module):
         heads: int = 8,
         layers: int = 2,
         ff_dim: int = 2048,
+        block_specific_heads: bool = False,
     ) -> None:
         super().__init__()
         if hidden_dim % heads:
@@ -217,6 +218,7 @@ class NativeKVFactorModulator(nn.Module):
         self.rank = int(rank)
         self.context_dim = int(context_dim)
         self.output_dim = int(output_dim)
+        self.block_specific_heads = bool(block_specific_heads)
         self.style_norm = nn.LayerNorm(style_dim)
         self.style_projection = nn.Linear(style_dim, hidden_dim, bias=False)
         self.block_embedding = nn.Embedding(blocks, hidden_dim)
@@ -238,10 +240,22 @@ class NativeKVFactorModulator(nn.Module):
         )
         self.factor_mixer = nn.TransformerEncoder(layer, num_layers=layers)
         self.output_norm = nn.LayerNorm(hidden_dim)
-        self.down_head = nn.Linear(hidden_dim, context_dim, bias=False)
-        self.up_head = nn.Linear(hidden_dim, output_dim, bias=False)
-        nn.init.xavier_uniform_(self.down_head.weight)
-        nn.init.xavier_uniform_(self.up_head.weight)
+        if self.block_specific_heads:
+            self.down_head = nn.ModuleList(
+                nn.Linear(hidden_dim, context_dim, bias=False)
+                for _ in range(blocks * 2)
+            )
+            self.up_head = nn.ModuleList(
+                nn.Linear(hidden_dim, output_dim, bias=False)
+                for _ in range(blocks * 2)
+            )
+            for head in (*self.down_head, *self.up_head):
+                nn.init.xavier_uniform_(head.weight)
+        else:
+            self.down_head = nn.Linear(hidden_dim, context_dim, bias=False)
+            self.up_head = nn.Linear(hidden_dim, output_dim, bias=False)
+            nn.init.xavier_uniform_(self.down_head.weight)
+            nn.init.xavier_uniform_(self.up_head.weight)
         self.down_log_scale = nn.Linear(hidden_dim, 1)
         self.up_log_scale = nn.Linear(hidden_dim, 1)
         nn.init.zeros_(self.down_log_scale.weight)
@@ -297,11 +311,29 @@ class NativeKVFactorModulator(nn.Module):
         factors = self.output_norm(
             self.factor_mixer(queries + attended)
         ).reshape(batch, 2, self.rank, -1)
+        if self.block_specific_heads:
+            unique_blocks = block_index.unique()
+            if unique_blocks.numel() != 1:
+                raise ValueError(
+                    "Block-specific heads require one block index per forward"
+                )
+            selected_block = int(unique_blocks.item())
+            down_raw = torch.stack([
+                self.down_head[selected_block * 2 + kind](factors[:, kind])
+                for kind in range(2)
+            ], dim=1)
+            up_raw = torch.stack([
+                self.up_head[selected_block * 2 + kind](factors[:, kind])
+                for kind in range(2)
+            ], dim=1)
+        else:
+            down_raw = self.down_head(factors)
+            up_raw = self.up_head(factors)
         down_direction = F.normalize(
-            self.down_head(factors).float(), dim=-1
+            down_raw.float(), dim=-1
         ).to(factors.dtype) * math.sqrt(self.context_dim)
         up_direction = F.normalize(
-            self.up_head(factors).float(), dim=-1
+            up_raw.float(), dim=-1
         ).to(factors.dtype) * math.sqrt(self.output_dim)
         down_scale = self.down_output_scale[block_index].to(factors.dtype)
         up_scale = self.up_output_scale[block_index].to(factors.dtype)
@@ -759,6 +791,10 @@ def train_kv_activation_modulator(
         "blocks": model.blocks,
         "rank": model.rank,
         "contexts": int(contexts.shape[0]),
+        "trainable_parameters": sum(
+            parameter.numel() for parameter in model.parameters()
+            if parameter.requires_grad
+        ),
         "elapsed_seconds": time.perf_counter() - started,
         "checkpoint": str(state_path),
     }
