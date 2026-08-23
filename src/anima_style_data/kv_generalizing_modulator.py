@@ -553,6 +553,19 @@ def train_generalizing_kv_activation_modulator(
                 "mean_references": reference_counts[view_indices].float().mean(),
                 "block": torch.tensor(float(block)),
             }
+            sample_kind = "mixture" if is_mixture else "single"
+            row_metrics.update(
+                {
+                    f"{sample_kind}_raw_loss": raw_loss.detach(),
+                    f"{sample_kind}_centered_loss": centered_loss.detach(),
+                    f"{sample_kind}_centered_cosine": centered_metrics[
+                        "cosine"
+                    ].detach(),
+                    f"{sample_kind}_centered_student_to_teacher_rms": (
+                        centered_metrics["student_to_teacher_rms"].detach()
+                    ),
+                }
+            )
             for key, value in row_metrics.items():
                 running[key].append(float(value))
             if step % log_every == 0:
