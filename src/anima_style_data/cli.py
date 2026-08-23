@@ -96,6 +96,7 @@ def build_parser() -> argparse.ArgumentParser:
         ("kv-activation-modulator-smoke", "Smoke-test direct native text K/V modulation"),
         ("kv-activation-modulator-train", "Distill K/V-only LoRAs into native text K/V deltas"),
         ("kv-activation-modulator-sample", "Compare native K/V LoRA teachers with predicted K/V deltas"),
+        ("kv-activation-reference-eval", "Evaluate fresh Human and Synthetic reference codes"),
         ("lora-functional-distill-smoke", "Smoke-test LoRA functional distillation"),
         ("lora-functional-distill-train", "Distill artist-tag, LoRA and mixed-LoRA teachers"),
         ("lora-functional-distill-v2-smoke", "Smoke-test artist-centered LoRA distillation"),
@@ -539,17 +540,22 @@ def main() -> None:
         "kv-activation-modulator-smoke",
         "kv-activation-modulator-train",
         "kv-activation-modulator-sample",
+        "kv-activation-reference-eval",
     }:
         from .kv_activation_modulation import (
             smoke_test_kv_activation_modulator,
             train_kv_activation_modulator,
         )
-        from .kv_activation_sampling import sample_kv_activation_modulator
+        from .kv_activation_sampling import (
+            evaluate_kv_activation_reference_generalization,
+            sample_kv_activation_modulator,
+        )
 
         stage = {
             "kv-activation-modulator-smoke": smoke_test_kv_activation_modulator,
             "kv-activation-modulator-train": train_kv_activation_modulator,
             "kv-activation-modulator-sample": sample_kv_activation_modulator,
+            "kv-activation-reference-eval": evaluate_kv_activation_reference_generalization,
         }[args.command]
         _run(stage, config, destination)
     elif args.command in {

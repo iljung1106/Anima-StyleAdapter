@@ -8,8 +8,11 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 from PIL import Image, ImageDraw
+from safetensors.torch import load_file
 
+from .detail_style_cross_attention import DetailPreservingTypedSlotReader
 from .dual_query_external_samples import load_dual_query_external_sample
+from .dual_query_style_tokenizer import CachedTeacherReferenceLoader
 from .io import write_json
 from .kv_activation_modulation import (
     NativeKVFactorModulator,
@@ -18,6 +21,7 @@ from .kv_activation_modulation import (
     load_kv_lora_factor_bank,
 )
 from .lora_functional_distillation import _preview_pixels
+from .lora_oracle_bootstrap import _oracle_detail_config
 from .style_transfer import (
     _load_sampling_vae,
     _optimize_frozen_anima,
@@ -228,6 +232,83 @@ def _factor_prompt_metrics(
     }
 
 
+def _predict_factor_bank(
+    model: NativeKVFactorModulator, codes: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    down_values = []
+    up_values = []
+    with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
+        for block in range(model.blocks):
+            down, up = model(codes, block)
+            down_values.append(down)
+            up_values.append(up)
+    return torch.stack(down_values, dim=1), torch.stack(up_values, dim=1)
+
+
+def _activation_bank_metrics(
+    contexts: torch.Tensor,
+    teacher_down: torch.Tensor,
+    teacher_up: torch.Tensor,
+    predicted_down: torch.Tensor,
+    predicted_up: torch.Tensor,
+) -> dict[str, float]:
+    values: dict[str, list[torch.Tensor]] = {
+        "cosine": [], "k_cosine": [], "v_cosine": [],
+        "rms_ratio": [], "relative_rms_error": [],
+    }
+    with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
+        for block in range(int(teacher_down.shape[1])):
+            for context in contexts:
+                expanded = context[None].expand(teacher_down.shape[0], -1, -1)
+                teacher = apply_kv_factors(
+                    expanded, teacher_down[:, block], teacher_up[:, block]
+                ).float()
+                predicted = apply_kv_factors(
+                    expanded, predicted_down[:, block], predicted_up[:, block]
+                ).float()
+                cosine = F.cosine_similarity(
+                    predicted.flatten(2), teacher.flatten(2), dim=-1
+                )
+                teacher_rms = teacher.square().mean(dim=(2, 3)).sqrt()
+                predicted_rms = predicted.square().mean(dim=(2, 3)).sqrt()
+                relative_error = (
+                    (predicted - teacher).square().mean(dim=(2, 3)).sqrt()
+                    / teacher_rms.clamp_min(1e-7)
+                )
+                values["cosine"].append(cosine.mean())
+                values["k_cosine"].append(cosine[:, 0].mean())
+                values["v_cosine"].append(cosine[:, 1].mean())
+                values["rms_ratio"].append(
+                    (predicted_rms / teacher_rms.clamp_min(1e-7)).mean()
+                )
+                values["relative_rms_error"].append(relative_error.mean())
+    return {
+        key: float(torch.stack(rows).mean()) for key, rows in values.items()
+    }
+
+
+def _style_code_metrics(
+    values: torch.Tensor, anchor: torch.Tensor
+) -> dict[str, float]:
+    values_f = values.float()
+    anchor_f = anchor.float()
+    centered_values = values_f - values_f.mean(dim=0, keepdim=True)
+    centered_anchor = anchor_f - anchor_f.mean(dim=0, keepdim=True)
+    return {
+        "anchor_cosine": float(F.cosine_similarity(
+            values_f.flatten(1), anchor_f.flatten(1), dim=1
+        ).mean()),
+        "centered_anchor_cosine": float(F.cosine_similarity(
+            centered_values.flatten(1), centered_anchor.flatten(1), dim=1
+        ).mean()),
+        "anchor_relative_rms_error": float(
+            (values_f - anchor_f).square().mean(dim=(1, 2)).sqrt().div(
+                anchor_f.square().mean(dim=(1, 2)).sqrt().clamp_min(1e-7)
+            ).mean()
+        ),
+    }
+
+
 def _safe_name(value: str) -> str:
     return re.sub(r"[^0-9A-Za-z._-]+", "_", value).strip("_") or "artist"
 
@@ -435,6 +516,178 @@ def sample_kv_activation_modulator(
         "activation_metrics": prompt_metrics,
         "latent_metrics": latent_metrics,
         "panel": str(panel),
+    }
+    write_json(output / "summary.json", summary)
+    return summary
+
+
+@torch.no_grad()
+def evaluate_kv_activation_reference_generalization(
+    config: dict[str, Any], destination: Path
+) -> dict[str, Any]:
+    """Replace fixed artist anchors with fresh Human/Synthetic reference sets."""
+
+    cfg = dict(config["kv_activation_reference_eval"])
+    device = str(cfg.get("device", "cuda"))
+    checkpoint = torch.load(
+        destination / str(cfg["checkpoint"]),
+        map_location="cpu",
+        weights_only=False,
+    )
+    mod_cfg = dict(checkpoint["config"])
+    artist_ids, teacher_down, teacher_up = load_kv_lora_factor_bank(
+        destination / str(mod_cfg["lora_directory"]),
+        blocks=int(mod_cfg.get("blocks", 28)),
+    )
+    artist_count = min(int(cfg.get("artists", 16)), len(artist_ids))
+    indices = torch.linspace(0, len(artist_ids) - 1, artist_count).round().long().unique()
+    selected_indices = [int(value) for value in indices]
+    selected_ids = [artist_ids[index] for index in selected_indices]
+    teacher_down = teacher_down[selected_indices].to(device)
+    teacher_up = teacher_up[selected_indices].to(device)
+    teacher_down, teacher_up = canonicalize_lora_factor_bank(
+        teacher_down,
+        teacher_up,
+        chunk_size=int(cfg.get("canonicalization_chunk_size", 64)),
+    )
+    teacher_down = teacher_down.to(dtype=torch.bfloat16)
+    teacher_up = teacher_up.to(dtype=torch.bfloat16)
+
+    style_codes = checkpoint["style_codes"][selected_indices]
+    model = NativeKVFactorModulator(
+        style_dim=int(style_codes.shape[-1]),
+        blocks=int(teacher_down.shape[1]),
+        rank=int(teacher_down.shape[-2]),
+        context_dim=int(teacher_down.shape[-1]),
+        output_dim=int(teacher_up.shape[-2]),
+        **dict(mod_cfg["model"]),
+    )
+    model.load_state_dict(checkpoint["model"], strict=True)
+    model.to(device=device, dtype=torch.bfloat16).eval()
+    anchor = style_codes.to(device=device, dtype=torch.bfloat16)
+
+    context_bank = load_file(
+        destination / str(mod_cfg["text_context_cache"]) / "base.safetensors",
+        device="cpu",
+    )["base_context"]
+    heldout = int(mod_cfg["training"].get("heldout_contexts", 32))
+    context_bank = context_bank[-heldout:]
+    context_count = min(int(cfg.get("contexts", 4)), len(context_bank))
+    context_indices = torch.linspace(
+        0, len(context_bank) - 1, context_count
+    ).round().long().unique()
+    contexts = context_bank[context_indices].to(device=device, dtype=torch.bfloat16)
+
+    oracle_cfg = dict(config["kv_lora_oracle_bootstrap"])
+    reader_state = torch.load(
+        destination / str(mod_cfg["style_code_checkpoint"]),
+        map_location="cpu",
+        weights_only=False,
+    )
+    detail_cfg = _oracle_detail_config(config, oracle_cfg)
+    reader = DetailPreservingTypedSlotReader(**dict(detail_cfg["model"])).to(
+        device=device, dtype=torch.bfloat16
+    )
+    reader.load_state_dict(reader_state["reader"], strict=True)
+    reader.requires_grad_(False).eval()
+    del reader_state, checkpoint
+    gc.collect()
+
+    counts = [int(value) for value in cfg.get("reference_counts", [1, 2, 4])]
+    max_references = max(counts)
+    loader_kwargs = {
+        "split": "train",
+        "style_ids": selected_ids,
+        "batch_size": len(selected_ids),
+        "references": max_references,
+        "seed": int(cfg.get("seed", 20260824)),
+        "token_lru_shards": int(cfg.get("token_lru_shards", 8)),
+        "strict_style_ids": True,
+    }
+    loaders = {
+        "human": CachedTeacherReferenceLoader(
+            destination / str(oracle_cfg["human_reference_cache"]),
+            **loader_kwargs,
+        ),
+        "synthetic": CachedTeacherReferenceLoader(
+            destination / str(oracle_cfg["synthetic_reference_cache"]),
+            **loader_kwargs,
+        ),
+    }
+    anchor_down, anchor_up = _predict_factor_bank(model, anchor)
+    results: dict[str, Any] = {
+        "anchor": {
+            **_style_code_metrics(anchor, anchor),
+            **_activation_bank_metrics(
+                contexts,
+                teacher_down,
+                teacher_up,
+                anchor_down,
+                anchor_up,
+            ),
+        }
+    }
+    seed = int(cfg.get("seed", 20260824))
+    views = int(cfg.get("views", 3))
+    for domain_index, (domain, loader) in enumerate(loaders.items()):
+        for count in counts:
+            view_rows = []
+            for view in range(views):
+                loaded = loader.load_styles(
+                    selected_ids,
+                    references_per_style=count,
+                    seed=(
+                        seed
+                        + domain_index * 100_000_003
+                        + count * 1_000_003
+                        + view * 10_007
+                    ),
+                )
+                tokens = loaded["tokens"].to(
+                    device=device, dtype=torch.bfloat16, non_blocking=True
+                )
+                mask = torch.ones(
+                    tokens.shape[:2], device=device, dtype=torch.bool
+                )
+                with torch.autocast("cuda", dtype=torch.bfloat16):
+                    codes = reader(tokens, mask).tokens
+                down, up = _predict_factor_bank(model, codes)
+                view_rows.append({
+                    "view": view,
+                    "reference_ids": [list(rows) for rows in loaded["ids"]],
+                    **_style_code_metrics(codes, anchor),
+                    **_activation_bank_metrics(
+                        contexts, teacher_down, teacher_up, down, up
+                    ),
+                })
+            metric_keys = [
+                key for key, value in view_rows[0].items()
+                if isinstance(value, float)
+            ]
+            results[f"{domain}_{count}ref"] = {
+                "mean": {
+                    key: sum(float(row[key]) for row in view_rows) / len(view_rows)
+                    for key in metric_keys
+                },
+                "views": view_rows,
+            }
+            mean = results[f"{domain}_{count}ref"]["mean"]
+            print(
+                f"K/V reference eval {domain} refs={count} "
+                f"cos={mean['cosine']:.4f} k={mean['k_cosine']:.4f} "
+                f"v={mean['v_cosine']:.4f} rms={mean['rms_ratio']:.3f} "
+                f"code_centered={mean['centered_anchor_cosine']:.4f}",
+                flush=True,
+            )
+    output = destination / str(cfg["output_directory"])
+    output.mkdir(parents=True, exist_ok=True)
+    summary = {
+        "artists": selected_ids,
+        "artist_indices": selected_indices,
+        "contexts": [int(value) for value in context_indices],
+        "reference_counts": counts,
+        "views": views,
+        "results": results,
     }
     write_json(output / "summary.json", summary)
     return summary
