@@ -253,11 +253,21 @@ def analyze_kv_lora_mixture_generalization(
         reconstructed = common + methods["visual_ridge"] @ (
             train_anchor.float() - common
         )
+        query_centered = query.float() - common
+        reconstructed_centered = reconstructed - common
         code_metrics[domain_name] = {
             "reference_count": float(max_references),
             "ridge_code_cosine": float(F.cosine_similarity(
                 reconstructed, query.float(), dim=-1
             ).mean()),
+            "ridge_centered_code_cosine": float(F.cosine_similarity(
+                reconstructed_centered, query_centered, dim=-1
+            ).mean()),
+            "ridge_centered_relative_rms_error": float(
+                (reconstructed_centered - query_centered).square().mean(dim=-1).sqrt()
+                .div(query_centered.square().mean(dim=-1).sqrt().clamp_min(1e-8))
+                .mean()
+            ),
         }
 
     # Fit a global signed artist-span coefficient using one held-out text
@@ -336,7 +346,7 @@ def analyze_kv_lora_mixture_generalization(
         "fit_contexts": 1,
         "evaluation_contexts": int(evaluation_contexts.shape[0]),
         "blocks": int(teacher_down.shape[1]),
-        "sampled_tokens": int(contexts.shape[2]),
+        "sampled_tokens": int(contexts.shape[1]),
         "sampled_output_channels": int(teacher_up_sampled.shape[-2]),
         "code_metrics": code_metrics,
         "activation_metrics": results,
