@@ -478,12 +478,22 @@ lora_oracle_bootstrap:
     fused_adamw: true
     token_lru_shards: 8
     loss_weights:
-      huber: 1.00
-      direction: 1.00
-      magnitude: 0.25
+      # Full-resolution LoRA velocity effects are dominated by content/noise.
+      # Keep them as weak detail supervision and optimize the repeatable
+      # low-frequency artist effect as the primary oracle target.
+      full_huber: 0.10
+      full_direction: 0.10
+      full_magnitude: 0.05
+      low_frequency_factors: [8, 16]
+      low_huber: 1.00
+      low_direction: 1.50
+      low_magnitude: 0.25
+      global_huber: 0.50
+      global_direction: 1.00
+      global_magnitude: 0.10
       infonce: 0.50
       infonce_temperature: 0.10
-      zero_mean: 0.25
+      zero_mean: 0.10
     log_every: 10
     checkpoint_every: 250
     sample_every: 500

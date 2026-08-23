@@ -1,4 +1,5 @@
 import torch
+import torch.nn.functional as F
 
 from anima_style_data.lora_oracle_bootstrap import (
     _cross_view_functional_objective,
@@ -114,6 +115,29 @@ def test_oracle_objective_penalizes_artist_branch_batch_mean():
     assert float(centered_metrics["artist_common_zero_loss"]) < 1e-8
     assert float(shifted_metrics["artist_common_zero_loss"]) > 0.1
     assert float(shifted_loss) > float(centered_loss)
+
+
+def test_oracle_objective_prefers_repeatable_low_frequency_artist_effect():
+    generator = torch.Generator().manual_seed(9)
+    artist = torch.eye(8).reshape(8, 8, 1, 1).expand(-1, -1, 16, 16)
+    detail_noise = 2.0 * torch.randn(8, 8, 16, 16, generator=generator)
+    detail_noise = detail_noise - F.avg_pool2d(detail_noise, 8, 8).repeat_interleave(
+        8, -2
+    ).repeat_interleave(8, -1)
+    teacher = artist + detail_noise
+    correct = artist - artist.mean(dim=0, keepdim=True)
+    wrong = correct.roll(1, dims=0)
+
+    correct_loss, correct_metrics = _artist_centered_oracle_objective(
+        correct, teacher, {"low_frequency_factors": [8], "infonce": 0.5}
+    )
+    wrong_loss, wrong_metrics = _artist_centered_oracle_objective(
+        wrong, teacher, {"low_frequency_factors": [8], "infonce": 0.5}
+    )
+
+    assert float(correct_metrics["low_frequency_cosine"]) > 0.99
+    assert float(wrong_metrics["low_frequency_cosine"]) < 0
+    assert float(correct_loss) < float(wrong_loss)
 
 
 def test_fixed_oracle_reader_returns_checkpoint_codes():

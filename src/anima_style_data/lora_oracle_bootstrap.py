@@ -155,32 +155,93 @@ def _artist_centered_oracle_objective(
         raise ValueError("Oracle supervision needs matching multi-artist batches")
     student_common, student_centered = decompose_teacher_effects(student)
     _, teacher_centered = decompose_teacher_effects(teacher)
-    reduce_dims = tuple(range(1, student.ndim))
-    row_shape = (-1,) + (1,) * (student.ndim - 1)
-    teacher_rms = teacher_centered.square().mean(dim=reduce_dims).sqrt().clamp_min(1e-4)
-    student_rms = (student_centered.square().mean(dim=reduce_dims) + 1e-12).sqrt()
-    scale = teacher_rms.reshape(row_shape)
-    huber = F.smooth_l1_loss(
-        student_centered / scale,
-        teacher_centered / scale,
-        beta=0.10,
+    def scaled_terms(
+        student_value: torch.Tensor, teacher_value: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        reduce_dims = tuple(range(1, student_value.ndim))
+        row_shape = (-1,) + (1,) * (student_value.ndim - 1)
+        teacher_rms = (
+            teacher_value.square().mean(dim=reduce_dims).sqrt().clamp_min(1e-4)
+        )
+        student_rms = (
+            student_value.square().mean(dim=reduce_dims) + 1e-12
+        ).sqrt()
+        scale = teacher_rms.reshape(row_shape)
+        huber = F.smooth_l1_loss(
+            student_value / scale, teacher_value / scale, beta=0.10
+        )
+        cosine = F.cosine_similarity(
+            student_value.flatten(1), teacher_value.flatten(1), dim=1
+        ).mean()
+        magnitude = F.smooth_l1_loss(
+            (student_rms / teacher_rms).clamp_min(1e-4).log().clamp(-4, 4),
+            torch.zeros_like(student_rms),
+            beta=0.10,
+        )
+        return huber, cosine, magnitude, student_rms, teacher_rms
+
+    huber, cosine, magnitude, student_rms, teacher_rms = scaled_terms(
+        student_centered, teacher_centered
     )
-    cosine = F.cosine_similarity(
-        student_centered.flatten(1), teacher_centered.flatten(1), dim=1
-    ).mean()
-    magnitude = F.smooth_l1_loss(
-        (student_rms / teacher_rms).clamp_min(1e-4).log().clamp(-4, 4),
-        torch.zeros_like(student_rms),
-        beta=0.10,
-    )
+
+    low_student: list[torch.Tensor] = []
+    low_teacher: list[torch.Tensor] = []
+    if student_centered.ndim >= 4:
+        factors = [
+            int(value)
+            for value in weights.get("low_frequency_factors", [8, 16])
+        ]
+        for factor in factors:
+            if factor <= 0 or min(student_centered.shape[-2:]) < factor:
+                continue
+            low_student.append(F.avg_pool2d(student_centered, factor, factor))
+            low_teacher.append(F.avg_pool2d(teacher_centered, factor, factor))
+    if not low_student:
+        low_student = [student_centered]
+        low_teacher = [teacher_centered]
+    low_terms = [
+        scaled_terms(student_value, teacher_value)
+        for student_value, teacher_value in zip(low_student, low_teacher)
+    ]
+    low_huber = torch.stack([value[0] for value in low_terms]).mean()
+    low_cosine = torch.stack([value[1] for value in low_terms]).mean()
+    low_magnitude = torch.stack([value[2] for value in low_terms]).mean()
+
+    if student_centered.ndim >= 4:
+        global_student = student_centered.mean(dim=(-2, -1))
+        global_teacher = teacher_centered.mean(dim=(-2, -1))
+    else:
+        global_student = student_centered
+        global_teacher = teacher_centered
+    (
+        global_huber,
+        global_cosine,
+        global_magnitude,
+        _,
+        _,
+    ) = scaled_terms(global_student, global_teacher)
     teacher_scale = teacher_rms.mean().clamp_min(1e-4)
     zero_mean = (student_common / teacher_scale).square().mean()
 
     temperature = float(weights.get("infonce_temperature", 0.10))
     if temperature <= 0:
         raise ValueError("infonce_temperature must be positive")
-    student_unit = F.normalize(student_centered.flatten(1), dim=1)
-    teacher_unit = F.normalize(teacher_centered.flatten(1), dim=1)
+    # Contrast styles in the repeatable low-frequency subspace.  Full
+    # velocity residuals are mostly content/noise-specific even for the same
+    # LoRA, while 8x/16x pooled and channel-global effects retain a much larger
+    # same-artist cosine gap.
+    student_descriptor = torch.cat(
+        [F.normalize(value.flatten(1), dim=1) for value in low_student]
+        + [F.normalize(global_student.flatten(1), dim=1)],
+        dim=1,
+    )
+    teacher_descriptor = torch.cat(
+        [F.normalize(value.flatten(1), dim=1) for value in low_teacher]
+        + [F.normalize(global_teacher.flatten(1), dim=1)],
+        dim=1,
+    )
+    student_unit = F.normalize(student_descriptor, dim=1)
+    teacher_unit = F.normalize(teacher_descriptor, dim=1)
     logits = student_unit @ teacher_unit.t() / temperature
     labels = torch.arange(student.shape[0], device=student.device)
     infonce = 0.5 * (
@@ -192,11 +253,19 @@ def _artist_centered_oracle_objective(
         torch.finfo(logits.dtype).min,
     ).max(dim=1).values * temperature
     total = (
-        float(weights.get("huber", 1.0)) * huber
-        + float(weights.get("direction", 1.0)) * (1 - cosine)
-        + float(weights.get("magnitude", 0.25)) * magnitude
+        float(weights.get("full_huber", weights.get("huber", 0.10))) * huber
+        + float(weights.get("full_direction", weights.get("direction", 0.10)))
+        * (1 - cosine)
+        + float(weights.get("full_magnitude", weights.get("magnitude", 0.05)))
+        * magnitude
+        + float(weights.get("low_huber", 1.0)) * low_huber
+        + float(weights.get("low_direction", 1.5)) * (1 - low_cosine)
+        + float(weights.get("low_magnitude", 0.25)) * low_magnitude
+        + float(weights.get("global_huber", 0.50)) * global_huber
+        + float(weights.get("global_direction", 1.0)) * (1 - global_cosine)
+        + float(weights.get("global_magnitude", 0.10)) * global_magnitude
         + float(weights.get("infonce", 0.50)) * infonce
-        + float(weights.get("zero_mean", 0.25)) * zero_mean
+        + float(weights.get("zero_mean", 0.10)) * zero_mean
     )
     student_total_rms = student.square().mean().sqrt().clamp_min(1e-8)
     return total, {
@@ -205,6 +274,12 @@ def _artist_centered_oracle_objective(
         "centered_cosine": cosine.detach(),
         "centered_magnitude_loss": magnitude.detach(),
         "centered_student_to_teacher_rms": (student_rms / teacher_rms).mean().detach(),
+        "low_frequency_huber": low_huber.detach(),
+        "low_frequency_cosine": low_cosine.detach(),
+        "low_frequency_magnitude_loss": low_magnitude.detach(),
+        "global_channel_huber": global_huber.detach(),
+        "global_channel_cosine": global_cosine.detach(),
+        "global_channel_magnitude_loss": global_magnitude.detach(),
         "functional_infonce_loss": infonce.detach(),
         "functional_infonce_accuracy": (
             logits.argmax(dim=1) == labels
