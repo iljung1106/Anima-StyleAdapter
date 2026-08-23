@@ -421,7 +421,7 @@ kv_lora_functional_teacher:
       - short_quality
     probe_latent_shape: [128, 96]
     text_conditioning_length: 512
-    condition_batch_rows: 72
+    condition_batch_rows: 128
     timesteps: [0.12, 0.40, 0.68, 0.90]
     # The oracle capacity gate currently uses individual teachers only.
     # Spend the cache budget on 256 distinct Q/content conditions rather than

@@ -606,8 +606,17 @@ def cache_lora_functional_teacher(
     device = str(cache_cfg.get("device", "cuda"))
     anima = _resolve_anima_model(config, destination, device).requires_grad_(False).eval()
     _optimize_frozen_anima(anima, low_precision_rmsnorm=True, fuse_attention_projections=False)
+    # Do not instantiate inactive LoRA branches.  Single-only capacity banks
+    # need one network, while pair/triple banks retain the previous maximum of
+    # two/three.  A zero multiplier still leaves the LoRA module in every
+    # linear forward, so allocating all three wastes substantial GPU work.
+    active_networks = max(len(spec.components) for spec in specs)
     networks = _create_lora_networks(
-        config, anima, 3, device, dict(cfg.get("network_selection", {}))
+        config,
+        anima,
+        active_networks,
+        device,
+        dict(cfg.get("network_selection", {})),
     )
     latent_device = latents.to(device=device, dtype=torch.bfloat16)
     context_device = contexts.to(device=device, dtype=torch.bfloat16)
