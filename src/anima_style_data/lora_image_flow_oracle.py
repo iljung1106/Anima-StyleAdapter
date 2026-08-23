@@ -172,6 +172,138 @@ def _flow_forward(
             adapter.clear_style_tokens()
 
 
+def _centered_image_flow_objective(
+    styled_prediction: torch.Tensor,
+    base_prediction: torch.Tensor,
+    target_velocity: torch.Tensor,
+    weights: dict[str, float],
+    *,
+    artist_weight_multiplier: float = 1.0,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Prioritize artist-specific x0 effects over the shared content shortcut."""
+
+    styled = styled_prediction.float()
+    base = base_prediction.detach().float()
+    target = target_velocity.detach().float()
+    if (
+        styled.shape != base.shape
+        or styled.shape != target.shape
+        or styled.shape[0] < 2
+    ):
+        raise ValueError("Centered image-flow supervision needs matching artist rows")
+    student = styled - base
+    desired = target - base
+    student_common = student.mean(dim=0, keepdim=True)
+    desired_common = desired.mean(dim=0, keepdim=True)
+    student_centered = student - student_common
+    desired_centered = desired - desired_common
+
+    reduce_dims = tuple(range(1, desired.ndim))
+    row_shape = (-1,) + (1,) * (desired.ndim - 1)
+    desired_rms = desired_centered.square().mean(dim=reduce_dims).sqrt().clamp_min(1e-4)
+    student_rms = (student_centered.square().mean(dim=reduce_dims) + 1e-12).sqrt()
+    scale = desired_rms.reshape(row_shape)
+    centered_mse = F.mse_loss(student_centered / scale, desired_centered / scale)
+    centered_cosine = F.cosine_similarity(
+        student_centered.flatten(1), desired_centered.flatten(1), dim=1
+    ).mean()
+    centered_magnitude = F.smooth_l1_loss(
+        (student_rms / desired_rms).clamp_min(1e-4).log().clamp(-4, 4),
+        torch.zeros_like(student_rms),
+        beta=0.10,
+    )
+
+    common_scale = desired_common.square().mean().sqrt().clamp_min(1e-4)
+    common_huber = F.smooth_l1_loss(
+        student_common / common_scale,
+        desired_common / common_scale,
+        beta=0.10,
+    )
+    flow_mse = F.mse_loss(styled, target)
+
+    factors = [int(value) for value in weights.get("descriptor_factors", [4, 8, 16])]
+    student_parts: list[torch.Tensor] = []
+    desired_parts: list[torch.Tensor] = []
+    for factor in factors:
+        if factor <= 0 or min(student.shape[-2:]) < factor:
+            continue
+        student_parts.append(
+            F.normalize(
+                F.avg_pool2d(student_centered, factor, factor).flatten(1), dim=1
+            )
+        )
+        desired_parts.append(
+            F.normalize(
+                F.avg_pool2d(desired_centered, factor, factor).flatten(1), dim=1
+            )
+        )
+    student_parts.append(F.normalize(student_centered.mean(dim=(-2, -1)), dim=1))
+    desired_parts.append(F.normalize(desired_centered.mean(dim=(-2, -1)), dim=1))
+    student_descriptor = F.normalize(torch.cat(student_parts, dim=1), dim=1)
+    desired_descriptor = F.normalize(torch.cat(desired_parts, dim=1), dim=1)
+    temperature = float(weights.get("infonce_temperature", 0.10))
+    logits = student_descriptor @ desired_descriptor.t() / temperature
+    labels = torch.arange(student.shape[0], device=student.device)
+    infonce = 0.5 * (
+        F.cross_entropy(logits, labels) + F.cross_entropy(logits.t(), labels)
+    )
+    positive = logits.diagonal() * temperature
+    wrong = (
+        logits.masked_fill(
+            torch.eye(student.shape[0], device=student.device, dtype=torch.bool),
+            torch.finfo(logits.dtype).min,
+        )
+        .max(dim=1)
+        .values
+        * temperature
+    )
+
+    artist_objective = (
+        float(weights.get("centered_mse", 1.0)) * centered_mse
+        + float(weights.get("centered_direction", 1.0)) * (1 - centered_cosine)
+        + float(weights.get("centered_magnitude", 0.10)) * centered_magnitude
+        + float(weights.get("infonce", 0.50)) * infonce
+    )
+    total = (
+        float(weights.get("flow_mse", 0.10)) * flow_mse
+        + float(weights.get("common_huber", 0.10)) * common_huber
+        + float(artist_weight_multiplier) * artist_objective
+    )
+    student_total_rms = student.square().mean().sqrt().clamp_min(1e-8)
+    return total, {
+        "loss": total.detach(),
+        "flow_loss": flow_mse.detach(),
+        "common_huber": common_huber.detach(),
+        "centered_mse": centered_mse.detach(),
+        "centered_cosine": centered_cosine.detach(),
+        "centered_magnitude_loss": centered_magnitude.detach(),
+        "centered_student_to_desired_rms": (student_rms / desired_rms).mean().detach(),
+        "infonce_loss": infonce.detach(),
+        "infonce_accuracy": (logits.argmax(dim=1) == labels).float().mean().detach(),
+        "infonce_positive_cosine": positive.mean().detach(),
+        "infonce_hardest_wrong_cosine": wrong.mean().detach(),
+        "infonce_cosine_gap": (positive - wrong).mean().detach(),
+        "common_output_ratio": (
+            student_common.square().mean().sqrt() / student_total_rms
+        ).detach(),
+    }
+
+
+def _sample_weighted_timestep(
+    rng: random.Random,
+    edges: list[float],
+    sampling_weights: list[float],
+) -> tuple[float, int]:
+    if len(edges) < 2 or len(sampling_weights) != len(edges) - 1:
+        raise ValueError("Timestep edges and sampling weights do not match")
+    if any(right <= left for left, right in zip(edges, edges[1:])):
+        raise ValueError("Timestep edges must be strictly increasing")
+    if any(weight <= 0 for weight in sampling_weights):
+        raise ValueError("Timestep sampling weights must be positive")
+    bin_index = rng.choices(range(len(sampling_weights)), weights=sampling_weights)[0]
+    return rng.uniform(edges[bin_index], edges[bin_index + 1]), bin_index
+
+
 @torch.no_grad()
 def _validate_image_flow_oracle(
     anima: torch.nn.Module,
@@ -216,6 +348,12 @@ def _validate_image_flow_oracle(
         desired = target - base
         student = styled - base
         cosine = F.cosine_similarity(student.flatten(1), desired.flatten(1), dim=1)
+        student_centered = student - student.mean(dim=0, keepdim=True)
+        desired_centered = desired - desired.mean(dim=0, keepdim=True)
+        centered_cosine = F.cosine_similarity(
+            student_centered.flatten(1), desired_centered.flatten(1), dim=1
+        )
+        timestep_key = f"timestep_{timestep_value:.2f}"
         values["base_flow_loss"].append(float(base_loss.mean()))
         values["flow_loss"].append(float(styled_loss.mean()))
         values["paired_flow_improvement"].append(
@@ -226,6 +364,22 @@ def _validate_image_flow_oracle(
             float(
                 student.square().mean().sqrt()
                 / desired.square().mean().sqrt().clamp_min(1e-8)
+            )
+        )
+        values[f"{timestep_key}/paired_flow_improvement"].append(
+            float((base_loss - styled_loss).mean())
+        )
+        values[f"{timestep_key}/centered_cosine"].append(float(centered_cosine.mean()))
+        values[f"{timestep_key}/centered_student_to_desired_rms"].append(
+            float(
+                student_centered.square().mean().sqrt()
+                / desired_centered.square().mean().sqrt().clamp_min(1e-8)
+            )
+        )
+        values[f"{timestep_key}/common_output_ratio"].append(
+            float(
+                student.mean(dim=0).square().mean().sqrt()
+                / student.square().mean().sqrt().clamp_min(1e-8)
             )
         )
     return {key: sum(items) / len(items) for key, items in values.items()}
@@ -288,7 +442,14 @@ def train_lora_image_flow_oracle(
         parameter.requires_grad_(False)
 
     style_ids = list(target_summary["style_ids"])
-    if resume_state is None:
+    initial_oracle_state = None
+    if resume_state is None and cfg.get("initial_oracle_checkpoint"):
+        initial_oracle_state = torch.load(
+            destination / str(cfg["initial_oracle_checkpoint"]),
+            map_location="cpu",
+            weights_only=False,
+        )
+    if resume_state is None and initial_oracle_state is None:
         references = int(training.get("initialization_references", 4))
         human_loader = CachedTeacherReferenceLoader(
             destination / str(cfg["human_reference_cache"]),
@@ -321,6 +482,17 @@ def train_lora_image_flow_oracle(
             device=device,
         ).to(device)
         oracle_codes = torch.nn.Parameter(oracle_anchor.clone())
+        start_step = 0
+    elif resume_state is None:
+        assert initial_oracle_state is not None
+        reader.load_state_dict(initial_oracle_state["reader"], strict=True)
+        adapter.load_state_dict(initial_oracle_state["adapter"], strict=True)
+        adapter.restore_timestep_strength_state()
+        adapter.set_bootstrap_phase("artist_only")
+        oracle_anchor = initial_oracle_state["oracle_anchor"].to(device)
+        oracle_codes = torch.nn.Parameter(
+            initial_oracle_state["oracle_codes"].to(device)
+        )
         start_step = 0
     else:
         reader.load_state_dict(resume_state["reader"], strict=True)
@@ -389,6 +561,25 @@ def train_lora_image_flow_oracle(
     checkpoint_every = int(training.get("checkpoint_every", 250))
     sample_every = int(training.get("sample_every", 500))
     anchor_weight = float(training.get("oracle_anchor_weight", 0.001))
+    timestep_edges = [
+        float(value)
+        for value in training.get("timestep_bin_edges", [0.0, 0.2, 0.45, 0.75, 1.0])
+    ]
+    timestep_sampling_weights = [
+        float(value)
+        for value in training.get(
+            "timestep_sampling_weights", [1.0] * (len(timestep_edges) - 1)
+        )
+    ]
+    timestep_artist_multipliers = [
+        float(value)
+        for value in training.get(
+            "timestep_artist_loss_multipliers",
+            [1.0] * (len(timestep_edges) - 1),
+        )
+    ]
+    if len(timestep_artist_multipliers) != len(timestep_edges) - 1:
+        raise ValueError("Timestep artist-loss multipliers do not match the bins")
     wandb_run = None
     wandb_cfg = dict(training.get("wandb", {}))
     if bool(wandb_cfg.get("enabled", True)):
@@ -434,7 +625,10 @@ def train_lora_image_flow_oracle(
                 dtype=torch.bfloat16,
                 generator=step_generator,
             ).expand_as(clean)
-            timestep_value = torch.rand((), device=device, generator=step_generator)
+            timestep_scalar, timestep_bin = _sample_weighted_timestep(
+                rng, timestep_edges, timestep_sampling_weights
+            )
+            timestep_value = torch.tensor(timestep_scalar, device=device)
             timestep = timestep_value.to(torch.bfloat16).expand(batch_size)
             sigma = timestep[:, None, None, None]
             noisy = (1 - sigma) * clean + sigma * noise
@@ -442,6 +636,16 @@ def train_lora_image_flow_oracle(
             context = contexts[content_index : content_index + 1].expand(
                 batch_size, -1, -1
             )
+            with torch.no_grad():
+                base_prediction = _flow_forward(
+                    anima,
+                    adapter,
+                    None,
+                    noisy,
+                    timestep,
+                    context,
+                    device,
+                )
             prediction = _flow_forward(
                 anima,
                 adapter,
@@ -451,11 +655,17 @@ def train_lora_image_flow_oracle(
                 context,
                 device,
             )
-            flow_loss = F.mse_loss(prediction, target)
+            objective, metrics = _centered_image_flow_objective(
+                prediction,
+                base_prediction,
+                target,
+                dict(training.get("loss_weights", {})),
+                artist_weight_multiplier=timestep_artist_multipliers[timestep_bin],
+            )
             anchor_loss = F.smooth_l1_loss(
                 oracle_codes[artists].float(), oracle_anchor[artists].float(), beta=0.10
             )
-            loss = flow_loss + anchor_weight * anchor_loss
+            loss = objective + anchor_weight * anchor_loss
             loss.backward()
             group_norms = {
                 str(group["name"]): torch.nn.utils.clip_grad_norm_(
@@ -464,10 +674,26 @@ def train_lora_image_flow_oracle(
                 for group in optimizer.param_groups
             }
             optimizer.step()
-            running["loss"].append(float(loss.detach()))
-            running["flow_loss"].append(float(flow_loss.detach()))
+            for key, value in metrics.items():
+                running[key].append(float(value))
             running["anchor_loss"].append(float(anchor_loss.detach()))
-            running["timestep"].append(float(timestep_value.detach()))
+            running["timestep"].append(timestep_scalar)
+            running["timestep_artist_loss_multiplier"].append(
+                timestep_artist_multipliers[timestep_bin]
+            )
+            for index in range(len(timestep_sampling_weights)):
+                running[f"timestep/bin_{index}_fraction"].append(
+                    float(index == timestep_bin)
+                )
+            for key in (
+                "centered_cosine",
+                "centered_student_to_desired_rms",
+                "infonce_accuracy",
+                "common_output_ratio",
+            ):
+                running[f"timestep/bin_{timestep_bin}_{key}"].append(
+                    float(metrics[key])
+                )
             for name, value in group_norms.items():
                 running[f"grad_norm_{name}"].append(float(value))
             if step % log_every == 0:

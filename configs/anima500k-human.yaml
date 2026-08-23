@@ -453,11 +453,15 @@ lora_functional_distillation_v2:
 # Training against their rectified-flow x0 target avoids asking a style-only
 # cross-attention branch to regress full-DiT LoRA internals it cannot represent.
 lora_image_flow_oracle:
-  output_directory: lora_image_flow_oracle_v1_256_independent_kv
+  output_directory: lora_image_flow_oracle_v2_centered_artist
   target_cache: lora_image_flow_targets_rank16_256x8_v1
   source_directory: lora_teacher_references_rank16_256x8_v2
   seed: 20260823
   initial_checkpoint: detail_preserving_style_cross_attention_v34_anti_common_functional/checkpoints/step-0000500.pt
+  # v1 step 250 is the last checkpoint with positive paired flow improvement.
+  # Reuse its basic K/V alignment but restart optimizer and curriculum so the
+  # artist-centered target, not shared full-flow MSE, controls later learning.
+  initial_oracle_checkpoint: lora_image_flow_oracle_v1_256_independent_kv/checkpoints/step-0000250.pt
   adapter_initialization: fresh_kv_checkpoint_strength
   human_reference_cache: dual_query_reference_tokens_v8_step10000
   synthetic_reference_cache: lora_teacher_references_rank16_256x8_v2/dual_query_reference_tokens_v8_step10000
@@ -478,19 +482,35 @@ lora_image_flow_oracle:
     batch_size: 16
     initialization_references: 4
     initialization_batch_size: 8
-    oracle_learning_rate: 0.00050
-    shared_learning_rate: 0.00020
+    oracle_learning_rate: 0.00100
+    shared_learning_rate: 0.00002
     delta_learning_rate: 0.0
     mix_learning_rate: 0.0
-    null_learning_rate: 0.00050
+    null_learning_rate: 0.00100
     oracle_anchor_weight: 0.001
-    warmup_steps: 100
+    warmup_steps: 50
+    # Low-noise timesteps were the weakest region in the measured functional
+    # oracle sweep. Sample them more often; only the normalized artist-centered
+    # objective is weighted, while raw flow/common terms and inference strength
+    # remain unchanged to avoid amplifying off-direction texture artifacts.
+    timestep_bin_edges: [0.0, 0.20, 0.45, 0.75, 1.0]
+    timestep_sampling_weights: [2.0, 1.5, 1.0, 1.0]
+    timestep_artist_loss_multipliers: [1.25, 1.10, 1.0, 1.0]
     betas: [0.9, 0.95]
     adam_eps: 0.00000001
     weight_decay: 0.01
     max_grad_norm: 1.0
     fused_adamw: true
     token_lru_shards: 8
+    loss_weights:
+      flow_mse: 0.10
+      common_huber: 0.10
+      centered_mse: 1.00
+      centered_direction: 1.00
+      centered_magnitude: 0.10
+      infonce: 0.50
+      infonce_temperature: 0.10
+      descriptor_factors: [4, 8, 16]
     log_every: 10
     validation_every: 250
     checkpoint_every: 250
@@ -499,8 +519,8 @@ lora_image_flow_oracle:
     wandb:
       enabled: true
       project: anima-style-adapter
-      name: lora-image-flow-oracle-v1-256-independent-kv
-      id: lora-image-flow-oracle-v1-256-independent-kv
+      name: lora-image-flow-oracle-v2-centered-artist
+      id: lora-image-flow-oracle-v2-centered-artist
 
 
 # Representability bootstrap.  A visual-anchored 28x1024 oracle code is learned
