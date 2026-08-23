@@ -85,8 +85,11 @@ def build_parser() -> argparse.ArgumentParser:
         ("artist-kv-lora-smoke", "Smoke-test a K/V-only artist LoRA"),
         ("artist-kv-lora-train", "Train K/V-only artist LoRA teachers"),
         ("lora-reference-generate", "Generate image references from the 64 LoRA teachers"),
+        ("kv-lora-reference-generate", "Generate references from K/V-only LoRAs"),
         ("lora-reference-token-cache", "Cache frozen Resampler tokens for LoRA images"),
+        ("kv-lora-reference-token-cache", "Cache Resampler tokens for K/V-only LoRA images"),
         ("lora-functional-teacher-cache", "Cache single and mixed LoRA functional effects"),
+        ("kv-lora-functional-teacher-cache", "Cache K/V-only LoRA effects"),
         ("lora-functional-distill-smoke", "Smoke-test LoRA functional distillation"),
         ("lora-functional-distill-train", "Distill artist-tag, LoRA and mixed-LoRA teachers"),
         ("lora-functional-distill-v2-smoke", "Smoke-test artist-centered LoRA distillation"),
@@ -441,6 +444,20 @@ def main() -> None:
         }[args.command]
         _run(stage, config, destination)
     elif args.command in {
+        "kv-lora-reference-generate",
+        "kv-lora-functional-teacher-cache",
+    }:
+        from .lora_functional_distillation import (
+            cache_kv_lora_functional_teacher,
+            generate_kv_lora_teacher_references,
+        )
+
+        stage = {
+            "kv-lora-reference-generate": generate_kv_lora_teacher_references,
+            "kv-lora-functional-teacher-cache": cache_kv_lora_functional_teacher,
+        }[args.command]
+        _run(stage, config, destination)
+    elif args.command in {
         "lora-oracle-bootstrap-smoke",
         "lora-oracle-bootstrap-train",
         "lora-oracle-bootstrap-sample",
@@ -481,12 +498,20 @@ def main() -> None:
             "lora-oracle-joint-manifold-train": train_lora_oracle_joint_manifold,
         }[args.command]
         _run(stage, config, destination)
-    elif args.command == "lora-reference-token-cache":
+    elif args.command in {
+        "lora-reference-token-cache",
+        "kv-lora-reference-token-cache",
+    }:
         from .synthetic_reference_pipeline import (
+            cache_kv_lora_teacher_dual_query_tokens,
             cache_lora_teacher_dual_query_tokens,
         )
 
-        _run(cache_lora_teacher_dual_query_tokens, config, destination)
+        stage = {
+            "lora-reference-token-cache": cache_lora_teacher_dual_query_tokens,
+            "kv-lora-reference-token-cache": cache_kv_lora_teacher_dual_query_tokens,
+        }[args.command]
+        _run(stage, config, destination)
     elif args.command in {
         "style-train", "style-token-cache", "style-smoke", "style-benchmark", "style-sample", "style-compare", "style-diagnose",
         "style-overfit", "style-overfit-sample", "style-exact-self-generalize",

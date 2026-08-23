@@ -356,6 +356,77 @@ lora_teacher_references:
       max_side: 512
       max_pixels: 262144
 
+# Image and functional reference banks produced by the representability-aligned
+# 64-artist K/V-only LoRAs. The module selector must match teacher training so
+# loading cannot silently instantiate Q/O/MLP LoRA modules.
+kv_lora_teacher_references:
+  output_directory: kv_lora_teacher_references_rank16_64x8_v1
+  lora_directory: artist_kv_lora_teachers_rank16_64_b2_v1
+  content_source_directory: synthetic_teacher_500x16
+  seed: 20260823
+  image_id_base: 32000000000
+  images_per_artist: 8
+  width: 512
+  height: 512
+  steps: 20
+  flow_shift: 3.0
+  text_cfg: 4.0
+  device: cuda
+  attention_mode: torch
+  webp_quality: 95
+  network_selection:
+    exclude_patterns: [".*"]
+    include_patterns: ["blocks\\.\\d+\\.cross_attn\\.(k_proj|v_proj)"]
+    required_module_patterns: ["blocks\\.\\d+\\.cross_attn\\.(k_proj|v_proj)"]
+    expected_module_count: 56
+  dual_query_token_cache:
+    output_directory: dual_query_reference_tokens_v8_step10000
+    resampler_checkpoint: dual_query_resampler_bprime_v8/checkpoints/step-010000.pt
+    device: cuda
+    batch_size: 32
+    shard_rows: 512
+    reader_workers: 16
+    prefetch_batches: 8
+    writer_workers: 2
+    pending_writes: 2
+    latent_lru_shards: 4
+    amp_dtype: bfloat16
+    semantic_dim: 1536
+    vae_channels: 16
+    preprocess:
+      max_side: 512
+      max_pixels: 262144
+
+kv_lora_functional_teacher:
+  lora_directory: artist_kv_lora_teachers_rank16_64_b2_v1
+  network_selection:
+    exclude_patterns: [".*"]
+    include_patterns: ["blocks\\.\\d+\\.cross_attn\\.(k_proj|v_proj)"]
+    required_module_patterns: ["blocks\\.\\d+\\.cross_attn\\.(k_proj|v_proj)"]
+    expected_module_count: 56
+  teacher_cache:
+    output_directory: kv_lora_functional_teacher_bank_rank16_64_v1_broad12x6
+    content_source_mode: cached_training
+    latent_cache_directory: anima_latent_cache_qwen_2d
+    text_cache_directory: anima_text_cache_post_llm_multimode_v1
+    device: cuda
+    seed: 20260823
+    contents: 12
+    content_variants:
+      - full
+      - full_quality
+      - tag_dropout
+      - tag_dropout_quality
+      - short
+      - short_quality
+    probe_latent_shape: [128, 96]
+    text_conditioning_length: 512
+    condition_batch_rows: 72
+    timesteps: [0.10, 0.25, 0.45, 0.65, 0.82, 0.95]
+    pair_mixtures: 64
+    triple_mixtures: 64
+    shard_mixtures: 16
+
 # Offline functional teacher and clean continuation runner. Teacher updates
 # cycle @artist : individual LoRA : mixed LoRA at 1:1:1 after an individual
 # LoRA bootstrap. LoRA steps alternate human and LoRA-generated references.

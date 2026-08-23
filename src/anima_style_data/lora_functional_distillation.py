@@ -19,6 +19,7 @@ from PIL import Image
 from safetensors.torch import load_file, save_file
 
 from .artist_lora_teachers import ArtistLoRAPlan
+from .artist_lora_teachers import _selected_lora_modules, _serialize_lora_patterns
 from .detail_style_cross_attention import (
     DetailPreservingTypedSlotReader,
     SeparatedCommonArtistKVStyleCrossAttention,
@@ -162,13 +163,18 @@ def _weight_paths(root: Path, plans: list[ArtistLoRAPlan]) -> list[Path]:
 
 
 def _create_lora_networks(
-    config: dict[str, Any], anima: torch.nn.Module, count: int, device: str
+    config: dict[str, Any],
+    anima: torch.nn.Module,
+    count: int,
+    device: str,
+    network_selection: dict[str, Any] | None = None,
 ) -> list[torch.nn.Module]:
     sd_root = Path(str(config["anima_cache"]["sd_scripts_path"])).resolve()
     if str(sd_root) not in sys.path:
         sys.path.insert(0, str(sd_root))
     from networks import lora_anima
 
+    selection = dict(network_selection or {})
     networks = []
     for _ in range(count):
         network = lora_anima.create_network(
@@ -180,7 +186,14 @@ def _create_lora_networks(
             unet=anima,
             neuron_dropout=None,
             train_llm_adapter="false",
+            include_patterns=_serialize_lora_patterns(
+                selection.get("include_patterns")
+            ),
+            exclude_patterns=_serialize_lora_patterns(
+                selection.get("exclude_patterns")
+            ),
         )
+        _selected_lora_modules(network, selection)
         network.apply_to([], anima, apply_text_encoder=False, apply_unet=True)
         network.to(device=device, dtype=torch.bfloat16).requires_grad_(False).eval()
         networks.append(network)
@@ -214,9 +227,12 @@ def _preview_pixels(values: torch.Tensor) -> list[Image.Image]:
 
 
 def generate_lora_teacher_references(
-    config: dict[str, Any], destination: Path
+    config: dict[str, Any],
+    destination: Path,
+    *,
+    config_key: str = "lora_teacher_references",
 ) -> dict[str, Any]:
-    cfg = dict(config["lora_teacher_references"])
+    cfg = dict(config[config_key])
     output = destination / str(cfg["output_directory"])
     output.mkdir(parents=True, exist_ok=True)
     (output / "images").mkdir(exist_ok=True)
@@ -236,7 +252,9 @@ def generate_lora_teacher_references(
     device = str(cfg.get("device", "cuda"))
     anima = _resolve_anima_model(config, destination, device).requires_grad_(False).eval()
     _optimize_frozen_anima(anima, low_precision_rmsnorm=True, fuse_attention_projections=False)
-    network = _create_lora_networks(config, anima, 1, device)[0]
+    network = _create_lora_networks(
+        config, anima, 1, device, dict(cfg.get("network_selection", {}))
+    )[0]
     vae = _load_sampling_vae(config, destination).to(device=device, dtype=torch.bfloat16)
     vae.requires_grad_(False).eval()
     steps = int(cfg.get("steps", 20))
@@ -537,9 +555,12 @@ def _predict_frozen_anima_in_chunks(
 
 
 def cache_lora_functional_teacher(
-    config: dict[str, Any], destination: Path
+    config: dict[str, Any],
+    destination: Path,
+    *,
+    config_key: str = "lora_functional_distillation",
 ) -> dict[str, Any]:
-    cfg = dict(config["lora_functional_distillation"])
+    cfg = dict(config[config_key])
     cache_cfg = dict(cfg["teacher_cache"])
     output = destination / str(cache_cfg["output_directory"])
     output.mkdir(parents=True, exist_ok=True)
@@ -585,7 +606,9 @@ def cache_lora_functional_teacher(
     device = str(cache_cfg.get("device", "cuda"))
     anima = _resolve_anima_model(config, destination, device).requires_grad_(False).eval()
     _optimize_frozen_anima(anima, low_precision_rmsnorm=True, fuse_attention_projections=False)
-    networks = _create_lora_networks(config, anima, 3, device)
+    networks = _create_lora_networks(
+        config, anima, 3, device, dict(cfg.get("network_selection", {}))
+    )
     latent_device = latents.to(device=device, dtype=torch.bfloat16)
     context_device = contexts.to(device=device, dtype=torch.bfloat16)
     noisy_rows = []
@@ -682,6 +705,22 @@ def cache_lora_functional_teacher(
     gc.collect()
     torch.cuda.empty_cache()
     return {**summary, "reused": False}
+
+
+def generate_kv_lora_teacher_references(
+    config: dict[str, Any], destination: Path
+) -> dict[str, Any]:
+    return generate_lora_teacher_references(
+        config, destination, config_key="kv_lora_teacher_references"
+    )
+
+
+def cache_kv_lora_functional_teacher(
+    config: dict[str, Any], destination: Path
+) -> dict[str, Any]:
+    return cache_lora_functional_teacher(
+        config, destination, config_key="kv_lora_functional_teacher"
+    )
 
 
 class FunctionalLoRATeacherBank:
