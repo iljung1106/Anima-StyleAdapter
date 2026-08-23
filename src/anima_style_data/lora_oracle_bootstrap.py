@@ -933,7 +933,10 @@ def train_lora_oracle_bootstrap(
                     for group in optimizer.param_groups
                 }
                 grad_norm = torch.stack(
-                    [value.float().square() for value in group_grad_norms.values()]
+                    [
+                        value.to(device=device, dtype=torch.float32).square()
+                        for value in group_grad_norms.values()
+                    ]
                 ).sum().sqrt()
             else:
                 parameters = [
