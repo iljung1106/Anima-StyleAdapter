@@ -434,9 +434,9 @@ kv_lora_functional_teacher:
 # codes remove visual encoding from the problem; success here is required
 # before attempting to distill the same effects from frozen visual tokens.
 kv_lora_oracle_bootstrap:
-  output_directory: kv_lora_oracle_bootstrap_v2_64_common_artist
+  output_directory: kv_lora_oracle_bootstrap_v3_64_broad256x4
   seed: 20260823
-  source_oracle_checkpoint: kv_lora_oracle_bootstrap_v1_64_independent_kv/training_state.pt
+  source_oracle_checkpoint: kv_lora_oracle_bootstrap_v2_64_common_artist/checkpoints/step-0001500.pt
   initial_checkpoint: detail_preserving_style_cross_attention_v34_anti_common_functional/checkpoints/step-0000500.pt
   adapter_initialization: fresh_kv_checkpoint_strength
   adapter_override:
@@ -448,12 +448,12 @@ kv_lora_oracle_bootstrap:
     mix_logit_scale: 32.0
     delta_k_init_scale: 0.0001
     delta_v_init_scale: 0.0001
-  teacher_cache: kv_lora_functional_teacher_bank_rank16_64_v1_broad12x6
+  teacher_cache: kv_lora_functional_teacher_bank_rank16_64_v2_broad256x4
   human_reference_cache: dual_query_reference_tokens_v8_step10000
   synthetic_reference_cache: kv_lora_teacher_references_rank16_64x8_v1/dual_query_reference_tokens_v8_step10000
   training:
     device: cuda
-    steps: 2250
+    steps: 4000
     batch_rows: 6
     initialization_references: 4
     initialization_batch_size: 8
@@ -528,8 +528,8 @@ kv_lora_oracle_bootstrap:
     wandb:
       enabled: true
       project: anima-style-adapter
-      name: kv-lora-oracle-bootstrap-v2-64-common-artist
-      id: kv-lora-oracle-bootstrap-v2-64-common-artist
+      name: kv-lora-oracle-bootstrap-v3-64-broad256x4
+      id: kv-lora-oracle-bootstrap-v3-64-broad256x4
 
 # Offline functional teacher and clean continuation runner. Teacher updates
 # cycle @artist : individual LoRA : mixed LoRA at 1:1:1 after an individual
