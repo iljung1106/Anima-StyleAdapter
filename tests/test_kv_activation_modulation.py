@@ -1,4 +1,5 @@
 import torch
+import torch.nn.functional as F
 
 from anima_style_data.kv_activation_modulation import (
     NativeKVFactorModulator,
@@ -8,6 +9,7 @@ from anima_style_data.kv_activation_modulation import (
     kv_activation_objective,
     kv_factor_objective,
 )
+from anima_style_data.kv_activation_sampling import NativeKVFactorInjector
 
 
 def test_apply_kv_factors_matches_explicit_low_rank_linears():
@@ -168,3 +170,47 @@ def test_factor_objective_prefers_canonical_teacher_factors():
     assert float(exact["cosine"]) > 0.999
     assert float(wrong["cosine"]) < 0.5
     assert float(wrong_loss) > float(exact_loss) + 0.5
+
+
+class _DummyCrossAttention(torch.nn.Module):
+    def __init__(self, context_dim: int, output_dim: int):
+        super().__init__()
+        self.kv_proj = torch.nn.Linear(context_dim, output_dim * 2, bias=False)
+
+
+class _DummyBlock(torch.nn.Module):
+    def __init__(self, context_dim: int, output_dim: int):
+        super().__init__()
+        self.cross_attn = _DummyCrossAttention(context_dim, output_dim)
+
+
+class _DummyAnima(torch.nn.Module):
+    def __init__(self, blocks: int, context_dim: int, output_dim: int):
+        super().__init__()
+        self.blocks = torch.nn.ModuleList(
+            _DummyBlock(context_dim, output_dim) for _ in range(blocks)
+        )
+
+
+def test_native_kv_factor_injector_matches_exact_low_rank_delta_with_cfg_rows():
+    torch.manual_seed(23)
+    anima = _DummyAnima(blocks=2, context_dim=6, output_dim=8)
+    injector = NativeKVFactorInjector(anima)
+    context = torch.randn(4, 7, 6)
+    down = torch.randn(2, 2, 2, 3, 6)
+    up = torch.randn(2, 2, 2, 8, 3)
+    injector.set_factors(down, up, strength=0.75)
+
+    native = F.linear(context, anima.blocks[1].cross_attn.kv_proj.weight)
+    actual = anima.blocks[1].cross_attn.kv_proj(context)
+    repeated_down = down[:, 1].repeat(2, 1, 1, 1)
+    repeated_up = up[:, 1].repeat(2, 1, 1, 1)
+    delta = apply_kv_factors(context, repeated_down, repeated_up)
+    expected = native + 0.75 * torch.cat((delta[:, 0], delta[:, 1]), dim=-1)
+
+    torch.testing.assert_close(actual, expected)
+    injector.disable()
+    torch.testing.assert_close(
+        anima.blocks[1].cross_attn.kv_proj(context), native
+    )
+    injector.close()
