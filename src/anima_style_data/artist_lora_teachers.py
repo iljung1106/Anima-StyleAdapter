@@ -375,8 +375,13 @@ def _reset_lora_network(network, seed: int) -> None:
     generator = torch.Generator(device=device).manual_seed(int(seed))
     with torch.no_grad():
         for lora in network.unet_loras:
-            torch.nn.init.kaiming_uniform_(
-                lora.lora_down.weight, a=math.sqrt(5), generator=generator
+            # This is exactly kaiming_uniform_(a=sqrt(5)) for the 2-D
+            # Linear LoRA-down weight, expressed with uniform_ so it remains
+            # deterministic on PyTorch versions whose init helper has no
+            # generator argument.
+            bound = 1.0 / math.sqrt(lora.lora_down.weight.shape[1])
+            lora.lora_down.weight.uniform_(
+                -bound, bound, generator=generator
             )
             lora.lora_up.weight.zero_()
         for parameter in network.parameters():
@@ -1052,7 +1057,10 @@ def train_artist_lora_teachers(
                         training,
                         null_condition,
                         prompt_probabilities,
-                        reset_seed ^ (step * 7919),
+                        # Keep validation images, prompt modes, timesteps and
+                        # noise identical so intermediate checkpoints are
+                        # directly comparable within an artist.
+                        reset_seed ^ 0x56414C49,
                     )
                     print(
                         f"artist-lora validation artist={plan.index + 1}/{len(plans)} "
