@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import torch
+from torch import nn
 
 from anima_style_data.kv_activation_generator import (
     ReferenceConditionedKVActivationGenerator,
     ReferenceConditionedLowRankKVOperator,
+    _NativeAttentionProbe,
     _apply_dense_kv_operator,
     _centered_residual_loss,
     _functional_centered_attention_loss,
@@ -12,6 +14,10 @@ from anima_style_data.kv_activation_generator import (
     _mixture_target,
 )
 from anima_style_data.kv_activation_modulation import apply_kv_factors
+from anima_style_data.kv_real_query_distillation import (
+    _operator_factors,
+    _selected_content_indices,
+)
 
 
 def test_activation_generator_is_reference_conditioned_and_backpropagates() -> None:
@@ -193,3 +199,67 @@ def test_functional_centered_loss_prefers_correct_artist_effects() -> None:
     assert matching < collapsed_loss
     assert metrics["functional_relation_accuracy"] == 1
     assert collapsed_metrics["functional_student_to_teacher_rms"] < 0.01
+
+
+def test_real_query_content_selection_is_even_and_unique() -> None:
+    assert _selected_content_indices(10, 4) == [0, 3, 6, 9]
+    selected = _selected_content_indices(256, 64)
+    assert len(selected) == len(set(selected)) == 64
+    assert selected[0] == 0 and selected[-1] == 255
+
+
+def test_operator_factor_export_matches_direct_activation() -> None:
+    torch.manual_seed(41)
+    model = ReferenceConditionedLowRankKVOperator(
+        style_dim=20,
+        context_dim=12,
+        output_dim=14,
+        blocks=2,
+        hidden_dim=16,
+        heads=4,
+        ff_dim=32,
+        operator_layers=1,
+        operator_rank=3,
+    )
+    style = torch.randn(2, 7, 20)
+    context = torch.randn(2, 5, 12)
+    down, up = _operator_factors(model, style)
+    expected = model(style, context, 1)
+    actual = apply_kv_factors(context, down[:, 1], up[:, 1])
+    assert down.shape == (2, 2, 2, 3, 12)
+    assert up.shape == (2, 2, 2, 14, 3)
+    assert torch.allclose(actual, expected, atol=2e-5, rtol=2e-4)
+
+
+class _ScaleNorm(nn.Module):
+    def forward(self, value: torch.Tensor) -> torch.Tensor:
+        return value * 2
+
+
+class _FakeCrossAttention(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.n_heads = 2
+        self.head_dim = 4
+        self.k_proj = nn.Linear(6, 8, bias=False)
+        self.v_proj = nn.Linear(6, 8, bias=False)
+        self.q_norm = _ScaleNorm()
+        self.k_norm = nn.Identity()
+        self.v_norm = nn.Identity()
+        self.output_proj = nn.Linear(8, 8, bias=False)
+
+
+def test_native_probe_does_not_renormalize_cached_real_queries() -> None:
+    torch.manual_seed(43)
+    probe = _NativeAttentionProbe(_FakeCrossAttention())
+    context = torch.randn(2, 5, 6)
+    delta = torch.zeros(2, 2, 5, 8)
+    key, value = probe.project_context(context, delta)
+    real_queries = torch.randn(2, 3, 2, 4)
+    cached_result = probe.attend(
+        real_queries, key, value, queries_normalized=True
+    )
+    renormalized_result = probe.attend(
+        real_queries, key, value, queries_normalized=False
+    )
+    assert not torch.allclose(cached_result, renormalized_result)

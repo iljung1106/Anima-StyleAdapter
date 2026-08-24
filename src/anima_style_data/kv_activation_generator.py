@@ -364,8 +364,11 @@ class _NativeAttentionProbe(nn.Module):
         queries: torch.Tensor,
         key: torch.Tensor,
         value: torch.Tensor,
+        *,
+        queries_normalized: bool = False,
     ) -> torch.Tensor:
-        queries = self.q_norm(queries)
+        if not queries_normalized:
+            queries = self.q_norm(queries)
         attended = F.scaled_dot_product_attention(
             queries.transpose(1, 2),
             key.transpose(1, 2),

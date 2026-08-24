@@ -100,12 +100,14 @@ def build_parser() -> argparse.ArgumentParser:
         ("lora-functional-teacher-cache-512", "Cache 512-artist single and mixed LoRA effects"),
         ("lora-mixture-reference-generate", "Generate actual merged-LoRA reference images"),
         ("kv-lora-reference-generate", "Generate references from K/V-only LoRAs"),
+        ("kv-lora-reference-320-generate", "Generate 320-teacher K/V-only references"),
         ("kv-activation-mixture-prepare", "Prepare stable signed/amplified K/V mixtures"),
         ("kv-activation-mixture-reference-generate", "Generate materialized K/V mixture references"),
         ("lora-reference-token-cache", "Cache frozen Resampler tokens for LoRA images"),
         ("lora-reference-expansion-token-cache", "Cache Resampler tokens for added LoRA images"),
         ("lora-mixture-reference-token-cache", "Cache Resampler tokens for merged-LoRA images"),
         ("kv-lora-reference-token-cache", "Cache Resampler tokens for K/V-only LoRA images"),
+        ("kv-lora-reference-320-token-cache", "Cache 320-teacher K/V-only reference tokens"),
         ("kv-activation-mixture-reference-token-cache", "Cache Resampler tokens for K/V mixture images"),
         ("lora-functional-teacher-cache", "Cache single and mixed LoRA functional effects"),
         ("kv-lora-functional-teacher-cache", "Cache K/V-only LoRA effects"),
@@ -126,6 +128,10 @@ def build_parser() -> argparse.ArgumentParser:
         ("kv-reference-functional-operator-smoke", "Smoke-test functional direct K/V operators"),
         ("kv-reference-functional-operator-train", "Train functional direct K/V operators"),
         ("kv-reference-functional-operator-fixed-sample", "Render fixed references with functional direct K/V operators"),
+        ("kv-real-query-cache", "Cache matched frozen-Anima cross-attention queries"),
+        ("kv-reference-real-query-operator-smoke", "Smoke-test real-query K/V operators"),
+        ("kv-reference-real-query-operator-train", "Train real-query K/V operators"),
+        ("kv-reference-real-query-operator-fixed-sample", "Render fixed references with real-query K/V operators"),
         ("kv-activation-modulator-sample", "Compare native K/V LoRA teachers with predicted K/V deltas"),
         ("kv-activation-reference-eval", "Evaluate fresh Human and Synthetic reference codes"),
         ("kv-activation-visual-projector-smoke", "Smoke-test fresh-reference projection into K/V anchor space"),
@@ -561,6 +567,7 @@ def main() -> None:
         _run(stage, config, destination)
     elif args.command in {
         "kv-lora-reference-generate",
+        "kv-lora-reference-320-generate",
         "kv-activation-mixture-reference-generate",
         "kv-lora-functional-teacher-cache",
         "kv-lora-fixed-teacher-compare",
@@ -570,10 +577,12 @@ def main() -> None:
             compare_kv_lora_fixed_prompt,
             generate_kv_activation_mixture_references,
             generate_kv_lora_teacher_references,
+            generate_kv_lora_teacher_references_320,
         )
 
         stage = {
             "kv-lora-reference-generate": generate_kv_lora_teacher_references,
+            "kv-lora-reference-320-generate": generate_kv_lora_teacher_references_320,
             "kv-activation-mixture-reference-generate": generate_kv_activation_mixture_references,
             "kv-lora-functional-teacher-cache": cache_kv_lora_functional_teacher,
             "kv-lora-fixed-teacher-compare": compare_kv_lora_fixed_prompt,
@@ -625,10 +634,12 @@ def main() -> None:
         "lora-reference-expansion-token-cache",
         "lora-mixture-reference-token-cache",
         "kv-lora-reference-token-cache",
+        "kv-lora-reference-320-token-cache",
         "kv-activation-mixture-reference-token-cache",
     }:
         from .synthetic_reference_pipeline import (
             cache_kv_lora_teacher_dual_query_tokens,
+            cache_kv_lora_teacher_320_dual_query_tokens,
             cache_kv_activation_mixture_dual_query_tokens,
             cache_lora_teacher_dual_query_tokens,
             cache_lora_teacher_expansion_dual_query_tokens,
@@ -640,6 +651,7 @@ def main() -> None:
             "lora-reference-expansion-token-cache": cache_lora_teacher_expansion_dual_query_tokens,
             "lora-mixture-reference-token-cache": cache_lora_mixture_dual_query_tokens,
             "kv-lora-reference-token-cache": cache_kv_lora_teacher_dual_query_tokens,
+            "kv-lora-reference-320-token-cache": cache_kv_lora_teacher_320_dual_query_tokens,
             "kv-activation-mixture-reference-token-cache": cache_kv_activation_mixture_dual_query_tokens,
         }[args.command]
         _run(stage, config, destination)
@@ -673,15 +685,9 @@ def main() -> None:
         "kv-reference-functional-operator-smoke",
         "kv-reference-functional-operator-train",
         "kv-reference-functional-operator-fixed-sample",
-        "kv-activation-modulator-sample",
-        "kv-activation-reference-eval",
-        "kv-activation-visual-projector-smoke",
-        "kv-activation-visual-projector-train",
-        "kv-activation-mixture-analyze",
-        "kv-activation-generalize-signal",
-        "kv-activation-generalize-smoke",
-        "kv-activation-generalize-train",
-        "kv-activation-generalize-sample",
+        "kv-real-query-cache",
+        "kv-reference-real-query-operator-smoke",
+        "kv-reference-real-query-operator-train",
         "kv-activation-knn-sample",
         "kv-lora-reader-anchor-cache",
         "kv-lora-count-aware-cache",
@@ -741,6 +747,12 @@ def main() -> None:
             cache_count_aware_lora_common,
             sample_count_aware_raw_references,
         )
+        from .kv_real_query_distillation import (
+            cache_real_anima_query_bank,
+            sample_external_reference_real_query_kv_operator,
+            smoke_test_real_query_reference_kv_operator,
+            train_real_query_reference_kv_operator,
+        )
 
         stage = {
             "kv-activation-modulator-smoke": smoke_test_kv_activation_modulator,
@@ -758,6 +770,10 @@ def main() -> None:
             "kv-reference-functional-operator-smoke": smoke_test_functional_reference_kv_operator,
             "kv-reference-functional-operator-train": train_functional_reference_kv_operator,
             "kv-reference-functional-operator-fixed-sample": sample_external_reference_functional_kv_operator,
+            "kv-real-query-cache": cache_real_anima_query_bank,
+            "kv-reference-real-query-operator-smoke": smoke_test_real_query_reference_kv_operator,
+            "kv-reference-real-query-operator-train": train_real_query_reference_kv_operator,
+            "kv-reference-real-query-operator-fixed-sample": sample_external_reference_real_query_kv_operator,
             "kv-activation-modulator-sample": sample_kv_activation_modulator,
             "kv-activation-reference-eval": evaluate_kv_activation_reference_generalization,
             "kv-activation-visual-projector-smoke": smoke_test_kv_activation_visual_projector,

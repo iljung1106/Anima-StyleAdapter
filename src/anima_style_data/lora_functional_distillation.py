@@ -1724,6 +1724,14 @@ def generate_kv_lora_teacher_references(
     )
 
 
+def generate_kv_lora_teacher_references_320(
+    config: dict[str, Any], destination: Path
+) -> dict[str, Any]:
+    return generate_lora_teacher_references(
+        config, destination, config_key="kv_lora_teacher_references_320"
+    )
+
+
 def generate_kv_activation_mixture_references(
     config: dict[str, Any], destination: Path
 ) -> dict[str, Any]:

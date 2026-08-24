@@ -649,6 +649,47 @@ kv_lora_teacher_references:
       max_side: 512
       max_pixels: 262144
 
+# Synthetic views rendered by the complete 320-artist K/V-only LoRA bank.
+# Human and synthetic views remain separate reference domains during real-Q
+# distillation; they are never concatenated into one reference set.
+kv_lora_teacher_references_320:
+  output_directory: kv_lora_teacher_references_rank16_320x8_realq_v2
+  lora_directory: artist_kv_lora_teachers_rank16_320_b2_v3
+  content_source_directory: synthetic_teacher_500x16
+  seed: 20260825
+  image_id_base: 35000000000
+  images_per_artist: 8
+  width: 512
+  height: 512
+  steps: 20
+  flow_shift: 3.0
+  text_cfg: 4.0
+  device: cuda
+  attention_mode: torch
+  webp_quality: 95
+  network_selection:
+    exclude_patterns: [".*"]
+    include_patterns: ["blocks\\.\\d+\\.cross_attn\\.(k_proj|v_proj)"]
+    required_module_patterns: ["blocks\\.\\d+\\.cross_attn\\.(k_proj|v_proj)"]
+    expected_module_count: 56
+  dual_query_token_cache:
+    output_directory: dual_query_reference_tokens_v8_step10000
+    resampler_checkpoint: dual_query_resampler_bprime_v8/checkpoints/step-010000.pt
+    device: cuda
+    batch_size: 32
+    shard_rows: 512
+    reader_workers: 16
+    prefetch_batches: 8
+    writer_workers: 2
+    pending_writes: 2
+    latent_lru_shards: 4
+    amp_dtype: bfloat16
+    semantic_dim: 1536
+    vae_channels: 16
+    preprocess:
+      max_side: 512
+      max_pixels: 262144
+
 kv_lora_functional_teacher:
   lora_directory: artist_kv_lora_teachers_rank16_64_b2_v1
   network_selection:
@@ -999,6 +1040,101 @@ kv_reference_functional_operator:
       name: kv-reference-functional-operator-r64-r16-320-v1
       id: kv-reference-functional-operator-r64-r16-320-v1
 
+# Matched native-query bank. Each row retains the exact text context,
+# noised latent and timestep that produced its post-q_norm Anima queries.
+kv_real_query_bank:
+  output_directory: kv_real_query_bank_broad64x4_q64_v1
+  source_cache: kv_lora_functional_teacher_bank_rank16_64_v2_broad256x4
+  device: cuda
+  seed: 20260825
+  contents: 64
+  queries_per_block: 64
+  shard_contents: 4
+  forward_batch_rows: 2
+
+# Production-form real-Q experiment. Dense updates match each block's native
+# post-attention effect under cached Anima queries. Every eighth update also
+# backpropagates through the complete frozen DiT so cross-block Q drift cannot
+# be hidden by the local proxy. Human and LoRA-rendered references alternate.
+kv_reference_real_query_operator:
+  output_directory: kv_reference_real_query_operator_rank64_r16_320_v2
+  seed: 20260825
+  blocks: 28
+  lora_directory: artist_kv_lora_teachers_rank16_320_b2_v3
+  reader_checkpoint: kv_lora_oracle_bootstrap_v3_64_broad256x4/checkpoints/step-0001750.pt
+  human_reference_cache: dual_query_reference_tokens_v8_step10000
+  synthetic_reference_cache: kv_lora_teacher_references_rank16_320x8_realq_v2/dual_query_reference_tokens_v8_step10000
+  query_cache: kv_real_query_bank_broad64x4_q64_v1
+  model:
+    architecture: bilinear_low_rank_operator
+    hidden_dim: 256
+    heads: 8
+    ff_dim: 1024
+    operator_layers: 2
+    operator_rank: 64
+    initial_sigma: 0.01
+    minimum_sigma: 0.000001
+    maximum_sigma: 1.0
+  training:
+    device: cuda
+    steps: 4000
+    batch_size: 8
+    blocks_per_step: 4
+    validation_artists: 32
+    heldout_contents: 8
+    human_reference_images: 12
+    human_train_reference_images: 8
+    synthetic_reference_images: 8
+    synthetic_train_reference_images: 6
+    materialization_style_chunk: 16
+    token_lru_shards: 8
+    reference_counts: [1, 2, 4]
+    reference_count_weights: [0.50, 0.30, 0.20]
+    gpu_resident_queries: true
+    functional_weight: 1.0
+    kv_auxiliary_weight: 0.05
+    kv_direction_weight: 0.05
+    kv_magnitude_weight: 0.01
+    dense_functional_loss:
+      centered_huber: 1.0
+      direction: 1.0
+      magnitude: 0.20
+      relation: 0.50
+      raw_huber: 0.05
+      temperature: 0.10
+    final_velocity_start_step: 500
+    final_velocity_every: 8
+    final_velocity_batch_size: 2
+    final_velocity_weight: 0.25
+    final_velocity_loss:
+      centered_huber: 1.0
+      direction: 0.50
+      magnitude: 0.20
+      relation: 0.0
+      raw_huber: 0.05
+      temperature: 0.10
+    # First prove the operator against a frozen visual representation. Only
+    # the Reader's final mixers open later and at a much smaller LR.
+    reader_unfreeze_step: 1500
+    operator_learning_rate: 0.0002
+    reader_learning_rate: 0.000005
+    warmup_steps: 100
+    betas: [0.9, 0.95]
+    adam_eps: 0.00000001
+    weight_decay: 0.01
+    max_grad_norm: 1.0
+    reader_max_grad_norm: 0.10
+    fused_adamw: true
+    log_every: 10
+    validation_every: 250
+    checkpoint_every: 250
+    resume: true
+    wandb:
+      enabled: true
+      project: anima-style-adapter
+      name: kv-reference-real-query-operator-r64-r16-320-v2
+      id: kv-reference-real-query-operator-r64-r16-320-v2
+
 kv_reference_bilinear_sample:
   checkpoint: kv_reference_bilinear_operator_rank32_r16_64_v1/checkpoints/step-0003000.pt
   output_directory: diagnostics/kv-reference-bilinear-r32-step3000
@@ -1030,6 +1166,14 @@ kv_reference_centered_bilinear_fixed_sample:
 kv_reference_functional_operator_fixed_sample:
   checkpoint: kv_reference_functional_operator_rank64_r16_320_v1/checkpoints/step-0004000.pt
   output_directory: diagnostics/kv-reference-functional-operator-r64-step4000-fixed-reference
+  device: cuda
+  predicted_strengths: [1.0, 1.5]
+  batch_size: 4
+  panel_tile_width: 320
+
+kv_reference_real_query_operator_fixed_sample:
+  checkpoint: kv_reference_real_query_operator_rank64_r16_320_v2/checkpoints/step-0001000.pt
+  output_directory: diagnostics/kv-reference-real-query-r64-step1000-fixed-reference
   device: cuda
   predicted_strengths: [1.0, 1.5]
   batch_size: 4
