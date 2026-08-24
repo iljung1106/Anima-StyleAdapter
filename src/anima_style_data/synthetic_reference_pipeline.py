@@ -76,7 +76,7 @@ def _cache_synthetic_dual_query_tokens(
             "split": _teacher_split(row),
         }
         for row in read_records(manifest_path)
-        if str(row.get("kind")) == "artist"
+        if str(row.get("kind")) in {"artist", "lora_mixture"}
     ]
     if not rows:
         raise RuntimeError("Synthetic manifest contains no artist images")
