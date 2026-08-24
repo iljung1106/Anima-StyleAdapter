@@ -105,6 +105,8 @@ def build_parser() -> argparse.ArgumentParser:
         ("kv-activation-generalize-train", "Train artist-disjoint visual K/V modulation"),
         ("kv-activation-generalize-sample", "Render fresh-reference heldout K/V modulation"),
         ("kv-activation-knn-sample", "Render heldout sparse train-LoRA mixtures"),
+        ("kv-sparse-mixture-smoke", "Smoke-test leave-one-out sparse LoRA selection"),
+        ("kv-sparse-mixture-train", "Train leave-one-out sparse LoRA selection"),
         ("lora-functional-distill-smoke", "Smoke-test LoRA functional distillation"),
         ("lora-functional-distill-train", "Distill artist-tag, LoRA and mixed-LoRA teachers"),
         ("lora-functional-distill-v2-smoke", "Smoke-test artist-centered LoRA distillation"),
@@ -557,6 +559,8 @@ def main() -> None:
         "kv-activation-generalize-train",
         "kv-activation-generalize-sample",
         "kv-activation-knn-sample",
+        "kv-sparse-mixture-smoke",
+        "kv-sparse-mixture-train",
     }:
         from .kv_activation_modulation import (
             smoke_test_kv_activation_modulator,
@@ -580,6 +584,10 @@ def main() -> None:
             train_generalizing_kv_activation_modulator,
             sample_generalizing_kv_activation_modulator,
         )
+        from .kv_sparse_mixture_selector import (
+            smoke_test_sparse_kv_lora_mixture_selector,
+            train_sparse_kv_lora_mixture_selector,
+        )
 
         stage = {
             "kv-activation-modulator-smoke": smoke_test_kv_activation_modulator,
@@ -594,6 +602,8 @@ def main() -> None:
             "kv-activation-generalize-train": train_generalizing_kv_activation_modulator,
             "kv-activation-generalize-sample": sample_generalizing_kv_activation_modulator,
             "kv-activation-knn-sample": sample_knn_kv_mixture_generalization,
+            "kv-sparse-mixture-smoke": smoke_test_sparse_kv_lora_mixture_selector,
+            "kv-sparse-mixture-train": train_sparse_kv_lora_mixture_selector,
         }[args.command]
         _run(stage, config, destination)
     elif args.command in {

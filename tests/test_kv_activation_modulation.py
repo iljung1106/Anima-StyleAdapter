@@ -25,6 +25,10 @@ from anima_style_data.kv_generalizing_modulator import (
     concatenate_weighted_lora_factors,
 )
 from anima_style_data.few_shot_kv_adapter import FewShotNativeKVStyleAdapter
+from anima_style_data.kv_sparse_mixture_selector import (
+    SparseLoRAMixtureSelector,
+    sparse_mixture_coefficients,
+)
 
 
 def test_generalizing_validation_samples_every_reference_count():
@@ -34,6 +38,41 @@ def test_generalizing_validation_samples_every_reference_count():
 
     assert selected.tolist() == [0, 3, 4, 5, 6]
     assert counts[selected].tolist() == [1.0, 1.0, 2.0, 2.0, 4.0]
+
+
+def test_sparse_selector_coefficients_respect_topk_and_exclusion():
+    similarity = torch.tensor([[0.1, 0.9, 0.8, 0.7], [0.9, 0.8, 0.1, 0.0]])
+    excluded = torch.tensor([
+        [False, True, False, False],
+        [True, False, False, False],
+    ])
+
+    coefficients = sparse_mixture_coefficients(
+        similarity, excluded=excluded, neighbors=2, temperature=0.1
+    )
+
+    torch.testing.assert_close(coefficients.sum(dim=-1), torch.ones(2))
+    assert (coefficients > 0).sum(dim=-1).tolist() == [2, 2]
+    assert coefficients[0, 1] == 0
+    assert coefficients[1, 0] == 0
+
+
+def test_sparse_selector_learns_on_top_of_raw_reader_metric():
+    torch.manual_seed(23)
+    model = SparseLoRAMixtureSelector(
+        slots=3, style_dim=4, hidden_dim=8, learned_mix_initial=0.15
+    )
+    anchors = torch.randn(5, 3, 4)
+    query = anchors[:2] + 0.01 * torch.randn(2, 3, 4)
+
+    similarity, metrics = model.similarities(query, anchors)
+    loss = -similarity[:, :2].diagonal().mean()
+    loss.backward()
+
+    assert similarity.shape == (2, 5)
+    assert 0.14 < float(metrics["learned_metric_fraction"]) < 0.16
+    assert model.projection[0].weight.grad is not None
+    assert model.learned_mix_logit.grad is not None
 
 
 def test_apply_kv_factors_matches_explicit_low_rank_linears():
