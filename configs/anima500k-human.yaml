@@ -815,7 +815,7 @@ kv_lora_retrieval_sample:
   validation_source_lora_directory: artist_kv_lora_teachers_rank16_256_b2_v2
   validation_artists: 32
   artists: 7
-  reference_counts: [1, 4]
+  reference_counts: [1, 2, 4]
   neighbors: 8
   temperature: 0.1
   predicted_strengths: [1.0, 1.5]
@@ -831,7 +831,7 @@ kv_lora_retrieval_sample_ablation:
   dictionary_source_lora_directory: artist_kv_lora_teachers_rank16_256_b2_v2
   validation_artists: 32
   artists: 7
-  reference_counts: [1, 4]
+  reference_counts: [1, 2, 4]
   neighbors: 8
   temperature: 0.1
   predicted_strengths: [1.0, 1.5]
@@ -846,7 +846,7 @@ kv_lora_sparse_ridge_sample:
   validation_source_lora_directory: artist_kv_lora_teachers_rank16_256_b2_v2
   validation_artists: 32
   artists: 7
-  reference_counts: [1, 4]
+  reference_counts: [1, 2, 4]
   neighbors: 32
   ridge: 0.05
   common_rank: 64
