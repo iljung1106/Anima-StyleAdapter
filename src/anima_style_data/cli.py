@@ -83,6 +83,7 @@ def build_parser() -> argparse.ArgumentParser:
         ("artist-lora-train", "Train independent persistent Anima LoRA teachers"),
         ("artist-lora-diverse-plan", "Select a Reader-diverse full-LoRA expansion"),
         ("artist-lora-diverse-train", "Train the Reader-diverse full-LoRA expansion"),
+        ("artist-lora-strength-compare", "Compare completed full LoRAs at matched strengths"),
         ("artist-kv-lora-plan", "Select the K/V-only LoRA pilot artists"),
         ("artist-kv-lora-smoke", "Smoke-test a K/V-only artist LoRA"),
         ("artist-kv-lora-train", "Train K/V-only artist LoRA teachers"),
@@ -403,7 +404,9 @@ def main() -> None:
     elif args.command in {
         "artist-lora-diverse-plan",
         "artist-lora-diverse-train",
+        "artist-lora-strength-compare",
     }:
+        from .artist_lora_teachers import compare_artist_lora_strengths
         from .kv_lora_diverse_expansion import (
             prepare_diverse_artist_lora_expansion,
             train_diverse_artist_lora_expansion,
@@ -412,6 +415,7 @@ def main() -> None:
         stage = {
             "artist-lora-diverse-plan": prepare_diverse_artist_lora_expansion,
             "artist-lora-diverse-train": train_diverse_artist_lora_expansion,
+            "artist-lora-strength-compare": compare_artist_lora_strengths,
         }[args.command]
         _run(stage, config, destination)
     elif args.command in {

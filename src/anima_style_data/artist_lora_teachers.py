@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import math
@@ -678,17 +679,20 @@ def _render_artist_lora_preview(
             ).to(torch.bfloat16)
         return value
 
+    strengths = [float(value) for value in preview_cfg.get("strengths", [1.0])]
+    if not strengths or any(value <= 0 for value in strengths):
+        raise ValueError("LoRA preview strengths must be positive")
     anima.eval()
     network.eval()
     try:
         with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
             base_latent = denoise(0.0)
-            lora_latent = denoise(1.0)
+            lora_latents = [denoise(value) for value in strengths]
             if vae is None:
                 vae = _load_sampling_vae(root_config, destination)
             vae.to(device=device, dtype=torch.bfloat16)
             generated = vae.decode_to_pixels(
-                torch.cat((base_latent, lora_latent), dim=0)
+                torch.cat((base_latent, *lora_latents), dim=0)
             )
             heldout_image = vae.decode_to_pixels(target)
             train_image = vae.decode_to_pixels(train_target)
@@ -705,7 +709,13 @@ def _render_artist_lora_preview(
             ("train cache", _preview_image(train_image)),
             ("held-out cache", _preview_image(heldout_image)),
             ("Frozen Anima", _preview_image(generated[0:1])),
-            ("rank-16 LoRA", _preview_image(generated[1:2])),
+        ]
+        + [
+            (
+                f"rank-16 LoRA {strength:g}x",
+                _preview_image(generated[index + 1 : index + 2]),
+            )
+            for index, strength in enumerate(strengths)
         ],
         plan.artist,
         int(preview_cfg.get("tile_size", 320)),
@@ -716,19 +726,132 @@ def _render_artist_lora_preview(
     temporary = preview_path.with_suffix(".tmp.png")
     panel.save(temporary)
     temporary.replace(preview_path)
-    difference = (lora_latent.float() - base_latent.float()).square().mean().sqrt()
+    differences = [
+        (value.float() - base_latent.float()).square().mean().sqrt()
+        for value in lora_latents
+    ]
     base_rms = base_latent.float().square().mean().sqrt()
     metrics = {
-        "preview_latent_delta_rms": float(difference),
+        "preview_latent_delta_rms": float(differences[0]),
         "preview_latent_delta_to_base_ratio": float(
-            difference / base_rms.clamp_min(1e-8)
+            differences[0] / base_rms.clamp_min(1e-8)
         ),
+        "preview_strengths": strengths,
+        "preview_delta_rms_by_strength": [float(value) for value in differences],
+        "preview_delta_to_base_by_strength": [
+            float(value / base_rms.clamp_min(1e-8)) for value in differences
+        ],
         "preview_seed": seed,
         "preview_steps": steps,
         "preview_prompt_variant": variant_name,
         "preview_path": str(preview_path),
     }
     return preview_path, vae, metrics
+
+
+def compare_artist_lora_strengths(
+    config: dict[str, Any], destination: Path
+) -> dict[str, Any]:
+    """Render matched 1x/1.5x panels from completed full-Anima LoRAs."""
+
+    import sys
+    import torch
+
+    from .style_transfer import _optimize_frozen_anima, _resolve_anima_model
+
+    cfg = dict(config["artist_lora_strength_comparison"])
+    teacher_cfg = copy.deepcopy(config["artist_lora_teachers"])
+    teacher_root = destination / str(cfg["teacher_directory"])
+    _, plans = _load_plan(teacher_root)
+    selected_indices = [int(value) for value in cfg["artist_indices"]]
+    selected_plans = [plans[index] for index in selected_indices]
+    output = destination / str(cfg["output_directory"])
+    output.mkdir(parents=True, exist_ok=True)
+    teacher_cfg["preview"].update({
+        "strengths": [float(value) for value in cfg.get("strengths", [1.0, 1.5])],
+        "steps": int(cfg.get("steps", teacher_cfg["preview"].get("steps", 20))),
+        "text_cfg": float(cfg.get("text_cfg", teacher_cfg["preview"].get("text_cfg", 4.0))),
+        "tile_size": int(cfg.get("tile_size", 320)),
+    })
+    training = dict(teacher_cfg["training"])
+    device = str(cfg.get("device", training.get("device", "cuda")))
+    anima = _resolve_anima_model(
+        config,
+        destination,
+        device,
+        attn_mode=str(training.get("attention_mode", "torch")),
+    ).requires_grad_(False)
+    _optimize_frozen_anima(
+        anima,
+        low_precision_rmsnorm=bool(training.get("low_precision_rmsnorm", True)),
+        fuse_attention_projections=False,
+    )
+    sd_root = Path(str(config["anima_cache"]["sd_scripts_path"])).resolve()
+    if str(sd_root) not in sys.path:
+        sys.path.insert(0, str(sd_root))
+    from networks import lora_anima
+
+    rank = int(training.get("rank", 16))
+    network = lora_anima.create_network(
+        multiplier=1.0,
+        network_dim=rank,
+        network_alpha=float(training.get("alpha", rank)),
+        vae=None,
+        text_encoders=[],
+        unet=anima,
+        neuron_dropout=None,
+        train_llm_adapter="false",
+        include_patterns=_serialize_lora_patterns(training.get("include_patterns")),
+        exclude_patterns=_serialize_lora_patterns(training.get("exclude_patterns")),
+    )
+    _selected_lora_modules(network, training)
+    network.apply_to([], anima, apply_text_encoder=False, apply_unet=True)
+    network.to(device=device, dtype=torch.bfloat16).requires_grad_(False).eval()
+    cache_index = _ArtistCacheIndex(destination, teacher_cfg)
+    null_condition = cache_index.null_condition.to(
+        device=device, dtype=torch.bfloat16
+    )
+    vae = None
+    results = []
+    for plan in selected_plans:
+        weight_path = teacher_root / "weights" / _safe_artist_filename(plan)
+        if not weight_path.exists():
+            raise FileNotFoundError(weight_path)
+        info = network.load_weights(str(weight_path))
+        if info.missing_keys or info.unexpected_keys:
+            raise RuntimeError(f"LoRA comparison key mismatch: {info}")
+        cpu_pack = cache_index.load_artist(plan)
+        train_buckets = _to_gpu_buckets(cpu_pack.train, device)
+        validation_buckets = _to_gpu_buckets(cpu_pack.validation, device)
+        path, vae, metrics = _render_artist_lora_preview(
+            anima,
+            network,
+            train_buckets,
+            validation_buckets,
+            cache_index,
+            null_condition,
+            config,
+            teacher_cfg,
+            destination,
+            output,
+            plan,
+            vae,
+        )
+        results.append({
+            "artist_index": plan.index,
+            "artist": plan.artist,
+            "style_id": plan.style_id,
+            "panel": str(path),
+            **metrics,
+        })
+        del train_buckets, validation_buckets, cpu_pack
+    summary = {
+        "teacher_directory": str(teacher_root),
+        "strengths": teacher_cfg["preview"]["strengths"],
+        "artists": results,
+    }
+    write_json(output / "summary.json", summary)
+    return summary
 
 
 def _snapshot_training_state(
