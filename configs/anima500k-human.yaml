@@ -1246,6 +1246,9 @@ direct_reference_kv_distillation:
     log_every: 10
     checkpoint_every: 250
     sample_every: 250
+    # Common remains 1x in both rows; only the reference-dependent Artist
+    # residual is doubled, making weak-signal vs common-collapse visible.
+    fixed_sample_strengths: [1.0, 2.0]
     resume: true
     wandb:
       enabled: true

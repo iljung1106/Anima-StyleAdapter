@@ -35,6 +35,9 @@ produce the effect through its own reference-conditioned K/V.
   independently: the first calibrated fresh forward placed Artist at 3-6x
   native scale while Common remained at 0.2-0.7x, so a single shared scalar
   could not correct both;
+- render both 1x and Artist-only 2x fixed-reference panels every 250 steps;
+  Common stays at 1x so the sweep distinguishes weak Artist signal from a
+  reference-independent Common collapse;
 - freshly initialize and train Common K/V, shared Style K/V, block-local K/V
   deltas, block mixing and the artist-null residual;
 - give the isolated native Common objective a nonzero full weight; disabling

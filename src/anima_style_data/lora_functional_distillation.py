@@ -1526,7 +1526,13 @@ def train_lora_functional_distillation(
             if sample_every > 0 and step % sample_every == 0:
                 sample = _generate_fixed_reference_sample(
                     fixed, config, destination, anima, reader, adapter,
-                    output, device, step, strengths_override=[1.0],
+                    output, device, step,
+                    strengths_override=[
+                        float(value)
+                        for value in training.get(
+                            "fixed_sample_strengths", [1.0]
+                        )
+                    ],
                     sample_group="fixed_reference_samples",
                 )
                 if wandb_run is not None:
