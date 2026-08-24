@@ -1317,6 +1317,20 @@ def sample_cached_knn_kv_retrieval(
         validation_count=int(sample_cfg.get("validation_artists", 32)),
         source_artist_ids=source_artist_ids,
     )
+    dictionary_source = sample_cfg.get("dictionary_source_lora_directory")
+    if dictionary_source:
+        dictionary_plan = json.loads(
+            (destination / str(dictionary_source) / "plan.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        allowed_dictionary_ids = {
+            str(row["style_id"]) for row in dictionary_plan["artists"]
+        }
+        dictionary_indices = [
+            index for index in dictionary_indices
+            if artist_ids[index] in allowed_dictionary_ids
+        ]
     artist_count = min(int(sample_cfg.get("artists", 7)), len(validation_indices))
     selected_positions = torch.linspace(
         0, len(validation_indices) - 1, artist_count
@@ -1454,3 +1468,15 @@ def sample_cached_knn_kv_retrieval(
     }
     write_json(output / "summary.json", summary)
     return summary
+
+
+def sample_cached_knn_kv_retrieval_ablation(
+    config: dict[str, Any], destination: Path
+) -> dict[str, Any]:
+    """Use identical persistent anchors while restricting the dictionary."""
+
+    effective = copy.deepcopy(config)
+    effective["kv_lora_retrieval_sample"] = dict(
+        config["kv_lora_retrieval_sample_ablation"]
+    )
+    return sample_cached_knn_kv_retrieval(effective, destination)
