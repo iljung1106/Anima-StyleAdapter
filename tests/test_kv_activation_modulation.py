@@ -18,6 +18,7 @@ from anima_style_data.kv_mixture_analysis import (
     _activation_from_coefficients,
     _knn_coefficients,
     _mixture_rank_energy_retention,
+    _sparse_ridge_coefficients,
 )
 from anima_style_data.kv_generalizing_modulator import (
     _stratified_view_indices,
@@ -73,6 +74,22 @@ def test_sparse_selector_learns_on_top_of_raw_reader_metric():
     assert 0.14 < float(metrics["learned_metric_fraction"]) < 0.16
     assert model.projection[0].weight.grad is not None
     assert model.learned_mix_logit.grad is not None
+
+
+def test_sparse_ridge_refits_only_selected_dictionary_atoms():
+    torch.manual_seed(31)
+    train = torch.randn(12, 20)
+    query = 0.7 * train[2:3] - 0.3 * train[7:8]
+
+    coefficients = _sparse_ridge_coefficients(
+        train, query, neighbors=3, ridge=0.01
+    )
+
+    assert coefficients.shape == (1, 12)
+    assert int((coefficients != 0).sum()) == 3
+    common = train.mean(dim=0, keepdim=True)
+    reconstructed = common + coefficients @ (train - common)
+    assert F.cosine_similarity(reconstructed, query).item() > 0.95
 
 
 def test_apply_kv_factors_matches_explicit_low_rank_linears():

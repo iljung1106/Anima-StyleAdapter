@@ -761,6 +761,7 @@ kv_activation_generalizing_signal_analysis:
   token_stride: 8
   output_stride: 8
   mixture_neighbors: [2, 4, 8]
+  ridge_sparse_neighbors: [8, 16, 32]
   knn_temperature: 0.1
   visual_ridge: 0.05
   oracle_ridge: 0.01

@@ -72,6 +72,37 @@ def _knn_coefficients(
     return weights.scatter(-1, indices, local)
 
 
+def _sparse_ridge_coefficients(
+    train: torch.Tensor,
+    query: torch.Tensor,
+    *,
+    neighbors: int,
+    ridge: float,
+) -> torch.Tensor:
+    """Refit a signed affine ridge solution on its strongest dictionary atoms."""
+
+    train_centered = train.float() - train.float().mean(dim=0, keepdim=True)
+    query_centered = query.float() - train.float().mean(dim=0, keepdim=True)
+    full = _ridge_coefficients(train, query, ridge=ridge)
+    keep = min(int(neighbors), int(train.shape[0]))
+    selected = full.abs().topk(keep, dim=-1).indices
+    result = torch.zeros_like(full)
+    for row in range(query.shape[0]):
+        atoms = train_centered[selected[row]]
+        gram = atoms @ atoms.t() / atoms.shape[1]
+        cross = atoms @ query_centered[row] / atoms.shape[1]
+        scale = gram.diagonal().mean().clamp_min(1e-8)
+        local = torch.linalg.solve(
+            gram
+            + float(ridge) * scale * torch.eye(
+                keep, device=train.device, dtype=gram.dtype
+            ),
+            cross,
+        )
+        result[row].scatter_(0, selected[row], local)
+    return result
+
+
 def _activation_from_coefficients(
     train_activation: torch.Tensor,
     coefficients: torch.Tensor,
@@ -579,6 +610,18 @@ def analyze_generalizing_kv_mixture_signal(
             train_anchor, query, ridge=float(cfg.get("visual_ridge", 0.05))
         )
         coefficient_methods[f"{reference_count}ref_visual_ridge"] = (ridge, True)
+        for neighbors in cfg.get("ridge_sparse_neighbors", [8, 16, 32]):
+            coefficient_methods[
+                f"{reference_count}ref_visual_sparse_ridge_{int(neighbors)}"
+            ] = (
+                _sparse_ridge_coefficients(
+                    train_anchor,
+                    query,
+                    neighbors=int(neighbors),
+                    ridge=float(cfg.get("visual_ridge", 0.05)),
+                ),
+                True,
+            )
         for neighbors in cfg.get("mixture_neighbors", [2, 4, 8]):
             coefficient_methods[
                 f"{reference_count}ref_visual_knn_{int(neighbors)}"
