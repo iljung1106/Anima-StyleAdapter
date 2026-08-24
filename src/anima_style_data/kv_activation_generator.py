@@ -1021,3 +1021,138 @@ def smoke_test_reference_conditioned_bilinear_kv_operator(
         steps_override=2,
         config_key="kv_reference_bilinear_operator",
     )
+
+
+@torch.no_grad()
+def sample_reference_conditioned_bilinear_kv_operator(
+    config: dict[str, Any], destination: Path
+) -> dict[str, Any]:
+    """Render fresh held-out Human references through the learned operator."""
+
+    from .kv_activation_sampling import sample_kv_activation_modulator
+    from .kv_generalizing_modulator import _teacher_image_split
+
+    sample_cfg = copy.deepcopy(config["kv_reference_bilinear_sample"])
+    device = str(sample_cfg.get("device", "cuda"))
+    checkpoint_path = destination / str(sample_cfg["checkpoint"])
+    checkpoint = torch.load(
+        checkpoint_path, map_location="cpu", weights_only=False
+    )
+    cfg = dict(checkpoint["config"])
+    model_cfg = dict(cfg["model"])
+    architecture = str(model_cfg.pop("architecture", ""))
+    if architecture != "bilinear_low_rank_operator":
+        raise RuntimeError(
+            f"Expected a bilinear operator checkpoint, got {architecture!r}"
+        )
+
+    artist_ids, teacher_down, teacher_up = load_kv_lora_factor_bank(
+        destination / str(cfg["lora_directory"]),
+        blocks=int(cfg.get("blocks", 28)),
+        dtype=torch.float16,
+    )
+    artist_count = min(int(sample_cfg.get("artists", 7)), len(artist_ids))
+    positions = torch.linspace(0, len(artist_ids) - 1, artist_count).round().long()
+    selected_indices = [int(value) for value in positions.unique().tolist()]
+    selected_ids = [artist_ids[index] for index in selected_indices]
+    _, validation_image_ids = _teacher_image_split(
+        destination / str(cfg["lora_directory"]), artist_ids
+    )
+
+    reader = _load_reader(config, destination, cfg, device)
+    operator = ReferenceConditionedLowRankKVOperator(
+        style_dim=int(reader.dim),
+        context_dim=int(teacher_down.shape[-1]),
+        output_dim=int(teacher_up.shape[-2]),
+        blocks=int(teacher_down.shape[1]),
+        **model_cfg,
+    ).to(device=device, dtype=torch.bfloat16)
+    operator.load_state_dict(checkpoint["model"], strict=True)
+    operator.requires_grad_(False).eval()
+
+    maximum_references = max(
+        int(value) for value in sample_cfg.get("reference_counts", [1, 4])
+    )
+    loader = CachedTeacherReferenceLoader(
+        destination / str(cfg["human_reference_cache"]),
+        split="train",
+        style_ids=selected_ids,
+        batch_size=len(selected_ids),
+        references=maximum_references,
+        seed=int(sample_cfg.get("seed", 20260824)),
+        token_lru_shards=int(sample_cfg.get("token_lru_shards", 8)),
+        strict_style_ids=True,
+        allowed_image_ids=validation_image_ids,
+    )
+    output = destination / str(sample_cfg["output_directory"])
+    output.mkdir(parents=True, exist_ok=True)
+    results: dict[str, Any] = {}
+    for reference_count_value in sample_cfg.get("reference_counts", [1, 4]):
+        reference_count = int(reference_count_value)
+        loaded = loader.load_styles(
+            selected_ids,
+            references_per_style=reference_count,
+            seed=int(sample_cfg.get("seed", 20260824))
+            + reference_count * 1_000_003,
+        )
+        references = loaded["tokens"].to(
+            device=device, dtype=torch.bfloat16, non_blocking=True
+        )
+        reference_mask = torch.ones(
+            references.shape[:2], device=device, dtype=torch.bool
+        )
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            style_memory = reader(references, reference_mask).tokens
+            down_rows: list[torch.Tensor] = []
+            up_rows: list[torch.Tensor] = []
+            for block in range(operator.blocks):
+                down, up, sigma = operator._operator(style_memory, block)
+                down_rows.append(down)
+                up_rows.append(
+                    up.transpose(-1, -2) * sigma[:, :, None, :]
+                )
+        predicted_down = torch.stack(down_rows, dim=1).cpu()
+        predicted_up = torch.stack(up_rows, dim=1).cpu()
+        compatibility = {
+            "predicted_down": predicted_down,
+            "predicted_up": predicted_up,
+            "predicted_artist_indices": selected_indices,
+            "config": {
+                "lora_directory": cfg["lora_directory"],
+                "blocks": int(cfg.get("blocks", 28)),
+            },
+        }
+        compatibility_path = output / f"reference-{reference_count}-operator.pt"
+        torch.save(compatibility, compatibility_path)
+
+        effective = copy.deepcopy(config)
+        render_output = output / f"reference-{reference_count}"
+        effective["kv_activation_modulator_sample"] = {
+            **dict(effective["kv_activation_modulator_sample"]),
+            "checkpoint": str(compatibility_path.relative_to(destination)),
+            "output_directory": str(render_output.relative_to(destination)),
+            "device": device,
+            "artist_indices": selected_indices,
+            "predicted_strengths": [
+                float(value)
+                for value in sample_cfg.get("predicted_strengths", [1.0, 1.5])
+            ],
+            "batch_size": int(sample_cfg.get("batch_size", 4)),
+            "panel_tile_width": int(sample_cfg.get("panel_tile_width", 320)),
+        }
+        rendered = sample_kv_activation_modulator(effective, destination)
+        rendered["reference_ids"] = [list(ids) for ids in loaded["ids"]]
+        results[f"{reference_count}ref"] = rendered
+
+    del operator, reader, checkpoint, teacher_down, teacher_up
+    gc.collect()
+    torch.cuda.empty_cache()
+    summary = {
+        "checkpoint": str(checkpoint_path),
+        "artists": selected_ids,
+        "artist_indices": selected_indices,
+        "fresh_human_validation_references": True,
+        "results": results,
+    }
+    write_json(output / "summary.json", summary)
+    return summary

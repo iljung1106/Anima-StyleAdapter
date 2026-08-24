@@ -862,6 +862,18 @@ kv_reference_bilinear_operator:
       name: kv-reference-bilinear-operator-r32-r16-64-v1
       id: kv-reference-bilinear-operator-r32-r16-64-v1
 
+kv_reference_bilinear_sample:
+  checkpoint: kv_reference_bilinear_operator_rank32_r16_64_v1/checkpoints/step-0003000.pt
+  output_directory: diagnostics/kv-reference-bilinear-r32-step3000
+  device: cuda
+  seed: 20260824
+  artists: 7
+  reference_counts: [1, 4]
+  predicted_strengths: [1.0, 1.5]
+  batch_size: 4
+  panel_tile_width: 320
+  token_lru_shards: 8
+
 # Capacity gate for the K/V-only teacher experiment. Learned per-artist oracle
 # codes remove visual encoding from the problem; success here is required
 # before attempting to distill the same effects from frozen visual tokens.
