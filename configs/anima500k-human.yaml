@@ -829,6 +829,13 @@ kv_lora_count_aware_adapter:
   compression_power_iterations: 1
   compression_seed: 20260824
 
+kv_lora_count_aware_raw_sample:
+  output_directory: kv_lora_count_aware_raw_fixed_samples_v1
+  device: cuda
+  strengths: [1.0]
+  batch_size: 4
+  panel_tile_width: 320
+
 kv_lora_retrieval_sample:
   output_directory: kv_lora_reader_anchors_rank16_320_reader_v3/fixed_heldout_samples
   validation_source_lora_directory: artist_kv_lora_teachers_rank16_256_b2_v2

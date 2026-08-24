@@ -143,6 +143,214 @@ def cache_count_aware_lora_common(
     return summary
 
 
+def _safe_sample_name(value: str) -> str:
+    return "".join(character if character.isalnum() else "_" for character in value)
+
+
+@torch.no_grad()
+def sample_count_aware_raw_references(
+    config: dict[str, Any], destination: Path
+) -> dict[str, Any]:
+    """Render the seven persistent raw references through the live adapter."""
+
+    from PIL import Image, ImageDraw, ImageOps
+
+    from .dual_query_external_samples import load_dual_query_external_sample
+    from .io import write_json
+    from .lora_functional_distillation import _preview_pixels
+    from .style_transfer import (
+        _load_sampling_vae,
+        _optimize_frozen_anima,
+        _resolve_anima_model,
+    )
+    from .synthetic_teacher import _sample_anima_batch
+
+    cfg = dict(config["kv_lora_count_aware_raw_sample"])
+    device = str(cfg.get("device", "cuda"))
+    batch_size = int(cfg.get("batch_size", 4))
+    strengths = [float(value) for value in cfg.get("strengths", [1.0])]
+    output = destination / str(cfg["output_directory"])
+    output.mkdir(parents=True, exist_ok=True)
+    prepared = load_dual_query_external_sample(config, destination)
+    sample_cfg = dict(prepared["cfg"])
+    paths = [Path(value) for value in prepared["paths"]]
+    names = [path.parent.name for path in paths]
+    reference_tokens = prepared["reference_tokens"].unsqueeze(1)
+    positive = prepared["positive"].to(device=device, dtype=torch.bfloat16)
+    negative = prepared["negative"].to(device=device, dtype=torch.bfloat16)
+    if positive.ndim == 2:
+        positive = positive[None]
+    if negative.ndim == 2:
+        negative = negative[None]
+
+    anima = _resolve_anima_model(config, destination, device).requires_grad_(False).eval()
+    _optimize_frozen_anima(
+        anima, low_precision_rmsnorm=True, fuse_attention_projections=True
+    )
+    adapter = CountAwareRetrievalFewShotKVStyleAdapter.from_cache(
+        config, destination, anima, device=device
+    )
+    style_codes, down, up, retrieval = adapter.encode_reference_tokens(
+        reference_tokens
+    )
+    width = int(sample_cfg["width"])
+    height = int(sample_cfg["height"])
+    seed = int(sample_cfg["seed"])
+    steps = int(sample_cfg["steps"])
+    shift = float(sample_cfg.get("flow_shift", 3.0))
+    text_cfg = float(sample_cfg["cfg"])
+    base_noise = torch.randn(
+        1,
+        16,
+        1,
+        height // 8,
+        width // 8,
+        generator=torch.Generator(device="cpu").manual_seed(seed),
+        dtype=torch.float32,
+    ).to(device=device, dtype=torch.bfloat16)
+    sigmas = torch.linspace(1.0, 0.0, steps + 1, device=device, dtype=torch.float32)
+    sigmas = sigmas * shift / (1 + (shift - 1) * sigmas)
+
+    def denoise(
+        factors: tuple[torch.Tensor, torch.Tensor] | None,
+        strength: float,
+    ) -> torch.Tensor:
+        rows = 1 if factors is None else int(factors[0].shape[0])
+        values = []
+        for start in range(0, rows, batch_size):
+            stop = min(rows, start + batch_size)
+            active_rows = stop - start
+            if factors is None:
+                adapter.injector.disable()
+            else:
+                adapter.injector.set_factors(
+                    factors[0][start:stop],
+                    factors[1][start:stop],
+                    strength=float(strength),
+                )
+            with torch.autocast("cuda", dtype=torch.bfloat16):
+                values.append(
+                    _sample_anima_batch(
+                        anima,
+                        base_noise.repeat(active_rows, 1, 1, 1, 1),
+                        positive.expand(active_rows, -1, -1),
+                        negative.expand(active_rows, -1, -1),
+                        sigmas,
+                        text_cfg=text_cfg,
+                        speed=None,
+                        generation_seeds=[seed] * active_rows,
+                    ).cpu()
+                )
+        return torch.cat(values)
+
+    baseline = denoise(None, 0.0)
+    predictions = {strength: denoise((down, up), strength) for strength in strengths}
+    adapter.close()
+    del anima, adapter, down, up
+    torch.cuda.empty_cache()
+
+    vae = _load_sampling_vae(config, destination).to(
+        device=device, dtype=torch.bfloat16
+    )
+    vae.requires_grad_(False).eval()
+    latent_groups = {
+        "Frozen Anima": baseline.expand(len(names), -1, -1, -1, -1)
+    }
+    latent_groups.update({f"Few-shot {value:g}x": latent for value, latent in predictions.items()})
+    images: dict[str, list[Image.Image]] = {}
+    for label, latent in latent_groups.items():
+        decoded: list[Image.Image] = []
+        for start in range(0, len(names), batch_size):
+            with torch.autocast("cuda", dtype=torch.bfloat16):
+                decoded.extend(
+                    _preview_pixels(
+                        vae.decode_to_pixels(latent[start : start + batch_size].to(device))
+                    )
+                )
+        images[label] = decoded
+    del vae
+    torch.cuda.empty_cache()
+
+    tile_width = int(cfg.get("panel_tile_width", 320))
+    tile_height = round(height * tile_width / width)
+    label_height = 30
+    labels = ["Raw reference", *latent_groups]
+    sheet = Image.new(
+        "RGB",
+        (tile_width * len(names), (tile_height + label_height) * len(labels)),
+        "white",
+    )
+    draw = ImageDraw.Draw(sheet)
+    raw_images = []
+    for path in paths:
+        with Image.open(path) as image:
+            raw_images.append(ImageOps.pad(
+                image.convert("RGB"),
+                (tile_width, tile_height),
+                method=Image.Resampling.LANCZOS,
+                color="white",
+            ))
+    for row, label in enumerate(labels):
+        y = row * (tile_height + label_height)
+        for column, name in enumerate(names):
+            x = column * tile_width
+            image = (
+                raw_images[column]
+                if label == "Raw reference"
+                else images[label][column].resize(
+                    (tile_width, tile_height), Image.Resampling.LANCZOS
+                )
+            )
+            sheet.paste(image, (x, y + label_height))
+            draw.text((x + 6, y + 7), f"{name} | {label}", fill="black")
+    panel = output / "raw-reference-few-shot-overview.jpg"
+    sheet.save(panel, "JPEG", quality=94, subsampling=0)
+    for index, name in enumerate(names):
+        row_output = output / f"{index:02d}-{_safe_sample_name(name)}"
+        row_output.mkdir(exist_ok=True)
+        raw_images[index].save(row_output / "Raw_reference.webp", "WEBP", quality=95)
+        for label in latent_groups:
+            images[label][index].save(
+                row_output / f"{_safe_sample_name(label)}.webp", "WEBP", quality=95
+            )
+
+    baseline_rows = baseline.float().expand(len(names), -1, -1, -1, -1)
+    metrics: dict[str, Any] = {}
+    for strength, latent in predictions.items():
+        effect = (latent.float() - baseline_rows).flatten(1)
+        common = effect.mean(dim=0, keepdim=True)
+        centered = effect - common
+        individual_rms = effect.square().mean(dim=1).sqrt().clamp_min(1e-8)
+        normalized = torch.nn.functional.normalize(effect, dim=-1)
+        pairwise = normalized @ normalized.t()
+        mask = ~torch.eye(len(names), dtype=torch.bool)
+        metrics[f"{strength:g}x"] = {
+            "effect_rms": float(individual_rms.mean()),
+            "common_output_ratio": float(
+                common.square().mean().sqrt() / individual_rms.mean()
+            ),
+            "artist_centered_to_effect_ratio": float(
+                centered.square().mean(dim=1).sqrt().mean() / individual_rms.mean()
+            ),
+            "mean_pairwise_effect_cosine": float(pairwise[mask].mean()),
+        }
+    summary = {
+        "references": [str(path) for path in paths],
+        "prompt": str(sample_cfg["prompt"]),
+        "negative_prompt": str(sample_cfg["negative_prompt"]),
+        "seed": seed,
+        "steps": steps,
+        "text_cfg": text_cfg,
+        "strengths": strengths,
+        "style_code_shape": list(style_codes.shape),
+        "retrieval": retrieval,
+        "metrics": metrics,
+        "panel": str(panel),
+    }
+    write_json(output / "summary.json", summary)
+    return summary
+
+
 class FewShotNativeKVStyleAdapter(nn.Module):
     """Convert frozen per-reference tokens into live Anima K/V deltas.
 
