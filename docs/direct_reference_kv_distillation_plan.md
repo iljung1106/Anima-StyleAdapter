@@ -31,6 +31,10 @@ produce the effect through its own reference-conditioned K/V.
 - initialize the fresh adapter's 28-block x 4-timestep alpha table from the
   previously measured native/raw residual ratio, without loading any adapter
   tensor; alpha=1 made the step-250 output 17.7x too large and pure noise;
+- calibrate the structurally separate fresh Common and Artist components
+  independently: the first calibrated fresh forward placed Artist at 3-6x
+  native scale while Common remained at 0.2-0.7x, so a single shared scalar
+  could not correct both;
 - freshly initialize and train Common K/V, shared Style K/V, block-local K/V
   deltas, block mixing and the artist-null residual;
 - give the isolated native Common objective a nonzero full weight; disabling

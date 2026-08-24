@@ -2418,12 +2418,14 @@ class SeparatedCommonArtistKVStyleCrossAttention(
         common_tokens: int = 16,
         artist_null_residual: bool = False,
         artist_residual_gain: float = 1.0,
+        common_residual_gain: float = 1.0,
         common_combined_gradient_scale: float = 1.0,
         **kwargs: Any,
     ) -> None:
         if (
             common_tokens <= 0
             or artist_residual_gain <= 0
+            or common_residual_gain <= 0
             or not 0.0 <= common_combined_gradient_scale <= 1.0
         ):
             raise ValueError(
@@ -2437,6 +2439,7 @@ class SeparatedCommonArtistKVStyleCrossAttention(
         self.common_tokens = int(common_tokens)
         self.artist_null_residual = bool(artist_null_residual)
         self.artist_residual_gain = float(artist_residual_gain)
+        self.common_residual_gain = float(common_residual_gain)
         self.common_combined_gradient_scale = float(
             common_combined_gradient_scale
         )
@@ -2555,7 +2558,8 @@ class SeparatedCommonArtistKVStyleCrossAttention(
         phase = self._bootstrap_phase
         common_component = (
             torch.zeros_like(common_attended)
-            if phase == "artist_only" else common_attended
+            if phase == "artist_only"
+            else self.common_residual_gain * common_attended
         )
         if phase == "combined" and self.common_combined_gradient_scale != 1.0:
             common_component = common_component.detach() + float(
@@ -2626,6 +2630,7 @@ class SeparatedCommonArtistKVStyleCrossAttention(
             ),
             "style_artist_null_residual": float(self.artist_null_residual),
             "style_artist_residual_gain": self.artist_residual_gain,
+            "style_common_residual_gain": self.common_residual_gain,
             "style_common_combined_gradient_scale": (
                 self.common_combined_gradient_scale
             ),

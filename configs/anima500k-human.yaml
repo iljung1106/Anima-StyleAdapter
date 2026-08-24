@@ -1156,7 +1156,7 @@ lora_functional_distillation_v2:
 # after that direct visual mapping has been established. No LoRA weight,
 # artist ID, retrieval index or mixture coefficient exists at inference.
 direct_reference_kv_distillation:
-  output_directory: direct_reference_kv_distillation_v2c_fresh_calibrated_joint_teacher
+  output_directory: direct_reference_kv_distillation_v2d_fresh_component_calibrated_joint_teacher
   seed: 20260824
   lora_directory: artist_lora_teachers_rank16_256_b2_v5
   initial_checkpoint: null
@@ -1167,6 +1167,12 @@ direct_reference_kv_distillation:
   initial_strength_multiplier: 1.0
   initial_strength_minimum: 0.0001
   initial_strength_maximum: 1.0
+  # A fresh forward showed that one shared alpha left Artist 3-6x too strong
+  # while Common was only 0.2-0.7x native scale. Calibrate the two structurally
+  # separate components without importing any learned adapter tensor.
+  adapter_overrides:
+    artist_residual_gain: 0.25
+    common_residual_gain: 2.0
   human_reference_cache: dual_query_reference_tokens_v8_step10000
   synthetic_reference_cache: lora_teacher_references_rank16_256x8_v2/dual_query_reference_tokens_v8_step10000
   teacher_cache:
@@ -1244,8 +1250,8 @@ direct_reference_kv_distillation:
     wandb:
       enabled: true
       project: anima-style-adapter
-      name: direct-reference-kv-distillation-v2c-fresh-calibrated-joint-teacher
-      id: direct-reference-kv-distillation-v2c-fresh-calibrated-joint-teacher
+      name: direct-reference-kv-distillation-v2d-fresh-component-calibrated-joint-teacher
+      id: direct-reference-kv-distillation-v2d-fresh-component-calibrated-joint-teacher
 
 
 # Direct image-distribution representability test.  The eight LoRA-generated

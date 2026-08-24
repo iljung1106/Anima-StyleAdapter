@@ -1262,6 +1262,7 @@ def train_lora_functional_distillation(
     anima = _resolve_anima_model(config, destination, device).requires_grad_(False).eval()
     _optimize_frozen_anima(anima, low_precision_rmsnorm=True, fuse_attention_projections=True)
     detail_cfg = copy.deepcopy(config["detail_preserving_style_cross_attention"])
+    detail_cfg["adapter"].update(dict(cfg.get("adapter_overrides", {})))
     reader = DetailPreservingTypedSlotReader(**dict(detail_cfg["model"])).to(device)
     adapter = _build_style_adapter(detail_cfg).to(device)
     if not isinstance(adapter, SeparatedCommonArtistKVStyleCrossAttention):
