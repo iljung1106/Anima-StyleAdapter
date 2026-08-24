@@ -7,13 +7,14 @@ from pathlib import Path
 from typing import Any
 
 import torch
-from safetensors.torch import load_file
+from safetensors.torch import load_file, save_file
 from torch import nn
 
 from .detail_style_cross_attention import DetailPreservingTypedSlotReader
 from .dual_query_external_samples import encode_dual_query_reference_images
 from .kv_activation_modulation import (
     NativeKVFactorModulator,
+    compress_lora_factors,
     load_kv_lora_factor_bank,
 )
 from .kv_activation_sampling import NativeKVFactorInjector
@@ -21,6 +22,7 @@ from .kv_generalizing_modulator import (
     _visual_knn_coefficients,
     concatenate_weighted_lora_factors,
 )
+from .kv_mixture_analysis import _sparse_ridge_coefficients
 from .lora_oracle_bootstrap import _oracle_detail_config
 
 
@@ -50,6 +52,95 @@ def prepare_reference_tokens(
         config, destination, paths, device=device
     )
     return encoded["tokens"].unsqueeze(0)
+
+
+@torch.no_grad()
+def compress_mean_lora_dictionary(
+    teacher_down: torch.Tensor,
+    teacher_up: torch.Tensor,
+    *,
+    target_rank: int,
+    device: str | torch.device,
+    oversample: int = 16,
+    power_iterations: int = 1,
+    seed: int = 20260824,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compress the exact arithmetic mean of a LoRA dictionary."""
+
+    if teacher_down.ndim != 5 or teacher_up.ndim != 5:
+        raise ValueError("Expected [artist,block,K/V,rank,input/output] factors")
+    if teacher_down.shape[:3] != teacher_up.shape[:3]:
+        raise ValueError("LoRA dictionary dimensions disagree")
+    if teacher_down.shape[-2] != teacher_up.shape[-1]:
+        raise ValueError("LoRA dictionary ranks disagree")
+    artists, blocks, kinds, teacher_rank, input_dim = teacher_down.shape
+    output_dim = int(teacher_up.shape[-2])
+    down = teacher_down.to(device=device).permute(1, 2, 0, 3, 4).reshape(
+        blocks, kinds, artists * teacher_rank, input_dim
+    )
+    up = teacher_up.to(device=device).permute(1, 2, 3, 0, 4).reshape(
+        blocks, kinds, output_dim, artists * teacher_rank
+    ) / float(artists)
+    return compress_lora_factors(
+        down,
+        up,
+        target_rank=target_rank,
+        oversample=oversample,
+        power_iterations=power_iterations,
+        seed=seed,
+    )
+
+
+@torch.no_grad()
+def cache_count_aware_lora_common(
+    config: dict[str, Any], destination: Path
+) -> dict[str, Any]:
+    """Cache the full-dictionary affine common used by signed retrieval."""
+
+    cfg = dict(config["kv_lora_count_aware_adapter"])
+    anchor_cfg = dict(config["kv_lora_reader_anchor_cache"])
+    output = destination / str(anchor_cfg["output_directory"])
+    output.mkdir(parents=True, exist_ok=True)
+    rank = int(cfg.get("ridge_rank", 64))
+    common_file = output / str(
+        cfg.get("common_file", f"affine-common-rank{rank}.safetensors")
+    )
+    lora_root = destination / str(anchor_cfg["lora_directory"])
+    artist_ids, teacher_down, teacher_up = load_kv_lora_factor_bank(
+        lora_root,
+        blocks=int(config["kv_activation_generalizing_modulator"].get("blocks", 28)),
+        dtype=torch.float16,
+    )
+    down, up = compress_mean_lora_dictionary(
+        teacher_down,
+        teacher_up,
+        target_rank=rank,
+        device=str(cfg.get("device", "cuda")),
+        oversample=int(cfg.get("compression_oversample", 16)),
+        power_iterations=int(cfg.get("compression_power_iterations", 1)),
+        seed=int(cfg.get("compression_seed", 20260824)),
+    )
+    temporary = common_file.with_suffix(common_file.suffix + ".tmp")
+    save_file(
+        {
+            "down": down.cpu().to(torch.float16).contiguous(),
+            "up": up.cpu().to(torch.float16).contiguous(),
+        },
+        temporary,
+    )
+    temporary.replace(common_file)
+    summary = {
+        "artists": len(artist_ids),
+        "rank": rank,
+        "shape_down": list(down.shape),
+        "shape_up": list(up.shape),
+        "bytes": common_file.stat().st_size,
+        "path": str(common_file),
+    }
+    from .io import write_json
+
+    write_json(output / "count_aware_common_summary.json", summary)
+    return summary
 
 
 class FewShotNativeKVStyleAdapter(nn.Module):
@@ -427,4 +518,300 @@ class RetrievalFewShotKVStyleAdapter(nn.Module):
             neighbors=neighbors,
             temperature=temperature,
             dictionary_indices=dictionary_indices,
+        )
+
+
+class CountAwareRetrievalFewShotKVStyleAdapter(
+    RetrievalFewShotKVStyleAdapter
+):
+    """Route one reference to convex retrieval and multiple to signed ridge.
+
+    Fixed-heldout evaluation showed that a one-reference Reader code is not
+    stable enough for extrapolation: exact kNN LoRA mixtures preserve quality
+    better.  With two or more references, the averaged code supports an affine
+    signed mixture and a rank-64 compression, which improves the final Anima
+    latent effect while halving the injected rank.
+    """
+
+    def __init__(
+        self,
+        *,
+        ridge_common_down: torch.Tensor,
+        ridge_common_up: torch.Tensor,
+        convex_dictionary_size: int = 256,
+        ridge_min_references: int = 2,
+        ridge_neighbors: int = 32,
+        ridge_regularization: float = 0.05,
+        ridge_rank: int = 64,
+        ridge_gain: float = 1.5,
+        compression_oversample: int = 16,
+        compression_power_iterations: int = 1,
+        compression_seed: int = 20260824,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(**kwargs)
+        if ridge_common_down.ndim != 4 or ridge_common_up.ndim != 4:
+            raise ValueError("Common LoRA factors must be [block,K/V,rank,dim]")
+        if ridge_common_down.shape[:2] != ridge_common_up.shape[:2]:
+            raise ValueError("Common LoRA block/K/V dimensions disagree")
+        if ridge_common_down.shape[-2] != ridge_common_up.shape[-1]:
+            raise ValueError("Common LoRA ranks disagree")
+        self.register_buffer(
+            "ridge_common_down",
+            ridge_common_down.to(device=self.device, dtype=torch.bfloat16),
+            persistent=False,
+        )
+        self.register_buffer(
+            "ridge_common_up",
+            ridge_common_up.to(device=self.device, dtype=torch.bfloat16),
+            persistent=False,
+        )
+        self.convex_dictionary_size = min(
+            int(convex_dictionary_size), len(self.artist_ids)
+        )
+        self.ridge_min_references = int(ridge_min_references)
+        self.ridge_neighbors = min(int(ridge_neighbors), len(self.artist_ids))
+        self.ridge_regularization = float(ridge_regularization)
+        self.ridge_rank = int(ridge_rank)
+        self.ridge_gain = float(ridge_gain)
+        self.compression_oversample = int(compression_oversample)
+        self.compression_power_iterations = int(compression_power_iterations)
+        self.compression_seed = int(compression_seed)
+
+    def _convex_factors(
+        self,
+        query: torch.Tensor,
+        anchor_position: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
+        dictionary = self.dictionary_indices[
+            : self.convex_dictionary_size
+        ].to(self.anchor_codes.device)
+        anchors = self.anchor_codes[anchor_position, dictionary].float().flatten(1)
+        coefficients = _visual_knn_coefficients(
+            anchors,
+            query.float().flatten(1),
+            neighbors=self.neighbors,
+            temperature=self.temperature,
+        )
+        weights, local = coefficients.topk(
+            min(self.neighbors, coefficients.shape[-1]), dim=-1
+        )
+        global_indices = dictionary[local[0]].cpu()
+        down, up = concatenate_weighted_lora_factors(
+            self.teacher_down[global_indices][None],
+            self.teacher_up[global_indices][None],
+            weights.cpu(),
+        )
+        return down[0], up[0], {
+            "route": "convex_knn",
+            "artist_indices": global_indices.tolist(),
+            "artist_ids": [self.artist_ids[int(index)] for index in global_indices],
+            "weights": weights[0].cpu().tolist(),
+            "effective_gain": 1.0,
+        }
+
+    def _ridge_factors(
+        self,
+        query: torch.Tensor,
+        anchor_position: int,
+        *,
+        row_seed: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
+        dictionary = self.dictionary_indices.to(self.anchor_codes.device)
+        anchors = self.anchor_codes[anchor_position, dictionary].float().flatten(1)
+        coefficients = _sparse_ridge_coefficients(
+            anchors,
+            query.float().flatten(1),
+            neighbors=self.ridge_neighbors,
+            ridge=self.ridge_regularization,
+        )
+        _, local = coefficients.abs().topk(self.ridge_neighbors, dim=-1)
+        weights = coefficients.gather(-1, local)[0].cpu()
+        global_indices = dictionary[local[0]].cpu()
+        selected_down = self.teacher_down[global_indices].to(self.device)
+        selected_up = self.teacher_up[global_indices].to(self.device)
+        neighbors, blocks, kinds, teacher_rank, input_dim = selected_down.shape
+        output_dim = int(selected_up.shape[-2])
+        selected_down = selected_down.permute(1, 2, 0, 3, 4).reshape(
+            blocks, kinds, neighbors * teacher_rank, input_dim
+        )
+        selected_up = (
+            selected_up * weights[:, None, None, None, None].to(selected_up)
+        ).permute(1, 2, 3, 0, 4).reshape(
+            blocks, kinds, output_dim, neighbors * teacher_rank
+        )
+        common_weight = 1.0 - weights.sum()
+        combined_down = torch.cat((self.ridge_common_down, selected_down), dim=-2)
+        combined_up = torch.cat((
+            self.ridge_common_up * common_weight.to(self.ridge_common_up),
+            selected_up,
+        ), dim=-1)
+        down, up = compress_lora_factors(
+            combined_down,
+            combined_up,
+            target_rank=self.ridge_rank,
+            oversample=self.compression_oversample,
+            power_iterations=self.compression_power_iterations,
+            seed=self.compression_seed + int(row_seed) * 1_000_003,
+        )
+        down = down * self.ridge_gain**0.5
+        up = up * self.ridge_gain**0.5
+        return down, up, {
+            "route": "sparse_signed_ridge",
+            "artist_indices": global_indices.tolist(),
+            "artist_ids": [self.artist_ids[int(index)] for index in global_indices],
+            "weights": weights.tolist(),
+            "common_weight": float(common_weight),
+            "effective_gain": self.ridge_gain,
+        }
+
+    @staticmethod
+    def _pad_factor_rank(
+        down: torch.Tensor,
+        up: torch.Tensor,
+        rank: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        missing = int(rank) - int(down.shape[-2])
+        if missing <= 0:
+            return down, up
+        down_padding = down.new_zeros(*down.shape[:-2], missing, down.shape[-1])
+        up_padding = up.new_zeros(*up.shape[:-1], missing)
+        return (
+            torch.cat((down, down_padding), dim=-2),
+            torch.cat((up, up_padding), dim=-1),
+        )
+
+    @torch.no_grad()
+    def encode_reference_tokens(
+        self,
+        reference_tokens: torch.Tensor,
+        reference_mask: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, list[dict[str, Any]]]:
+        tokens = reference_tokens.to(
+            device=self.device, dtype=next(self.reader.parameters()).dtype
+        )
+        if reference_mask is None:
+            reference_mask = torch.ones(
+                tokens.shape[:2], device=self.device, dtype=torch.bool
+            )
+        else:
+            reference_mask = reference_mask.to(device=self.device, dtype=torch.bool)
+        with torch.autocast(
+            device_type=self.device.type,
+            dtype=torch.bfloat16,
+            enabled=self.device.type == "cuda",
+        ):
+            style_codes = self.reader(tokens, reference_mask).tokens
+
+        down_rows: list[torch.Tensor] = []
+        up_rows: list[torch.Tensor] = []
+        retrieval: list[dict[str, Any]] = []
+        for row in range(style_codes.shape[0]):
+            reference_count = int(reference_mask[row].sum().item())
+            anchor_position = self._anchor_position(reference_count)
+            query = style_codes[row : row + 1]
+            if reference_count < self.ridge_min_references:
+                down, up, details = self._convex_factors(query, anchor_position)
+            else:
+                down, up, details = self._ridge_factors(
+                    query, anchor_position, row_seed=row
+                )
+            down = down.to(device=self.device, dtype=torch.bfloat16)
+            up = up.to(device=self.device, dtype=torch.bfloat16)
+            details.update({
+                "reference_count": reference_count,
+                "anchor_reference_count": int(
+                    self.anchor_reference_counts[anchor_position].item()
+                ),
+            })
+            down_rows.append(down)
+            up_rows.append(up)
+            retrieval.append(details)
+
+        max_rank = max(int(value.shape[-2]) for value in down_rows)
+        padded = [
+            self._pad_factor_rank(down, up, max_rank)
+            for down, up in zip(down_rows, up_rows, strict=True)
+        ]
+        return (
+            style_codes,
+            torch.stack([value[0] for value in padded]).to(
+                device=self.device, dtype=torch.bfloat16
+            ),
+            torch.stack([value[1] for value in padded]).to(
+                device=self.device, dtype=torch.bfloat16
+            ),
+            retrieval,
+        )
+
+    @classmethod
+    def from_cache(
+        cls,
+        config: dict[str, Any],
+        destination: Path,
+        anima: nn.Module,
+        *,
+        device: str = "cuda",
+    ) -> "CountAwareRetrievalFewShotKVStyleAdapter":
+        cfg = dict(config["kv_lora_count_aware_adapter"])
+        cache_cfg = dict(config["kv_lora_reader_anchor_cache"])
+        cache_root = destination / str(cache_cfg["output_directory"])
+        anchors = load_file(cache_root / "anchors.safetensors", device="cpu")
+        summary = json.loads(
+            (cache_root / "summary.json").read_text(encoding="utf-8")
+        )
+        artist_ids = [str(value) for value in summary["artist_ids"]]
+        common_file = cache_root / str(
+            cfg.get(
+                "common_file",
+                f"affine-common-rank{int(cfg.get('ridge_rank', 64))}.safetensors",
+            )
+        )
+        if not common_file.exists():
+            raise FileNotFoundError(
+                f"Missing {common_file}; run kv-lora-count-aware-cache first"
+            )
+        common = load_file(common_file, device="cpu")
+        lora_root = destination / str(cache_cfg["lora_directory"])
+        blocks = int(
+            config["kv_activation_generalizing_modulator"].get("blocks", 28)
+        )
+        loaded_ids, teacher_down, teacher_up = load_kv_lora_factor_bank(
+            lora_root, blocks=blocks, dtype=torch.float16
+        )
+        if loaded_ids != artist_ids:
+            raise RuntimeError("Anchor cache and LoRA factor bank artist order disagree")
+        reader_state = torch.load(
+            destination / str(cache_cfg["reader_checkpoint"]),
+            map_location="cpu",
+            weights_only=False,
+        )
+        oracle_cfg = dict(config["kv_lora_oracle_bootstrap"])
+        detail_cfg = _oracle_detail_config(config, oracle_cfg)
+        reader = DetailPreservingTypedSlotReader(**dict(detail_cfg["model"]))
+        reader.load_state_dict(reader_state["reader"], strict=True)
+        reader.to(device=device, dtype=torch.bfloat16)
+        return cls(
+            reader=reader,
+            anima=anima,
+            anchor_codes=anchors["anchors"].to(device=device),
+            anchor_reference_counts=anchors["reference_counts"].to(device=device),
+            artist_ids=artist_ids,
+            teacher_down=teacher_down,
+            teacher_up=teacher_up,
+            neighbors=int(cfg.get("convex_neighbors", 8)),
+            temperature=float(cfg.get("convex_temperature", 0.1)),
+            ridge_common_down=common["down"],
+            ridge_common_up=common["up"],
+            convex_dictionary_size=int(cfg.get("convex_dictionary_artists", 256)),
+            ridge_min_references=int(cfg.get("ridge_min_references", 2)),
+            ridge_neighbors=int(cfg.get("ridge_neighbors", 32)),
+            ridge_regularization=float(cfg.get("ridge_regularization", 0.05)),
+            ridge_rank=int(cfg.get("ridge_rank", 64)),
+            ridge_gain=float(cfg.get("ridge_gain", 1.5)),
+            compression_oversample=int(cfg.get("compression_oversample", 16)),
+            compression_power_iterations=int(
+                cfg.get("compression_power_iterations", 1)
+            ),
+            compression_seed=int(cfg.get("compression_seed", 20260824)),
         )

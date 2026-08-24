@@ -106,6 +106,7 @@ def build_parser() -> argparse.ArgumentParser:
         ("kv-activation-generalize-sample", "Render fresh-reference heldout K/V modulation"),
         ("kv-activation-knn-sample", "Render heldout sparse train-LoRA mixtures"),
         ("kv-lora-reader-anchor-cache", "Cache compact Reader anchors for LoRA retrieval"),
+        ("kv-lora-count-aware-cache", "Cache the affine common for count-aware LoRA retrieval"),
         ("kv-lora-retrieval-sample", "Render persistent-anchor few-shot LoRA retrieval"),
         ("kv-lora-retrieval-ablation", "Render the old dictionary with the new fixed anchors"),
         ("kv-lora-sparse-ridge-sample", "Render compressed signed LoRA ridge mixtures"),
@@ -564,6 +565,7 @@ def main() -> None:
         "kv-activation-generalize-sample",
         "kv-activation-knn-sample",
         "kv-lora-reader-anchor-cache",
+        "kv-lora-count-aware-cache",
         "kv-lora-retrieval-sample",
         "kv-lora-retrieval-ablation",
         "kv-lora-sparse-ridge-sample",
@@ -600,6 +602,7 @@ def main() -> None:
             smoke_test_sparse_kv_lora_mixture_selector,
             train_sparse_kv_lora_mixture_selector,
         )
+        from .few_shot_kv_adapter import cache_count_aware_lora_common
 
         stage = {
             "kv-activation-modulator-smoke": smoke_test_kv_activation_modulator,
@@ -615,6 +618,7 @@ def main() -> None:
             "kv-activation-generalize-sample": sample_generalizing_kv_activation_modulator,
             "kv-activation-knn-sample": sample_knn_kv_mixture_generalization,
             "kv-lora-reader-anchor-cache": cache_kv_lora_reader_anchors,
+            "kv-lora-count-aware-cache": cache_count_aware_lora_common,
             "kv-lora-retrieval-sample": sample_cached_knn_kv_retrieval,
             "kv-lora-retrieval-ablation": sample_cached_knn_kv_retrieval_ablation,
             "kv-lora-sparse-ridge-sample": sample_compressed_sparse_ridge_kv_retrieval,

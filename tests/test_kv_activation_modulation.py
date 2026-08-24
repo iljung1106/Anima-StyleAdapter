@@ -29,8 +29,10 @@ from anima_style_data.kv_generalizing_modulator import (
     concatenate_weighted_lora_factors,
 )
 from anima_style_data.few_shot_kv_adapter import (
+    CountAwareRetrievalFewShotKVStyleAdapter,
     FewShotNativeKVStyleAdapter,
     RetrievalFewShotKVStyleAdapter,
+    compress_mean_lora_dictionary,
 )
 from anima_style_data.kv_sparse_mixture_selector import (
     SparseLoRAMixtureSelector,
@@ -585,6 +587,79 @@ def test_retrieval_adapter_uses_an_exact_sparse_lora_mixture():
     torch.testing.assert_close(actual, expected)
     assert len(retrieval["artist_ids"]) == 2
     adapter.close()
+
+
+def test_count_aware_adapter_routes_single_and_multi_reference_rows():
+    torch.manual_seed(49)
+    anima = _DummyAnima(blocks=2, context_dim=6, output_dim=8)
+    reader = _DummyReader(style_dim=12)
+    anchors = torch.randn(2, 6, 5, 12)
+    down = torch.randn(6, 2, 2, 2, 6)
+    up = torch.randn(6, 2, 2, 8, 2)
+    common_down, common_up = compress_mean_lora_dictionary(
+        down,
+        up,
+        target_rank=4,
+        device="cpu",
+        oversample=4,
+        seed=7,
+    )
+    adapter = CountAwareRetrievalFewShotKVStyleAdapter(
+        reader=reader,
+        anima=anima,
+        anchor_codes=anchors,
+        anchor_reference_counts=torch.tensor([1, 2]),
+        artist_ids=[f"artist-{index}" for index in range(6)],
+        teacher_down=down,
+        teacher_up=up,
+        neighbors=2,
+        temperature=0.05,
+        ridge_common_down=common_down,
+        ridge_common_up=common_up,
+        convex_dictionary_size=4,
+        ridge_min_references=2,
+        ridge_neighbors=3,
+        ridge_rank=3,
+        ridge_gain=1.5,
+        compression_oversample=3,
+        compression_seed=11,
+    )
+    references = torch.stack((
+        torch.stack((anchors[0, 1], torch.zeros_like(anchors[0, 1]))),
+        torch.stack((anchors[1, 4], anchors[1, 4])),
+    ))
+    mask = torch.tensor([[True, False], [True, True]])
+    context = torch.randn(4, 7, 6)
+    baseline = anima.blocks[0].cross_attn.kv_proj(context)
+
+    adapter.set_references(references, mask, strength=1.0)
+    styled = anima.blocks[0].cross_attn.kv_proj(context)
+
+    assert adapter.last_retrieval[0]["route"] == "convex_knn"
+    assert adapter.last_retrieval[1]["route"] == "sparse_signed_ridge"
+    assert adapter.last_retrieval[1]["effective_gain"] == 1.5
+    assert adapter.injector.down.shape[0] == 2
+    assert adapter.injector.down.shape[-2] == 4
+    assert not torch.equal(styled, baseline)
+    adapter.close()
+
+
+def test_compressed_lora_dictionary_mean_preserves_dense_mean():
+    torch.manual_seed(51)
+    down = torch.randn(3, 1, 2, 2, 7)
+    up = torch.randn(3, 1, 2, 6, 2)
+    compressed_down, compressed_up = compress_mean_lora_dictionary(
+        down,
+        up,
+        target_rank=6,
+        device="cpu",
+        oversample=2,
+        seed=17,
+    )
+    expected = (up @ down).mean(dim=0)
+    actual = compressed_up @ compressed_down
+
+    torch.testing.assert_close(actual, expected, rtol=3e-4, atol=3e-4)
 
 
 def test_randomized_lora_compression_matches_the_best_low_rank_matrix():

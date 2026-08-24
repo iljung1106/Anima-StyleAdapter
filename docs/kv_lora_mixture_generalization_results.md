@@ -2,9 +2,9 @@
 
 ## Setup
 
-- K/V-only rank-16 LoRA teachers: 256 artists
-- Dictionary/train artists: 224
-- Completely held-out artists: 32
+- K/V-only rank-16 LoRA teachers: 320 artists (expanded from 256)
+- Fixed comparison dictionaries: 224 old / 288 expanded artists
+- Completely held-out artists: the same 32 original artists in every comparison
 - Teacher-train and heldout-reference images are disjoint
 - Frozen visual path: Dual-query Resampler Reader, 28×1024 tokens
 - Functional comparison: 28 Anima blocks, heldout text contexts, native K/V activation
@@ -31,6 +31,21 @@ not the LoRA-mixture path: the raw metric already selects functionally useful
 neighbors, while only 224 independent teacher points are available to learn a
 new metric.
 
+Expanding the dictionary from 224 to 288 candidates improved the fixed-heldout
+activation signal only modestly:
+
+| Metric | 224 dictionary | 288 dictionary | Relative change |
+|---|---:|---:|---:|
+| Activation oracle ridge | 0.3293 | 0.3451 | +4.8% |
+| Visual dense ridge, 1 ref | 0.1905 | 0.1960 | +2.9% |
+| Visual kNN-8, 1 ref | 0.1596 | 0.1624 | +1.7% |
+| Visual dense ridge, 4 refs | 0.1774 | 0.1827 | +3.0% |
+| Visual kNN-8, 4 refs | 0.1601 | 0.1630 | +1.8% |
+
+This is real additional span coverage, but the new Reader anchors also create
+nearest-neighbour hubs.  Consequently, larger raw-kNN dictionaries can improve
+the local activation metric while making the final generated image worse.
+
 ## End-to-end generation evidence
 
 On seven heldout artists, exact convex kNN-8 mixtures produced the following
@@ -42,21 +57,41 @@ final latent metrics against each artist's exact teacher LoRA:
 | 4 | 1.0 | 0.824 | 0.567 | +0.148 |
 | 4 | 1.5 | 0.936 | 0.612 | +0.160 |
 
-The visual panels also show substantially stronger artist-specific changes
-than the direct visual-to-factor hypernetwork.  More references improve the
-functional and visual match.
+The expanded experiment then reused exactly the same seven heldout artists,
+reference images, prompt, seed and anchors across all methods:
+
+| Route | Refs | Strength | Effect ratio | Final cosine | Paired improvement |
+|---|---:|---:|---:|---:|---:|
+| Old-dictionary convex kNN-8 | 1 | 1.0 | 0.849 | **0.526** | **+0.092** |
+| Expanded convex kNN-8 | 1 | 1.0 | 0.842 | 0.498 | +0.074 |
+| Signed ridge-32, rank 64 | 1 | 1.0 | 0.837 | 0.470 | +0.047 |
+| Old-dictionary convex kNN-8 | 2 | 1.0 | 0.881 | 0.527 | +0.087 |
+| Signed ridge-32, rank 64 | 2 | 1.5 | 0.930 | **0.584** | **+0.135** |
+| Old-dictionary convex kNN-8 | 4 | 1.5 | 1.017 | **0.595** | +0.093 |
+| Signed ridge-32, rank 64 | 4 | 1.5 | 0.938 | 0.569 | **+0.110** |
+
+One reference is too noisy for signed extrapolation.  From two references,
+averaging stabilizes the Reader code enough that the affine mixture improves
+the final latent effect.  The rank-64 compressed route also uses half the live
+rank of exact kNN-8 (rank 128).
 
 ## Decision
 
-Use raw Reader cosine with eight train-artist neighbors as the stable coarse
-few-shot K/V path.  Concatenate their weighted rank-16 factors to obtain an
-exact rank-128 LoRA sum.  Do not use the learned selector or the direct
-bilinear factor hypernetwork.  Sparse signed mixtures are retained only as an
-analysis baseline: their small gain at 32 neighbors does not justify four
-times the rank and greater extrapolation risk.
+Use a count-aware production path:
 
-This mechanism provides interpolation/generalization inside the visual and
-functional coverage of the LoRA dictionary.  It cannot by itself teach an
-unrestricted unseen style direction.  Improving coverage therefore requires
-more diverse teacher LoRAs or a separately validated residual correction on
-top of the stable mixture, not merely more synthetic convex mixtures.
+- One reference: raw Reader cosine over the stable original dictionary, exact
+  convex kNN-8, rank 128, calibrated gain 1.0.
+- Two or more references: full-dictionary affine signed ridge-32, compressed
+  to rank 64, calibrated gain 1.5.
+- Keep the frozen Reader, LoRA factor dictionary and compressed affine common;
+  transfer only selected factors to the GPU when references change.
+- Do not use the failed learned selector or direct bilinear factor hypernetwork.
+
+Multi-artist weighted sums contain useful generalization information in a
+precise but limited sense.  They densely sample combinations inside the
+functional span of the artist LoRAs and teach/validate coefficient composition;
+they do **not** create a direction outside that span.  The visual Reader supplies
+the unseen-reference-to-coefficient signal, while the LoRA dictionary supplies
+the available style basis.  Improving unrestricted coverage therefore needs
+more diverse, visually well-spaced teacher LoRAs or a separately validated
+raw-reference residual correction—not merely more synthetic convex mixtures.

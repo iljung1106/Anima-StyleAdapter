@@ -810,6 +810,25 @@ kv_lora_reader_anchor_cache:
   materialization_artist_chunk: 16
   token_lru_shards: 8
 
+# Production few-shot routing selected on the same fixed 32-artist holdout.
+# A single reference uses the stable first-256 convex dictionary.  Two or
+# more references use an affine signed mixture over all 320 LoRAs, compressed
+# to rank 64 and calibrated by the measured 1.5x multi-reference optimum.
+kv_lora_count_aware_adapter:
+  common_file: affine-common-rank64.safetensors
+  device: cuda
+  convex_dictionary_artists: 256
+  convex_neighbors: 8
+  convex_temperature: 0.1
+  ridge_min_references: 2
+  ridge_neighbors: 32
+  ridge_regularization: 0.05
+  ridge_rank: 64
+  ridge_gain: 1.5
+  compression_oversample: 16
+  compression_power_iterations: 1
+  compression_seed: 20260824
+
 kv_lora_retrieval_sample:
   output_directory: kv_lora_reader_anchors_rank16_320_reader_v3/fixed_heldout_samples
   validation_source_lora_directory: artist_kv_lora_teachers_rank16_256_b2_v2
