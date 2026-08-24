@@ -18,6 +18,9 @@ Common/Artist 분리 및 매 스텝 full-Anima functional objective를 유지한
 각 혼합은 실제 merged-LoRA로 네 장의 reference를 생성한다. Student 입력에는
 LoRA ID, 혼합 계수 또는 component reference가 들어가지 않으며, materialized
 image를 Frozen Resampler로 인코딩한 토큰만 들어간다.
+각 mixture는 준비된 artist-free content bank에서 서로 다른 네 prompt를
+결정론적으로 무작위 선택해, 모든 스타일이 같은 composition template를
+반복하는 content shortcut을 막는다.
 
 ## 학습
 

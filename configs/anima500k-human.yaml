@@ -2032,6 +2032,10 @@ lora_mixture_references_v2d_diverse:
   output_directory: lora_mixture_references_rank16_v2d_diverse384x4_v1
   functional_config_key: lora_functional_teacher_v2d_diverse
   content_source_directory: synthetic_teacher_500x16
+  # Give each mixture a deterministic artist-free subset instead of repeating
+  # the same four compositions for every merged style.
+  random_content_per_mixture: true
+  content_seed: 20260827
   kinds: [pair, triple, amplified, signed]
   seed: 20260826
   image_id_base: 36000000000
