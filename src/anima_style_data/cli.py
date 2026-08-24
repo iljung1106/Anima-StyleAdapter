@@ -116,6 +116,8 @@ def build_parser() -> argparse.ArgumentParser:
         ("kv-activation-modulator-train", "Distill K/V-only LoRAs into native text K/V deltas"),
         ("kv-reference-activation-smoke", "Smoke-test reference-conditioned K/V activation generation"),
         ("kv-reference-activation-train", "Train reference-conditioned K/V activation generation"),
+        ("kv-reference-bilinear-smoke", "Smoke-test reference-conditioned bilinear K/V operators"),
+        ("kv-reference-bilinear-train", "Train reference-conditioned bilinear K/V operators"),
         ("kv-activation-modulator-sample", "Compare native K/V LoRA teachers with predicted K/V deltas"),
         ("kv-activation-reference-eval", "Evaluate fresh Human and Synthetic reference codes"),
         ("kv-activation-visual-projector-smoke", "Smoke-test fresh-reference projection into K/V anchor space"),
@@ -653,6 +655,8 @@ def main() -> None:
         "kv-activation-mixture-prepare",
         "kv-reference-activation-smoke",
         "kv-reference-activation-train",
+        "kv-reference-bilinear-smoke",
+        "kv-reference-bilinear-train",
         "kv-activation-modulator-sample",
         "kv-activation-reference-eval",
         "kv-activation-visual-projector-smoke",
@@ -678,7 +682,9 @@ def main() -> None:
         )
         from .kv_activation_generator import (
             prepare_kv_activation_mixture_specs,
+            smoke_test_reference_conditioned_bilinear_kv_operator,
             smoke_test_reference_conditioned_kv_activation_generator,
+            train_reference_conditioned_bilinear_kv_operator,
             train_reference_conditioned_kv_activation_generator,
         )
         from .kv_activation_sampling import (
@@ -718,6 +724,8 @@ def main() -> None:
             "kv-activation-mixture-prepare": prepare_kv_activation_mixture_specs,
             "kv-reference-activation-smoke": smoke_test_reference_conditioned_kv_activation_generator,
             "kv-reference-activation-train": train_reference_conditioned_kv_activation_generator,
+            "kv-reference-bilinear-smoke": smoke_test_reference_conditioned_bilinear_kv_operator,
+            "kv-reference-bilinear-train": train_reference_conditioned_bilinear_kv_operator,
             "kv-activation-modulator-sample": sample_kv_activation_modulator,
             "kv-activation-reference-eval": evaluate_kv_activation_reference_generalization,
             "kv-activation-visual-projector-smoke": smoke_test_kv_activation_visual_projector,

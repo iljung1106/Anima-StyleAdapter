@@ -146,6 +146,194 @@ class ReferenceConditionedKVActivationGenerator(nn.Module):
         return output * gain[None, :, None, None]
 
 
+class _OperatorCrossBlock(nn.Module):
+    """Let operator queries read the complete typed reference memory."""
+
+    def __init__(self, dim: int, heads: int, ff_dim: int) -> None:
+        super().__init__()
+        if dim % heads:
+            raise ValueError("operator hidden dimension must divide heads")
+        self.heads = int(heads)
+        self.head_dim = int(dim // heads)
+        self.query_norm = nn.LayerNorm(dim)
+        self.memory_norm = nn.LayerNorm(dim)
+        self.query = nn.Linear(dim, dim, bias=False)
+        self.key = nn.Linear(dim, dim, bias=False)
+        self.value = nn.Linear(dim, dim, bias=False)
+        self.output = nn.Linear(dim, dim, bias=False)
+        self.ff_norm = nn.LayerNorm(dim)
+        self.ff = _SwiGLU(dim, ff_dim)
+
+    def forward(
+        self, queries: torch.Tensor, memory: torch.Tensor
+    ) -> torch.Tensor:
+        batch, query_tokens, dim = queries.shape
+        memory_tokens = int(memory.shape[1])
+        query = self.query(self.query_norm(queries)).reshape(
+            batch, query_tokens, self.heads, self.head_dim
+        ).transpose(1, 2)
+        normalized_memory = self.memory_norm(memory)
+        key = self.key(normalized_memory).reshape(
+            batch, memory_tokens, self.heads, self.head_dim
+        ).transpose(1, 2)
+        value = self.value(normalized_memory).reshape(
+            batch, memory_tokens, self.heads, self.head_dim
+        ).transpose(1, 2)
+        attended = F.scaled_dot_product_attention(query, key, value)
+        attended = attended.transpose(1, 2).reshape(batch, query_tokens, dim)
+        queries = queries + self.output(attended)
+        return queries + self.ff(self.ff_norm(queries))
+
+
+class ReferenceConditionedLowRankKVOperator(nn.Module):
+    """Generate a fresh low-rank text K/V operator from each reference set.
+
+    The reference does not emit extra style-attention tokens.  Instead it
+    generates normalized input/output directions and singular strengths for
+    a block-local operator, then applies that operator to all native text
+    tokens.  This preserves the exact algebraic form of a K/V-only LoRA while
+    never exposing teacher factors, artist IDs, or mixture coefficients.
+    """
+
+    def __init__(
+        self,
+        *,
+        style_dim: int = 1024,
+        context_dim: int = 1024,
+        output_dim: int = 2048,
+        blocks: int = 28,
+        hidden_dim: int = 256,
+        heads: int = 8,
+        ff_dim: int = 1024,
+        operator_layers: int = 2,
+        operator_rank: int = 32,
+        initial_sigma: float = 0.01,
+        minimum_sigma: float = 1e-6,
+        maximum_sigma: float = 1.0,
+    ) -> None:
+        super().__init__()
+        if hidden_dim % heads:
+            raise ValueError("hidden_dim must be divisible by heads")
+        if operator_layers <= 0 or operator_rank <= 0:
+            raise ValueError("operator layers/rank must be positive")
+        if not 0 < minimum_sigma <= initial_sigma <= maximum_sigma:
+            raise ValueError("operator sigma bounds/initializer are invalid")
+        self.style_dim = int(style_dim)
+        self.context_dim = int(context_dim)
+        self.output_dim = int(output_dim)
+        self.blocks = int(blocks)
+        self.hidden_dim = int(hidden_dim)
+        self.operator_rank = int(operator_rank)
+        self.minimum_sigma = float(minimum_sigma)
+        self.maximum_sigma = float(maximum_sigma)
+        self.style_norm = nn.LayerNorm(style_dim)
+        self.style_input = nn.Linear(style_dim, hidden_dim, bias=False)
+        # [block, K/V, down/up, rank, hidden].  The identities are explicit;
+        # no mean pooling or shared rank token is used.
+        self.operator_queries = nn.Parameter(
+            torch.empty(blocks, 2, 2, operator_rank, hidden_dim)
+        )
+        self.reader = nn.ModuleList(
+            _OperatorCrossBlock(hidden_dim, heads, ff_dim)
+            for _ in range(operator_layers)
+        )
+        # Dense output directions are block-local.  Sharing only the reader
+        # trunk avoids constraining unseen styles to a stored global LoRA basis.
+        self.down_output = nn.ModuleList(
+            nn.ModuleList(
+                nn.Linear(hidden_dim, context_dim, bias=False) for _ in range(2)
+            )
+            for _ in range(blocks)
+        )
+        self.up_output = nn.ModuleList(
+            nn.ModuleList(
+                nn.Linear(hidden_dim, output_dim, bias=False) for _ in range(2)
+            )
+            for _ in range(blocks)
+        )
+        self.log_sigma = nn.ModuleList(
+            nn.ModuleList(
+                nn.Linear(hidden_dim, 1, bias=True) for _ in range(2)
+            )
+            for _ in range(blocks)
+        )
+        self.reset_parameters(float(initial_sigma))
+
+    def reset_parameters(self, initial_sigma: float) -> None:
+        for module in self.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.xavier_uniform_(module.weight)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+        nn.init.normal_(self.operator_queries, std=self.hidden_dim**-0.5)
+        for block_heads in self.log_sigma:
+            for head in block_heads:
+                nn.init.normal_(head.weight, std=0.01)
+                nn.init.constant_(head.bias, float(torch.tensor(initial_sigma).log()))
+
+    def _operator(
+        self, style_memory: torch.Tensor, block: int
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        batch = int(style_memory.shape[0])
+        memory = self.style_input(self.style_norm(style_memory))
+        queries = self.operator_queries[block].reshape(
+            4 * self.operator_rank, self.hidden_dim
+        )[None].expand(batch, -1, -1)
+        for layer in self.reader:
+            queries = layer(queries, memory)
+        queries = queries.reshape(
+            batch, 2, 2, self.operator_rank, self.hidden_dim
+        )
+        down_values = []
+        up_values = []
+        sigma_values = []
+        for kind in range(2):
+            down_hidden = queries[:, kind, 0]
+            up_hidden = queries[:, kind, 1]
+            down = self.down_output[block][kind](down_hidden)
+            up = self.up_output[block][kind](up_hidden)
+            # Unit directions plus an explicit singular strength remove the
+            # arbitrary up/down scale gauge that otherwise destabilizes a
+            # dynamically generated factorization.
+            down_values.append(
+                F.normalize(down.float(), dim=-1).to(down.dtype)
+            )
+            up_values.append(F.normalize(up.float(), dim=-1).to(up.dtype))
+            log_sigma = self.log_sigma[block][kind](
+                0.5 * (down_hidden + up_hidden)
+            ).squeeze(-1)
+            sigma_values.append(
+                log_sigma.float().exp().clamp(
+                    self.minimum_sigma, self.maximum_sigma
+                ).to(down.dtype)
+            )
+        return (
+            torch.stack(down_values, dim=1),
+            torch.stack(up_values, dim=1),
+            torch.stack(sigma_values, dim=1),
+        )
+
+    def forward(
+        self,
+        style_memory: torch.Tensor,
+        text_context: torch.Tensor,
+        block_index: int,
+    ) -> torch.Tensor:
+        if style_memory.ndim != 3 or style_memory.shape[-1] != self.style_dim:
+            raise ValueError("style_memory must be [batch,slots,style_dim]")
+        if text_context.ndim != 3 or text_context.shape[-1] != self.context_dim:
+            raise ValueError("text_context must be [batch,tokens,context_dim]")
+        if style_memory.shape[0] != text_context.shape[0]:
+            raise ValueError("style and text batches disagree")
+        block = int(block_index)
+        if not 0 <= block < self.blocks:
+            raise ValueError("block_index is outside the model")
+        down, up, sigma = self._operator(style_memory, block)
+        hidden = torch.einsum("bnc,bkrc->bknr", text_context, down)
+        hidden = hidden * sigma[:, :, None]
+        return torch.einsum("bknr,bkro->bkno", hidden, up)
+
+
 class _NativeAttentionProbe(nn.Module):
     """Frozen native K/V normalization and O for functional probe queries."""
 
@@ -470,8 +658,9 @@ def train_reference_conditioned_kv_activation_generator(
     destination: Path,
     *,
     steps_override: int | None = None,
+    config_key: str = "kv_reference_activation_generator",
 ) -> dict[str, Any]:
-    cfg = copy.deepcopy(config["kv_reference_activation_generator"])
+    cfg = copy.deepcopy(config[config_key])
     training = dict(cfg["training"])
     steps = int(steps_override or training.get("steps", 3000))
     device = str(training.get("device", "cuda"))
@@ -513,12 +702,21 @@ def train_reference_conditioned_kv_activation_generator(
     train_context_count = len(contexts) - heldout_contexts
     if train_context_count <= 0:
         raise ValueError("heldout_contexts leaves no training captions")
-    model = ReferenceConditionedKVActivationGenerator(
+    model_cfg = dict(cfg["model"])
+    architecture = str(model_cfg.pop("architecture", "direct_cross_attention"))
+    model_type: type[nn.Module]
+    if architecture == "direct_cross_attention":
+        model_type = ReferenceConditionedKVActivationGenerator
+    elif architecture == "bilinear_low_rank_operator":
+        model_type = ReferenceConditionedLowRankKVOperator
+    else:
+        raise ValueError(f"Unsupported K/V activation architecture: {architecture}")
+    model = model_type(
         style_dim=int(next(iter(single_codes.values())).shape[-1]),
         context_dim=int(teacher_down.shape[-1]),
         output_dim=int(teacher_up.shape[-2]),
         blocks=int(teacher_down.shape[1]),
-        **dict(cfg["model"]),
+        **model_cfg,
     ).to(device=device, dtype=torch.bfloat16)
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=float(training.get("learning_rate", 2e-4)),
@@ -573,7 +771,7 @@ def train_reference_conditioned_kv_activation_generator(
             name=str(wandb_cfg.get("name", "kv-reference-activation-generator")),
             id=str(wandb_cfg.get("id", "kv-reference-activation-generator")),
             resume="allow" if start_step else "never",
-            config={"kv_reference_activation_generator": cfg},
+            config={config_key: cfg},
         )
     running: dict[str, list[float]] = defaultdict(list)
     native_probes: nn.ModuleList | None = None
@@ -769,6 +967,7 @@ def train_reference_conditioned_kv_activation_generator(
         "mixtures": len(mixture_rows),
         "contexts": len(contexts),
         "trainable_parameters": sum(parameter.numel() for parameter in model.parameters()),
+        "architecture": architecture,
         "elapsed_seconds": time.perf_counter() - started,
         "end_to_end_flow_training": False,
         "native_artist_teacher": False,
@@ -791,4 +990,34 @@ def smoke_test_reference_conditioned_kv_activation_generator(
     cfg["training"]["blocks_per_step"] = 1
     return train_reference_conditioned_kv_activation_generator(
         effective, destination, steps_override=2
+    )
+
+
+def train_reference_conditioned_bilinear_kv_operator(
+    config: dict[str, Any], destination: Path
+) -> dict[str, Any]:
+    return train_reference_conditioned_kv_activation_generator(
+        config,
+        destination,
+        config_key="kv_reference_bilinear_operator",
+    )
+
+
+def smoke_test_reference_conditioned_bilinear_kv_operator(
+    config: dict[str, Any], destination: Path
+) -> dict[str, Any]:
+    effective = copy.deepcopy(config)
+    cfg = effective["kv_reference_bilinear_operator"]
+    cfg["output_directory"] = "kv_reference_bilinear_operator_smoke"
+    cfg["training"]["resume"] = False
+    cfg["training"]["wandb"]["enabled"] = False
+    cfg["training"]["validation_every"] = 0
+    cfg["training"]["checkpoint_every"] = 1
+    cfg["training"]["batch_size"] = 2
+    cfg["training"]["blocks_per_step"] = 1
+    return train_reference_conditioned_kv_activation_generator(
+        effective,
+        destination,
+        steps_override=2,
+        config_key="kv_reference_bilinear_operator",
     )

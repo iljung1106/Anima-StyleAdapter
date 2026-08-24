@@ -800,6 +800,68 @@ kv_reference_activation_generator:
       name: kv-reference-activation-generator-r16-64-v1
       id: kv-reference-activation-generator-r16-64-v1
 
+# Reference-conditioned low-rank operator pilot. Unlike the direct activation
+# head above, the reference generates a fresh block-local linear operator and
+# applies it to every native text token.  Teacher factors remain offline
+# supervision only and are never selected, retrieved, or mixed at inference.
+kv_reference_bilinear_operator:
+  output_directory: kv_reference_bilinear_operator_rank32_r16_64_v1
+  seed: 20260824
+  blocks: 28
+  lora_directory: artist_kv_lora_teachers_rank16_64_b2_v1
+  reader_checkpoint: kv_lora_oracle_bootstrap_v3_64_broad256x4/checkpoints/step-0001750.pt
+  human_reference_cache: dual_query_reference_tokens_v8_step10000
+  synthetic_reference_cache: kv_lora_teacher_references_rank16_64x8_v1/dual_query_reference_tokens_v8_step10000
+  mixture_reference_cache: kv_activation_mixture_references_rank16_256x4_v1/dual_query_reference_tokens_v8_step10000
+  mixture_manifest: kv_activation_mixture_specs_rank16_64_v1/mixtures.parquet
+  text_context_cache: kv_lora_functional_teacher_bank_rank16_64_v2_broad256x4
+  model:
+    architecture: bilinear_low_rank_operator
+    hidden_dim: 256
+    heads: 8
+    ff_dim: 1024
+    operator_layers: 2
+    operator_rank: 32
+    initial_sigma: 0.01
+    minimum_sigma: 0.000001
+    maximum_sigma: 1.0
+  training:
+    device: cuda
+    steps: 3000
+    batch_size: 8
+    blocks_per_step: 4
+    single_reference_images: 8
+    mixture_reference_images: 4
+    materialization_style_chunk: 16
+    token_lru_shards: 8
+    category_weights: [0.25, 0.1875, 0.0625, 0.25, 0.25]
+    heldout_contexts: 32
+    validation_tokens: 64
+    learning_rate: 0.0001
+    warmup_steps: 100
+    betas: [0.9, 0.95]
+    adam_eps: 0.00000001
+    weight_decay: 0.01
+    max_grad_norm: 1.0
+    direction_weight: 0.2
+    magnitude_weight: 0.05
+    # Phase A is pure operator/KV alignment. Phase B remains offline and adds
+    # only a weak native-attention functional target; there is no flow phase.
+    attention_start_step: 1500
+    attention_ramp_steps: 500
+    attention_weight: 0.1
+    attention_queries: 32
+    fused_adamw: true
+    log_every: 10
+    validation_every: 250
+    checkpoint_every: 250
+    resume: true
+    wandb:
+      enabled: true
+      project: anima-style-adapter
+      name: kv-reference-bilinear-operator-r32-r16-64-v1
+      id: kv-reference-bilinear-operator-r32-r16-64-v1
+
 # Capacity gate for the K/V-only teacher experiment. Learned per-artist oracle
 # codes remove visual encoding from the problem; success here is required
 # before attempting to distill the same effects from frozen visual tokens.

@@ -4,6 +4,7 @@ import torch
 
 from anima_style_data.kv_activation_generator import (
     ReferenceConditionedKVActivationGenerator,
+    ReferenceConditionedLowRankKVOperator,
     _mixture_target,
 )
 from anima_style_data.kv_activation_modulation import apply_kv_factors
@@ -55,3 +56,55 @@ def test_mixture_target_matches_exact_weighted_factor_effect() -> None:
                 )[0]
         expected.append(value)
     assert torch.allclose(actual, torch.stack(expected), atol=1e-5)
+
+
+def test_bilinear_operator_is_linear_in_context_and_reference_conditioned() -> None:
+    torch.manual_seed(17)
+    model = ReferenceConditionedLowRankKVOperator(
+        style_dim=20,
+        context_dim=12,
+        output_dim=14,
+        blocks=3,
+        hidden_dim=16,
+        heads=4,
+        ff_dim=32,
+        operator_layers=2,
+        operator_rank=3,
+    )
+    style = torch.randn(2, 7, 20)
+    left = torch.randn(2, 5, 12)
+    right = torch.randn(2, 5, 12)
+    combined = model(style, 0.25 * left - 0.75 * right, 1)
+    expected = 0.25 * model(style, left, 1) - 0.75 * model(style, right, 1)
+    assert combined.shape == (2, 2, 5, 14)
+    assert torch.allclose(combined, expected, atol=2e-5, rtol=2e-4)
+
+    changed_style = style.clone()
+    changed_style[1].add_(torch.randn_like(changed_style[1]))
+    changed = model(changed_style, left, 1)
+    assert not torch.allclose(changed[1], model(style, left, 1)[1])
+    changed.square().mean().backward()
+    assert model.down_output[1][0].weight.grad is not None
+    assert model.down_output[0][0].weight.grad is None
+
+
+def test_bilinear_operator_respects_configured_rank() -> None:
+    torch.manual_seed(23)
+    rank = 3
+    dimensions = 9
+    model = ReferenceConditionedLowRankKVOperator(
+        style_dim=16,
+        context_dim=dimensions,
+        output_dim=11,
+        blocks=1,
+        hidden_dim=16,
+        heads=4,
+        ff_dim=32,
+        operator_layers=1,
+        operator_rank=rank,
+    )
+    style = torch.randn(1, 6, 16)
+    identity_context = torch.eye(dimensions)[None]
+    operator_matrix = model(style, identity_context, 0)[0]
+    for kind in range(2):
+        assert int(torch.linalg.matrix_rank(operator_matrix[kind], tol=1e-5)) <= rank
