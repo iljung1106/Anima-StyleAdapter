@@ -4,16 +4,19 @@ import torch
 from safetensors.torch import save_file
 
 from anima_style_data.lora_functional_distillation import (
+    _configure_reader_trainable_scope,
     _cached_training_probe_bank,
     _initialize_fresh_adapter_strength,
     _teacher_decomposed_functional_objective,
     build_mixture_specs,
     decompose_teacher_effects,
     scheduled_teacher_category,
+    scheduled_reference_domain,
     teacher_category,
     teacher_category_v2,
 )
 from anima_style_data.detail_style_cross_attention import (
+    DetailPreservingTypedSlotReader,
     SeparatedCommonArtistKVStyleCrossAttention,
 )
 from anima_style_data.io import write_records
@@ -103,6 +106,57 @@ def test_fresh_direct_kv_bootstrap_jointly_uses_lora_and_native_teachers():
         "lora_mixture",
         "artist_tag",
     ]
+
+
+def test_continuation_schedule_emphasizes_lora_and_human_references():
+    assert [
+        scheduled_teacher_category(
+            step,
+            single_only_steps=0,
+            schedule=(
+                "lora_single",
+                "lora_single",
+                "lora_mixture",
+                "artist_tag",
+            ),
+        )
+        for step in range(1, 9)
+    ] == [
+        "lora_single",
+        "lora_single",
+        "lora_mixture",
+        "artist_tag",
+        "lora_single",
+        "lora_single",
+        "lora_mixture",
+        "artist_tag",
+    ]
+    assert [
+        scheduled_reference_domain(step, ("human", "human", "synthetic"))
+        for step in range(1, 7)
+    ] == ["human", "human", "synthetic", "human", "human", "synthetic"]
+
+
+def test_pooling_reader_scope_preserves_per_reference_encoder():
+    reader = DetailPreservingTypedSlotReader(
+        dim=32,
+        heads=4,
+        reader_ff_dim=64,
+        mixer_ff_dim=64,
+        strict_v1=True,
+    )
+    selected = _configure_reader_trainable_scope(reader, "pooling")
+    selected_ids = {id(parameter) for parameter in selected}
+    names = {
+        name
+        for name, parameter in reader.named_parameters()
+        if id(parameter) in selected_ids
+    }
+    assert names
+    assert any(name.startswith("set_attention.") for name in names)
+    assert any(name.startswith("mixers.") for name in names)
+    assert not any(name.startswith("reader.") for name in names)
+    assert not any(name.startswith("input_projections.") for name in names)
 
 
 def test_fresh_adapter_uses_measured_block_timestep_strength(tmp_path):

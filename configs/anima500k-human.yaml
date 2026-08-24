@@ -1156,11 +1156,11 @@ lora_functional_distillation_v2:
 # after that direct visual mapping has been established. No LoRA weight,
 # artist ID, retrieval index or mixture coefficient exists at inference.
 direct_reference_kv_distillation:
-  output_directory: direct_reference_kv_distillation_v2d_fresh_component_calibrated_joint_teacher
+  output_directory: direct_reference_kv_distillation_v2e_lora_focused_pooling_reader
   seed: 20260824
   lora_directory: artist_lora_teachers_rank16_256_b2_v5
-  initial_checkpoint: null
-  reader_checkpoint: detail_style_reader_pretrain_v1/checkpoints/step-0004000.pt
+  initial_checkpoint: direct_reference_kv_distillation_v2d_fresh_component_calibrated_joint_teacher/checkpoints/step-0002000.pt
+  reader_checkpoint: null
   # Reuse only measured physical output scales, never adapter weights. Fresh
   # normalized K/V at alpha=1 produced a 17.7x teacher residual and pure noise.
   initial_strength_profile: diagnostics/detail_style_block_timestep_strength_v1/profile.json
@@ -1186,16 +1186,18 @@ direct_reference_kv_distillation:
       - synthetic_teacher_additional_1500x6/dual_query_reference_tokens_v8_step10000
   training:
     device: cuda
-    steps: 8000
-    # Native and individual-LoRA effects supervise the fresh K/V model jointly
-    # from the first update. Afterwards the exact 1:1:1 schedule also teaches
-    # multi-reference interpolation using actual weighted-LoRA forwards.
-    single_only_steps: 1500
-    bootstrap_teacher_schedule: [lora_single, artist_tag]
-    teacher_schedule: [artist_tag, lora_single, lora_mixture]
-    curriculum: direct_reference_kv_fresh_joint
+    steps: 6000
+    # Continue from the stable fresh 2k alignment. LoRA teachers now own 75%
+    # of updates; the native artist effect remains a 25% on-manifold anchor.
+    single_only_steps: 0
+    bootstrap_teacher_schedule: [lora_single]
+    teacher_schedule: [lora_single, lora_single, lora_mixture, artist_tag]
+    lora_reference_domain_schedule: [human, human, synthetic]
+    curriculum: direct_reference_kv_lora_focused_reader_pooling
     functional_objective: teacher_decomposed
-    freeze_reader: true
+    reader_trainable_scope: pooling
+    reader_learning_rate: 0.00001
+    reader_max_grad_norm: 0.25
     freeze_common: false
     batch_rows: 6
     references_per_component: 4
@@ -1205,12 +1207,12 @@ direct_reference_kv_distillation:
     native_microbatch_rows: 4
     native_references: 4
     shared_learning_rate: 0.00010
-    common_learning_rate: 0.00010
+    common_learning_rate: 0.00002
     delta_learning_rate: 0.00020
     mix_learning_rate: 0.00004
     null_learning_rate: 0.00020
-    warmup_steps: 200
-    lr_decay_start_step: 6500
+    warmup_steps: 100
+    lr_decay_start_step: 4500
     minimum_lr_ratio: 0.10
     betas: [0.9, 0.95]
     adam_eps: 0.00000001
@@ -1237,11 +1239,11 @@ direct_reference_kv_distillation:
       centered_huber: 1.50
       centered_direction: 1.50
       centered_magnitude: 0.50
-      functional_infonce: 1.00
+      functional_infonce: 1.50
       functional_infonce_temperature: 0.10
       common_huber: 0.10
       common_direction: 0.05
-      common_ratio_excess: 8.00
+      common_ratio_excess: 12.00
       common_ratio_margin: 0.00
     log_every: 10
     checkpoint_every: 250
@@ -1253,8 +1255,8 @@ direct_reference_kv_distillation:
     wandb:
       enabled: true
       project: anima-style-adapter
-      name: direct-reference-kv-distillation-v2d-fresh-component-calibrated-joint-teacher
-      id: direct-reference-kv-distillation-v2d-fresh-component-calibrated-joint-teacher
+      name: direct-reference-kv-distillation-v2e-lora-focused-pooling-reader
+      id: direct-reference-kv-distillation-v2e-lora-focused-pooling-reader
 
 
 # Direct image-distribution representability test.  The eight LoRA-generated

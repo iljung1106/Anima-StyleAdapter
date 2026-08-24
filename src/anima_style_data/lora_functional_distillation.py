@@ -94,6 +94,7 @@ def teacher_category_v2(
 
 
 _TEACHER_CATEGORIES = frozenset(("artist_tag", "lora_single", "lora_mixture"))
+_REFERENCE_DOMAINS = frozenset(("human", "synthetic"))
 
 
 def scheduled_teacher_category(
@@ -126,6 +127,67 @@ def scheduled_teacher_category(
     if step <= int(single_only_steps):
         return bootstrap[(step - 1) % len(bootstrap)]
     return normalized[(step - int(single_only_steps) - 1) % len(normalized)]
+
+
+def scheduled_reference_domain(
+    update: int, schedule: tuple[str, ...] | list[str]
+) -> str:
+    """Select the visual-reference domain without changing the teacher target.
+
+    Human and LoRA-generated references supervise the same offline LoRA effect,
+    but deployment starts from human artwork. An explicit deterministic cycle
+    emphasizes that domain without dropping the cleaner synthetic pairing.
+    """
+
+    normalized = tuple(str(value) for value in schedule)
+    if update <= 0:
+        raise ValueError("update must be positive")
+    if not normalized:
+        raise ValueError("reference domain schedule must not be empty")
+    invalid = set(normalized) - _REFERENCE_DOMAINS
+    if invalid:
+        raise ValueError(f"Unsupported reference domains: {sorted(invalid)}")
+    return normalized[(update - 1) % len(normalized)]
+
+
+_POOLING_READER_PREFIXES = (
+    "set_query",
+    "set_norm",
+    "reference_identity_norm",
+    "reference_identity_projection",
+    "pool_type_embeddings",
+    "pool_type_preference",
+    "set_attention",
+    "set_ff_norm",
+    "set_ff",
+    "mixers",
+)
+
+
+def _configure_reader_trainable_scope(
+    reader: DetailPreservingTypedSlotReader, scope: str
+) -> list[torch.nn.Parameter]:
+    """Open reference aggregation/output layers while preserving visual reads."""
+
+    normalized = str(scope).strip().lower()
+    if normalized not in {"none", "pooling", "all"}:
+        raise ValueError(
+            "reader_trainable_scope must be one of: none, pooling, all"
+        )
+    selected: list[torch.nn.Parameter] = []
+    for name, parameter in reader.named_parameters():
+        trainable = normalized == "all" or (
+            normalized == "pooling"
+            and any(
+                name == prefix or name.startswith(f"{prefix}.")
+                for prefix in _POOLING_READER_PREFIXES
+            )
+        )
+        parameter.requires_grad_(trainable)
+        if trainable:
+            selected.append(parameter)
+    reader.train(normalized != "none")
+    return selected
 
 
 def build_mixture_specs(
@@ -1306,9 +1368,14 @@ def train_lora_functional_distillation(
         for value in training.get("bootstrap_teacher_schedule", ("lora_single",))
     )
     freeze_common = bool(training.get("freeze_common", False))
-    freeze_reader = bool(training.get("freeze_reader", False))
-    reader.requires_grad_(not freeze_reader)
-    reader.train(not freeze_reader)
+    configured_reader_scope = training.get("reader_trainable_scope")
+    reader_scope = str(
+        configured_reader_scope
+        if configured_reader_scope is not None
+        else ("none" if bool(training.get("freeze_reader", False)) else "all")
+    )
+    reader_parameters = _configure_reader_trainable_scope(reader, reader_scope)
+    freeze_reader = not reader_parameters
     for parameter in adapter.common_parameters():
         parameter.requires_grad_(not freeze_common)
 
@@ -1355,9 +1422,9 @@ def train_lora_functional_distillation(
         {"params": adapter.delta_parameters(), "lr": float(training.get("delta_learning_rate", 2e-4)), "name": "block_delta"},
         {"params": adapter.mixing_parameters(), "lr": float(training.get("mix_learning_rate", 4e-5)), "name": "base_mix", "weight_decay": 0.0},
     ]
-    if not freeze_reader:
+    if reader_parameters:
         groups.insert(0, {
-            "params": list(reader.parameters()),
+            "params": reader_parameters,
             "lr": float(training.get("reader_learning_rate", 2e-5)),
             "name": "reader",
         })
@@ -1410,6 +1477,9 @@ def train_lora_functional_distillation(
     checkpoint_every = int(training.get("checkpoint_every", 250))
     sample_every = int(training.get("sample_every", 1000))
     max_grad_norm = float(training.get("max_grad_norm", 1.0))
+    reader_max_grad_norm = float(
+        training.get("reader_max_grad_norm", max_grad_norm)
+    )
     running: dict[str, list[float]] = defaultdict(list)
     updates = defaultdict(int)
     native_common_cache: dict[tuple[int, int], torch.Tensor] = {}
@@ -1475,8 +1545,17 @@ def train_lora_functional_distillation(
                     step=step, probe_index=updates[category],
                 )
             else:
+                domain_schedule = tuple(
+                    str(value)
+                    for value in training.get(
+                        "lora_reference_domain_schedule", ("human", "synthetic")
+                    )
+                )
+                domain = scheduled_reference_domain(
+                    updates[category], domain_schedule
+                )
                 domain_loader = (
-                    human_loader if updates[category] % 2 else synthetic_loader
+                    human_loader if domain == "human" else synthetic_loader
                 )
                 kind = "single"
                 if category == "lora_mixture":
@@ -1489,8 +1568,20 @@ def train_lora_functional_distillation(
                 metrics["domain_synthetic"] = torch.tensor(
                     float(domain_loader is synthetic_loader), device=device
                 )
-            parameters = [parameter for group in optimizer.param_groups for parameter in group["params"]]
-            grad_norm = torch.nn.utils.clip_grad_norm_(parameters, max_grad_norm, foreach=True)
+            adapter_parameters = [
+                parameter
+                for group in optimizer.param_groups
+                if str(group["name"]) != "reader"
+                for parameter in group["params"]
+            ]
+            grad_norm = torch.nn.utils.clip_grad_norm_(
+                adapter_parameters, max_grad_norm, foreach=True
+            )
+            reader_grad_norm = None
+            if reader_parameters:
+                reader_grad_norm = torch.nn.utils.clip_grad_norm_(
+                    reader_parameters, reader_max_grad_norm, foreach=True
+                )
             optimizer.step()
             domain_name = None
             if category != "artist_tag":
@@ -1505,9 +1596,14 @@ def train_lora_functional_distillation(
                             float(value.detach())
                         )
             running["optimizer/grad_norm"].append(float(grad_norm))
+            if reader_grad_norm is not None:
+                running["optimizer/reader_grad_norm"].append(
+                    float(reader_grad_norm)
+                )
             if step % log_every == 0:
                 row = {key: sum(values) / len(values) for key, values in running.items() if values}
-                row["optimizer/learning_rate"] = float(optimizer.param_groups[0]["lr"])
+                for group in optimizer.param_groups:
+                    row[f"optimizer/lr/{group['name']}"] = float(group["lr"])
                 row["progress/category"] = {"artist_tag": 0, "lora_single": 1, "lora_mixture": 2}[category]
                 row["progress/common_frozen"] = float(freeze_common)
                 print(f"LoRA distill step={step}/{steps} category={category} {row}", flush=True)
@@ -1557,6 +1653,7 @@ def train_lora_functional_distillation(
         "curriculum": curriculum,
         "common_frozen": freeze_common,
         "reader_frozen": freeze_reader,
+        "reader_trainable_scope": reader_scope,
         "initialization": initialization,
         "strength_initialization": strength_initialization,
         "inference_contract": (
