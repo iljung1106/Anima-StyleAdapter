@@ -218,6 +218,69 @@ def apply_kv_factors(
     return torch.einsum("btnr,btor->btno", hidden, up)
 
 
+@torch.no_grad()
+def compress_lora_factors(
+    down: torch.Tensor,
+    up: torch.Tensor,
+    *,
+    target_rank: int,
+    oversample: int = 16,
+    power_iterations: int = 1,
+    seed: int = 0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compress ``up @ down`` without materializing its dense matrix."""
+
+    if down.shape[:-2] != up.shape[:-2] or down.shape[-2] != up.shape[-1]:
+        raise ValueError("LoRA factor shapes disagree")
+    rank = int(target_rank)
+    if rank <= 0:
+        raise ValueError("target_rank must be positive")
+    leading = down.shape[:-2]
+    input_dim = int(down.shape[-1])
+    output_dim = int(up.shape[-2])
+    source_rank = int(down.shape[-2])
+    rank = min(rank, input_dim, output_dim, source_rank)
+    sketch_rank = min(
+        rank + max(0, int(oversample)), input_dim, output_dim, source_rank
+    )
+    flat_down = down.reshape(-1, source_rank, input_dim)
+    flat_up = up.reshape(-1, output_dim, source_rank)
+    compressed_down = []
+    compressed_up = []
+    for index, (down_row, up_row) in enumerate(
+        zip(flat_down, flat_up, strict=True)
+    ):
+        down_f = down_row.float()
+        up_f = up_row.float()
+        generator = torch.Generator(device=down_row.device).manual_seed(
+            int(seed) + index * 1_000_003
+        )
+        omega = torch.randn(
+            input_dim,
+            sketch_rank,
+            device=down_row.device,
+            dtype=torch.float32,
+            generator=generator,
+        )
+        projected = up_f @ (down_f @ omega)
+        basis = torch.linalg.qr(projected, mode="reduced").Q
+        for _ in range(max(0, int(power_iterations))):
+            transposed = down_f.t() @ (up_f.t() @ basis)
+            projected = up_f @ (down_f @ transposed)
+            basis = torch.linalg.qr(projected, mode="reduced").Q
+        small = (basis.t() @ up_f) @ down_f
+        left, singular, right_h = torch.linalg.svd(small, full_matrices=False)
+        root = singular[:rank].clamp_min(0).sqrt()
+        compressed_up.append(
+            (basis @ left[:, :rank]) * root.unsqueeze(0)
+        )
+        compressed_down.append(root.unsqueeze(1) * right_h[:rank])
+    return (
+        torch.stack(compressed_down).reshape(*leading, rank, input_dim),
+        torch.stack(compressed_up).reshape(*leading, output_dim, rank),
+    )
+
+
 class NativeKVFactorModulator(nn.Module):
     """Generate block-specific low-rank K/V factors from frozen style codes.
 

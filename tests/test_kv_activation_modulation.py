@@ -9,6 +9,7 @@ from anima_style_data.kv_activation_modulation import (
     apply_kv_factors,
     canonicalize_lora_factor_bank,
     canonicalize_lora_factors,
+    compress_lora_factors,
     kv_activation_objective,
     kv_factor_objective,
     load_kv_lora_factor_bank,
@@ -584,6 +585,26 @@ def test_retrieval_adapter_uses_an_exact_sparse_lora_mixture():
     torch.testing.assert_close(actual, expected)
     assert len(retrieval["artist_ids"]) == 2
     adapter.close()
+
+
+def test_randomized_lora_compression_matches_the_best_low_rank_matrix():
+    torch.manual_seed(53)
+    down = torch.randn(2, 12, 17)
+    up = torch.randn(2, 13, 12)
+    compressed_down, compressed_up = compress_lora_factors(
+        down,
+        up,
+        target_rank=5,
+        oversample=7,
+        power_iterations=1,
+        seed=91,
+    )
+    dense = up @ down
+    left, singular, right_h = torch.linalg.svd(dense, full_matrices=False)
+    optimal = (left[:, :, :5] * singular[:, None, :5]) @ right_h[:, :5]
+    actual = compressed_up @ compressed_down
+
+    torch.testing.assert_close(actual, optimal, rtol=2e-4, atol=2e-4)
 
 
 def test_native_kv_injector_repeats_style_rows_in_cfg_branch_order():

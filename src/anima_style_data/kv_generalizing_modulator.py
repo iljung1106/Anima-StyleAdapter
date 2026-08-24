@@ -29,6 +29,7 @@ from .kv_activation_modulation import (
     NativeKVFactorModulator,
     apply_kv_factors,
     canonicalize_lora_factor_bank,
+    compress_lora_factors,
     kv_activation_objective,
     load_kv_lora_factor_bank,
 )
@@ -1480,3 +1481,268 @@ def sample_cached_knn_kv_retrieval_ablation(
         config["kv_lora_retrieval_sample_ablation"]
     )
     return sample_cached_knn_kv_retrieval(effective, destination)
+
+
+@torch.no_grad()
+def sample_compressed_sparse_ridge_kv_retrieval(
+    config: dict[str, Any], destination: Path
+) -> dict[str, Any]:
+    """Render an affine signed visual mixture compressed back to rank 64."""
+
+    from .kv_activation_sampling import sample_kv_activation_modulator
+    from .kv_mixture_analysis import (
+        _fixed_artist_holdout,
+        _sparse_ridge_coefficients,
+    )
+
+    sample_cfg = dict(config["kv_lora_sparse_ridge_sample"])
+    cache_cfg = dict(config["kv_lora_reader_anchor_cache"])
+    device = str(sample_cfg.get("device", "cuda"))
+    seed = int(sample_cfg.get("seed", 20260824))
+    neighbors = int(sample_cfg.get("neighbors", 32))
+    ridge = float(sample_cfg.get("ridge", 0.05))
+    target_rank = int(sample_cfg.get("target_rank", 64))
+    common_rank = int(sample_cfg.get("common_rank", 64))
+    oversample = int(sample_cfg.get("oversample", 16))
+    power_iterations = int(sample_cfg.get("power_iterations", 1))
+    cache_root = destination / str(cache_cfg["output_directory"])
+    cache_summary = json.loads(
+        (cache_root / "summary.json").read_text(encoding="utf-8")
+    )
+    artist_ids = [str(value) for value in cache_summary["artist_ids"]]
+    cached = load_file(cache_root / "anchors.safetensors", device="cpu")
+    anchors = cached["anchors"]
+    anchor_counts = cached["reference_counts"].to(torch.int64)
+
+    lora_root = destination / str(cache_cfg["lora_directory"])
+    blocks = int(config["kv_activation_generalizing_modulator"].get("blocks", 28))
+    loaded_ids, teacher_down, teacher_up = load_kv_lora_factor_bank(
+        lora_root, blocks=blocks, dtype=torch.float16
+    )
+    if loaded_ids != artist_ids:
+        raise RuntimeError("Reader anchor and LoRA dictionary orders disagree")
+    source_root = destination / str(
+        sample_cfg["validation_source_lora_directory"]
+    )
+    source_plan = json.loads(
+        (source_root / "plan.json").read_text(encoding="utf-8")
+    )
+    source_artist_ids = [str(row["style_id"]) for row in source_plan["artists"]]
+    dictionary_indices, validation_indices = _fixed_artist_holdout(
+        artist_ids,
+        validation_count=int(sample_cfg.get("validation_artists", 32)),
+        source_artist_ids=source_artist_ids,
+    )
+    artist_count = min(int(sample_cfg.get("artists", 7)), len(validation_indices))
+    selected_positions = torch.linspace(
+        0, len(validation_indices) - 1, artist_count
+    ).round().long().unique()
+    selected_indices = [
+        validation_indices[int(position)] for position in selected_positions
+    ]
+    selected_ids = [artist_ids[index] for index in selected_indices]
+
+    dictionary = torch.tensor(dictionary_indices, device=device, dtype=torch.long)
+    dictionary_down = teacher_down[dictionary.cpu()].to(device)
+    dictionary_up = teacher_up[dictionary.cpu()].to(device)
+    dictionary_size = int(dictionary.shape[0])
+    teacher_rank = int(dictionary_down.shape[-2])
+    context_dim = int(dictionary_down.shape[-1])
+    output_dim = int(dictionary_up.shape[-2])
+    common_down_source = dictionary_down.permute(1, 2, 0, 3, 4).reshape(
+        blocks, 2, dictionary_size * teacher_rank, context_dim
+    )
+    common_up_source = dictionary_up.permute(1, 2, 3, 0, 4).reshape(
+        blocks, 2, output_dim, dictionary_size * teacher_rank
+    ) / dictionary_size
+    common_down, common_up = compress_lora_factors(
+        common_down_source,
+        common_up_source,
+        target_rank=common_rank,
+        oversample=oversample,
+        power_iterations=power_iterations,
+        seed=seed ^ 0x434F4D4D,
+    )
+    del common_down_source, common_up_source
+
+    reader_state = torch.load(
+        destination / str(cache_cfg["reader_checkpoint"]),
+        map_location="cpu",
+        weights_only=False,
+    )
+    oracle_cfg = dict(config["kv_lora_oracle_bootstrap"])
+    detail_cfg = _oracle_detail_config(config, oracle_cfg)
+    reader = DetailPreservingTypedSlotReader(**dict(detail_cfg["model"])).to(
+        device=device, dtype=torch.bfloat16
+    )
+    reader.load_state_dict(reader_state["reader"], strict=True)
+    reader.requires_grad_(False).eval()
+    del reader_state
+    _, teacher_validation_ids = _teacher_image_split(lora_root, artist_ids)
+    requested_counts = [
+        int(value) for value in sample_cfg.get("reference_counts", [1, 4])
+    ]
+    validation_loader = CachedTeacherReferenceLoader(
+        destination / str(cache_cfg["human_reference_cache"]),
+        split="train",
+        style_ids=selected_ids,
+        batch_size=artist_count,
+        references=max(requested_counts),
+        seed=seed,
+        token_lru_shards=int(cache_cfg.get("token_lru_shards", 8)),
+        strict_style_ids=True,
+        allowed_image_ids=teacher_validation_ids,
+    )
+    output = destination / str(sample_cfg["output_directory"])
+    output.mkdir(parents=True, exist_ok=True)
+    prepared: dict[int, dict[str, Any]] = {}
+    for count in requested_counts:
+        anchor_position = int((anchor_counts - count).abs().argmin().item())
+        train_anchor = anchors[anchor_position, dictionary_indices].float().flatten(1)
+        loaded = validation_loader.load_styles(
+            selected_ids,
+            references_per_style=count,
+            seed=seed + count * 1_000_003,
+        )
+        tokens = loaded["tokens"].to(
+            device=device, dtype=torch.bfloat16, non_blocking=True
+        )
+        mask = torch.ones(tokens.shape[:2], device=device, dtype=torch.bool)
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            query_codes = reader(tokens, mask).tokens
+        coefficients = _sparse_ridge_coefficients(
+            train_anchor.to(device),
+            query_codes.float().flatten(1),
+            neighbors=neighbors,
+            ridge=ridge,
+        )
+        values, local_indices = coefficients.abs().topk(neighbors, dim=-1)
+        del values
+        local_weights = coefficients.gather(-1, local_indices)
+        global_neighbors = dictionary[local_indices]
+        selected_down = teacher_down[global_neighbors.cpu()].to(device)
+        selected_up = teacher_up[global_neighbors.cpu()].to(device)
+        selected_down = selected_down.permute(0, 2, 3, 1, 4, 5).reshape(
+            artist_count,
+            blocks,
+            2,
+            neighbors * teacher_rank,
+            context_dim,
+        )
+        weighted_up = teacher_up[global_neighbors.cpu()].to(device) * (
+            local_weights[:, :, None, None, None, None]
+        )
+        selected_up = weighted_up.permute(0, 2, 3, 4, 1, 5).reshape(
+            artist_count,
+            blocks,
+            2,
+            output_dim,
+            neighbors * teacher_rank,
+        )
+        common_weight = 1.0 - local_weights.sum(dim=-1)
+        combined_down = torch.cat((
+            common_down.unsqueeze(0).expand(artist_count, -1, -1, -1, -1),
+            selected_down,
+        ), dim=-2)
+        combined_up = torch.cat((
+            common_up.unsqueeze(0)
+            * common_weight[:, None, None, None, None],
+            selected_up,
+        ), dim=-1)
+        predicted_down, predicted_up = compress_lora_factors(
+            combined_down,
+            combined_up,
+            target_rank=target_rank,
+            oversample=oversample,
+            power_iterations=power_iterations,
+            seed=seed + count * 1_000_003,
+        )
+        compatibility = {
+            "predicted_down": predicted_down.cpu().to(torch.bfloat16),
+            "predicted_up": predicted_up.cpu().to(torch.bfloat16),
+            "predicted_artist_indices": selected_indices,
+            "config": {
+                "lora_directory": str(cache_cfg["lora_directory"]),
+                "blocks": blocks,
+            },
+        }
+        checkpoint_path = output / f"reference-{count}-ridge{neighbors}-rank{target_rank}.pt"
+        torch.save(compatibility, checkpoint_path)
+        prepared[count] = {
+            "checkpoint": checkpoint_path,
+            "reference_ids": [list(rows) for rows in loaded["ids"]],
+            "neighbor_ids": [
+                [artist_ids[int(index)] for index in row]
+                for row in global_neighbors.cpu().tolist()
+            ],
+            "neighbor_weights": local_weights.cpu().tolist(),
+            "common_weights": common_weight.cpu().tolist(),
+            "anchor_reference_count": int(anchor_counts[anchor_position]),
+        }
+        del (
+            coefficients,
+            selected_down,
+            selected_up,
+            weighted_up,
+            combined_down,
+            combined_up,
+            predicted_down,
+            predicted_up,
+        )
+        torch.cuda.empty_cache()
+    del (
+        reader,
+        anchors,
+        teacher_down,
+        teacher_up,
+        dictionary_down,
+        dictionary_up,
+        common_down,
+        common_up,
+        cached,
+    )
+    gc.collect()
+    torch.cuda.empty_cache()
+
+    summaries: dict[str, Any] = {}
+    for count, values in prepared.items():
+        effective = copy.deepcopy(config)
+        effective_sample = dict(effective["kv_activation_modulator_sample"])
+        effective_sample.update({
+            "checkpoint": str(values["checkpoint"].relative_to(destination)),
+            "output_directory": str(
+                (output / f"reference-{count}").relative_to(destination)
+            ),
+            "device": device,
+            "artist_indices": selected_indices,
+            "predicted_strengths": [
+                float(value)
+                for value in sample_cfg.get("predicted_strengths", [1.0, 1.5])
+            ],
+            "batch_size": int(sample_cfg.get("batch_size", 4)),
+            "panel_tile_width": int(sample_cfg.get("panel_tile_width", 416)),
+        })
+        effective["kv_activation_modulator_sample"] = effective_sample
+        rendered = sample_kv_activation_modulator(effective, destination)
+        rendered.update({key: values[key] for key in (
+            "reference_ids",
+            "neighbor_ids",
+            "neighbor_weights",
+            "common_weights",
+            "anchor_reference_count",
+        )})
+        summaries[f"{count}ref"] = rendered
+        values["checkpoint"].unlink(missing_ok=True)
+    summary = {
+        "artists": selected_ids,
+        "artist_indices": selected_indices,
+        "dictionary_artists": dictionary_size,
+        "heldout_artists": len(validation_indices),
+        "neighbors": neighbors,
+        "ridge": ridge,
+        "common_rank": common_rank,
+        "target_rank": target_rank,
+        "results": summaries,
+    }
+    write_json(output / "summary.json", summary)
+    return summary
