@@ -152,6 +152,7 @@ def _load_predicted_and_teacher_factors(
     artist_ids, teacher_down, teacher_up = load_kv_lora_factor_bank(
         destination / str(checkpoint["config"]["lora_directory"]),
         blocks=int(checkpoint["config"].get("blocks", 28)),
+        dtype=torch.float16,
     )
     if max(indices) >= len(artist_ids):
         raise IndexError("Sample artist index exceeds the K/V-LoRA bank")
