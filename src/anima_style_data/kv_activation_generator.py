@@ -1422,15 +1422,15 @@ def sample_reference_conditioned_bilinear_kv_operator(
 
 
 @torch.no_grad()
-def sample_external_reference_bilinear_kv_operator(
-    config: dict[str, Any], destination: Path
+def _sample_external_reference_bilinear_kv_operator(
+    config: dict[str, Any], destination: Path, *, config_key: str
 ) -> dict[str, Any]:
     """Render the established TestSample 1-7 external references."""
 
     from .dual_query_external_samples import load_dual_query_external_sample
     from .kv_activation_sampling import sample_kv_activation_modulator
 
-    sample_cfg = copy.deepcopy(config["kv_reference_bilinear_fixed_sample"])
+    sample_cfg = copy.deepcopy(config[config_key])
     device = str(sample_cfg.get("device", "cuda"))
     checkpoint_path = destination / str(sample_cfg["checkpoint"])
     checkpoint = torch.load(
@@ -1481,8 +1481,7 @@ def sample_external_reference_bilinear_kv_operator(
     output.mkdir(parents=True, exist_ok=True)
     compatibility_path = output / "fixed-reference-operator.pt"
     row_indices = list(range(len(prepared["paths"])))
-    torch.save(
-        {
+    compatibility = {
             "predicted_down": predicted_down,
             "predicted_up": predicted_up,
             "predicted_artist_indices": row_indices,
@@ -1490,9 +1489,13 @@ def sample_external_reference_bilinear_kv_operator(
                 "lora_directory": cfg["lora_directory"],
                 "blocks": int(cfg.get("blocks", 28)),
             },
-        },
-        compatibility_path,
-    )
+    }
+    if str(cfg.get("teacher_decomposition", "full")) == "centered":
+        common_path = checkpoint_path.parent.parent / "frozen_common_operator.pt"
+        compatibility["common_operator"] = torch.load(
+            common_path, map_location="cpu", weights_only=True
+        )["common_operator"]
+    torch.save(compatibility, compatibility_path)
     effective = copy.deepcopy(config)
     labels = [f"TestSample {index + 1}" for index in row_indices]
     effective["kv_activation_modulator_sample"] = {
@@ -1519,3 +1522,23 @@ def sample_external_reference_bilinear_kv_operator(
     gc.collect()
     torch.cuda.empty_cache()
     return rendered
+
+
+def sample_external_reference_bilinear_kv_operator(
+    config: dict[str, Any], destination: Path
+) -> dict[str, Any]:
+    return _sample_external_reference_bilinear_kv_operator(
+        config,
+        destination,
+        config_key="kv_reference_bilinear_fixed_sample",
+    )
+
+
+def sample_external_reference_centered_bilinear_kv_operator(
+    config: dict[str, Any], destination: Path
+) -> dict[str, Any]:
+    return _sample_external_reference_bilinear_kv_operator(
+        config,
+        destination,
+        config_key="kv_reference_centered_bilinear_fixed_sample",
+    )

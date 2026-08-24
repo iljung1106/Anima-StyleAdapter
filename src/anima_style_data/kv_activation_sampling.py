@@ -141,6 +141,79 @@ class NativeKVFactorInjector:
         return hook
 
 
+class NativeKVCommonResidualInjector(NativeKVFactorInjector):
+    """Inject a frozen dense common operator plus strength-scaled factors."""
+
+    def __init__(self, anima: torch.nn.Module, common: torch.Tensor) -> None:
+        if common.ndim != 4 or common.shape[1] != 2:
+            raise ValueError("common must be [block,K/V,output,context]")
+        self.common = common
+        self.include_common = False
+        super().__init__(anima)
+
+    def set_factors(
+        self,
+        down: torch.Tensor,
+        up: torch.Tensor,
+        *,
+        strength: float = 1.0,
+        include_common: bool = True,
+    ) -> None:
+        super().set_factors(down, up, strength=strength)
+        self.include_common = bool(include_common)
+
+    def disable(self) -> None:
+        super().disable()
+        self.include_common = False
+
+    def _common_delta(
+        self, context: torch.Tensor, block_index: int
+    ) -> torch.Tensor:
+        operator = self.common[block_index].to(
+            device=context.device, dtype=context.dtype
+        )
+        return torch.einsum("bnc,koc->bkno", context, operator)
+
+    def _fused_hook(self, block_index: int):
+        def hook(module, inputs, output):
+            if not self.enabled:
+                return output
+            context = inputs[0]
+            down, up = self._block_factors(block_index, int(context.shape[0]))
+            delta = apply_kv_factors(
+                context,
+                down.to(device=context.device, dtype=context.dtype),
+                up.to(device=context.device, dtype=context.dtype),
+            ) * self.strength
+            if self.include_common:
+                delta = delta + self._common_delta(context, block_index)
+            return output + torch.cat((delta[:, 0], delta[:, 1]), dim=-1).to(
+                output.dtype
+            )
+
+        return hook
+
+    def _split_hook(self, block_index: int, kind: int):
+        def hook(module, inputs, output):
+            if not self.enabled:
+                return output
+            context = inputs[0]
+            down, up = self._block_factors(block_index, int(context.shape[0]))
+            hidden = torch.einsum(
+                "bnc,brc->bnr", context, down[:, kind].to(context.dtype)
+            )
+            delta = torch.einsum(
+                "bnr,bor->bno", hidden, up[:, kind].to(context.dtype)
+            ) * self.strength
+            if self.include_common:
+                delta = delta + self._common_delta(
+                    context, block_index
+                )[:, kind]
+            return output + delta.to(output.dtype)
+
+        return hook
+
+
 def _load_predicted_and_teacher_factors(
     cfg: dict[str, Any], destination: Path, indices: list[int], device: str
 ) -> tuple[list[str], torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -421,11 +494,24 @@ def sample_kv_activation_modulator(
     if len(display_labels) != len(artist_ids):
         raise ValueError("artist_labels must match the predicted factor rows")
 
+    compatibility = torch.load(
+        destination / str(cfg["checkpoint"]),
+        map_location="cpu",
+        weights_only=False,
+    )
+    common_operator = compatibility.get("common_operator")
     anima = _resolve_anima_model(config, destination, device).requires_grad_(False).eval()
     _optimize_frozen_anima(
         anima, low_precision_rmsnorm=True, fuse_attention_projections=True
     )
-    injector = NativeKVFactorInjector(anima)
+    injector: NativeKVFactorInjector = (
+        NativeKVCommonResidualInjector(
+            anima,
+            common_operator.to(device=device, dtype=torch.bfloat16),
+        )
+        if common_operator is not None
+        else NativeKVFactorInjector(anima)
+    )
     width = int(sample_cfg["width"])
     height = int(sample_cfg["height"])
     seed = int(sample_cfg["seed"])
@@ -448,6 +534,7 @@ def sample_kv_activation_modulator(
         down: torch.Tensor | None,
         up: torch.Tensor | None,
         strength: float,
+        include_common: bool = False,
         anima_model: torch.nn.Module = anima,
         factor_injector: NativeKVFactorInjector = injector,
     ) -> torch.Tensor:
@@ -459,9 +546,19 @@ def sample_kv_activation_modulator(
             if down is None or up is None:
                 factor_injector.disable()
             else:
-                factor_injector.set_factors(
-                    down[start:stop], up[start:stop], strength=strength
-                )
+                if isinstance(
+                    factor_injector, NativeKVCommonResidualInjector
+                ):
+                    factor_injector.set_factors(
+                        down[start:stop],
+                        up[start:stop],
+                        strength=strength,
+                        include_common=include_common,
+                    )
+                else:
+                    factor_injector.set_factors(
+                        down[start:stop], up[start:stop], strength=strength
+                    )
             with torch.autocast("cuda", dtype=torch.bfloat16):
                 values.append(
                     _sample_anima_batch(
@@ -479,12 +576,17 @@ def sample_kv_activation_modulator(
 
     baseline = denoise_rows(None, None, 0.0)
     teacher = (
-        denoise_rows(teacher_down, teacher_up, 1.0)
+        denoise_rows(teacher_down, teacher_up, 1.0, include_common=False)
         if include_teacher
         else None
     )
     predictions = {
-        strength: denoise_rows(predicted_down, predicted_up, strength)
+        strength: denoise_rows(
+            predicted_down,
+            predicted_up,
+            strength,
+            include_common=common_operator is not None,
+        )
         for strength in strengths
     }
     injector.close()

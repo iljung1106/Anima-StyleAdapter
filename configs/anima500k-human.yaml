@@ -951,6 +951,14 @@ kv_reference_bilinear_fixed_sample:
   batch_size: 4
   panel_tile_width: 320
 
+kv_reference_centered_bilinear_fixed_sample:
+  checkpoint: kv_reference_centered_bilinear_operator_rank32_r16_64_v1/checkpoints/step-0003000.pt
+  output_directory: diagnostics/kv-reference-centered-bilinear-r32-step3000-fixed-reference
+  device: cuda
+  predicted_strengths: [1.0, 1.5]
+  batch_size: 4
+  panel_tile_width: 320
+
 # Capacity gate for the K/V-only teacher experiment. Learned per-artist oracle
 # codes remove visual encoding from the problem; success here is required
 # before attempting to distill the same effects from frozen visual tokens.
