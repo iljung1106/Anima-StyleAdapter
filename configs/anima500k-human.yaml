@@ -1156,7 +1156,7 @@ lora_functional_distillation_v2:
 # after that direct visual mapping has been established. No LoRA weight,
 # artist ID, retrieval index or mixture coefficient exists at inference.
 direct_reference_kv_distillation:
-  output_directory: direct_reference_kv_distillation_v2_fresh_joint_teacher
+  output_directory: direct_reference_kv_distillation_v2b_fresh_joint_teacher
   seed: 20260824
   lora_directory: artist_lora_teachers_rank16_256_b2_v5
   initial_checkpoint: null
@@ -1238,8 +1238,8 @@ direct_reference_kv_distillation:
     wandb:
       enabled: true
       project: anima-style-adapter
-      name: direct-reference-kv-distillation-v2-fresh-joint-teacher
-      id: direct-reference-kv-distillation-v2-fresh-joint-teacher
+      name: direct-reference-kv-distillation-v2b-fresh-joint-teacher
+      id: direct-reference-kv-distillation-v2b-fresh-joint-teacher
 
 
 # Direct image-distribution representability test.  The eight LoRA-generated
