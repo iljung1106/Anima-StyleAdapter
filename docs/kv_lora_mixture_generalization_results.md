@@ -75,6 +75,26 @@ averaging stabilizes the Reader code enough that the affine mixture improves
 the final latent effect.  The rank-64 compressed route also uses half the live
 rank of exact kNN-8 (rank 128).
 
+Seven unrelated raw reference files were then encoded through the exact cached
+C-RADIO → Qwen VAE → frozen Resampler → Reader path.  Their retrieved kNN sets
+were genuinely different (45 unique LoRAs among 56 selections, mean pairwise
+Jaccard 0.043), yet the final effects still shared a large component:
+
+| Common-LoRA scale | Effect RMS | Common-output ratio | Centered/effect | Pairwise effect cosine |
+|---:|---:|---:|---:|---:|
+| 1.00 | 0.335 | 0.800 | 0.622 | 0.561 |
+| 0.50 | 0.291 | 0.765 | 0.645 | 0.518 |
+| 0.25 | 0.272 | 0.797 | 0.611 | 0.563 |
+| 0.00 | 0.247 | **0.745** | **0.699** | **0.442** |
+
+Removing the compressed dictionary mean improves diversity but does not solve
+style matching: individual teacher LoRAs themselves contain correlated effects,
+and the current random 320-artist basis does not cover arbitrary raw references
+well enough.  The next expansion therefore uses four-reference Reader-code
+cosine k-center over all 2,185 eligible artists, while reusing the existing 320
+weights exactly.  This tests added *coverage*, rather than adding more redundant
+random teachers or more mixtures inside the same span.
+
 ## Decision
 
 Use a count-aware production path:

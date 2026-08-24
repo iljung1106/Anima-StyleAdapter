@@ -84,6 +84,8 @@ def build_parser() -> argparse.ArgumentParser:
         ("artist-kv-lora-plan", "Select the K/V-only LoRA pilot artists"),
         ("artist-kv-lora-smoke", "Smoke-test a K/V-only artist LoRA"),
         ("artist-kv-lora-train", "Train K/V-only artist LoRA teachers"),
+        ("artist-kv-lora-diverse-plan", "Select a Reader-diverse K/V-LoRA expansion"),
+        ("artist-kv-lora-diverse-train", "Train the Reader-diverse K/V-LoRA expansion"),
         ("lora-reference-generate", "Generate image references from the 64 LoRA teachers"),
         ("kv-lora-reference-generate", "Generate references from K/V-only LoRAs"),
         ("lora-reference-token-cache", "Cache frozen Resampler tokens for LoRA images"),
@@ -427,17 +429,25 @@ def main() -> None:
         "artist-kv-lora-plan",
         "artist-kv-lora-smoke",
         "artist-kv-lora-train",
+        "artist-kv-lora-diverse-plan",
+        "artist-kv-lora-diverse-train",
     }:
         from .artist_lora_teachers import (
             prepare_artist_kv_lora_teachers,
             smoke_test_artist_kv_lora_teachers,
             train_artist_kv_lora_teachers,
         )
+        from .kv_lora_diverse_expansion import (
+            prepare_diverse_kv_lora_expansion,
+            train_diverse_kv_lora_expansion,
+        )
 
         stage = {
             "artist-kv-lora-plan": prepare_artist_kv_lora_teachers,
             "artist-kv-lora-smoke": smoke_test_artist_kv_lora_teachers,
             "artist-kv-lora-train": train_artist_kv_lora_teachers,
+            "artist-kv-lora-diverse-plan": prepare_diverse_kv_lora_expansion,
+            "artist-kv-lora-diverse-train": train_diverse_kv_lora_expansion,
         }[args.command]
         _run(stage, config, destination)
     elif args.command in {
