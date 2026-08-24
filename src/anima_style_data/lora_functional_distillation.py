@@ -93,6 +93,34 @@ def teacher_category_v2(
     ]
 
 
+_TEACHER_CATEGORIES = frozenset(("artist_tag", "lora_single", "lora_mixture"))
+
+
+def scheduled_teacher_category(
+    step: int,
+    *,
+    single_only_steps: int,
+    schedule: tuple[str, ...] | list[str],
+) -> str:
+    """Bootstrap on individual teachers, then follow an explicit schedule.
+
+    A direct reference-to-K/V run can therefore forbid mixed-LoRA teachers
+    while retaining individual LoRA effects as offline supervision.  This
+    schedule is never part of inference; the trained adapter only receives
+    visual reference tokens.
+    """
+
+    normalized = tuple(str(value) for value in schedule)
+    if not normalized:
+        raise ValueError("teacher_schedule must contain at least one category")
+    invalid = set(normalized) - _TEACHER_CATEGORIES
+    if invalid:
+        raise ValueError(f"Unsupported teacher categories: {sorted(invalid)}")
+    if step <= int(single_only_steps):
+        return "lora_single"
+    return normalized[(step - int(single_only_steps) - 1) % len(normalized)]
+
+
 def build_mixture_specs(
     artists: int,
     *,
@@ -1085,10 +1113,33 @@ def _lora_teacher_step(
     rng = random.Random(int(training.get("seed", 20260823)) + update * 1_000_003)
     indices = rng.sample(candidates, batch_rows)
     rows = [bank.mixtures[index] for index in indices]
+    reference_counts = tuple(
+        int(value)
+        for value in training.get(
+            "reference_counts", [training.get("references_per_component", 1)]
+        )
+    )
+    if not reference_counts or any(value <= 0 for value in reference_counts):
+        raise ValueError("reference_counts must contain positive integers")
+    count_weights = tuple(
+        float(value)
+        for value in training.get(
+            "reference_count_weights", [1.0] * len(reference_counts)
+        )
+    )
+    if (
+        len(count_weights) != len(reference_counts)
+        or any(value < 0 for value in count_weights)
+        or sum(count_weights) <= 0
+    ):
+        raise ValueError("reference_count_weights must match reference_counts")
+    references_per_component = rng.choices(
+        reference_counts, weights=count_weights, k=1
+    )[0]
     references, mask, reference_weights = _pack_mixture_references(
         loader,
         rows,
-        references_per_component=int(training.get("references_per_component", 1)),
+        references_per_component=references_per_component,
         seed=int(training.get("seed", 20260823)) ^ (update * 7919),
         device=device,
     )
@@ -1169,7 +1220,13 @@ def train_lora_functional_distillation(
     adapter.load_state_dict(initial["adapter"], strict=True)
     adapter.restore_timestep_strength_state()
     adapter.set_bootstrap_phase("combined")
+    teacher_schedule = tuple(
+        str(value) for value in training.get("teacher_schedule", ())
+    )
     freeze_common = bool(training.get("freeze_common", False))
+    freeze_reader = bool(training.get("freeze_reader", False))
+    reader.requires_grad_(not freeze_reader)
+    reader.train(not freeze_reader)
     for parameter in adapter.common_parameters():
         parameter.requires_grad_(not freeze_common)
 
@@ -1212,11 +1269,16 @@ def train_lora_functional_distillation(
     )
 
     groups = [
-        {"params": list(reader.parameters()), "lr": float(training.get("reader_learning_rate", 2e-5)), "name": "reader"},
         {"params": adapter.shared_parameters(), "lr": float(training.get("shared_learning_rate", 1e-4)), "name": "shared_kv"},
         {"params": adapter.delta_parameters(), "lr": float(training.get("delta_learning_rate", 2e-4)), "name": "block_delta"},
         {"params": adapter.mixing_parameters(), "lr": float(training.get("mix_learning_rate", 4e-5)), "name": "base_mix", "weight_decay": 0.0},
     ]
+    if not freeze_reader:
+        groups.insert(0, {
+            "params": list(reader.parameters()),
+            "lr": float(training.get("reader_learning_rate", 2e-5)),
+            "name": "reader",
+        })
     if not freeze_common:
         groups.insert(1, {
             "params": adapter.common_parameters(),
@@ -1282,15 +1344,22 @@ def train_lora_functional_distillation(
             for group in optimizer.param_groups:
                 group["lr"] = base_lrs[str(group["name"])] * lr_scale
             optimizer.zero_grad(set_to_none=True)
-            category = (
-                teacher_category_v2(
+            if teacher_schedule:
+                category = scheduled_teacher_category(
                     step,
                     single_only_steps=single_only,
-                    artist_intro_steps=artist_intro,
+                    schedule=teacher_schedule,
                 )
-                if curriculum == "artist_centered_v2"
-                else teacher_category(step, single_only_steps=single_only)
-            )
+            else:
+                category = (
+                    teacher_category_v2(
+                        step,
+                        single_only_steps=single_only,
+                        artist_intro_steps=artist_intro,
+                    )
+                    if curriculum == "artist_centered_v2"
+                    else teacher_category(step, single_only_steps=single_only)
+                )
             updates[category] += 1
             if category == "artist_tag":
                 native_training = {
@@ -1381,10 +1450,15 @@ def train_lora_functional_distillation(
         "start_step": start_step,
         "updates": dict(updates),
         "elapsed_s": time.perf_counter() - started,
-        "teacher_ratio_after_bootstrap": "1:1:1",
+        "teacher_schedule_after_bootstrap": list(teacher_schedule) or "legacy",
         "lora_reference_domains": "human:synthetic=1:1",
         "curriculum": curriculum,
         "common_frozen": freeze_common,
+        "reader_frozen": freeze_reader,
+        "inference_contract": (
+            "reference_tokens -> Reader -> per-block style K/V; "
+            "no LoRA dictionary, retrieval, artist ID, or runtime LoRA mixture"
+        ),
     }
     write_json(output / "summary.json", summary)
     return summary
@@ -1435,4 +1509,39 @@ def smoke_test_lora_functional_distillation_v2(
         destination,
         steps_override=3,
         config_key="lora_functional_distillation_v2",
+    )
+
+
+def train_direct_reference_kv_distillation(
+    config: dict[str, Any], destination: Path
+) -> dict[str, Any]:
+    """Train a reference-only direct K/V adapter from functional teachers."""
+
+    return train_lora_functional_distillation(
+        config,
+        destination,
+        config_key="direct_reference_kv_distillation",
+    )
+
+
+def smoke_test_direct_reference_kv_distillation(
+    config: dict[str, Any], destination: Path
+) -> dict[str, Any]:
+    effective = copy.deepcopy(config)
+    cfg = effective["direct_reference_kv_distillation"]
+    cfg["output_directory"] = str(
+        Path(cfg["output_directory"]).with_name(
+            "direct_reference_kv_distillation_smoke"
+        )
+    )
+    cfg["training"]["wandb"]["enabled"] = False
+    cfg["training"]["resume"] = False
+    cfg["training"]["checkpoint_every"] = 1
+    cfg["training"]["sample_every"] = 0
+    cfg["training"]["single_only_steps"] = 1
+    return train_lora_functional_distillation(
+        effective,
+        destination,
+        steps_override=2,
+        config_key="direct_reference_kv_distillation",
     )

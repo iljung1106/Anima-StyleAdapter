@@ -97,15 +97,11 @@ random teachers or more mixtures inside the same span.
 
 ## Decision
 
-Use a count-aware production path:
-
-- One reference: raw Reader cosine over the stable original dictionary, exact
-  convex kNN-8, rank 128, calibrated gain 1.0.
-- Two or more references: full-dictionary affine signed ridge-32, compressed
-  to rank 64, calibrated gain 1.5.
-- Keep the frozen Reader, LoRA factor dictionary and compressed affine common;
-  transfer only selected factors to the GPU when references change.
-- Do not use the failed learned selector or direct bilinear factor hypernetwork.
+This retrieval experiment is retained for analysis only and is rejected as a
+production inference path. Production must generate per-block Style K/V from
+the supplied references without loading, retrieving or combining a LoRA
+dictionary. Individual and weighted LoRA effects may still be used as offline
+functional teachers for that direct generator.
 
 Multi-artist weighted sums contain useful generalization information in a
 precise but limited sense.  They densely sample combinations inside the

@@ -6,6 +6,7 @@ from anima_style_data.lora_functional_distillation import (
     _teacher_decomposed_functional_objective,
     build_mixture_specs,
     decompose_teacher_effects,
+    scheduled_teacher_category,
     teacher_category,
     teacher_category_v2,
 )
@@ -51,6 +52,26 @@ def test_v2_teacher_schedule_delays_mixtures_until_artist_intro_finishes():
         "lora_single",
         "artist_tag",
         "lora_single",
+        "artist_tag",
+        "lora_single",
+        "lora_mixture",
+    ]
+
+
+def test_direct_kv_teacher_schedule_keeps_mixtures_as_offline_supervision():
+    assert [
+        scheduled_teacher_category(
+            step,
+            single_only_steps=2,
+            schedule=("artist_tag", "lora_single", "lora_mixture"),
+        )
+        for step in range(1, 9)
+    ] == [
+        "lora_single",
+        "lora_single",
+        "artist_tag",
+        "lora_single",
+        "lora_mixture",
         "artist_tag",
         "lora_single",
         "lora_mixture",

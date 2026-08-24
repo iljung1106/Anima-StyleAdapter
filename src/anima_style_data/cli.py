@@ -119,6 +119,8 @@ def build_parser() -> argparse.ArgumentParser:
         ("lora-functional-distill-train", "Distill artist-tag, LoRA and mixed-LoRA teachers"),
         ("lora-functional-distill-v2-smoke", "Smoke-test artist-centered LoRA distillation"),
         ("lora-functional-distill-v2-train", "Train artist-centered LoRA distillation"),
+        ("direct-reference-kv-smoke", "Smoke-test direct reference-to-K/V distillation"),
+        ("direct-reference-kv-train", "Train reference-conditioned per-block K/V directly"),
         ("lora-image-flow-cache", "Cache LoRA-generated x0 latents and text contexts"),
         ("lora-image-flow-oracle-smoke", "Smoke-test direct LoRA image-flow oracle"),
         ("lora-image-flow-oracle-train", "Train direct LoRA image-flow oracle"),
@@ -457,12 +459,16 @@ def main() -> None:
         "lora-functional-distill-train",
         "lora-functional-distill-v2-smoke",
         "lora-functional-distill-v2-train",
+        "direct-reference-kv-smoke",
+        "direct-reference-kv-train",
     }:
         from .lora_functional_distillation import (
             cache_lora_functional_teacher,
             generate_lora_teacher_references,
             smoke_test_lora_functional_distillation,
             smoke_test_lora_functional_distillation_v2,
+            smoke_test_direct_reference_kv_distillation,
+            train_direct_reference_kv_distillation,
             train_lora_functional_distillation,
             train_lora_functional_distillation_v2,
         )
@@ -474,6 +480,8 @@ def main() -> None:
             "lora-functional-distill-train": train_lora_functional_distillation,
             "lora-functional-distill-v2-smoke": smoke_test_lora_functional_distillation_v2,
             "lora-functional-distill-v2-train": train_lora_functional_distillation_v2,
+            "direct-reference-kv-smoke": smoke_test_direct_reference_kv_distillation,
+            "direct-reference-kv-train": train_direct_reference_kv_distillation,
         }[args.command]
         _run(stage, config, destination)
     elif args.command in {
