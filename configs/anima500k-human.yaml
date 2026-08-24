@@ -682,6 +682,124 @@ kv_lora_functional_teacher:
     triple_mixtures: 0
     shard_mixtures: 4
 
+# Reference-only K/V Activation Generator pilot.  The lightweight Teacher
+# manifest measures exact native text K/V deltas and never builds a full-DiT
+# flow cache. Materialized pair/triple/amplified/signed images make the target
+# mixture identifiable without exposing coefficients to the student.
+kv_activation_mixture_teacher:
+  lora_directory: artist_kv_lora_teachers_rank16_64_b2_v1
+  blocks: 28
+  network_selection:
+    exclude_patterns: [".*"]
+    include_patterns: ["blocks\\.\\d+\\.cross_attn\\.(k_proj|v_proj)"]
+    required_module_patterns: ["blocks\\.\\d+\\.cross_attn\\.(k_proj|v_proj)"]
+    expected_module_count: 56
+  teacher_cache:
+    output_directory: kv_activation_mixture_specs_rank16_64_v1
+    text_context_cache: kv_lora_functional_teacher_bank_rank16_64_v2_broad256x4
+    device: cuda
+    seed: 20260824
+    pair_mixtures: 64
+    triple_mixtures: 64
+    amplified_mixtures: 64
+    signed_mixtures: 64
+    amplified_sum_range: [1.0, 1.5]
+    signed_beta_range: [0.05, 0.5]
+    stable_activation_ratio_range: [0.2, 1.5]
+    probe_contexts: 8
+    probe_tokens: 64
+    probe_channels: 256
+    probe_blocks: [0, 4, 8, 12, 16, 20, 24, 27]
+
+kv_activation_mixture_references:
+  output_directory: kv_activation_mixture_references_rank16_256x4_v1
+  functional_config_key: kv_activation_mixture_teacher
+  content_context_cache: kv_lora_functional_teacher_bank_rank16_64_v2_broad256x4
+  negative_conditioning_file: synthetic_teacher_500x16/text/negative.safetensors
+  random_content_per_mixture: true
+  content_seed: 20260824
+  kinds: [pair, triple, amplified, signed]
+  seed: 20260824
+  image_id_base: 34000000000
+  images_per_mixture: 4
+  width: 512
+  height: 512
+  steps: 20
+  flow_shift: 3.0
+  text_cfg: 4.0
+  device: cuda
+  attention_mode: torch
+  webp_quality: 95
+  dual_query_token_cache:
+    output_directory: dual_query_reference_tokens_v8_step10000
+    resampler_checkpoint: dual_query_resampler_bprime_v8/checkpoints/step-010000.pt
+    device: cuda
+    batch_size: 32
+    shard_rows: 512
+    reader_workers: 16
+    prefetch_batches: 8
+    writer_workers: 2
+    pending_writes: 2
+    latent_lru_shards: 4
+    amp_dtype: bfloat16
+    semantic_dim: 1536
+    vae_channels: 16
+    preprocess:
+      max_side: 512
+      max_pixels: 262144
+
+kv_reference_activation_generator:
+  output_directory: kv_reference_activation_generator_rank16_64_v1
+  seed: 20260824
+  blocks: 28
+  lora_directory: artist_kv_lora_teachers_rank16_64_b2_v1
+  reader_checkpoint: kv_lora_oracle_bootstrap_v3_64_broad256x4/checkpoints/step-0001750.pt
+  human_reference_cache: dual_query_reference_tokens_v8_step10000
+  synthetic_reference_cache: kv_lora_teacher_references_rank16_64x8_v1/dual_query_reference_tokens_v8_step10000
+  mixture_reference_cache: kv_activation_mixture_references_rank16_256x4_v1/dual_query_reference_tokens_v8_step10000
+  mixture_manifest: kv_activation_mixture_specs_rank16_64_v1/mixtures.parquet
+  text_context_cache: kv_lora_functional_teacher_bank_rank16_64_v2_broad256x4
+  model:
+    hidden_dim: 256
+    heads: 8
+    ff_dim: 1024
+    output_init_scale: 0.02
+  training:
+    device: cuda
+    steps: 3000
+    batch_size: 8
+    blocks_per_step: 4
+    single_reference_images: 8
+    mixture_reference_images: 4
+    materialization_style_chunk: 16
+    token_lru_shards: 8
+    # single 25%, normalized-positive 25%, amplified 25%, signed 25%.
+    category_weights: [0.25, 0.1875, 0.0625, 0.25, 0.25]
+    heldout_contexts: 32
+    validation_tokens: 64
+    learning_rate: 0.0002
+    warmup_steps: 100
+    betas: [0.9, 0.95]
+    adam_eps: 0.00000001
+    weight_decay: 0.01
+    max_grad_norm: 1.0
+    direction_weight: 0.2
+    magnitude_weight: 0.05
+    attention_start_step: 1000
+    attention_ramp_steps: 500
+    attention_weight: 0.3
+    attention_queries: 32
+    fused_adamw: true
+    log_every: 10
+    validation_every: 250
+    checkpoint_every: 250
+    resume: true
+    wandb:
+      enabled: true
+      project: anima-style-adapter
+      name: kv-reference-activation-generator-r16-64-v1
+      id: kv-reference-activation-generator-r16-64-v1
+
 # Capacity gate for the K/V-only teacher experiment. Learned per-artist oracle
 # codes remove visual encoding from the problem; success here is required
 # before attempting to distill the same effects from frozen visual tokens.

@@ -512,7 +512,7 @@ def _generate_fewshot_reference_sweep(
     sheet.paste(_fewshot_label_cell(size, ["FROZEN ANIMA", "NO STYLE"]), (0, height))
     for row_index, count in enumerate(counts, start=2):
         sheet.paste(
-            _fewshot_label_cell(size, [f"STYLE ADAPTER", f"{count} reference(s)"]),
+            _fewshot_label_cell(size, ["STYLE ADAPTER", f"{count} reference(s)"]),
             (0, row_index * height),
         )
     for artist_index, (style_id, artist_paths) in enumerate(
@@ -1083,13 +1083,29 @@ def generate_lora_mixture_references(
     lora_root = destination / str(functional_cfg["lora_directory"])
     plans = _load_lora_plan(lora_root)
     weight_paths = _weight_paths(lora_root, plans)
-    source = destination / str(cfg["content_source_directory"])
-    content_rows, conditions, negative = _load_content_conditions(source)
+    context_cache = cfg.get("content_context_cache")
+    if context_cache:
+        context_root = destination / str(context_cache)
+        content_rows = read_records(context_root / "content_manifest.parquet")
+        conditions = load_file(
+            context_root / "base.safetensors", device="cpu"
+        )["base_context"]
+        if len(content_rows) != len(conditions):
+            raise RuntimeError(
+                "Mixture caption manifest and cached text contexts disagree"
+            )
+        negative_path = destination / str(cfg["negative_conditioning_file"])
+        negative = load_file(negative_path, device="cpu")["conditioning"]
+    else:
+        source = destination / str(cfg["content_source_directory"])
+        content_rows, conditions, negative = _load_content_conditions(source)
     images_per_mixture = int(cfg.get("images_per_mixture", 4))
     if len(content_rows) < images_per_mixture:
         raise RuntimeError("The source text bank has too few mixture prompts")
-    content_rows = content_rows[:images_per_mixture]
-    conditions = conditions[:images_per_mixture]
+    random_content = bool(cfg.get("random_content_per_mixture", False))
+    if not random_content:
+        content_rows = content_rows[:images_per_mixture]
+        conditions = conditions[:images_per_mixture]
     width, height = int(cfg.get("width", 512)), int(cfg.get("height", 512))
     device = str(cfg.get("device", "cuda"))
     anima = _resolve_anima_model(config, destination, device).requires_grad_(False).eval()
@@ -1113,7 +1129,6 @@ def generate_lora_mixture_references(
     sigmas = torch.linspace(1.0, 0.0, steps + 1, device=device, dtype=torch.float32)
     sigmas = sigmas * shift / (1 + (shift - 1) * sigmas)
     text_cfg = float(cfg.get("text_cfg", 4.0))
-    positive = conditions.to(device=device, dtype=torch.bfloat16)
     negative = negative.to(device=device, dtype=torch.bfloat16).expand(
         images_per_mixture, -1, -1
     )
@@ -1134,6 +1149,24 @@ def generate_lora_mixture_references(
                 network.set_multiplier(float(row["weights"][slot]))
             else:
                 network.set_multiplier(0.0)
+        if random_content:
+            content_rng = random.Random(
+                int(cfg.get("content_seed", cfg.get("seed", 20260824)))
+                + mixture_index * 1_000_003
+            )
+            selected_content_indices = content_rng.sample(
+                range(len(content_rows)), images_per_mixture
+            )
+            selected_content_rows = [
+                content_rows[index] for index in selected_content_indices
+            ]
+            positive = conditions[selected_content_indices].to(
+                device=device, dtype=torch.bfloat16
+            )
+        else:
+            selected_content_indices = list(range(images_per_mixture))
+            selected_content_rows = content_rows
+            positive = conditions.to(device=device, dtype=torch.bfloat16)
         seeds = [
             int(cfg.get("seed", 20260824))
             + mixture_index * 100_003
@@ -1176,8 +1209,14 @@ def generate_lora_mixture_references(
         mixture_dir = output / "images" / style_id
         mixture_dir.mkdir(exist_ok=True)
         rows = []
-        for content_index, (image, source_row, seed) in enumerate(
-            zip(images, content_rows, seeds, strict=True)
+        for content_index, (image, source_index, source_row, seed) in enumerate(
+            zip(
+                images,
+                selected_content_indices,
+                selected_content_rows,
+                seeds,
+                strict=True,
+            )
         ):
             image_path = mixture_dir / f"content-{content_index:02d}.webp"
             image.save(
@@ -1197,8 +1236,13 @@ def generate_lora_mixture_references(
                 "split": "train",
                 "content_index": content_index,
                 "generation_seed": seed,
-                "content_prompt": str(source_row["prompt"]),
-                "artist_prompt": str(source_row["prompt"]),
+                "source_content_index": int(source_index),
+                "content_prompt": str(
+                    source_row.get("prompt", source_row.get("caption", ""))
+                ),
+                "artist_prompt": str(
+                    source_row.get("prompt", source_row.get("caption", ""))
+                ),
                 "artist_tag": "",
                 "components": list(row["components"]),
                 "weights": list(row["weights"]),
@@ -1233,6 +1277,8 @@ def generate_lora_mixture_references(
             for kind in sorted({str(row["kind"]) for row in mixture_rows})
         },
         "functional_teacher_cache": str(teacher_root),
+        "content_pool_size": len(content_rows),
+        "random_content_per_mixture": random_content,
         "inference_coefficients_exposed_to_student": False,
         "elapsed_s": time.perf_counter() - started,
     }
@@ -1675,6 +1721,14 @@ def generate_kv_lora_teacher_references(
 ) -> dict[str, Any]:
     return generate_lora_teacher_references(
         config, destination, config_key="kv_lora_teacher_references"
+    )
+
+
+def generate_kv_activation_mixture_references(
+    config: dict[str, Any], destination: Path
+) -> dict[str, Any]:
+    return generate_lora_mixture_references(
+        config, destination, config_key="kv_activation_mixture_references"
     )
 
 

@@ -100,10 +100,13 @@ def build_parser() -> argparse.ArgumentParser:
         ("lora-functional-teacher-cache-512", "Cache 512-artist single and mixed LoRA effects"),
         ("lora-mixture-reference-generate", "Generate actual merged-LoRA reference images"),
         ("kv-lora-reference-generate", "Generate references from K/V-only LoRAs"),
+        ("kv-activation-mixture-prepare", "Prepare stable signed/amplified K/V mixtures"),
+        ("kv-activation-mixture-reference-generate", "Generate materialized K/V mixture references"),
         ("lora-reference-token-cache", "Cache frozen Resampler tokens for LoRA images"),
         ("lora-reference-expansion-token-cache", "Cache Resampler tokens for added LoRA images"),
         ("lora-mixture-reference-token-cache", "Cache Resampler tokens for merged-LoRA images"),
         ("kv-lora-reference-token-cache", "Cache Resampler tokens for K/V-only LoRA images"),
+        ("kv-activation-mixture-reference-token-cache", "Cache Resampler tokens for K/V mixture images"),
         ("lora-functional-teacher-cache", "Cache single and mixed LoRA functional effects"),
         ("kv-lora-functional-teacher-cache", "Cache K/V-only LoRA effects"),
         ("kv-lora-fixed-teacher-compare", "Compare K/V LoRAs on one prompt and seed"),
@@ -111,6 +114,8 @@ def build_parser() -> argparse.ArgumentParser:
         ("kv-lora-oracle-bootstrap-train", "Train K/V-only LoRA oracle capacity"),
         ("kv-activation-modulator-smoke", "Smoke-test direct native text K/V modulation"),
         ("kv-activation-modulator-train", "Distill K/V-only LoRAs into native text K/V deltas"),
+        ("kv-reference-activation-smoke", "Smoke-test reference-conditioned K/V activation generation"),
+        ("kv-reference-activation-train", "Train reference-conditioned K/V activation generation"),
         ("kv-activation-modulator-sample", "Compare native K/V LoRA teachers with predicted K/V deltas"),
         ("kv-activation-reference-eval", "Evaluate fresh Human and Synthetic reference codes"),
         ("kv-activation-visual-projector-smoke", "Smoke-test fresh-reference projection into K/V anchor space"),
@@ -546,17 +551,20 @@ def main() -> None:
         _run(stage, config, destination)
     elif args.command in {
         "kv-lora-reference-generate",
+        "kv-activation-mixture-reference-generate",
         "kv-lora-functional-teacher-cache",
         "kv-lora-fixed-teacher-compare",
     }:
         from .lora_functional_distillation import (
             cache_kv_lora_functional_teacher,
             compare_kv_lora_fixed_prompt,
+            generate_kv_activation_mixture_references,
             generate_kv_lora_teacher_references,
         )
 
         stage = {
             "kv-lora-reference-generate": generate_kv_lora_teacher_references,
+            "kv-activation-mixture-reference-generate": generate_kv_activation_mixture_references,
             "kv-lora-functional-teacher-cache": cache_kv_lora_functional_teacher,
             "kv-lora-fixed-teacher-compare": compare_kv_lora_fixed_prompt,
         }[args.command]
@@ -607,9 +615,11 @@ def main() -> None:
         "lora-reference-expansion-token-cache",
         "lora-mixture-reference-token-cache",
         "kv-lora-reference-token-cache",
+        "kv-activation-mixture-reference-token-cache",
     }:
         from .synthetic_reference_pipeline import (
             cache_kv_lora_teacher_dual_query_tokens,
+            cache_kv_activation_mixture_dual_query_tokens,
             cache_lora_teacher_dual_query_tokens,
             cache_lora_teacher_expansion_dual_query_tokens,
             cache_lora_mixture_dual_query_tokens,
@@ -620,6 +630,7 @@ def main() -> None:
             "lora-reference-expansion-token-cache": cache_lora_teacher_expansion_dual_query_tokens,
             "lora-mixture-reference-token-cache": cache_lora_mixture_dual_query_tokens,
             "kv-lora-reference-token-cache": cache_kv_lora_teacher_dual_query_tokens,
+            "kv-activation-mixture-reference-token-cache": cache_kv_activation_mixture_dual_query_tokens,
         }[args.command]
         _run(stage, config, destination)
     elif args.command in {
@@ -639,6 +650,9 @@ def main() -> None:
     elif args.command in {
         "kv-activation-modulator-smoke",
         "kv-activation-modulator-train",
+        "kv-activation-mixture-prepare",
+        "kv-reference-activation-smoke",
+        "kv-reference-activation-train",
         "kv-activation-modulator-sample",
         "kv-activation-reference-eval",
         "kv-activation-visual-projector-smoke",
@@ -661,6 +675,11 @@ def main() -> None:
         from .kv_activation_modulation import (
             smoke_test_kv_activation_modulator,
             train_kv_activation_modulator,
+        )
+        from .kv_activation_generator import (
+            prepare_kv_activation_mixture_specs,
+            smoke_test_reference_conditioned_kv_activation_generator,
+            train_reference_conditioned_kv_activation_generator,
         )
         from .kv_activation_sampling import (
             evaluate_kv_activation_reference_generalization,
@@ -696,6 +715,9 @@ def main() -> None:
         stage = {
             "kv-activation-modulator-smoke": smoke_test_kv_activation_modulator,
             "kv-activation-modulator-train": train_kv_activation_modulator,
+            "kv-activation-mixture-prepare": prepare_kv_activation_mixture_specs,
+            "kv-reference-activation-smoke": smoke_test_reference_conditioned_kv_activation_generator,
+            "kv-reference-activation-train": train_reference_conditioned_kv_activation_generator,
             "kv-activation-modulator-sample": sample_kv_activation_modulator,
             "kv-activation-reference-eval": evaluate_kv_activation_reference_generalization,
             "kv-activation-visual-projector-smoke": smoke_test_kv_activation_visual_projector,

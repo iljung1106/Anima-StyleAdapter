@@ -441,6 +441,14 @@ def cache_lora_mixture_dual_query_tokens(
     )
 
 
+def cache_kv_activation_mixture_dual_query_tokens(
+    config: dict[str, Any], destination: Path
+) -> dict[str, Any]:
+    return _cache_synthetic_dual_query_tokens(
+        config, destination, config_key="kv_activation_mixture_references"
+    )
+
+
 def cache_kv_lora_teacher_dual_query_tokens(
     config: dict[str, Any], destination: Path
 ) -> dict[str, Any]:
