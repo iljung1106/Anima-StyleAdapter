@@ -7,7 +7,7 @@ from typing import Any
 
 import torch
 import torch.nn.functional as F
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageOps
 from safetensors.torch import load_file
 
 from .detail_style_cross_attention import DetailPreservingTypedSlotReader
@@ -361,11 +361,18 @@ def _save_panel(
     for row, artist in enumerate(artist_ids):
         y = row * (tile_height + label_height)
         for column, label in enumerate(labels):
-            image = images[label][row].resize(
-                (tile_width, tile_height), Image.Resampling.LANCZOS
+            image = ImageOps.contain(
+                images[label][row],
+                (tile_width, tile_height),
+                Image.Resampling.LANCZOS,
+            )
+            tile = Image.new("RGB", (tile_width, tile_height), "white")
+            tile.paste(
+                image,
+                ((tile_width - image.width) // 2, (tile_height - image.height) // 2),
             )
             x = column * tile_width
-            sheet.paste(image, (x, y + label_height))
+            sheet.paste(tile, (x, y + label_height))
             title = f"{artist} | {label}" if column == 0 else label
             draw.text((x + 6, y + 7), title, fill="black")
     path = output / "teacher-vs-predicted-overview.jpg"
@@ -384,6 +391,7 @@ def sample_kv_activation_modulator(
     batch_size = int(cfg.get("batch_size", 4))
     output = destination / str(cfg["output_directory"])
     output.mkdir(parents=True, exist_ok=True)
+    include_teacher = bool(cfg.get("include_teacher", True))
 
     prepared = load_dual_query_external_sample(config, destination)
     sample_cfg = dict(prepared["cfg"])
@@ -396,13 +404,22 @@ def sample_kv_activation_modulator(
     artist_ids, teacher_down, teacher_up, predicted_down, predicted_up = (
         _load_predicted_and_teacher_factors(cfg, destination, indices, device)
     )
-    prompt_metrics = _factor_prompt_metrics(
-        positive,
-        teacher_down,
-        teacher_up,
-        predicted_down,
-        predicted_up,
+    prompt_metrics = (
+        _factor_prompt_metrics(
+            positive,
+            teacher_down,
+            teacher_up,
+            predicted_down,
+            predicted_up,
+        )
+        if include_teacher
+        else {}
     )
+    display_labels = [
+        str(value) for value in cfg.get("artist_labels", artist_ids)
+    ]
+    if len(display_labels) != len(artist_ids):
+        raise ValueError("artist_labels must match the predicted factor rows")
 
     anima = _resolve_anima_model(config, destination, device).requires_grad_(False).eval()
     _optimize_frozen_anima(
@@ -431,6 +448,8 @@ def sample_kv_activation_modulator(
         down: torch.Tensor | None,
         up: torch.Tensor | None,
         strength: float,
+        anima_model: torch.nn.Module = anima,
+        factor_injector: NativeKVFactorInjector = injector,
     ) -> torch.Tensor:
         values = []
         row_count = 1 if down is None else int(down.shape[0])
@@ -438,15 +457,15 @@ def sample_kv_activation_modulator(
             stop = min(row_count, start + batch_size)
             rows = stop - start
             if down is None or up is None:
-                injector.disable()
+                factor_injector.disable()
             else:
-                injector.set_factors(
+                factor_injector.set_factors(
                     down[start:stop], up[start:stop], strength=strength
                 )
             with torch.autocast("cuda", dtype=torch.bfloat16):
                 values.append(
                     _sample_anima_batch(
-                        anima,
+                        anima_model,
                         base_noise.repeat(rows, 1, 1, 1, 1),
                         positive.expand(rows, -1, -1),
                         negative.expand(rows, -1, -1),
@@ -459,7 +478,11 @@ def sample_kv_activation_modulator(
         return torch.cat(values)
 
     baseline = denoise_rows(None, None, 0.0)
-    teacher = denoise_rows(teacher_down, teacher_up, 1.0)
+    teacher = (
+        denoise_rows(teacher_down, teacher_up, 1.0)
+        if include_teacher
+        else None
+    )
     predictions = {
         strength: denoise_rows(predicted_down, predicted_up, strength)
         for strength in strengths
@@ -472,11 +495,20 @@ def sample_kv_activation_modulator(
         device=device, dtype=torch.bfloat16
     )
     vae.requires_grad_(False).eval()
-    latent_groups = {"Frozen Anima": baseline.expand(len(artist_ids), -1, -1, -1, -1)}
-    latent_groups["Teacher LoRA 1.0x"] = teacher
+    latent_groups = {
+        "Frozen Anima": baseline.expand(len(artist_ids), -1, -1, -1, -1)
+    }
+    if teacher is not None:
+        latent_groups["Teacher LoRA 1.0x"] = teacher
     for strength, value in predictions.items():
         latent_groups[f"Predicted {strength:g}x"] = value
     images: dict[str, list[Image.Image]] = {}
+    if bool(cfg.get("include_reference_images", False)):
+        if len(prepared["paths"]) != len(artist_ids):
+            raise ValueError("External reference count must match factor rows")
+        images["Reference original"] = [
+            Image.open(path).convert("RGB") for path in prepared["paths"]
+        ]
     for label, latent in latent_groups.items():
         decoded = []
         for start in range(0, latent.shape[0], batch_size):
@@ -489,8 +521,8 @@ def sample_kv_activation_modulator(
                     )
                 )
         images[label] = decoded
-    labels = list(latent_groups)
-    for row, artist in enumerate(artist_ids):
+    labels = list(images)
+    for row, artist in enumerate(display_labels):
         artist_dir = output / f"{row:02d}-{_safe_name(artist)}"
         artist_dir.mkdir(exist_ok=True)
         for label in labels:
@@ -499,39 +531,56 @@ def sample_kv_activation_modulator(
             )
     panel = _save_panel(
         output,
-        artist_ids,
+        display_labels,
         images,
         labels,
         tile_width=int(cfg.get("panel_tile_width", 416)),
     )
 
     base = baseline.float().expand(len(artist_ids), -1, -1, -1, -1)
-    teacher_effect = (teacher.float() - base).flatten(1)
     latent_metrics = {}
-    for strength, value in predictions.items():
-        predicted_effect = (value.float() - base).flatten(1)
-        difference = (value.float() - teacher.float()).flatten(1)
-        teacher_distance = teacher_effect.square().mean(dim=1).sqrt()
-        latent_metrics[f"predicted_{strength:g}x"] = {
-            "effect_to_teacher_ratio": float(
-                (
-                    predicted_effect.square().mean(dim=1).sqrt()
-                    / teacher_distance.clamp_min(1e-8)
-                ).mean()
-            ),
-            "teacher_direction_cosine": float(
-                F.cosine_similarity(predicted_effect, teacher_effect, dim=1).mean()
-            ),
-            "paired_improvement": float(
-                (
-                    1
-                    - difference.square().mean(dim=1).sqrt()
-                    / teacher_distance.clamp_min(1e-8)
-                ).mean()
-            ),
-        }
+    if teacher is not None:
+        teacher_effect = (teacher.float() - base).flatten(1)
+        for strength, value in predictions.items():
+            predicted_effect = (value.float() - base).flatten(1)
+            difference = (value.float() - teacher.float()).flatten(1)
+            teacher_distance = teacher_effect.square().mean(dim=1).sqrt()
+            latent_metrics[f"predicted_{strength:g}x"] = {
+                "effect_to_teacher_ratio": float(
+                    (
+                        predicted_effect.square().mean(dim=1).sqrt()
+                        / teacher_distance.clamp_min(1e-8)
+                    ).mean()
+                ),
+                "teacher_direction_cosine": float(
+                    F.cosine_similarity(
+                        predicted_effect, teacher_effect, dim=1
+                    ).mean()
+                ),
+                "paired_improvement": float(
+                    (
+                        1
+                        - difference.square().mean(dim=1).sqrt()
+                        / teacher_distance.clamp_min(1e-8)
+                    ).mean()
+                ),
+            }
+    else:
+        for strength, value in predictions.items():
+            effect = (value.float() - base).flatten(1)
+            centered = effect - effect.mean(dim=0, keepdim=True)
+            latent_metrics[f"predicted_{strength:g}x"] = {
+                "effect_rms": float(effect.square().mean().sqrt()),
+                "artist_centered_effect_rms": float(
+                    centered.square().mean().sqrt()
+                ),
+                "artist_centered_to_total_ratio": float(
+                    centered.square().mean().sqrt()
+                    / effect.square().mean().sqrt().clamp_min(1e-8)
+                ),
+            }
     summary = {
-        "artists": artist_ids,
+        "artists": display_labels,
         "artist_indices": indices,
         "prompt": str(sample_cfg["prompt"]),
         "negative_prompt": str(sample_cfg["negative_prompt"]),

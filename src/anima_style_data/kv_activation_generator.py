@@ -1156,3 +1156,103 @@ def sample_reference_conditioned_bilinear_kv_operator(
     }
     write_json(output / "summary.json", summary)
     return summary
+
+
+@torch.no_grad()
+def sample_external_reference_bilinear_kv_operator(
+    config: dict[str, Any], destination: Path
+) -> dict[str, Any]:
+    """Render the established TestSample 1-7 external references."""
+
+    from .dual_query_external_samples import load_dual_query_external_sample
+    from .kv_activation_sampling import sample_kv_activation_modulator
+
+    sample_cfg = copy.deepcopy(config["kv_reference_bilinear_fixed_sample"])
+    device = str(sample_cfg.get("device", "cuda"))
+    checkpoint_path = destination / str(sample_cfg["checkpoint"])
+    checkpoint = torch.load(
+        checkpoint_path, map_location="cpu", weights_only=False
+    )
+    cfg = dict(checkpoint["config"])
+    model_cfg = dict(cfg["model"])
+    architecture = str(model_cfg.pop("architecture", ""))
+    if architecture != "bilinear_low_rank_operator":
+        raise RuntimeError(
+            f"Expected a bilinear operator checkpoint, got {architecture!r}"
+        )
+
+    prepared = load_dual_query_external_sample(config, destination)
+    references = prepared["reference_tokens"].to(
+        device=device, dtype=torch.bfloat16, non_blocking=True
+    )[:, None]
+    reference_mask = torch.ones(
+        references.shape[:2], device=device, dtype=torch.bool
+    )
+    reader = _load_reader(config, destination, cfg, device)
+    _, teacher_down, teacher_up = load_kv_lora_factor_bank(
+        destination / str(cfg["lora_directory"]),
+        blocks=int(cfg.get("blocks", 28)),
+        dtype=torch.float16,
+    )
+    operator = ReferenceConditionedLowRankKVOperator(
+        style_dim=int(reader.dim),
+        context_dim=int(teacher_down.shape[-1]),
+        output_dim=int(teacher_up.shape[-2]),
+        blocks=int(teacher_down.shape[1]),
+        **model_cfg,
+    ).to(device=device, dtype=torch.bfloat16)
+    operator.load_state_dict(checkpoint["model"], strict=True)
+    operator.requires_grad_(False).eval()
+    with torch.autocast("cuda", dtype=torch.bfloat16):
+        style_memory = reader(references, reference_mask).tokens
+        down_rows: list[torch.Tensor] = []
+        up_rows: list[torch.Tensor] = []
+        for block in range(operator.blocks):
+            down, up, sigma = operator._operator(style_memory, block)
+            down_rows.append(down)
+            up_rows.append(up.transpose(-1, -2) * sigma[:, :, None, :])
+    predicted_down = torch.stack(down_rows, dim=1).cpu()
+    predicted_up = torch.stack(up_rows, dim=1).cpu()
+
+    output = destination / str(sample_cfg["output_directory"])
+    output.mkdir(parents=True, exist_ok=True)
+    compatibility_path = output / "fixed-reference-operator.pt"
+    row_indices = list(range(len(prepared["paths"])))
+    torch.save(
+        {
+            "predicted_down": predicted_down,
+            "predicted_up": predicted_up,
+            "predicted_artist_indices": row_indices,
+            "config": {
+                "lora_directory": cfg["lora_directory"],
+                "blocks": int(cfg.get("blocks", 28)),
+            },
+        },
+        compatibility_path,
+    )
+    effective = copy.deepcopy(config)
+    labels = [f"TestSample {index + 1}" for index in row_indices]
+    effective["kv_activation_modulator_sample"] = {
+        **dict(effective["kv_activation_modulator_sample"]),
+        "checkpoint": str(compatibility_path.relative_to(destination)),
+        "output_directory": str(output.relative_to(destination)),
+        "device": device,
+        "artist_indices": row_indices,
+        "artist_labels": labels,
+        "predicted_strengths": [
+            float(value)
+            for value in sample_cfg.get("predicted_strengths", [1.0, 1.5])
+        ],
+        "batch_size": int(sample_cfg.get("batch_size", 4)),
+        "panel_tile_width": int(sample_cfg.get("panel_tile_width", 320)),
+        "include_teacher": False,
+        "include_reference_images": True,
+    }
+    rendered = sample_kv_activation_modulator(effective, destination)
+    rendered["checkpoint"] = str(checkpoint_path)
+    rendered["reference_paths"] = [str(path) for path in prepared["paths"]]
+    write_json(output / "summary.json", rendered)
+    del operator, reader, checkpoint, teacher_down, teacher_up
+    gc.collect()
+    torch.cuda.empty_cache()
+    return rendered
