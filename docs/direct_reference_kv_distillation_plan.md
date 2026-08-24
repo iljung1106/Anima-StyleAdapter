@@ -28,6 +28,9 @@ produce the effect through its own reference-conditioned K/V.
 
 - do not warm-start v34 or any prior Style Adapter;
 - load only the independently reconstruction-pretrained typed Reader;
+- initialize the fresh adapter's 28-block x 4-timestep alpha table from the
+  previously measured native/raw residual ratio, without loading any adapter
+  tensor; alpha=1 made the step-250 output 17.7x too large and pure noise;
 - freshly initialize and train Common K/V, shared Style K/V, block-local K/V
   deltas, block mixing and the artist-null residual;
 - give the isolated native Common objective a nonzero full weight; disabling

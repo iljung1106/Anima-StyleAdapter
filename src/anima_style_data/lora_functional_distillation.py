@@ -182,6 +182,41 @@ def decompose_teacher_effects(
     return common, effects - common
 
 
+def _initialize_fresh_adapter_strength(
+    adapter: SeparatedCommonArtistKVStyleCrossAttention,
+    cfg: dict[str, Any],
+    destination: Path,
+) -> str:
+    """Apply measured Anima block/timestep scale without loading model weights."""
+
+    profile_path = cfg.get("initial_strength_profile")
+    if not profile_path:
+        return "constructor_default"
+    payload = json.loads(
+        (destination / str(profile_path)).read_text(encoding="utf-8")
+    )
+    alpha = torch.tensor(
+        payload["teacher_to_centered_raw_ratio_by_timestep_bin"],
+        dtype=torch.float32,
+        device=adapter.alpha.device,
+    )
+    alpha.mul_(float(cfg.get("initial_strength_multiplier", 1.0)))
+    alpha.clamp_(
+        min=float(cfg.get("initial_strength_minimum", 1e-4)),
+        max=float(cfg.get("initial_strength_maximum", 1.0)),
+    )
+    adapter.configure_timestep_strength(
+        timestep_bin_edges=payload["timestep_bin_edges"],
+        alpha_by_timestep=alpha,
+        native_lower_by_timestep=torch.zeros_like(alpha),
+        native_upper_by_timestep=torch.full_like(alpha, float("inf")),
+    )
+    return (
+        f"profile:{profile_path}:median={float(alpha.median()):.6g}:"
+        f"min={float(alpha.min()):.6g}:max={float(alpha.max()):.6g}"
+    )
+
+
 def _load_lora_plan(root: Path) -> list[ArtistLoRAPlan]:
     payload = json.loads((root / "plan.json").read_text(encoding="utf-8"))
     return [ArtistLoRAPlan.from_dict(row) for row in payload["artists"]]
@@ -1235,6 +1270,7 @@ def train_lora_functional_distillation(
     initial_checkpoint = cfg.get("initial_checkpoint")
     reader_checkpoint = cfg.get("reader_checkpoint")
     initialization = "fresh_reader_and_adapter"
+    strength_initialization = "checkpoint_or_constructor_default"
     if initial_checkpoint:
         initial = torch.load(
             destination / str(initial_checkpoint),
@@ -1253,6 +1289,13 @@ def train_lora_functional_distillation(
         )
         reader.load_state_dict(reader_state.get("reader", reader_state), strict=True)
         initialization = f"pretrained_reader_fresh_adapter:{reader_checkpoint}"
+        strength_initialization = _initialize_fresh_adapter_strength(
+            adapter, cfg, destination
+        )
+    else:
+        strength_initialization = _initialize_fresh_adapter_strength(
+            adapter, cfg, destination
+        )
     adapter.set_bootstrap_phase("combined")
     teacher_schedule = tuple(
         str(value) for value in training.get("teacher_schedule", ())
@@ -1508,6 +1551,7 @@ def train_lora_functional_distillation(
         "common_frozen": freeze_common,
         "reader_frozen": freeze_reader,
         "initialization": initialization,
+        "strength_initialization": strength_initialization,
         "inference_contract": (
             "reference_tokens -> Reader -> per-block style K/V; "
             "no LoRA dictionary, retrieval, artist ID, or runtime LoRA mixture"

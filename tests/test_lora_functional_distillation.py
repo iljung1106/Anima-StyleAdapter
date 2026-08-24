@@ -1,14 +1,20 @@
+import json
+
 import torch
 from safetensors.torch import save_file
 
 from anima_style_data.lora_functional_distillation import (
     _cached_training_probe_bank,
+    _initialize_fresh_adapter_strength,
     _teacher_decomposed_functional_objective,
     build_mixture_specs,
     decompose_teacher_effects,
     scheduled_teacher_category,
     teacher_category,
     teacher_category_v2,
+)
+from anima_style_data.detail_style_cross_attention import (
+    SeparatedCommonArtistKVStyleCrossAttention,
 )
 from anima_style_data.io import write_records
 
@@ -97,6 +103,39 @@ def test_fresh_direct_kv_bootstrap_jointly_uses_lora_and_native_teachers():
         "lora_mixture",
         "artist_tag",
     ]
+
+
+def test_fresh_adapter_uses_measured_block_timestep_strength(tmp_path):
+    profile = {
+        "timestep_bin_edges": [0.0, 0.5, 1.0],
+        "teacher_to_centered_raw_ratio_by_timestep_bin": [
+            [0.02, 0.04],
+            [0.03, 0.06],
+        ],
+    }
+    path = tmp_path / "profile.json"
+    path.write_text(json.dumps(profile), encoding="utf-8")
+    adapter = SeparatedCommonArtistKVStyleCrossAttention(
+        context_dim=8,
+        blocks=2,
+        shared_bases=1,
+        medoid_blocks=[0],
+        block_to_base=[0, 0],
+        delta_rank=2,
+    )
+
+    summary = _initialize_fresh_adapter_strength(
+        adapter,
+        {"initial_strength_profile": "profile.json"},
+        tmp_path,
+    )
+
+    torch.testing.assert_close(
+        adapter.alpha_by_timestep,
+        torch.tensor([[0.02, 0.04], [0.03, 0.06]]),
+    )
+    assert adapter._timestep_strength_active
+    assert "median=" in summary
 
 
 def test_decomposed_objective_penalizes_common_output_collapse():
