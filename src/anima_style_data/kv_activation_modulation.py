@@ -117,6 +117,7 @@ def load_kv_lora_factor_bank(
     root: Path,
     *,
     blocks: int,
+    dtype: torch.dtype = torch.float32,
 ) -> tuple[list[str], torch.Tensor, torch.Tensor]:
     """Load K/V-only teacher factors as ``[artist, block, kind, ...]``.
 
@@ -139,7 +140,7 @@ def load_kv_lora_factor_bank(
             or up.shape[1] != blocks
         ):
             raise RuntimeError(f"Consolidated K/V factor bank shape is stale: {cache_path}")
-        return artist_ids, down.float(), up.float()
+        return artist_ids, down.to(dtype=dtype), up.to(dtype=dtype)
 
     paths = _weight_paths(root, plans)
     all_down: list[torch.Tensor] = []
@@ -191,7 +192,11 @@ def load_kv_lora_factor_bank(
         temporary,
     )
     temporary.replace(cache_path)
-    return artist_ids, down_bank, up_bank
+    return (
+        artist_ids,
+        down_bank.to(dtype=dtype),
+        up_bank.to(dtype=dtype),
+    )
 
 
 def apply_kv_factors(

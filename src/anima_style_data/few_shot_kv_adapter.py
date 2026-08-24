@@ -402,7 +402,7 @@ class RetrievalFewShotKVStyleAdapter(nn.Module):
             config["kv_activation_generalizing_modulator"].get("blocks", 28)
         )
         loaded_ids, teacher_down, teacher_up = load_kv_lora_factor_bank(
-            lora_root, blocks=blocks
+            lora_root, blocks=blocks, dtype=torch.float16
         )
         if loaded_ids != artist_ids:
             raise RuntimeError("Anchor cache and LoRA factor bank artist order disagree")
