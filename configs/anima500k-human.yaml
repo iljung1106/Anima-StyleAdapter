@@ -238,9 +238,10 @@ artist_lora_teachers:
 # MLP and the LLM adapter remain frozen. sd-scripts treats include_patterns as
 # an override rather than a whitelist, hence the explicit exclude-all rule.
 artist_kv_lora_teachers:
-  output_directory: artist_kv_lora_teachers_rank16_256_b2_v2
+  output_directory: artist_kv_lora_teachers_rank16_320_b2_v3
+  reuse_completed_prefix_directory: artist_kv_lora_teachers_rank16_256_b2_v2
   seed: 20260823
-  artist_count: 256
+  artist_count: 320
   images_per_artist: 30
   train_images_per_artist: 24
   validation_images_per_artist: 6
@@ -307,8 +308,8 @@ artist_kv_lora_teachers:
     wandb:
       enabled: true
       project: anima-style-adapter
-      name: artist-kv-lora-teachers-r16-256-b2
-      id: artist-kv-lora-teachers-r16-256-b2-v2
+      name: artist-kv-lora-teachers-r16-320-b2
+      id: artist-kv-lora-teachers-r16-320-b2-v3
   preview:
     enabled: true
     every_artists: 8

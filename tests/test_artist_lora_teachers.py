@@ -1,11 +1,16 @@
 from __future__ import annotations
 
+import json
+
 import pytest
 import torch
 
 from anima_style_data.artist_lora_teachers import (
+    ArtistLoRAPlan,
     _prompt_probabilities,
     _reset_lora_network,
+    _reuse_completed_prefix,
+    _safe_artist_filename,
     _selected_lora_modules,
     _serialize_lora_patterns,
     select_artist_lora_plans,
@@ -134,3 +139,35 @@ def test_kv_only_lora_selection_contract():
     )
     assert len(names) == 56
     assert _serialize_lora_patterns([pattern]) == repr([pattern])
+
+
+def test_teacher_bank_extension_reuses_only_an_exact_plan_prefix(tmp_path):
+    source = tmp_path / "source"
+    output = tmp_path / "expanded"
+    (source / "weights").mkdir(parents=True)
+    (source / "metrics").mkdir()
+    first = ArtistLoRAPlan(0, "style-a", "artist-a", (1, 2), (3,))
+    second = ArtistLoRAPlan(1, "style-b", "artist-b", (4, 5), (6,))
+    (source / "plan.json").write_text(
+        json.dumps({"signature": "old", "artists": [first.__dict__]}),
+        encoding="utf-8",
+    )
+    filename = _safe_artist_filename(first)
+    (source / "weights" / filename).write_bytes(b"teacher")
+    (source / "metrics" / "artist-000.json").write_text(
+        json.dumps({"index": 0, "weight_path": "old"}), encoding="utf-8"
+    )
+
+    reused = _reuse_completed_prefix(
+        tmp_path,
+        {"reuse_completed_prefix_directory": "source"},
+        output,
+        [first, second],
+    )
+
+    assert reused == 1
+    assert (output / "weights" / filename).read_bytes() == b"teacher"
+    metric = json.loads(
+        (output / "metrics" / "artist-000.json").read_text(encoding="utf-8")
+    )
+    assert metric["reused_from"] == str(source)

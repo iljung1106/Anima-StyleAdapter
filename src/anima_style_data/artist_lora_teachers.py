@@ -3,8 +3,10 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import os
 import random
 import re
+import shutil
 import time
 from collections import Counter, defaultdict
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -809,6 +811,64 @@ def _safe_artist_filename(plan: ArtistLoRAPlan) -> str:
     return f"artist-{plan.index:03d}-{digest}.safetensors"
 
 
+def _reuse_completed_prefix(
+    destination: Path,
+    cfg: dict[str, Any],
+    output: Path,
+    plans: list[ArtistLoRAPlan],
+) -> int:
+    """Reuse a verified prefix of an earlier teacher bank without retraining."""
+
+    source_value = cfg.get("reuse_completed_prefix_directory")
+    if not source_value:
+        return 0
+    source = destination / str(source_value)
+    _, source_plans = _load_plan(source)
+    if len(source_plans) > len(plans):
+        raise RuntimeError("Reusable teacher bank is larger than the new plan")
+    for source_plan, target_plan in zip(
+        source_plans, plans[: len(source_plans)], strict=True
+    ):
+        if source_plan != target_plan:
+            raise RuntimeError(
+                "Reusable teacher plan is not an exact prefix of the new plan: "
+                f"index {source_plan.index}"
+            )
+
+    weights_dir = output / "weights"
+    metrics_dir = output / "metrics"
+    weights_dir.mkdir(parents=True, exist_ok=True)
+    metrics_dir.mkdir(parents=True, exist_ok=True)
+    reused = 0
+    for plan in source_plans:
+        filename = _safe_artist_filename(plan)
+        source_weight = source / "weights" / filename
+        source_metric = source / "metrics" / f"artist-{plan.index:03d}.json"
+        if not source_weight.exists() or not source_metric.exists():
+            raise RuntimeError(
+                f"Reusable teacher {plan.index} is incomplete in {source}"
+            )
+        target_weight = weights_dir / filename
+        if not target_weight.exists():
+            try:
+                os.link(source_weight, target_weight)
+            except OSError:
+                shutil.copy2(source_weight, target_weight)
+        target_metric = metrics_dir / f"artist-{plan.index:03d}.json"
+        if not target_metric.exists():
+            metric = json.loads(source_metric.read_text(encoding="utf-8"))
+            metric["weight_path"] = str(target_weight)
+            metric["reused_from"] = str(source)
+            write_json(target_metric, metric)
+        reused += 1
+    write_json(output / "reused_prefix.json", {
+        "source": str(source),
+        "artists": reused,
+        "hardlink_preferred": True,
+    })
+    return reused
+
+
 def train_artist_lora_teachers(
     config: dict[str, Any],
     destination: Path,
@@ -829,6 +889,9 @@ def train_artist_lora_teachers(
     metrics_dir = output / "metrics"
     weights_dir.mkdir(parents=True, exist_ok=True)
     metrics_dir.mkdir(parents=True, exist_ok=True)
+    reused_prefix = _reuse_completed_prefix(
+        destination, cfg, output, plans
+    )
 
     torch.backends.cuda.matmul.allow_tf32 = bool(training.get("allow_tf32", True))
     torch.backends.cudnn.allow_tf32 = bool(training.get("allow_tf32", True))
@@ -1176,6 +1239,7 @@ def train_artist_lora_teachers(
     result = {
         "artists_completed": len(all_metrics),
         "artists_requested": len(plans),
+        "artists_reused": reused_prefix,
         "rank": rank,
         "alpha": alpha,
         "parameters": parameter_count,
