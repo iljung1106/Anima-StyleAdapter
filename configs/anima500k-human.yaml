@@ -1209,7 +1209,9 @@ direct_reference_kv_distillation:
     ram_resident_tokens: true
     native_global_weight: 0.25
     native_infonce_weight: 0.50
-    native_artist_mean_weight: 0.0
+    # This must be nonzero for a fresh Common branch. The v1 frozen-Common
+    # setting left the isolated native-common objective multiplied by zero.
+    native_common_weight: 1.0
     native_loss:
       artist_direction_weight: 1.0
       magnitude_weight: 0.10

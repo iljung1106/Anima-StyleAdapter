@@ -30,6 +30,8 @@ produce the effect through its own reference-conditioned K/V.
 - load only the independently reconstruction-pretrained typed Reader;
 - freshly initialize and train Common K/V, shared Style K/V, block-local K/V
   deltas, block mixing and the artist-null residual;
+- give the isolated native Common objective a nonzero full weight; disabling
+  it leaves the normalized random Common K/V output unable to calibrate itself;
 - alternate individual LoRA and native Anima artist teachers 1:1 for the first
   1,500 updates;
 - then cycle native artist, individual LoRA and weighted LoRA teachers 1:1:1;

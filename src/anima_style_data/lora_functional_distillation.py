@@ -1415,7 +1415,10 @@ def train_lora_functional_distillation(
                         "enabled": False,
                         "artist_mean_weight": (
                             0.0 if freeze_common else float(
-                                training.get("native_artist_mean_weight", 0.25)
+                                training.get(
+                                    "native_common_weight",
+                                    training.get("native_artist_mean_weight", 0.25),
+                                )
                             )
                         ),
                     },
