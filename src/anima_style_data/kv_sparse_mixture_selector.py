@@ -34,7 +34,6 @@ from .kv_activation_modulation import (
 from .kv_generalizing_modulator import (
     _stratified_view_indices,
     _teacher_image_split,
-    _view_probabilities,
 )
 from .lora_oracle_bootstrap import (
     _materialize_reader_code_bank,
@@ -83,16 +82,23 @@ class SparseLoRAMixtureSelector(nn.Module):
             raise ValueError("Query Reader-code shape does not match selector")
         if anchors.shape[1:] != (self.slots, self.style_dim):
             raise ValueError("Anchor Reader-code shape does not match selector")
-        anchor_flat = self.style_norm(anchors).flatten(1)
-        query_flat = self.style_norm(query).flatten(1)
+        # Preserve the exact Reader geometry used by the successful kNN
+        # baseline.  Per-slot LayerNorm removes absolute channel statistics
+        # that proved useful for visual style retrieval, so it belongs only
+        # to the learned correction branch.
+        anchor_flat = anchors.float().flatten(1)
+        query_flat = query.float().flatten(1)
         common = anchor_flat.mean(dim=0, keepdim=True)
         anchor_centered = anchor_flat - common
         query_centered = query_flat - common
         raw = F.normalize(query_centered.float(), dim=-1) @ F.normalize(
             anchor_centered.float(), dim=-1
         ).t()
-        projected_anchor = self.projection(anchor_centered)
-        projected_query = self.projection(query_centered)
+        learned_anchor = self.style_norm(anchors).flatten(1)
+        learned_query = self.style_norm(query).flatten(1)
+        learned_common = learned_anchor.mean(dim=0, keepdim=True)
+        projected_anchor = self.projection(learned_anchor - learned_common)
+        projected_query = self.projection(learned_query - learned_common)
         learned = F.normalize(projected_query.float(), dim=-1) @ F.normalize(
             projected_anchor.float(), dim=-1
         ).t()
@@ -167,7 +173,8 @@ def _save_state(
 @torch.no_grad()
 def _validate_selector(
     model: SparseLoRAMixtureSelector,
-    anchor_codes: torch.Tensor,
+    anchor_codes_by_count: torch.Tensor,
+    anchor_reference_counts: torch.Tensor,
     validation_codes: torch.Tensor,
     reference_counts: torch.Tensor,
     validation_indices: torch.Tensor,
@@ -200,9 +207,16 @@ def _validate_selector(
     train_up = teacher_up[train_indices].index_select(-2, output_indices)
     target_down = teacher_down[validation_indices]
     target_up = teacher_up[validation_indices].index_select(-2, output_indices)
-    anchors = anchor_codes[train_indices]
     for view in view_indices.tolist():
         reference_count = int(reference_counts[view])
+        count_position = torch.nonzero(
+            anchor_reference_counts == reference_count
+        ).flatten()
+        if count_position.numel() != 1:
+            raise RuntimeError(
+                f"Expected exactly one {reference_count}-reference anchor bank"
+            )
+        anchors = anchor_codes_by_count[int(count_position.item()), train_indices]
         query = validation_codes[validation_indices, view]
         with torch.autocast("cuda", dtype=torch.bfloat16):
             similarity, similarity_metrics = model.similarities(query, anchors)
@@ -355,10 +369,16 @@ def train_sparse_kv_lora_mixture_selector(
     torch.cuda.empty_cache()
     code_bank = code_bank.to(device=device, dtype=torch.bfloat16)
     validation_codes = validation_codes.to(device=device, dtype=torch.bfloat16)
-    anchor_codes = code_bank.mean(dim=1)
-    view_probabilities = _view_probabilities(
-        reference_counts, dict(training.get("reference_count_weights", {}))
+    anchor_reference_counts = reference_counts.unique(sorted=True)
+    anchor_codes_by_count = torch.stack([
+        code_bank[:, reference_counts == count].float().mean(dim=1)
+        for count in anchor_reference_counts
+    ]).to(code_bank.dtype)
+    count_weights = dict(training.get("reference_count_weights", {}))
+    count_probabilities = torch.tensor(
+        [float(count_weights.get(str(int(count)), 1.0)) for count in anchor_reference_counts]
     )
+    count_probabilities /= count_probabilities.sum()
 
     context_bank = load_file(
         destination / str(cfg["text_context_cache"]) / "base.safetensors",
@@ -433,6 +453,50 @@ def train_sparse_kv_lora_mixture_selector(
     checkpoint_every = int(training.get("checkpoint_every", 250))
     validation_history: list[dict[str, Any]] = []
 
+    # Record the untrained, almost-pure Reader kNN baseline in the exact same
+    # evaluator.  A learned metric is useful only if it improves this number.
+    if start_step == 0 and validation_every > 0:
+        initial_validation = _validate_selector(
+            model,
+            anchor_codes_by_count,
+            anchor_reference_counts,
+            validation_codes,
+            validation_counts,
+            validation_indices,
+            validation_contexts,
+            teacher_down,
+            teacher_up,
+            train_indices,
+            neighbors=validation_neighbors,
+            temperature=temperature,
+            views_per_count=int(training.get("validation_views", 2)),
+            tokens=int(training.get("validation_tokens", 64)),
+            output_channels=int(training.get("validation_output_channels", 256)),
+            direction_weight=direction_weight,
+            magnitude_weight=magnitude_weight,
+        )
+        validation_history.append({"step": 0, **initial_validation})
+        write_json(output / "validation_history.json", validation_history)
+        best_cosine = float(initial_validation["centered_cosine"])
+        best_step = 0
+        best_validation = dict(initial_validation)
+        _save_state(
+            output / "best.pt",
+            step=0,
+            model=model,
+            optimizer=optimizer,
+            cfg=cfg,
+            train_indices=train_list,
+            validation_indices=validation_list,
+            best_cosine=best_cosine,
+            best_step=best_step,
+            best_validation=best_validation,
+        )
+        print(
+            f"K/V sparse selector baseline step=0 {initial_validation}",
+            flush=True,
+        )
+
     wandb_run = None
     wandb_cfg = dict(training.get("wandb", {}))
     if bool(wandb_cfg.get("enabled", False)):
@@ -463,12 +527,18 @@ def train_sparse_kv_lora_mixture_selector(
                 len(train_list), generator=generator
             )[:needed].reshape(batch_artists, group_size).to(device)
             global_groups = train_indices[local_groups]
-            views = torch.multinomial(
-                view_probabilities,
-                needed,
-                replacement=True,
+            count_position = int(torch.multinomial(
+                count_probabilities, 1, generator=generator
+            ))
+            active_reference_count = anchor_reference_counts[count_position]
+            candidate_views = torch.nonzero(
+                reference_counts == active_reference_count
+            ).flatten().cpu()
+            views = candidate_views[torch.randint(
+                len(candidate_views),
+                (batch_artists, group_size),
                 generator=generator,
-            ).reshape(batch_artists, group_size).to(device)
+            )].to(device)
             if group_size == 1:
                 mixture_weights = torch.ones(batch_artists, 1, device=device)
             else:
@@ -504,7 +574,7 @@ def train_sparse_kv_lora_mixture_selector(
             optimizer.zero_grad(set_to_none=True)
             with torch.autocast("cuda", dtype=torch.bfloat16):
                 similarity, similarity_metrics = model.similarities(
-                    visual, anchor_codes[train_indices]
+                    visual, anchor_codes_by_count[count_position, train_indices]
                 )
             coefficients = sparse_mixture_coefficients(
                 similarity,
@@ -589,7 +659,7 @@ def train_sparse_kv_lora_mixture_selector(
                 "source_excluded": excluded.any(dim=1).float().mean(),
                 "mixture": torch.tensor(float(is_mixture)),
                 "mixture_size": torch.tensor(float(group_size)),
-                "mean_references": reference_counts[views].float().mean(),
+                "mean_references": active_reference_count.float(),
                 "grad_norm": grad_norm.detach(),
                 "learning_rate": torch.tensor(learning_rate),
                 "block": torch.tensor(float(block)),
@@ -610,7 +680,8 @@ def train_sparse_kv_lora_mixture_selector(
             if validation_every > 0 and step % validation_every == 0:
                 validation = _validate_selector(
                     model,
-                    anchor_codes,
+                    anchor_codes_by_count,
+                    anchor_reference_counts,
                     validation_codes,
                     validation_counts,
                     validation_indices,

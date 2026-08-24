@@ -800,7 +800,7 @@ kv_activation_knn_mixture_sample:
 # making the selector approximate each training function from other artists.
 # Heldout artists and their validation images never enter optimization.
 kv_sparse_mixture_selector:
-  output_directory: kv_sparse_mixture_selector_v1_224train_32heldout
+  output_directory: kv_sparse_mixture_selector_v2_count_matched_224train_32heldout
   lora_directory: artist_kv_lora_teachers_rank16_256_b2_v2
   reader_checkpoint: kv_lora_oracle_bootstrap_v3_64_broad256x4/checkpoints/step-0001750.pt
   human_reference_cache: dual_query_reference_tokens_v8_step10000
@@ -809,7 +809,7 @@ kv_sparse_mixture_selector:
   seed: 20260824
   model:
     hidden_dim: 512
-    learned_mix_initial: 0.15
+    learned_mix_initial: 0.01
   training:
     device: cuda
     steps: 4000
@@ -853,8 +853,8 @@ kv_sparse_mixture_selector:
     wandb:
       enabled: true
       project: anima-style-adapter
-      name: kv-sparse-mixture-selector-v1-224train-32heldout
-      id: kv-sparse-mixture-selector-v1-224train-32heldout
+      name: kv-sparse-mixture-selector-v2-count-matched
+      id: kv-sparse-mixture-selector-v2-count-matched
 
 # Offline functional teacher and clean continuation runner. Teacher updates
 # cycle @artist : individual LoRA : mixed LoRA at 1:1:1 after an individual
