@@ -69,6 +69,32 @@ def test_mixture_plan_supports_bounded_amplification_and_signed_extrapolation():
     )
 
 
+def test_diverse_mixture_plan_supports_signed_triples_with_l1_cap():
+    specs = build_mixture_specs(
+        32,
+        pair_count=0,
+        triple_count=0,
+        amplified_count=4,
+        signed_count=8,
+        amplified_sum_range=(1.0, 1.7),
+        amplified_triple_probability=1.0,
+        signed_beta_range=(0.05, 0.35),
+        signed_triple_probability=1.0,
+        signed_l1_maximum=1.7,
+        seed=31,
+    )
+    amplified = [value for value in specs if value.kind == "amplified"]
+    signed = [value for value in specs if value.kind == "signed"]
+    assert all(len(value.components) == 3 for value in amplified + signed)
+    assert all(1.0 <= sum(value.weights) <= 1.7 for value in amplified)
+    assert all(abs(sum(value.weights) - 1.0) < 1e-7 for value in signed)
+    assert all(sum(weight < 0 for weight in value.weights) == 1 for value in signed)
+    assert all(
+        sum(abs(weight) for weight in value.weights) <= 1.7 + 1e-7
+        for value in signed
+    )
+
+
 def test_materialized_signed_mixture_never_passes_coefficients_to_reader():
     class Loader:
         def load_styles(self, style_ids, *, references_per_style, seed):

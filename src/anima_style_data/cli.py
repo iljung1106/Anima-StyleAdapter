@@ -99,6 +99,8 @@ def build_parser() -> argparse.ArgumentParser:
         ("lora-reference-expansion-generate", "Generate references for added LoRA teachers"),
         ("lora-functional-teacher-cache-512", "Cache 512-artist single and mixed LoRA effects"),
         ("lora-mixture-reference-generate", "Generate actual merged-LoRA reference images"),
+        ("v2d-diverse-functional-teacher-cache", "Cache v2d diverse-mixture LoRA effects"),
+        ("v2d-diverse-mixture-reference-generate", "Generate v2d diverse merged-LoRA references"),
         ("kv-lora-reference-generate", "Generate references from K/V-only LoRAs"),
         ("kv-lora-reference-320-generate", "Generate 320-teacher K/V-only references"),
         ("kv-activation-mixture-prepare", "Prepare stable signed/amplified K/V mixtures"),
@@ -106,6 +108,7 @@ def build_parser() -> argparse.ArgumentParser:
         ("lora-reference-token-cache", "Cache frozen Resampler tokens for LoRA images"),
         ("lora-reference-expansion-token-cache", "Cache Resampler tokens for added LoRA images"),
         ("lora-mixture-reference-token-cache", "Cache Resampler tokens for merged-LoRA images"),
+        ("v2d-diverse-mixture-reference-token-cache", "Cache v2d diverse-mixture Resampler tokens"),
         ("kv-lora-reference-token-cache", "Cache Resampler tokens for K/V-only LoRA images"),
         ("kv-lora-reference-320-token-cache", "Cache 320-teacher K/V-only reference tokens"),
         ("kv-activation-mixture-reference-token-cache", "Cache Resampler tokens for K/V mixture images"),
@@ -156,6 +159,8 @@ def build_parser() -> argparse.ArgumentParser:
         ("lora-functional-distill-v2-train", "Train artist-centered LoRA distillation"),
         ("direct-reference-kv-smoke", "Smoke-test direct reference-to-K/V distillation"),
         ("direct-reference-kv-train", "Train reference-conditioned per-block K/V directly"),
+        ("v2d-diverse-smoke", "Smoke-test preserved v2d with diverse mixtures"),
+        ("v2d-diverse-train", "Train preserved v2d with diverse mixtures"),
         ("lora-image-flow-cache", "Cache LoRA-generated x0 latents and text contexts"),
         ("lora-image-flow-oracle-smoke", "Smoke-test direct LoRA image-flow oracle"),
         ("lora-image-flow-oracle-train", "Train direct LoRA image-flow oracle"),
@@ -527,6 +532,8 @@ def main() -> None:
         "lora-reference-expansion-generate",
         "lora-functional-teacher-cache-512",
         "lora-mixture-reference-generate",
+        "v2d-diverse-functional-teacher-cache",
+        "v2d-diverse-mixture-reference-generate",
         "lora-functional-teacher-cache",
         "lora-functional-distill-smoke",
         "lora-functional-distill-train",
@@ -534,10 +541,14 @@ def main() -> None:
         "lora-functional-distill-v2-train",
         "direct-reference-kv-smoke",
         "direct-reference-kv-train",
+        "v2d-diverse-smoke",
+        "v2d-diverse-train",
     }:
         from .lora_functional_distillation import (
             cache_lora_functional_teacher,
+            cache_v2d_diverse_functional_teacher,
             generate_lora_mixture_references,
+            generate_v2d_diverse_mixture_references,
             generate_lora_teacher_references,
             smoke_test_lora_functional_distillation,
             smoke_test_lora_functional_distillation_v2,
@@ -545,6 +556,8 @@ def main() -> None:
             train_direct_reference_kv_distillation,
             train_lora_functional_distillation,
             train_lora_functional_distillation_v2,
+            smoke_test_v2d_diverse_mixture_distillation,
+            train_v2d_diverse_mixture_distillation,
         )
 
         stage = {
@@ -556,6 +569,8 @@ def main() -> None:
                 cfg, dst, config_key="lora_functional_teacher_512"
             ),
             "lora-mixture-reference-generate": generate_lora_mixture_references,
+            "v2d-diverse-functional-teacher-cache": cache_v2d_diverse_functional_teacher,
+            "v2d-diverse-mixture-reference-generate": generate_v2d_diverse_mixture_references,
             "lora-functional-teacher-cache": cache_lora_functional_teacher,
             "lora-functional-distill-smoke": smoke_test_lora_functional_distillation,
             "lora-functional-distill-train": train_lora_functional_distillation,
@@ -563,6 +578,8 @@ def main() -> None:
             "lora-functional-distill-v2-train": train_lora_functional_distillation_v2,
             "direct-reference-kv-smoke": smoke_test_direct_reference_kv_distillation,
             "direct-reference-kv-train": train_direct_reference_kv_distillation,
+            "v2d-diverse-smoke": smoke_test_v2d_diverse_mixture_distillation,
+            "v2d-diverse-train": train_v2d_diverse_mixture_distillation,
         }[args.command]
         _run(stage, config, destination)
     elif args.command in {
@@ -633,6 +650,7 @@ def main() -> None:
         "lora-reference-token-cache",
         "lora-reference-expansion-token-cache",
         "lora-mixture-reference-token-cache",
+        "v2d-diverse-mixture-reference-token-cache",
         "kv-lora-reference-token-cache",
         "kv-lora-reference-320-token-cache",
         "kv-activation-mixture-reference-token-cache",
@@ -644,12 +662,14 @@ def main() -> None:
             cache_lora_teacher_dual_query_tokens,
             cache_lora_teacher_expansion_dual_query_tokens,
             cache_lora_mixture_dual_query_tokens,
+            cache_v2d_diverse_mixture_dual_query_tokens,
         )
 
         stage = {
             "lora-reference-token-cache": cache_lora_teacher_dual_query_tokens,
             "lora-reference-expansion-token-cache": cache_lora_teacher_expansion_dual_query_tokens,
             "lora-mixture-reference-token-cache": cache_lora_mixture_dual_query_tokens,
+            "v2d-diverse-mixture-reference-token-cache": cache_v2d_diverse_mixture_dual_query_tokens,
             "kv-lora-reference-token-cache": cache_kv_lora_teacher_dual_query_tokens,
             "kv-lora-reference-320-token-cache": cache_kv_lora_teacher_320_dual_query_tokens,
             "kv-activation-mixture-reference-token-cache": cache_kv_activation_mixture_dual_query_tokens,

@@ -710,6 +710,9 @@ def build_mixture_specs(
     signed_count: int = 0,
     amplified_sum_range: tuple[float, float] = (1.05, 1.35),
     signed_beta_range: tuple[float, float] = (0.05, 0.25),
+    amplified_triple_probability: float = 0.5,
+    signed_triple_probability: float = 0.0,
+    signed_l1_maximum: float = 1.5,
     seed: int,
 ) -> list[MixtureSpec]:
     if artists < 3:
@@ -750,8 +753,10 @@ def build_mixture_specs(
     amplified_min, amplified_max = map(float, amplified_sum_range)
     if not (1.0 <= amplified_min <= amplified_max):
         raise ValueError("amplified_sum_range must be ordered and at least one")
+    if not 0.0 <= amplified_triple_probability <= 1.0:
+        raise ValueError("amplified_triple_probability must lie within [0, 1]")
     for _ in range(amplified_count):
-        component_count = 2 if rng.random() < 0.5 else 3
+        component_count = 3 if rng.random() < amplified_triple_probability else 2
         components = sample_components(component_count)
         raw = [rng.uniform(0.25, 1.0) for _ in range(component_count)]
         target_sum = rng.uniform(amplified_min, amplified_max)
@@ -767,17 +772,28 @@ def build_mixture_specs(
     signed_min, signed_max = map(float, signed_beta_range)
     if not (0.0 <= signed_min <= signed_max <= 0.5):
         raise ValueError("signed_beta_range must lie within [0, 0.5]")
+    if not 0.0 <= signed_triple_probability <= 1.0:
+        raise ValueError("signed_triple_probability must lie within [0, 1]")
+    if signed_l1_maximum < 1.0:
+        raise ValueError("signed_l1_maximum must be at least one")
+    if 1.0 + 2.0 * signed_max > signed_l1_maximum + 1e-7:
+        raise ValueError(
+            "signed_beta_range exceeds the requested signed L1 maximum"
+        )
     for _ in range(signed_count):
-        components = sample_components(2)
-        if rng.random() < 0.5:
-            components = (components[1], components[0])
+        component_count = 3 if rng.random() < signed_triple_probability else 2
+        components = list(sample_components(component_count))
+        rng.shuffle(components)
         beta = rng.uniform(signed_min, signed_max)
+        positive_raw = [rng.uniform(0.25, 1.0) for _ in range(component_count - 1)]
+        positive_total = sum(positive_raw)
+        positive_weights = [
+            (1.0 + beta) * value / positive_total for value in positive_raw
+        ]
         specs.append(
             MixtureSpec(
-                len(specs),
-                "signed",
-                components,
-                (1.0 + beta, -beta),
+                len(specs), "signed", tuple(components),
+                tuple(positive_weights + [-beta]),
             )
         )
     return specs
@@ -1522,6 +1538,13 @@ def cache_lora_functional_teacher(
             float(value)
             for value in cache_cfg.get("signed_beta_range", [0.05, 0.25])
         ),
+        amplified_triple_probability=float(
+            cache_cfg.get("amplified_triple_probability", 0.5)
+        ),
+        signed_triple_probability=float(
+            cache_cfg.get("signed_triple_probability", 0.0)
+        ),
+        signed_l1_maximum=float(cache_cfg.get("signed_l1_maximum", 1.5)),
         seed=int(cache_cfg.get("seed", 20260823)),
     )
     mixture_records = [
@@ -1530,6 +1553,9 @@ def cache_lora_functional_teacher(
             "kind": spec.kind,
             "components": list(spec.components),
             "weights": list(spec.weights),
+            "component_count": len(spec.components),
+            "coefficient_sum": sum(spec.weights),
+            "coefficient_l1": sum(abs(value) for value in spec.weights),
             "style_ids": [plans[index].style_id for index in spec.components],
             "mixture_style_id": f"lora-mixture-{spec.index:05d}",
         }
@@ -1695,7 +1721,23 @@ def cache_lora_functional_teacher(
         "pairs": sum(spec.kind == "pair" for spec in specs),
         "triples": sum(spec.kind == "triple" for spec in specs),
         "amplified": sum(spec.kind == "amplified" for spec in specs),
+        "amplified_pairs": sum(
+            spec.kind == "amplified" and len(spec.components) == 2
+            for spec in specs
+        ),
+        "amplified_triples": sum(
+            spec.kind == "amplified" and len(spec.components) == 3
+            for spec in specs
+        ),
         "signed": sum(spec.kind == "signed" for spec in specs),
+        "signed_pairs": sum(
+            spec.kind == "signed" and len(spec.components) == 2
+            for spec in specs
+        ),
+        "signed_triples": sum(
+            spec.kind == "signed" and len(spec.components) == 3
+            for spec in specs
+        ),
         "contents": contents,
         "timesteps": timesteps,
         "content_source_mode": source_mode,
@@ -1740,11 +1782,29 @@ def generate_kv_activation_mixture_references(
     )
 
 
+def generate_v2d_diverse_mixture_references(
+    config: dict[str, Any], destination: Path
+) -> dict[str, Any]:
+    return generate_lora_mixture_references(
+        config, destination,
+        config_key="lora_mixture_references_v2d_diverse",
+    )
+
+
 def cache_kv_lora_functional_teacher(
     config: dict[str, Any], destination: Path
 ) -> dict[str, Any]:
     return cache_lora_functional_teacher(
         config, destination, config_key="kv_lora_functional_teacher"
+    )
+
+
+def cache_v2d_diverse_functional_teacher(
+    config: dict[str, Any], destination: Path
+) -> dict[str, Any]:
+    return cache_lora_functional_teacher(
+        config, destination,
+        config_key="lora_functional_teacher_v2d_diverse",
     )
 
 
@@ -2803,4 +2863,39 @@ def smoke_test_direct_reference_kv_distillation(
         destination,
         steps_override=2,
         config_key="direct_reference_kv_distillation",
+    )
+
+
+def train_v2d_diverse_mixture_distillation(
+    config: dict[str, Any], destination: Path
+) -> dict[str, Any]:
+    """Run the preserved v2d model with materialized diverse mixtures."""
+
+    return train_lora_functional_distillation(
+        config,
+        destination,
+        config_key="direct_reference_kv_distillation_v2d_diverse",
+    )
+
+
+def smoke_test_v2d_diverse_mixture_distillation(
+    config: dict[str, Any], destination: Path
+) -> dict[str, Any]:
+    effective = copy.deepcopy(config)
+    cfg = effective["direct_reference_kv_distillation_v2d_diverse"]
+    cfg["output_directory"] = str(
+        Path(cfg["output_directory"]).with_name(
+            "direct_reference_kv_distillation_v2d_diverse_smoke"
+        )
+    )
+    cfg["training"]["wandb"]["enabled"] = False
+    cfg["training"]["resume"] = False
+    cfg["training"]["checkpoint_every"] = 1
+    cfg["training"]["sample_every"] = 0
+    cfg["training"]["single_only_steps"] = 1
+    return train_lora_functional_distillation(
+        effective,
+        destination,
+        steps_override=2,
+        config_key="direct_reference_kv_distillation_v2d_diverse",
     )

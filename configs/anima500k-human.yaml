@@ -1991,6 +1991,169 @@ lora_functional_distillation_v2:
 # native Anima artist teachers alternate; weighted LoRA teachers join only
 # after that direct visual mapping has been established. No LoRA weight,
 # artist ID, retrieval index or mixture coefficient exists at inference.
+# Controlled v2d continuation: preserve the verified fresh Common/Artist model,
+# pretrained Reader and every-step full-Anima functional objective. Only the
+# teacher distribution changes. Positive mixtures reach sum 1.7; signed pair
+# and triple mixtures keep algebraic sum one and L1 norm at most 1.7.
+lora_functional_teacher_v2d_diverse:
+  lora_directory: artist_lora_teachers_rank16_256_b2_v5
+  teacher_cache:
+    output_directory: lora_functional_teacher_bank_rank16_256_v2d_diverse_broad12x6_v1
+    content_source_mode: cached_training
+    latent_cache_directory: anima_latent_cache_qwen_2d
+    text_cache_directory: anima_text_cache_post_llm_multimode_v1
+    device: cuda
+    seed: 20260826
+    contents: 12
+    content_variants:
+      - full
+      - full_quality
+      - tag_dropout
+      - tag_dropout_quality
+      - short
+      - short_quality
+    probe_latent_shape: [128, 96]
+    text_conditioning_length: 512
+    condition_batch_rows: 72
+    timesteps: [0.10, 0.25, 0.45, 0.65, 0.82, 0.95]
+    pair_mixtures: 116
+    triple_mixtures: 76
+    amplified_mixtures: 116
+    signed_mixtures: 76
+    amplified_sum_range: [1.0, 1.7]
+    amplified_triple_probability: 0.5
+    signed_beta_range: [0.05, 0.35]
+    signed_triple_probability: 0.5
+    signed_l1_maximum: 1.7
+    stable_effect_ratio_range: [0.40, 2.50]
+    shard_mixtures: 16
+
+lora_mixture_references_v2d_diverse:
+  output_directory: lora_mixture_references_rank16_v2d_diverse384x4_v1
+  functional_config_key: lora_functional_teacher_v2d_diverse
+  content_source_directory: synthetic_teacher_500x16
+  kinds: [pair, triple, amplified, signed]
+  seed: 20260826
+  image_id_base: 36000000000
+  images_per_mixture: 4
+  width: 512
+  height: 512
+  steps: 20
+  flow_shift: 3.0
+  text_cfg: 4.0
+  device: cuda
+  attention_mode: torch
+  webp_quality: 95
+  dual_query_token_cache:
+    output_directory: dual_query_reference_tokens_v8_step10000
+    resampler_checkpoint: dual_query_resampler_bprime_v8/checkpoints/step-010000.pt
+    device: cuda
+    batch_size: 32
+    shard_rows: 512
+    reader_workers: 16
+    prefetch_batches: 8
+    writer_workers: 2
+    pending_writes: 2
+    latent_lru_shards: 4
+    amp_dtype: bfloat16
+    semantic_dim: 1536
+    vae_channels: 16
+    preprocess:
+      max_side: 512
+      max_pixels: 262144
+
+direct_reference_kv_distillation_v2d_diverse:
+  output_directory: direct_reference_kv_distillation_v2d_diverse_mixture_v1
+  seed: 20260826
+  lora_directory: artist_lora_teachers_rank16_256_b2_v5
+  initial_checkpoint: null
+  reader_checkpoint: detail_style_reader_pretrain_v1/checkpoints/step-0004000.pt
+  initial_strength_profile: diagnostics/detail_style_block_timestep_strength_v1/profile.json
+  initial_strength_multiplier: 1.0
+  initial_strength_minimum: 0.0001
+  initial_strength_maximum: 1.0
+  adapter_overrides:
+    artist_residual_gain: 0.25
+    common_residual_gain: 2.0
+  human_reference_cache: dual_query_reference_tokens_v8_step10000
+  synthetic_reference_cache: lora_teacher_references_rank16_256x8_v2/dual_query_reference_tokens_v8_step10000
+  mixture_reference_cache: lora_mixture_references_rank16_v2d_diverse384x4_v1/dual_query_reference_tokens_v8_step10000
+  teacher_cache:
+    output_directory: lora_functional_teacher_bank_rank16_256_v2d_diverse_broad12x6_v1
+  native_teacher:
+    bank_config_key: dual_domain_native_teacher
+    context_cache: native_artist_post_llm_context_5000_v1
+    context_lru_shards: 8
+    reference_caches:
+      - synthetic_teacher_500x16/dual_query_reference_tokens_v8_step10000
+      - synthetic_teacher_additional_1500x6/dual_query_reference_tokens_v8_step10000
+  training:
+    device: cuda
+    steps: 8000
+    single_only_steps: 1500
+    bootstrap_teacher_schedule: [lora_single, artist_tag]
+    teacher_schedule: [artist_tag, lora_single, lora_mixture]
+    lora_reference_domain_schedule: [human, synthetic]
+    mixture_kind_schedule: [pair, pair, pair, triple, triple, amplified, amplified, amplified, signed, signed]
+    extrapolation_start_step: 1500
+    curriculum: direct_reference_kv_fresh_joint_diverse_mixture
+    functional_objective: teacher_decomposed
+    freeze_reader: true
+    freeze_common: false
+    batch_rows: 6
+    references_per_component: 4
+    reference_counts: [1, 2, 4]
+    reference_count_weights: [0.50, 0.30, 0.20]
+    native_batch_rows: 8
+    native_microbatch_rows: 4
+    native_references: 4
+    shared_learning_rate: 0.00010
+    common_learning_rate: 0.00010
+    delta_learning_rate: 0.00020
+    mix_learning_rate: 0.00004
+    null_learning_rate: 0.00020
+    warmup_steps: 200
+    lr_decay_start_step: 6500
+    minimum_lr_ratio: 0.10
+    betas: [0.9, 0.95]
+    adam_eps: 0.00000001
+    weight_decay: 0.01
+    max_grad_norm: 1.0
+    fused_adamw: true
+    token_lru_shards: 8
+    ram_resident_tokens: true
+    native_global_weight: 0.25
+    native_infonce_weight: 0.50
+    native_common_weight: 1.0
+    native_loss:
+      artist_direction_weight: 1.0
+      magnitude_weight: 0.10
+      magnitude_floor_start_step: 1
+      magnitude_floor_end_step: 1000
+      magnitude_floor_start: 0.25
+      magnitude_floor_end: 0.70
+      magnitude_upper: 1.50
+      magnitude_upper_weight: 0.25
+    loss_weights:
+      centered_huber: 1.50
+      centered_direction: 1.50
+      centered_magnitude: 0.50
+      functional_infonce: 1.00
+      functional_infonce_temperature: 0.10
+      common_huber: 0.10
+      common_direction: 0.05
+      common_ratio_excess: 8.00
+      common_ratio_margin: 0.00
+    log_every: 10
+    checkpoint_every: 250
+    sample_every: 250
+    resume: true
+    wandb:
+      enabled: true
+      project: anima-style-adapter
+      name: direct-reference-kv-v2d-diverse-mixture-v1
+      id: direct-reference-kv-v2d-diverse-mixture-v1
+
 direct_reference_kv_distillation:
   output_directory: direct_reference_kv_distillation_v3_512_materialized_mixtures
   seed: 20260824
