@@ -436,6 +436,139 @@ def _mixture_target(
     return result
 
 
+def _mean_teacher_operator(
+    teacher_down: torch.Tensor,
+    teacher_up: torch.Tensor,
+) -> torch.Tensor:
+    """Compose and average LoRA functions, never their gauge-dependent factors."""
+
+    artists, blocks, kinds, rank, context_dim = teacher_down.shape
+    if teacher_up.shape[:3] != (artists, blocks, kinds):
+        raise ValueError("Teacher factor-bank leading dimensions disagree")
+    if teacher_up.shape[-1] != rank:
+        raise ValueError("Teacher factor-bank rank dimensions disagree")
+    output_dim = int(teacher_up.shape[-2])
+    values: list[torch.Tensor] = []
+    for block in range(blocks):
+        block_values: list[torch.Tensor] = []
+        for kind in range(kinds):
+            up = teacher_up[:, block, kind].float().permute(1, 0, 2).reshape(
+                output_dim, artists * rank
+            )
+            down = teacher_down[:, block, kind].float().reshape(
+                artists * rank, context_dim
+            )
+            block_values.append((up @ down).div_(artists).to(torch.bfloat16))
+        values.append(torch.stack(block_values))
+    return torch.stack(values)
+
+
+def _apply_dense_kv_operator(
+    context: torch.Tensor,
+    operator: torch.Tensor,
+) -> torch.Tensor:
+    """Apply one block's [K/V, output, context] operator."""
+
+    return torch.einsum(
+        "bnc,koc->bkno", context, operator.to(context.dtype)
+    )
+
+
+def _centered_residual_loss(
+    student: torch.Tensor,
+    teacher: torch.Tensor,
+    *,
+    direction_weight: float,
+    magnitude_weight: float,
+    relation_weight: float,
+    common_weight: float,
+    magnitude_floor: float,
+    magnitude_ceiling: float,
+    temperature: float,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Fit artist-centered effects without rewarding a second common output."""
+
+    student_f = student.float()
+    teacher_f = teacher.detach().float()
+    reduce_dims = tuple(range(2, teacher_f.ndim))
+    teacher_rms = teacher_f.square().mean(dim=reduce_dims).sqrt().clamp_min(1e-5)
+    student_rms = student_f.square().mean(dim=reduce_dims).sqrt()
+    scale = teacher_rms[..., None, None]
+    reconstruction = F.smooth_l1_loss(
+        student_f / scale, teacher_f / scale, beta=0.1
+    )
+    cosine_rows = F.cosine_similarity(
+        student_f.flatten(2), teacher_f.flatten(2), dim=-1
+    )
+    direction = (1.0 - cosine_rows).mean()
+    ratio = student_rms / teacher_rms
+    magnitude = (
+        F.softplus((float(magnitude_floor) - ratio) / 0.1)
+        + F.softplus((ratio - float(magnitude_ceiling)) / 0.1)
+    ).mean() * 0.1
+
+    # Match every reference to its own centered teacher effect and use every
+    # other artist in the controlled batch as a negative.  K and V are kept
+    # separate because their useful geometries are not interchangeable.
+    relation_terms: list[torch.Tensor] = []
+    relation_accuracy: list[torch.Tensor] = []
+    if student_f.shape[0] > 1:
+        labels = torch.arange(student_f.shape[0], device=student_f.device)
+        for kind in range(student_f.shape[1]):
+            student_descriptor = F.normalize(
+                student_f[:, kind].flatten(1), dim=1
+            )
+            teacher_descriptor = F.normalize(
+                teacher_f[:, kind].flatten(1), dim=1
+            )
+            logits = student_descriptor @ teacher_descriptor.t()
+            logits = logits / float(temperature)
+            relation_terms.append(F.cross_entropy(logits, labels))
+            relation_accuracy.append((logits.argmax(dim=1) == labels).float().mean())
+    relation = (
+        torch.stack(relation_terms).mean()
+        if relation_terms
+        else reconstruction.new_zeros(())
+    )
+    accuracy = (
+        torch.stack(relation_accuracy).mean()
+        if relation_accuracy
+        else reconstruction.new_ones(())
+    )
+
+    # The exact dataset-level centered target has zero mean.  Matching the
+    # stochastic teacher-batch mean gives an unbiased anti-common gradient
+    # without forcing every small batch to an artificial zero tensor.
+    batch_scale = teacher_rms.mean().clamp_min(1e-5)
+    common = F.smooth_l1_loss(
+        student_f.mean(dim=0) / batch_scale,
+        teacher_f.mean(dim=0) / batch_scale,
+        beta=0.1,
+    )
+    loss = (
+        reconstruction
+        + float(direction_weight) * direction
+        + float(magnitude_weight) * magnitude
+        + float(relation_weight) * relation
+        + float(common_weight) * common
+    )
+    return loss, {
+        "loss": loss.detach(),
+        "centered_huber": reconstruction.detach(),
+        "cosine": cosine_rows.mean().detach(),
+        "direction_loss": direction.detach(),
+        "magnitude_band_loss": magnitude.detach(),
+        "student_to_teacher_rms": ratio.mean().detach(),
+        "relation_loss": relation.detach(),
+        "relation_accuracy": accuracy.detach(),
+        "residual_common_loss": common.detach(),
+        "residual_common_ratio": (
+            student_f.mean(dim=0).square().mean().sqrt()
+            / student_f.square().mean().sqrt().clamp_min(1e-8)
+        ).detach(),
+    }
+
+
 def prepare_kv_activation_mixture_specs(
     config: dict[str, Any], destination: Path
 ) -> dict[str, Any]:
@@ -677,6 +810,21 @@ def train_reference_conditioned_kv_activation_generator(
     )
     teacher_down = teacher_down.to(device=device, dtype=torch.bfloat16)
     teacher_up = teacher_up.to(device=device, dtype=torch.bfloat16)
+    centered_teacher = str(cfg.get("teacher_decomposition", "full")) == "centered"
+    output = destination / str(cfg["output_directory"])
+    output.mkdir(parents=True, exist_ok=True)
+    common_operator: torch.Tensor | None = None
+    if centered_teacher:
+        common_path = output / "frozen_common_operator.pt"
+        if common_path.exists():
+            common_operator = torch.load(
+                common_path, map_location="cpu", weights_only=True
+            )["common_operator"].to(device=device, dtype=torch.bfloat16)
+        else:
+            common_operator = _mean_teacher_operator(teacher_down, teacher_up)
+            torch.save(
+                {"common_operator": common_operator.cpu()}, common_path
+            )
     mixture_rows = [
         row for row in read_records(destination / str(cfg["mixture_manifest"]))
         if str(row["kind"]) != "single" and bool(row.get("enabled", True))
@@ -725,7 +873,6 @@ def train_reference_conditioned_kv_activation_generator(
         weight_decay=float(training.get("weight_decay", 0.01)),
         fused=bool(training.get("fused_adamw", True)),
     )
-    output = destination / str(cfg["output_directory"])
     checkpoints = output / "checkpoints"
     checkpoints.mkdir(parents=True, exist_ok=True)
     state_path = output / "training_state.pt"
@@ -743,6 +890,15 @@ def train_reference_conditioned_kv_activation_generator(
     blocks_per_step = int(training.get("blocks_per_step", 4))
     direction_weight = float(training.get("direction_weight", 0.2))
     magnitude_weight = float(training.get("magnitude_weight", 0.05))
+    relation_weight = float(training.get("relation_weight", 0.0))
+    common_weight = float(training.get("residual_common_weight", 0.0))
+    magnitude_floor = float(training.get("magnitude_floor", 0.7))
+    magnitude_ceiling = float(training.get("magnitude_ceiling", 1.3))
+    relation_temperature = float(training.get("relation_temperature", 0.1))
+    relation_start = int(training.get("relation_start_step", 250))
+    relation_ramp = int(training.get("relation_ramp_steps", 250))
+    single_only_steps = int(training.get("single_only_steps", 0))
+    mixture_ramp_steps = int(training.get("mixture_ramp_steps", 1))
     base_lr = float(training.get("learning_rate", 2e-4))
     warmup = int(training.get("warmup_steps", 100))
     max_grad_norm = float(training.get("max_grad_norm", 1.0))
@@ -780,17 +936,43 @@ def train_reference_conditioned_kv_activation_generator(
     try:
         for step in range(start_step + 1, steps + 1):
             rng = random.Random(seed + step * 1_000_003)
-            category = rng.choices(categories, weights=category_weights, k=1)[0]
-            context_indices = torch.tensor(
-                [rng.randrange(train_context_count) for _ in range(batch)],
-                device=device,
+            mixture_progress = max(
+                0.0,
+                min(
+                    1.0,
+                    (step - single_only_steps) / max(1, mixture_ramp_steps),
+                ),
             )
-            context = contexts[context_indices]
-            if category == "single":
-                target_indices = torch.tensor(
-                    [rng.randrange(len(artist_ids)) for _ in range(batch)],
+            active_category_weights = (
+                (
+                    1.0 - mixture_progress
+                    + mixture_progress * category_weights[0],
+                    *(mixture_progress * value for value in category_weights[1:]),
+                )
+                if centered_teacher
+                else category_weights
+            )
+            category = rng.choices(
+                categories, weights=active_category_weights, k=1
+            )[0]
+            if centered_teacher:
+                context_indices = torch.full(
+                    (batch,), rng.randrange(train_context_count),
+                    device=device, dtype=torch.long,
+                )
+            else:
+                context_indices = torch.tensor(
+                    [rng.randrange(train_context_count) for _ in range(batch)],
                     device=device,
                 )
+            context = contexts[context_indices]
+            if category == "single":
+                selected_indices = (
+                    rng.sample(range(len(artist_ids)), batch)
+                    if centered_teacher and batch <= len(artist_ids)
+                    else [rng.randrange(len(artist_ids)) for _ in range(batch)]
+                )
+                target_indices = torch.tensor(selected_indices, device=device)
                 domain = "human" if rng.random() < 0.5 else "synthetic"
                 codes = single_codes[domain]
                 view_indices = torch.tensor(
@@ -801,9 +983,12 @@ def train_reference_conditioned_kv_activation_generator(
                 weights = torch.ones(batch, 1, device=device)
             else:
                 source_rows = rows_by_kind[category]
-                target_indices = torch.tensor(
-                    [rng.randrange(len(source_rows)) for _ in range(batch)], device=device
+                selected_rows = (
+                    rng.sample(range(len(source_rows)), batch)
+                    if centered_teacher and batch <= len(source_rows)
+                    else [rng.randrange(len(source_rows)) for _ in range(batch)]
                 )
+                target_indices = torch.tensor(selected_rows, device=device)
                 codes = mixture_codes[category]
                 view_indices = torch.tensor(
                     [rng.randrange(codes.shape[1]) for _ in range(batch)], device=device
@@ -829,6 +1014,10 @@ def train_reference_conditioned_kv_activation_generator(
                 0.0,
                 min(1.0, (step - attention_start) / max(1, attention_ramp)),
             )
+            active_relation_weight = relation_weight * max(
+                0.0,
+                min(1.0, (step - relation_start) / max(1, relation_ramp)),
+            )
             if active_attention_weight > 0 and native_probes is None:
                 native_probes = _load_native_attention_probes(
                     config, destination, device
@@ -840,11 +1029,30 @@ def train_reference_conditioned_kv_activation_generator(
                         context, teacher_down, teacher_up,
                         components, weights, block,
                     )
-                    block_loss, block_metrics = _normalized_activation_loss(
-                        student, teacher,
-                        direction_weight=direction_weight,
-                        magnitude_weight=magnitude_weight,
-                    )
+                    common_delta = None
+                    if centered_teacher:
+                        assert common_operator is not None
+                        common_delta = _apply_dense_kv_operator(
+                            context, common_operator[block]
+                        ) * weights.sum(dim=1)[:, None, None, None]
+                        teacher = teacher - common_delta
+                        block_loss, block_metrics = _centered_residual_loss(
+                            student,
+                            teacher,
+                            direction_weight=direction_weight,
+                            magnitude_weight=magnitude_weight,
+                            relation_weight=active_relation_weight,
+                            common_weight=common_weight,
+                            magnitude_floor=magnitude_floor,
+                            magnitude_ceiling=magnitude_ceiling,
+                            temperature=relation_temperature,
+                        )
+                    else:
+                        block_loss, block_metrics = _normalized_activation_loss(
+                            student, teacher,
+                            direction_weight=direction_weight,
+                            magnitude_weight=magnitude_weight,
+                        )
                     if active_attention_weight > 0:
                         assert native_probes is not None
                         probe = native_probes[block]
@@ -861,12 +1069,17 @@ def train_reference_conditioned_kv_activation_generator(
                             generator=query_generator,
                         )
                         zero = torch.zeros_like(student)
-                        base_key, base_value = probe.project_context(context, zero)
+                        attention_base = (
+                            common_delta if common_delta is not None else zero
+                        )
+                        base_key, base_value = probe.project_context(
+                            context, attention_base
+                        )
                         student_key, student_value = probe.project_context(
-                            context, student
+                            context, attention_base + student
                         )
                         teacher_key, teacher_value = probe.project_context(
-                            context, teacher
+                            context, attention_base + teacher
                         )
                         base_output = probe.attend(queries, base_key, base_value)
                         student_effect = (
@@ -907,6 +1120,8 @@ def train_reference_conditioned_kv_activation_generator(
             running["grad_norm"].append(float(grad_norm))
             running["learning_rate"].append(lr)
             running["attention_weight"].append(active_attention_weight)
+            running["relation_weight"].append(active_relation_weight)
+            running["mixture_progress"].append(mixture_progress)
             running[f"category/{category}"].append(1.0)
             for key in metrics_by_block[0]:
                 running[key].append(sum(float(row[key]) for row in metrics_by_block) / len(metrics_by_block))
@@ -940,11 +1155,28 @@ def train_reference_conditioned_kv_activation_generator(
                                 val_context, teacher_down, teacher_up,
                                 val_artists[:, None], torch.ones(len(val_artists), 1, device=device), block,
                             )
-                            _, values = _normalized_activation_loss(
-                                student, teacher,
-                                direction_weight=direction_weight,
-                                magnitude_weight=magnitude_weight,
-                            )
+                            if centered_teacher:
+                                assert common_operator is not None
+                                teacher = teacher - _apply_dense_kv_operator(
+                                    val_context, common_operator[block]
+                                )
+                                _, values = _centered_residual_loss(
+                                    student,
+                                    teacher,
+                                    direction_weight=direction_weight,
+                                    magnitude_weight=magnitude_weight,
+                                    relation_weight=relation_weight,
+                                    common_weight=common_weight,
+                                    magnitude_floor=magnitude_floor,
+                                    magnitude_ceiling=magnitude_ceiling,
+                                    temperature=relation_temperature,
+                                )
+                            else:
+                                _, values = _normalized_activation_loss(
+                                    student, teacher,
+                                    direction_weight=direction_weight,
+                                    magnitude_weight=magnitude_weight,
+                                )
                             for key, value in values.items():
                                 validation_rows[key].append(float(value))
                 validation = {key: sum(values) / len(values) for key, values in validation_rows.items()}
@@ -968,6 +1200,7 @@ def train_reference_conditioned_kv_activation_generator(
         "contexts": len(contexts),
         "trainable_parameters": sum(parameter.numel() for parameter in model.parameters()),
         "architecture": architecture,
+        "teacher_decomposition": "centered" if centered_teacher else "full",
         "elapsed_seconds": time.perf_counter() - started,
         "end_to_end_flow_training": False,
         "native_artist_teacher": False,
@@ -1020,6 +1253,36 @@ def smoke_test_reference_conditioned_bilinear_kv_operator(
         destination,
         steps_override=2,
         config_key="kv_reference_bilinear_operator",
+    )
+
+
+def train_centered_reference_bilinear_kv_operator(
+    config: dict[str, Any], destination: Path
+) -> dict[str, Any]:
+    return train_reference_conditioned_kv_activation_generator(
+        config,
+        destination,
+        config_key="kv_reference_centered_bilinear_operator",
+    )
+
+
+def smoke_test_centered_reference_bilinear_kv_operator(
+    config: dict[str, Any], destination: Path
+) -> dict[str, Any]:
+    effective = copy.deepcopy(config)
+    cfg = effective["kv_reference_centered_bilinear_operator"]
+    cfg["output_directory"] = "kv_reference_centered_bilinear_operator_smoke"
+    cfg["training"]["resume"] = False
+    cfg["training"]["wandb"]["enabled"] = False
+    cfg["training"]["validation_every"] = 0
+    cfg["training"]["checkpoint_every"] = 1
+    cfg["training"]["batch_size"] = 2
+    cfg["training"]["blocks_per_step"] = 1
+    return train_reference_conditioned_kv_activation_generator(
+        effective,
+        destination,
+        steps_override=2,
+        config_key="kv_reference_centered_bilinear_operator",
     )
 
 
