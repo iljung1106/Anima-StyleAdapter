@@ -27,7 +27,10 @@ from anima_style_data.kv_generalizing_modulator import (
     build_mixed_activation_batch,
     concatenate_weighted_lora_factors,
 )
-from anima_style_data.few_shot_kv_adapter import FewShotNativeKVStyleAdapter
+from anima_style_data.few_shot_kv_adapter import (
+    FewShotNativeKVStyleAdapter,
+    RetrievalFewShotKVStyleAdapter,
+)
 from anima_style_data.kv_sparse_mixture_selector import (
     SparseLoRAMixtureSelector,
     sparse_mixture_coefficients,
@@ -536,6 +539,50 @@ def test_few_shot_adapter_activates_and_rescales_native_kv_hook():
     torch.testing.assert_close(styled_full - baseline, 2 * (styled_half - baseline))
     adapter.disable()
     torch.testing.assert_close(anima.blocks[0].cross_attn.kv_proj(context), baseline)
+    adapter.close()
+
+
+def test_retrieval_adapter_uses_an_exact_sparse_lora_mixture():
+    torch.manual_seed(47)
+    anima = _DummyAnima(blocks=2, context_dim=6, output_dim=8)
+    reader = _DummyReader(style_dim=12)
+    anchors = torch.randn(1, 5, 5, 12)
+    down = torch.randn(5, 2, 2, 2, 6)
+    up = torch.randn(5, 2, 2, 8, 2)
+    adapter = RetrievalFewShotKVStyleAdapter(
+        reader=reader,
+        anima=anima,
+        anchor_codes=anchors,
+        anchor_reference_counts=torch.tensor([4]),
+        artist_ids=[f"artist-{index}" for index in range(5)],
+        teacher_down=down,
+        teacher_up=up,
+        neighbors=2,
+        temperature=0.05,
+    )
+    context = torch.randn(1, 7, 6)
+    baseline = anima.blocks[1].cross_attn.kv_proj(context)
+    references = anchors[0, 2].unsqueeze(0).unsqueeze(0).expand(1, 4, -1, -1)
+
+    adapter.set_references(references, strength=1.0)
+    actual = anima.blocks[1].cross_attn.kv_proj(context)
+    retrieval = adapter.last_retrieval[0]
+    indices = torch.tensor(retrieval["artist_indices"])
+    weights = torch.tensor(retrieval["weights"])
+    expected_down, expected_up = concatenate_weighted_lora_factors(
+        adapter.teacher_down[indices][None],
+        adapter.teacher_up[indices][None],
+        weights[None],
+    )
+    delta = apply_kv_factors(
+        context,
+        expected_down[:, 1].to(torch.bfloat16).float(),
+        expected_up[:, 1].to(torch.bfloat16).float(),
+    )
+    expected = baseline + torch.cat((delta[:, 0], delta[:, 1]), dim=-1)
+
+    torch.testing.assert_close(actual, expected)
+    assert len(retrieval["artist_ids"]) == 2
     adapter.close()
 
 
