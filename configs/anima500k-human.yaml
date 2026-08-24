@@ -776,8 +776,8 @@ kv_activation_generalizing_modulator:
       id: kv-activation-generalizing-modulator-v5-256-artist-holdout
 
 kv_activation_generalizing_signal_analysis:
-  output_directory: kv_activation_generalizing_signal_v3_288train_32fixedheldout
-  lora_directory: artist_kv_lora_teachers_rank16_320_b2_v3
+  output_directory: kv_activation_generalizing_signal_v4_352train_32fixedheldout
+  lora_directory: artist_kv_lora_teachers_rank16_384_diverse_b2_v4
   validation_source_lora_directory: artist_kv_lora_teachers_rank16_256_b2_v2
   device: cuda
   seed: 20260824
@@ -822,8 +822,8 @@ kv_activation_knn_mixture_sample:
   canonicalization_chunk_size: 64
 
 kv_lora_reader_anchor_cache:
-  output_directory: kv_lora_reader_anchors_rank16_320_reader_v3
-  lora_directory: artist_kv_lora_teachers_rank16_320_b2_v3
+  output_directory: kv_lora_reader_anchors_rank16_384_diverse_reader_v4
+  lora_directory: artist_kv_lora_teachers_rank16_384_diverse_b2_v4
   reader_checkpoint: kv_lora_oracle_bootstrap_v3_64_broad256x4/checkpoints/step-0001750.pt
   human_reference_cache: dual_query_reference_tokens_v8_step10000
   device: cuda
@@ -854,7 +854,7 @@ kv_lora_count_aware_adapter:
   compression_seed: 20260824
 
 kv_lora_count_aware_raw_sample:
-  output_directory: kv_lora_count_aware_raw_fixed_samples_common_ablation_v2
+  output_directory: kv_lora_count_aware_raw_fixed_samples_384_diverse_v3
   device: cuda
   strengths: [1.0]
   common_scales: [0.0, 0.25, 0.5, 1.0]
@@ -862,7 +862,7 @@ kv_lora_count_aware_raw_sample:
   panel_tile_width: 320
 
 kv_lora_retrieval_sample:
-  output_directory: kv_lora_reader_anchors_rank16_320_reader_v3/fixed_heldout_samples
+  output_directory: kv_lora_reader_anchors_rank16_384_diverse_reader_v4/fixed_heldout_samples
   validation_source_lora_directory: artist_kv_lora_teachers_rank16_256_b2_v2
   validation_artists: 32
   artists: 7
@@ -877,7 +877,7 @@ kv_lora_retrieval_sample:
   seed: 20260824
 
 kv_lora_retrieval_sample_ablation:
-  output_directory: kv_lora_reader_anchors_rank16_320_reader_v3/fixed_heldout_samples_dictionary224_sameanchors
+  output_directory: kv_lora_reader_anchors_rank16_384_diverse_reader_v4/fixed_heldout_samples_dictionary224_sameanchors
   validation_source_lora_directory: artist_kv_lora_teachers_rank16_256_b2_v2
   dictionary_source_lora_directory: artist_kv_lora_teachers_rank16_256_b2_v2
   validation_artists: 32
@@ -893,7 +893,7 @@ kv_lora_retrieval_sample_ablation:
   seed: 20260824
 
 kv_lora_sparse_ridge_sample:
-  output_directory: kv_lora_reader_anchors_rank16_320_reader_v3/fixed_heldout_sparse_ridge32_rank64
+  output_directory: kv_lora_reader_anchors_rank16_384_diverse_reader_v4/fixed_heldout_sparse_ridge32_rank64
   validation_source_lora_directory: artist_kv_lora_teachers_rank16_256_b2_v2
   validation_artists: 32
   artists: 7
