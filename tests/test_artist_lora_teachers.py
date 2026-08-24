@@ -7,6 +7,7 @@ import torch
 
 from anima_style_data.artist_lora_teachers import (
     ArtistLoRAPlan,
+    _learning_rate_scale,
     _prompt_probabilities,
     _reset_lora_network,
     _reuse_completed_prefix,
@@ -15,6 +16,12 @@ from anima_style_data.artist_lora_teachers import (
     _serialize_lora_patterns,
     select_artist_lora_plans,
 )
+
+
+def test_learning_rate_can_hold_peak_before_cosine_decay():
+    assert _learning_rate_scale(25, 250, 25, 0.1, 175) == pytest.approx(1.0)
+    assert _learning_rate_scale(100, 250, 25, 0.1, 175) == pytest.approx(1.0)
+    assert _learning_rate_scale(250, 250, 25, 0.1, 175) == pytest.approx(0.1)
 
 
 def _rows(styles: int = 3, images: int = 5):

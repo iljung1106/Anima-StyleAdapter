@@ -514,10 +514,21 @@ def _flow_loss(anima, latents, conditions, cfg, generator):
     return F.mse_loss(prediction.float(), target.float())
 
 
-def _learning_rate_scale(step: int, steps: int, warmup: int, minimum: float) -> float:
+def _learning_rate_scale(
+    step: int,
+    steps: int,
+    warmup: int,
+    minimum: float,
+    decay_start: int | None = None,
+) -> float:
     if warmup > 0 and step <= warmup:
         return step / warmup
-    progress = (step - warmup) / max(1, steps - warmup)
+    if decay_start is None:
+        decay_start = warmup
+    decay_start = min(steps, max(warmup, int(decay_start)))
+    if step <= decay_start:
+        return 1.0
+    progress = (step - decay_start) / max(1, steps - decay_start)
     cosine = 0.5 * (1.0 + math.cos(math.pi * min(1.0, max(0.0, progress))))
     return minimum + (1.0 - minimum) * cosine
 
@@ -712,7 +723,8 @@ def _render_artist_lora_preview(
         ]
         + [
             (
-                f"rank-16 LoRA {strength:g}x",
+                f"rank-{int(artist_config['training'].get('rank', 16))} "
+                f"LoRA {strength:g}x",
                 _preview_image(generated[index + 1 : index + 2]),
             )
             for index, strength in enumerate(strengths)
@@ -1093,6 +1105,7 @@ def train_artist_lora_teachers(
     batch_size = int(training.get("batch_size", 2))
     warmup = int(training.get("warmup_steps", 50))
     minimum_lr_ratio = float(training.get("minimum_lr_ratio", 0.1))
+    decay_start_step = int(training.get("decay_start_step", warmup))
     max_grad_norm = float(training.get("max_grad_norm", 1.0))
     log_every = int(training.get("log_every", 25))
     validation_every = int(training.get("validation_every", 250))
@@ -1147,6 +1160,7 @@ def train_artist_lora_teachers(
             validation_buckets = _to_gpu_buckets(cpu_pack.validation, device)
             torch.cuda.synchronize()
             transfer_seconds = time.perf_counter() - transfer_started
+            torch.cuda.reset_peak_memory_stats()
 
             reset_seed = int(cfg.get("seed", 20260823)) + plan.index * 1009
             _reset_lora_network(network, reset_seed)
@@ -1182,7 +1196,11 @@ def train_artist_lora_teachers(
             last_validation = float("nan")
             for step in range(start_step + 1, steps + 1):
                 lr_scale = _learning_rate_scale(
-                    step, steps, warmup, minimum_lr_ratio
+                    step,
+                    steps,
+                    warmup,
+                    minimum_lr_ratio,
+                    decay_start_step,
                 )
                 for group in optimizer.param_groups:
                     group["lr"] = base_lr * lr_scale
@@ -1214,7 +1232,8 @@ def train_artist_lora_teachers(
                         f"artist-lora artist={plan.index + 1}/{len(plans)} "
                         f"step={step}/{steps} loss={mean_loss:.6f} "
                         f"grad={float(grad_norm):.4f} step_s={step_seconds:.3f} "
-                        f"img_s={batch_size / max(step_seconds, 1e-6):.2f}",
+                        f"img_s={batch_size / max(step_seconds, 1e-6):.2f} "
+                        f"vram_gib={torch.cuda.max_memory_allocated() / (1024**3):.2f}",
                         flush=True,
                     )
                     if wandb_run is not None:
@@ -1226,6 +1245,10 @@ def train_artist_lora_teachers(
                                 "system/step_seconds": step_seconds,
                                 "system/images_per_second": batch_size
                                 / max(step_seconds, 1e-6),
+                                "system/max_memory_allocated_gib":
+                                torch.cuda.max_memory_allocated() / (1024**3),
+                                "system/max_memory_reserved_gib":
+                                torch.cuda.max_memory_reserved() / (1024**3),
                                 "progress/artist_index": plan.index,
                                 "progress/artist_step": step,
                             },
@@ -1394,7 +1417,9 @@ def smoke_test_artist_lora_teachers(
     cfg["train_images_per_artist"] = 3
     cfg["validation_images_per_artist"] = 1
     cfg["training"]["steps"] = 2
-    cfg["training"]["batch_size"] = 1
+    cfg["training"]["batch_size"] = int(
+        cfg["training"].get("smoke_batch_size", 1)
+    )
     cfg["training"]["warmup_steps"] = 1
     cfg["training"]["log_every"] = 1
     cfg["training"]["validation_every"] = 2
@@ -1430,4 +1455,28 @@ def smoke_test_artist_kv_lora_teachers(
 ) -> dict[str, Any]:
     return smoke_test_artist_lora_teachers(
         config, destination, config_key="artist_kv_lora_teachers"
+    )
+
+
+def prepare_artist_kv_lora_rank32_pilot(
+    config: dict[str, Any], destination: Path
+) -> dict[str, Any]:
+    return prepare_artist_lora_teachers(
+        config, destination, config_key="artist_kv_lora_rank32_pilot"
+    )
+
+
+def train_artist_kv_lora_rank32_pilot(
+    config: dict[str, Any], destination: Path
+) -> dict[str, Any]:
+    return train_artist_lora_teachers(
+        config, destination, config_key="artist_kv_lora_rank32_pilot"
+    )
+
+
+def smoke_test_artist_kv_lora_rank32_pilot(
+    config: dict[str, Any], destination: Path
+) -> dict[str, Any]:
+    return smoke_test_artist_lora_teachers(
+        config, destination, config_key="artist_kv_lora_rank32_pilot"
     )

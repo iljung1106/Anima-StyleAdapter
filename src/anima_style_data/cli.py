@@ -87,6 +87,9 @@ def build_parser() -> argparse.ArgumentParser:
         ("artist-kv-lora-plan", "Select the K/V-only LoRA pilot artists"),
         ("artist-kv-lora-smoke", "Smoke-test a K/V-only artist LoRA"),
         ("artist-kv-lora-train", "Train K/V-only artist LoRA teachers"),
+        ("artist-kv-lora-r32-plan", "Plan the rank-32 K/V-only LoRA pilot"),
+        ("artist-kv-lora-r32-smoke", "Smoke-test rank-32 batch-8 K/V-only LoRA"),
+        ("artist-kv-lora-r32-train", "Train the rank-32 K/V-only LoRA pilot"),
         ("artist-kv-lora-diverse-plan", "Select a Reader-diverse K/V-LoRA expansion"),
         ("artist-kv-lora-diverse-train", "Train the Reader-diverse K/V-LoRA expansion"),
         ("lora-reference-generate", "Generate image references from the LoRA teachers"),
@@ -456,13 +459,19 @@ def main() -> None:
         "artist-kv-lora-plan",
         "artist-kv-lora-smoke",
         "artist-kv-lora-train",
+        "artist-kv-lora-r32-plan",
+        "artist-kv-lora-r32-smoke",
+        "artist-kv-lora-r32-train",
         "artist-kv-lora-diverse-plan",
         "artist-kv-lora-diverse-train",
     }:
         from .artist_lora_teachers import (
             prepare_artist_kv_lora_teachers,
+            prepare_artist_kv_lora_rank32_pilot,
             smoke_test_artist_kv_lora_teachers,
+            smoke_test_artist_kv_lora_rank32_pilot,
             train_artist_kv_lora_teachers,
+            train_artist_kv_lora_rank32_pilot,
         )
         from .kv_lora_diverse_expansion import (
             prepare_diverse_kv_lora_expansion,
@@ -473,6 +482,9 @@ def main() -> None:
             "artist-kv-lora-plan": prepare_artist_kv_lora_teachers,
             "artist-kv-lora-smoke": smoke_test_artist_kv_lora_teachers,
             "artist-kv-lora-train": train_artist_kv_lora_teachers,
+            "artist-kv-lora-r32-plan": prepare_artist_kv_lora_rank32_pilot,
+            "artist-kv-lora-r32-smoke": smoke_test_artist_kv_lora_rank32_pilot,
+            "artist-kv-lora-r32-train": train_artist_kv_lora_rank32_pilot,
             "artist-kv-lora-diverse-plan": prepare_diverse_kv_lora_expansion,
             "artist-kv-lora-diverse-train": train_diverse_kv_lora_expansion,
         }[args.command]
