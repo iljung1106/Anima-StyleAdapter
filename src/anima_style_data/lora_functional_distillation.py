@@ -101,23 +101,30 @@ def scheduled_teacher_category(
     *,
     single_only_steps: int,
     schedule: tuple[str, ...] | list[str],
+    bootstrap_schedule: tuple[str, ...] | list[str] | None = None,
 ) -> str:
-    """Bootstrap on individual teachers, then follow an explicit schedule.
+    """Follow explicit bootstrap and post-bootstrap teacher schedules.
 
-    A direct reference-to-K/V run can therefore forbid mixed-LoRA teachers
-    while retaining individual LoRA effects as offline supervision.  This
-    schedule is never part of inference; the trained adapter only receives
-    visual reference tokens.
+    Weighted LoRA mixtures remain offline functional teachers. They are
+    delayed until the direct visual mapping has first seen both individual
+    LoRA effects and native Anima artist effects. Neither schedule is part of
+    inference; the trained adapter only receives visual reference tokens.
     """
 
     normalized = tuple(str(value) for value in schedule)
-    if not normalized:
-        raise ValueError("teacher_schedule must contain at least one category")
-    invalid = set(normalized) - _TEACHER_CATEGORIES
+    bootstrap = tuple(
+        str(value)
+        for value in (
+            ("lora_single",) if bootstrap_schedule is None else bootstrap_schedule
+        )
+    )
+    if not normalized or not bootstrap:
+        raise ValueError("teacher schedules must contain at least one category")
+    invalid = (set(normalized) | set(bootstrap)) - _TEACHER_CATEGORIES
     if invalid:
         raise ValueError(f"Unsupported teacher categories: {sorted(invalid)}")
     if step <= int(single_only_steps):
-        return "lora_single"
+        return bootstrap[(step - 1) % len(bootstrap)]
     return normalized[(step - int(single_only_steps) - 1) % len(normalized)]
 
 
@@ -1031,15 +1038,21 @@ def _teacher_decomposed_functional_objective(
     )
     common_excess_loss = common_excess.square()
 
-    total = (
-        float(weights.get("centered_huber", 1.0)) * centered_huber
-        + float(weights.get("centered_direction", 1.0)) * (1 - centered_cosine)
-        + float(weights.get("centered_magnitude", 0.25)) * centered_magnitude
-        + float(weights.get("functional_infonce", 0.25)) * infonce
-        + float(weights.get("common_huber", 0.10)) * common_huber
-        + float(weights.get("common_direction", 0.05)) * (1 - common_cosine)
-        + float(weights.get("common_ratio_excess", 1.0)) * common_excess_loss
-    )
+    weighted = {
+        "centered_huber": float(weights.get("centered_huber", 1.0)) * centered_huber,
+        "centered_direction": float(weights.get("centered_direction", 1.0))
+        * (1 - centered_cosine),
+        "centered_magnitude": float(weights.get("centered_magnitude", 0.25))
+        * centered_magnitude,
+        "functional_infonce": float(weights.get("functional_infonce", 0.25))
+        * infonce,
+        "common_huber": float(weights.get("common_huber", 0.10)) * common_huber,
+        "common_direction": float(weights.get("common_direction", 0.05))
+        * (1 - common_cosine),
+        "common_ratio_excess": float(weights.get("common_ratio_excess", 1.0))
+        * common_excess_loss,
+    }
+    total = sum(weighted.values())
     return total, {
         "loss": total.detach(),
         "centered_huber": centered_huber.detach(),
@@ -1062,6 +1075,10 @@ def _teacher_decomposed_functional_objective(
         "common_output_excess": common_excess.detach(),
         "common_output_excess_loss": common_excess_loss.detach(),
         "student_to_teacher_rms": (student_total_rms / teacher_total_rms).detach(),
+        **{
+            f"weighted_{name}": value.detach()
+            for name, value in weighted.items()
+        },
     }
 
 
@@ -1215,13 +1232,34 @@ def train_lora_functional_distillation(
     if not isinstance(adapter, SeparatedCommonArtistKVStyleCrossAttention):
         raise TypeError("LoRA distillation requires the separated Common/Artist adapter")
     attach_same_q_style_adapter(anima, adapter)
-    initial = torch.load(destination / str(cfg["initial_checkpoint"]), map_location="cpu", weights_only=False)
-    reader.load_state_dict(initial["reader"], strict=True)
-    adapter.load_state_dict(initial["adapter"], strict=True)
-    adapter.restore_timestep_strength_state()
+    initial_checkpoint = cfg.get("initial_checkpoint")
+    reader_checkpoint = cfg.get("reader_checkpoint")
+    initialization = "fresh_reader_and_adapter"
+    if initial_checkpoint:
+        initial = torch.load(
+            destination / str(initial_checkpoint),
+            map_location="cpu",
+            weights_only=False,
+        )
+        reader.load_state_dict(initial["reader"], strict=True)
+        adapter.load_state_dict(initial["adapter"], strict=True)
+        adapter.restore_timestep_strength_state()
+        initialization = f"full_checkpoint:{initial_checkpoint}"
+    elif reader_checkpoint:
+        reader_state = torch.load(
+            destination / str(reader_checkpoint),
+            map_location="cpu",
+            weights_only=False,
+        )
+        reader.load_state_dict(reader_state.get("reader", reader_state), strict=True)
+        initialization = f"pretrained_reader_fresh_adapter:{reader_checkpoint}"
     adapter.set_bootstrap_phase("combined")
     teacher_schedule = tuple(
         str(value) for value in training.get("teacher_schedule", ())
+    )
+    bootstrap_teacher_schedule = tuple(
+        str(value)
+        for value in training.get("bootstrap_teacher_schedule", ("lora_single",))
     )
     freeze_common = bool(training.get("freeze_common", False))
     freeze_reader = bool(training.get("freeze_reader", False))
@@ -1349,6 +1387,7 @@ def train_lora_functional_distillation(
                     step,
                     single_only_steps=single_only,
                     schedule=teacher_schedule,
+                    bootstrap_schedule=bootstrap_teacher_schedule,
                 )
             else:
                 category = (
@@ -1406,9 +1445,18 @@ def train_lora_functional_distillation(
             parameters = [parameter for group in optimizer.param_groups for parameter in group["params"]]
             grad_norm = torch.nn.utils.clip_grad_norm_(parameters, max_grad_norm, foreach=True)
             optimizer.step()
+            domain_name = None
+            if category != "artist_tag":
+                domain_name = (
+                    "synthetic" if domain_loader is synthetic_loader else "human"
+                )
             for key, value in metrics.items():
                 if torch.is_tensor(value) and value.numel() == 1:
                     running[f"{category}/{key}"].append(float(value.detach()))
+                    if domain_name is not None:
+                        running[f"{category}/{domain_name}/{key}"].append(
+                            float(value.detach())
+                        )
             running["optimizer/grad_norm"].append(float(grad_norm))
             if step % log_every == 0:
                 row = {key: sum(values) / len(values) for key, values in running.items() if values}
@@ -1451,10 +1499,12 @@ def train_lora_functional_distillation(
         "updates": dict(updates),
         "elapsed_s": time.perf_counter() - started,
         "teacher_schedule_after_bootstrap": list(teacher_schedule) or "legacy",
+        "teacher_schedule_during_bootstrap": list(bootstrap_teacher_schedule),
         "lora_reference_domains": "human:synthetic=1:1",
         "curriculum": curriculum,
         "common_frozen": freeze_common,
         "reader_frozen": freeze_reader,
+        "initialization": initialization,
         "inference_contract": (
             "reference_tokens -> Reader -> per-block style K/V; "
             "no LoRA dictionary, retrieval, artist ID, or runtime LoRA mixture"

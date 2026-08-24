@@ -24,16 +24,20 @@ The weighted teachers densify the functional style space; they are never
 reconstructed by selecting or combining LoRAs at inference. The student must
 produce the effect through its own reference-conditioned K/V.
 
-## Initial run
+## Fresh joint-teacher run
 
-- warm-start the visually diverse v34 step-500 direct K/V checkpoint;
-- freeze the pretrained Resampler/Reader and reference-independent Common path;
-- train shared Style K/V, block-local K/V deltas and block mixing;
-- use only individual LoRA teachers for 500 steps;
+- do not warm-start v34 or any prior Style Adapter;
+- load only the independently reconstruction-pretrained typed Reader;
+- freshly initialize and train Common K/V, shared Style K/V, block-local K/V
+  deltas, block mixing and the artist-null residual;
+- alternate individual LoRA and native Anima artist teachers 1:1 for the first
+  1,500 updates;
 - then cycle native artist, individual LoRA and weighted LoRA teachers 1:1:1;
 - alternate human and LoRA-rendered references;
 - sample 1/2/4 references with probabilities 0.50/0.30/0.20;
-- save optimizer state every 250 steps and fixed-reference samples every 500.
+- compute weighted-LoRA targets with actual frozen-Anima forwards and never
+  expose mixture coefficients to the student;
+- save optimizer state and fixed-reference samples every 250 steps.
 
 Acceptance is based on heldout raw-reference samples showing distinct style
 effects under identical generation controls. Teacher regression alone is not

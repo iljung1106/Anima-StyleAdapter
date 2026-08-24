@@ -78,6 +78,27 @@ def test_direct_kv_teacher_schedule_keeps_mixtures_as_offline_supervision():
     ]
 
 
+def test_fresh_direct_kv_bootstrap_jointly_uses_lora_and_native_teachers():
+    assert [
+        scheduled_teacher_category(
+            step,
+            single_only_steps=4,
+            bootstrap_schedule=("lora_single", "artist_tag"),
+            schedule=("artist_tag", "lora_single", "lora_mixture"),
+        )
+        for step in range(1, 9)
+    ] == [
+        "lora_single",
+        "artist_tag",
+        "lora_single",
+        "artist_tag",
+        "artist_tag",
+        "lora_single",
+        "lora_mixture",
+        "artist_tag",
+    ]
+
+
 def test_decomposed_objective_penalizes_common_output_collapse():
     teacher = torch.eye(4).reshape(4, 1, 4) + 0.2
     exact = teacher.clone().requires_grad_(True)

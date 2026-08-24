@@ -1148,16 +1148,19 @@ lora_functional_distillation_v2:
       name: detail-style-lora-functional-distill-v2-artist-centered
       id: detail-style-lora-functional-distill-v2-artist-centered
 
-# Production-direction experiment: references are encoded by the frozen
-# Dual-query Resampler and typed Reader, then projected directly into a fresh
-# per-block Style K/V branch. Individual and weighted LoRA effects are offline
-# functional teachers only. No LoRA weight, artist ID, retrieval index or
-# mixture coefficient exists in the saved adapter's inference path.
+# Production-direction experiment v2: retain only the independently
+# reconstruction-pretrained Reader. Common K/V, reference-conditioned shared
+# K/V bases, block deltas, base mixing and the artist-null residual all start
+# from their normal fresh initializers. During bootstrap, individual LoRA and
+# native Anima artist teachers alternate; weighted LoRA teachers join only
+# after that direct visual mapping has been established. No LoRA weight,
+# artist ID, retrieval index or mixture coefficient exists at inference.
 direct_reference_kv_distillation:
-  output_directory: direct_reference_kv_distillation_v1_256_teacher
+  output_directory: direct_reference_kv_distillation_v2_fresh_joint_teacher
   seed: 20260824
   lora_directory: artist_lora_teachers_rank16_256_b2_v5
-  initial_checkpoint: detail_preserving_style_cross_attention_v34_anti_common_functional/checkpoints/step-0000500.pt
+  initial_checkpoint: null
+  reader_checkpoint: detail_style_reader_pretrain_v1/checkpoints/step-0004000.pt
   human_reference_cache: dual_query_reference_tokens_v8_step10000
   synthetic_reference_cache: lora_teacher_references_rank16_256x8_v2/dual_query_reference_tokens_v8_step10000
   teacher_cache:
@@ -1172,14 +1175,16 @@ direct_reference_kv_distillation:
   training:
     device: cuda
     steps: 8000
-    # First align direct K/V on individual functional teachers. Afterwards,
-    # artist-tag, individual LoRA and weighted LoRA teachers cycle 1:1:1.
-    single_only_steps: 500
+    # Native and individual-LoRA effects supervise the fresh K/V model jointly
+    # from the first update. Afterwards the exact 1:1:1 schedule also teaches
+    # multi-reference interpolation using actual weighted-LoRA forwards.
+    single_only_steps: 1500
+    bootstrap_teacher_schedule: [lora_single, artist_tag]
     teacher_schedule: [artist_tag, lora_single, lora_mixture]
-    curriculum: direct_reference_kv
+    curriculum: direct_reference_kv_fresh_joint
     functional_objective: teacher_decomposed
     freeze_reader: true
-    freeze_common: true
+    freeze_common: false
     batch_rows: 6
     references_per_component: 4
     reference_counts: [1, 2, 4]
@@ -1188,10 +1193,11 @@ direct_reference_kv_distillation:
     native_microbatch_rows: 4
     native_references: 4
     shared_learning_rate: 0.00010
+    common_learning_rate: 0.00010
     delta_learning_rate: 0.00020
     mix_learning_rate: 0.00004
     null_learning_rate: 0.00020
-    warmup_steps: 100
+    warmup_steps: 200
     lr_decay_start_step: 6500
     minimum_lr_ratio: 0.10
     betas: [0.9, 0.95]
@@ -1201,8 +1207,8 @@ direct_reference_kv_distillation:
     fused_adamw: true
     token_lru_shards: 8
     ram_resident_tokens: true
-    native_global_weight: 0.15
-    native_infonce_weight: 0.20
+    native_global_weight: 0.25
+    native_infonce_weight: 0.50
     native_artist_mean_weight: 0.0
     native_loss:
       artist_direction_weight: 1.0
@@ -1214,24 +1220,24 @@ direct_reference_kv_distillation:
       magnitude_upper: 1.50
       magnitude_upper_weight: 0.25
     loss_weights:
-      centered_huber: 1.00
-      centered_direction: 1.00
-      centered_magnitude: 0.25
-      functional_infonce: 0.50
+      centered_huber: 1.50
+      centered_direction: 1.50
+      centered_magnitude: 0.50
+      functional_infonce: 1.00
       functional_infonce_temperature: 0.10
-      common_huber: 0.05
-      common_direction: 0.025
-      common_ratio_excess: 2.00
-      common_ratio_margin: 0.03
+      common_huber: 0.10
+      common_direction: 0.05
+      common_ratio_excess: 8.00
+      common_ratio_margin: 0.00
     log_every: 10
     checkpoint_every: 250
-    sample_every: 500
+    sample_every: 250
     resume: true
     wandb:
       enabled: true
       project: anima-style-adapter
-      name: direct-reference-kv-distillation-v1-256-teacher
-      id: direct-reference-kv-distillation-v1-256-teacher
+      name: direct-reference-kv-distillation-v2-fresh-joint-teacher
+      id: direct-reference-kv-distillation-v2-fresh-joint-teacher
 
 
 # Direct image-distribution representability test.  The eight LoRA-generated
