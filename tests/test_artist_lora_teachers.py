@@ -7,8 +7,11 @@ import torch
 
 from anima_style_data.artist_lora_teachers import (
     ArtistLoRAPlan,
+    _build_svd_down_cache,
     _learning_rate_scale,
     _prompt_probabilities,
+    _relational_repa_loss,
+    _repa_target_relation,
     _reset_lora_network,
     _reuse_completed_prefix,
     _safe_artist_filename,
@@ -122,6 +125,55 @@ def test_lora_reset_changes_down_and_zeros_up():
     _reset_lora_network(network, 11)
     assert not torch.equal(before, network.item.lora_down.weight)
     assert torch.count_nonzero(network.item.lora_up.weight) == 0
+
+
+def test_svd_down_reset_keeps_the_initial_delta_zero():
+    class TinyLoRA(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            original = torch.nn.Linear(4, 3, bias=False)
+            self.org_forward = original.forward
+            self.lora_down = torch.nn.Linear(4, 2, bias=False)
+            self.lora_up = torch.nn.Linear(2, 3, bias=False)
+            self.lora_name = "tiny"
+
+    class TinyNetwork(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.item = TinyLoRA()
+            self.unet_loras = [self.item]
+
+    network = TinyNetwork()
+    cache = _build_svd_down_cache(network, {"down_init": "weight_svd"})
+    _reset_lora_network(
+        network,
+        3,
+        down_init="weight_svd",
+        svd_down_cache=cache,
+    )
+    assert cache is not None
+    assert torch.equal(network.item.lora_down.weight, cache[0])
+    assert torch.count_nonzero(network.item.lora_up.weight) == 0
+
+
+def test_relational_repa_matches_the_cached_clean_relation():
+    clean = torch.randn(16, 6)
+    target, grid = _repa_target_relation(
+        clean, (4, 4), 4, spatial_norm=True
+    )
+    normalized = (clean - clean.mean(dim=0, keepdim=True)) / (
+        clean.std(dim=0, keepdim=True) + 1e-6
+    )
+    # A 4x4 fake DiT grid carrying the same relational tokens should match.
+    captured = normalized.reshape(1, 1, 4, 4, 6)
+    loss = _relational_repa_loss(
+        captured,
+        target[None],
+        (8, 8),
+        grid,
+        patch=2,
+    )
+    assert float(loss) < 1e-6
 
 
 def test_kv_only_lora_selection_contract():

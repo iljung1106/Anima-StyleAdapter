@@ -76,6 +76,8 @@ class _CpuBucket:
     image_ids: tuple[int, ...]
     latents: Any
     conditions: Any
+    repa_relations: Any | None = None
+    repa_grid: tuple[int, int] | None = None
 
 
 @dataclass
@@ -92,6 +94,8 @@ class _GpuBucket:
     image_ids: tuple[int, ...]
     latents: Any
     conditions: Any
+    repa_relations: Any | None = None
+    repa_grid: tuple[int, int] | None = None
 
 
 def _selection_signature(cfg: dict[str, Any]) -> str:
@@ -245,6 +249,16 @@ class _ArtistCacheIndex:
         self.variant_names = tuple(str(value) for value in cfg["variant_names"])
         self.conditioning_length = int(cfg.get("text_conditioning_length", 512))
         self.pin_memory = bool(cfg.get("pin_memory", True))
+        self.repa_cfg = dict(cfg.get("repa", {}))
+        self.repa_enabled = bool(self.repa_cfg.get("enabled", False))
+        self.repa_root = None
+        self.repa_by_id: dict[int, dict[str, Any]] = {}
+        if self.repa_enabled:
+            self.repa_root = destination / str(self.repa_cfg["feature_cache"])
+            self.repa_by_id = {
+                int(row["id"]): row
+                for row in read_records(self.repa_root / "manifest.parquet")
+            }
 
         from safetensors.torch import load_file
 
@@ -290,6 +304,44 @@ class _ArtistCacheIndex:
                     row = self.latent_by_id[image_id]
                     latents[image_id] = values[int(row["row_index"])].clone()
 
+        repa_relations: dict[int, Any] = {}
+        repa_grids: dict[int, tuple[int, int]] = {}
+        if self.repa_enabled:
+            assert self.repa_root is not None
+            missing = [image_id for image_id in image_ids if image_id not in self.repa_by_id]
+            if missing:
+                raise RuntimeError(
+                    f"REPA feature cache is missing {len(missing)} selected images"
+                )
+            feature_name = str(self.repa_cfg.get("feature_name", "layer_18_spatial"))
+            patch_size = int(self.repa_cfg.get("feature_patch_size", 16))
+            maximum_grid = int(self.repa_cfg.get("maximum_grid", 16))
+            spatial_norm = bool(self.repa_cfg.get("spatial_norm", True))
+            repa_groups: dict[str, list[int]] = defaultdict(list)
+            for image_id in image_ids:
+                repa_groups[str(self.repa_by_id[image_id]["feature_shard"])].append(
+                    image_id
+                )
+            for shard_name, shard_ids in repa_groups.items():
+                with safe_open(
+                    self.repa_root / shard_name, framework="pt", device="cpu"
+                ) as handle:
+                    for image_id in shard_ids:
+                        row = self.repa_by_id[image_id]
+                        tokens = handle.get_tensor(f"{image_id}.{feature_name}")
+                        source_grid = (
+                            int(row["target_height"]) // patch_size,
+                            int(row["target_width"]) // patch_size,
+                        )
+                        relation, target_grid = _repa_target_relation(
+                            tokens,
+                            source_grid,
+                            maximum_grid,
+                            spatial_norm=spatial_norm,
+                        )
+                        repa_relations[image_id] = relation
+                        repa_grids[image_id] = target_grid
+
         conditions: dict[int, dict[str, Any]] = defaultdict(dict)
         text_groups: dict[str, list[tuple[int, str]]] = defaultdict(list)
         for image_id in image_ids:
@@ -309,13 +361,14 @@ class _ArtistCacheIndex:
                         values[start : start + length]
                     )
 
-        def make_buckets(ids: tuple[int, ...]) -> dict[tuple[int, int], _CpuBucket]:
-            grouped: dict[tuple[int, int], list[int]] = defaultdict(list)
+        def make_buckets(ids: tuple[int, ...]) -> dict[tuple[int, ...], _CpuBucket]:
+            grouped: dict[tuple[int, ...], list[int]] = defaultdict(list)
             for image_id in ids:
                 value = latents[image_id]
-                grouped[(int(value.shape[-2]), int(value.shape[-1]))].append(
-                    image_id
-                )
+                key: tuple[int, ...] = (int(value.shape[-2]), int(value.shape[-1]))
+                if self.repa_enabled:
+                    key += repa_grids[image_id]
+                grouped[key].append(image_id)
             result = {}
             for shape, bucket_ids in grouped.items():
                 latent_tensor = torch.stack([latents[value] for value in bucket_ids])
@@ -330,10 +383,21 @@ class _ArtistCacheIndex:
                 if self.pin_memory and torch.cuda.is_available():
                     latent_tensor = latent_tensor.pin_memory()
                     condition_tensor = condition_tensor.pin_memory()
+                relation_tensor = None
+                target_grid = None
+                if self.repa_enabled:
+                    relation_tensor = torch.stack(
+                        [repa_relations[value] for value in bucket_ids]
+                    )
+                    target_grid = repa_grids[bucket_ids[0]]
+                    if self.pin_memory and torch.cuda.is_available():
+                        relation_tensor = relation_tensor.pin_memory()
                 result[shape] = _CpuBucket(
                     image_ids=tuple(bucket_ids),
                     latents=latent_tensor,
                     conditions=condition_tensor,
+                    repa_relations=relation_tensor,
+                    repa_grid=target_grid,
                 )
             return result
 
@@ -342,6 +406,11 @@ class _ArtistCacheIndex:
         bytes_loaded = sum(
             bucket.latents.numel() * bucket.latents.element_size()
             + bucket.conditions.numel() * bucket.conditions.element_size()
+            + (
+                bucket.repa_relations.numel() * bucket.repa_relations.element_size()
+                if bucket.repa_relations is not None
+                else 0
+            )
             for buckets in (train, validation)
             for bucket in buckets.values()
         )
@@ -366,29 +435,154 @@ def _to_gpu_buckets(cpu_buckets: dict[tuple[int, int], _CpuBucket], device: str)
             conditions=bucket.conditions.to(
                 device=device, dtype=torch.bfloat16, non_blocking=True
             ),
+            repa_relations=(
+                bucket.repa_relations.to(
+                    device=device, dtype=torch.float16, non_blocking=True
+                )
+                if bucket.repa_relations is not None
+                else None
+            ),
+            repa_grid=bucket.repa_grid,
         )
         for shape, bucket in cpu_buckets.items()
     }
 
 
-def _reset_lora_network(network, seed: int) -> None:
+def _build_svd_down_cache(network, training: dict[str, Any]):
+    """Build one reusable pretrained-weight basis for every selected LoRA.
+
+    The cache is materialized only once for the resident Anima model and then
+    copied into each independent artist LoRA.  ``lora_up`` stays zero, so the
+    effective delta remains exactly zero at initialization and the saved file
+    stays a conventional sd-scripts LoRA.
+    """
+    import torch
+
+    if str(training.get("down_init", "kaiming")).casefold() != "weight_svd":
+        return None
+    cache = []
+    with torch.no_grad():
+        for lora in network.unet_loras:
+            original = getattr(lora, "org_forward", None)
+            original = getattr(original, "__self__", None)
+            if original is None or not hasattr(original, "weight"):
+                raise RuntimeError(
+                    f"Cannot resolve pretrained weight for {lora.lora_name}"
+                )
+            weight = original.weight.detach().float()
+            if weight.ndim != 2:
+                raise RuntimeError("weight_svd currently supports Linear LoRAs only")
+            rank = int(lora.lora_down.weight.shape[0])
+            # Only Vh is retained.  full_matrices=False avoids allocating the
+            # unused square U for Anima's wide projection matrices.
+            _, _, vh = torch.linalg.svd(weight, full_matrices=False)
+            cache.append(
+                (vh[:rank] / math.sqrt(3.0)).to(lora.lora_down.weight.dtype)
+            )
+    return tuple(cache)
+
+
+def _reset_lora_network(
+    network,
+    seed: int,
+    *,
+    down_init: str = "kaiming",
+    svd_down_cache=None,
+) -> None:
     import torch
 
     device = next(network.parameters()).device
     generator = torch.Generator(device=device).manual_seed(int(seed))
     with torch.no_grad():
-        for lora in network.unet_loras:
-            # This is exactly kaiming_uniform_(a=sqrt(5)) for the 2-D
-            # Linear LoRA-down weight, expressed with uniform_ so it remains
-            # deterministic on PyTorch versions whose init helper has no
-            # generator argument.
-            bound = 1.0 / math.sqrt(lora.lora_down.weight.shape[1])
-            lora.lora_down.weight.uniform_(
-                -bound, bound, generator=generator
-            )
+        for index, lora in enumerate(network.unet_loras):
+            if str(down_init).casefold() == "weight_svd":
+                if svd_down_cache is None:
+                    raise RuntimeError("weight_svd requested without a basis cache")
+                lora.lora_down.weight.copy_(svd_down_cache[index])
+            else:
+                # This is exactly kaiming_uniform_(a=sqrt(5)) for the 2-D
+                # Linear LoRA-down weight, expressed with uniform_ so it remains
+                # deterministic on PyTorch versions whose init helper has no
+                # generator argument.
+                bound = 1.0 / math.sqrt(lora.lora_down.weight.shape[1])
+                lora.lora_down.weight.uniform_(
+                    -bound, bound, generator=generator
+                )
             lora.lora_up.weight.zero_()
         for parameter in network.parameters():
             parameter.grad = None
+
+
+def _repa_target_relation(
+    tokens,
+    source_grid: tuple[int, int],
+    maximum_grid: int,
+    *,
+    spatial_norm: bool,
+):
+    """Compress a clean C-RADIO grid and cache its relational REPA target."""
+    import torch.nn.functional as F
+
+    height, width = source_grid
+    if tokens.shape[0] != height * width:
+        raise RuntimeError(
+            f"C-RADIO token/grid mismatch: {tokens.shape[0]} vs {height}x{width}"
+        )
+    scale = min(1.0, float(maximum_grid) / max(height, width))
+    target_height = max(1, round(height * scale))
+    target_width = max(1, round(width * scale))
+    grid = tokens.float().reshape(height, width, -1).permute(2, 0, 1)[None]
+    pooled = F.adaptive_avg_pool2d(grid, (target_height, target_width))
+    pooled = pooled.flatten(2).transpose(1, 2)
+    if spatial_norm:
+        pooled = (pooled - pooled.mean(dim=1, keepdim=True)) / (
+            pooled.std(dim=1, keepdim=True) + 1e-6
+        )
+    normalized = F.normalize(pooled, dim=-1)
+    relation = normalized @ normalized.transpose(1, 2)
+    return relation[0].to(dtype=tokens.dtype), (target_height, target_width)
+
+
+class _REPACapture:
+    def __init__(self, module):
+        self.value = None
+
+        def capture(_module, _inputs, output):
+            self.value = output
+
+        self.handle = module.register_forward_hook(capture)
+
+    def close(self) -> None:
+        self.handle.remove()
+
+
+def _relational_repa_loss(
+    captured,
+    target_relation,
+    latent_hw: tuple[int, int],
+    target_grid: tuple[int, int],
+    *,
+    patch: int,
+    trim_tokens: int = 0,
+):
+    import torch.nn.functional as F
+
+    batch, dim = captured.shape[0], captured.shape[-1]
+    tokens = captured.reshape(batch, -1, dim)
+    if trim_tokens:
+        tokens = tokens[:, :-trim_tokens]
+    latent_height, latent_width = latent_hw
+    dit_height, dit_width = latent_height // patch, latent_width // patch
+    if tokens.shape[1] != dit_height * dit_width:
+        raise RuntimeError(
+            f"REPA capture has {tokens.shape[1]} tokens, expected "
+            f"{dit_height}x{dit_width} for latent {latent_hw}"
+        )
+    grid = tokens.reshape(batch, dit_height, dit_width, dim).permute(0, 3, 1, 2)
+    pooled = F.adaptive_avg_pool2d(grid.float(), target_grid).flatten(2).transpose(1, 2)
+    normalized = F.normalize(pooled, dim=-1)
+    relation = normalized @ normalized.transpose(1, 2)
+    return F.mse_loss(relation, target_relation.float())
 
 
 def _compile_anima_blocks(anima, cfg: dict[str, Any]) -> None:
@@ -474,10 +668,27 @@ def _sample_batch(
         null_condition[None].expand_as(conditions),
         conditions,
     )
-    return bucket.latents[indices], conditions
+    relations = (
+        bucket.repa_relations[indices]
+        if bucket.repa_relations is not None
+        else None
+    )
+    return bucket.latents[indices], conditions, relations, bucket.repa_grid
 
 
-def _flow_loss(anima, latents, conditions, cfg, generator):
+def _flow_loss(
+    anima,
+    latents,
+    conditions,
+    cfg,
+    generator,
+    *,
+    repa_relations=None,
+    repa_grid=None,
+    repa_capture: _REPACapture | None = None,
+    repa_cfg: dict[str, Any] | None = None,
+    return_components: bool = False,
+):
     import torch
     import torch.nn.functional as F
 
@@ -502,6 +713,8 @@ def _flow_loss(anima, latents, conditions, cfg, generator):
         device=latents.device,
         dtype=latents.dtype,
     )
+    if repa_capture is not None:
+        repa_capture.value = None
     with torch.autocast("cuda", dtype=torch.bfloat16):
         prediction = anima(
             noisy.unsqueeze(2),
@@ -511,7 +724,24 @@ def _flow_loss(anima, latents, conditions, cfg, generator):
             target_input_ids=None,
         ).squeeze(2)
     target = noise - latents
-    return F.mse_loss(prediction.float(), target.float())
+    flow = F.mse_loss(prediction.float(), target.float())
+    repa = flow.new_zeros(())
+    if repa_relations is not None:
+        if repa_capture is None or repa_capture.value is None or repa_grid is None:
+            raise RuntimeError("REPA target was sampled but its block hook did not fire")
+        effective = dict(repa_cfg or {})
+        repa = _relational_repa_loss(
+            repa_capture.value,
+            repa_relations,
+            (int(latents.shape[-2]), int(latents.shape[-1])),
+            repa_grid,
+            patch=int(effective.get("dit_patch_size", 2)),
+            trim_tokens=int(effective.get("trim_tokens", 0)),
+        )
+    total = flow + float((repa_cfg or {}).get("weight", 0.0)) * repa
+    if return_components:
+        return total, flow, repa
+    return total
 
 
 def _learning_rate_scale(
@@ -555,7 +785,7 @@ def _evaluate(
     losses = []
     with torch.no_grad():
         for _ in range(int(cfg.get("validation_batches", 4))):
-            latents, conditions = _sample_batch(
+            latents, conditions, _, _ = _sample_batch(
                 buckets,
                 int(cfg.get("batch_size", 2)),
                 shape_rng,
@@ -1081,6 +1311,24 @@ def train_artist_lora_teachers(
     anima.train()
     _compile_anima_blocks(anima, dict(training.get("compile", {})))
 
+    repa_cfg = dict(cfg.get("repa", {}))
+    repa_capture = None
+    if bool(repa_cfg.get("enabled", False)):
+        repa_layer = int(repa_cfg.get("layer", 8))
+        if not 0 <= repa_layer < len(anima.blocks):
+            raise ValueError(f"REPA layer {repa_layer} is outside the Anima blocks")
+        # The hook lives on block.__call__ outside the compiled _forward graph,
+        # matching anima_lora's implementation while retaining the grad path.
+        repa_capture = _REPACapture(anima.blocks[repa_layer])
+        print(
+            f"artist-lora REPA relational layer={repa_layer} "
+            f"weight={float(repa_cfg.get('weight', 0.0)):.4g} "
+            f"anneal_step={int(repa_cfg.get('anneal_step', 0))}",
+            flush=True,
+        )
+
+    svd_down_cache = _build_svd_down_cache(network, training)
+
     parameters = [value for value in network.parameters() if value.requires_grad]
     parameter_count = sum(value.numel() for value in parameters)
     optimizer = torch.optim.AdamW(
@@ -1163,7 +1411,12 @@ def train_artist_lora_teachers(
             torch.cuda.reset_peak_memory_stats()
 
             reset_seed = int(cfg.get("seed", 20260823)) + plan.index * 1009
-            _reset_lora_network(network, reset_seed)
+            _reset_lora_network(
+                network,
+                reset_seed,
+                down_init=str(training.get("down_init", "kaiming")),
+                svd_down_cache=svd_down_cache,
+            )
             optimizer.state.clear()
             for group in optimizer.param_groups:
                 group["lr"] = base_lr
@@ -1190,6 +1443,8 @@ def train_artist_lora_teachers(
             if start_step and "shape_rng_state" in resume:
                 shape_rng.setstate(resume["shape_rng_state"])
             running_loss = torch.zeros((), device=device, dtype=torch.float32)
+            running_flow_loss = torch.zeros((), device=device, dtype=torch.float32)
+            running_repa_loss = torch.zeros((), device=device, dtype=torch.float32)
             interval_step_count = 0
             interval_started = time.perf_counter()
             artist_started = time.perf_counter()
@@ -1205,7 +1460,7 @@ def train_artist_lora_teachers(
                 for group in optimizer.param_groups:
                     group["lr"] = base_lr * lr_scale
                 optimizer.zero_grad(set_to_none=True)
-                latents, conditions = _sample_batch(
+                latents, conditions, repa_relations, repa_grid = _sample_batch(
                     train_buckets,
                     batch_size,
                     shape_rng,
@@ -1213,24 +1468,51 @@ def train_artist_lora_teachers(
                     prompt_probabilities,
                     null_condition,
                 )
-                loss = _flow_loss(anima, latents, conditions, training, generator)
+                repa_active = (
+                    repa_relations is not None
+                    and (
+                        int(repa_cfg.get("anneal_step", 0)) <= 0
+                        or step <= int(repa_cfg["anneal_step"])
+                    )
+                )
+                loss, flow_loss, repa_loss = _flow_loss(
+                    anima,
+                    latents,
+                    conditions,
+                    training,
+                    generator,
+                    repa_relations=repa_relations if repa_active else None,
+                    repa_grid=repa_grid if repa_active else None,
+                    repa_capture=repa_capture if repa_active else None,
+                    repa_cfg=repa_cfg,
+                    return_components=True,
+                )
                 loss.backward()
                 grad_norm = torch.nn.utils.clip_grad_norm_(
                     parameters, max_grad_norm, foreach=True
                 )
                 optimizer.step()
                 running_loss += loss.detach()
+                running_flow_loss += flow_loss.detach()
+                running_repa_loss += repa_loss.detach()
                 interval_step_count += 1
 
                 if step % log_every == 0 or step == steps:
                     torch.cuda.synchronize()
                     elapsed = time.perf_counter() - interval_started
                     mean_loss = float(running_loss / max(1, interval_step_count))
+                    mean_flow_loss = float(
+                        running_flow_loss / max(1, interval_step_count)
+                    )
+                    mean_repa_loss = float(
+                        running_repa_loss / max(1, interval_step_count)
+                    )
                     step_seconds = elapsed / max(1, interval_step_count)
                     global_step = plan.index * steps + step
                     print(
                         f"artist-lora artist={plan.index + 1}/{len(plans)} "
                         f"step={step}/{steps} loss={mean_loss:.6f} "
+                        f"flow={mean_flow_loss:.6f} repa={mean_repa_loss:.6f} "
                         f"grad={float(grad_norm):.4f} step_s={step_seconds:.3f} "
                         f"img_s={batch_size / max(step_seconds, 1e-6):.2f} "
                         f"vram_gib={torch.cuda.max_memory_allocated() / (1024**3):.2f}",
@@ -1240,6 +1522,9 @@ def train_artist_lora_teachers(
                         wandb_run.log(
                             {
                                 "train/loss": mean_loss,
+                                "train/flow_loss": mean_flow_loss,
+                                "train/repa_loss": mean_repa_loss,
+                                "train/repa_active": float(repa_active),
                                 "train/grad_norm": float(grad_norm),
                                 "train/learning_rate": float(optimizer.param_groups[0]["lr"]),
                                 "system/step_seconds": step_seconds,
@@ -1255,6 +1540,8 @@ def train_artist_lora_teachers(
                             step=global_step,
                         )
                     running_loss.zero_()
+                    running_flow_loss.zero_()
+                    running_repa_loss.zero_()
                     interval_step_count = 0
                     interval_started = time.perf_counter()
 
@@ -1308,6 +1595,8 @@ def train_artist_lora_teachers(
                 "anima_style_plan_signature": plan_signature,
                 "anima_style_lora_config": config_key,
                 "anima_style_lora_modules": str(len(selected_modules)),
+                "anima_style_down_init": str(training.get("down_init", "kaiming")),
+                "anima_style_repa": json.dumps(repa_cfg, sort_keys=True),
             }
             temporary_weight_path = weight_path.with_name(
                 weight_path.stem + ".tmp.safetensors"
@@ -1375,6 +1664,8 @@ def train_artist_lora_teachers(
             torch.cuda.empty_cache()
     finally:
         prefetch.shutdown(wait=True, cancel_futures=True)
+        if repa_capture is not None:
+            repa_capture.close()
         if wandb_run is not None:
             wandb_run.finish()
 
@@ -1389,6 +1680,8 @@ def train_artist_lora_teachers(
         "rank": rank,
         "alpha": alpha,
         "parameters": parameter_count,
+        "down_init": str(training.get("down_init", "kaiming")),
+        "repa": repa_cfg,
         "selected_module_count": len(selected_modules),
         "selected_modules": list(selected_modules),
         "optimizer_steps": len(all_metrics) * steps,
@@ -1479,4 +1772,28 @@ def smoke_test_artist_kv_lora_rank32_pilot(
 ) -> dict[str, Any]:
     return smoke_test_artist_lora_teachers(
         config, destination, config_key="artist_kv_lora_rank32_pilot"
+    )
+
+
+def prepare_artist_kv_lora_rank32_repa_pilot(
+    config: dict[str, Any], destination: Path
+) -> dict[str, Any]:
+    return prepare_artist_lora_teachers(
+        config, destination, config_key="artist_kv_lora_rank32_repa_pilot"
+    )
+
+
+def train_artist_kv_lora_rank32_repa_pilot(
+    config: dict[str, Any], destination: Path
+) -> dict[str, Any]:
+    return train_artist_lora_teachers(
+        config, destination, config_key="artist_kv_lora_rank32_repa_pilot"
+    )
+
+
+def smoke_test_artist_kv_lora_rank32_repa_pilot(
+    config: dict[str, Any], destination: Path
+) -> dict[str, Any]:
+    return smoke_test_artist_lora_teachers(
+        config, destination, config_key="artist_kv_lora_rank32_repa_pilot"
     )

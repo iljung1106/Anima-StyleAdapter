@@ -409,6 +409,110 @@ artist_kv_lora_rank32_pilot:
     seed: 20260823
     tile_size: 320
 
+# Matched eight-artist A/B for the rank-32 baseline above.  It keeps the same
+# artist/image split, optimizer, resolution buckets, and visual evaluation.
+# The only training-method changes are a zero-delta pretrained SVD basis and
+# an early relational REPA regularizer against cached clean C-RADIO L18 grids.
+# REPA targets are reduced to aspect-preserving <=16x16 Gram matrices once per
+# artist and retained on the GPU; they add no per-step disk or H2D traffic.
+artist_kv_lora_rank32_repa_pilot:
+  output_directory: artist_kv_lora_teachers_rank32_svddown_repa_pilot8_b8_s250_v2
+  seed: 20260823
+  artist_count: 8
+  images_per_artist: 30
+  train_images_per_artist: 24
+  validation_images_per_artist: 6
+  split: train
+  maximum_bucket_count: 32
+  latent_cache: anima_latent_cache_qwen_2d
+  text_cache: anima_text_cache_post_llm_multimode_v1
+  text_conditioning_length: 512
+  pin_memory: true
+  variant_names:
+    - full
+    - full_quality
+    - tag_dropout
+    - tag_dropout_quality
+    - short
+    - short_quality
+  prompt:
+    mode_weights:
+      full: 0.30
+      tag_dropout: 0.40
+      short: 0.20
+      empty: 0.10
+    quality_probability: 0.50
+  repa:
+    enabled: true
+    feature_cache: style_features_l18_l24_siglip_l24
+    feature_name: layer_18_spatial
+    feature_patch_size: 16
+    maximum_grid: 16
+    spatial_norm: true
+    layer: 8
+    dit_patch_size: 2
+    trim_tokens: 0
+    weight: 0.05
+    anneal_step: 125
+  training:
+    device: cuda
+    rank: 32
+    alpha: 32
+    down_init: weight_svd
+    steps: 250
+    batch_size: 8
+    smoke_batch_size: 8
+    learning_rate: 0.0002
+    warmup_steps: 25
+    decay_start_step: 175
+    minimum_lr_ratio: 0.10
+    betas: [0.9, 0.99]
+    adam_eps: 0.00000001
+    weight_decay: 0.01
+    max_grad_norm: 1.0
+    fused_adamw: true
+    allow_tf32: true
+    cudnn_benchmark: true
+    low_precision_rmsnorm: true
+    attention_mode: torch
+    timestep_sampling: shift
+    sigmoid_scale: 1.0
+    sigmoid_bias: 0.0
+    discrete_flow_shift: 3.0
+    exclude_patterns:
+      - ".*"
+    include_patterns:
+      - "blocks\\.\\d+\\.cross_attn\\.(k_proj|v_proj)"
+    required_module_patterns:
+      - "blocks\\.\\d+\\.cross_attn\\.(k_proj|v_proj)"
+    expected_module_count: 56
+    log_every: 25
+    validation_every: 125
+    validation_batches: 4
+    state_every: 125
+    compile:
+      enabled: true
+      backend: inductor
+      mode: default
+      dynamic: auto
+      fullgraph: false
+      cache_size_limit: 32
+    wandb:
+      enabled: true
+      project: anima-style-adapter
+      name: artist-kv-lora-r32-svddown-repa-pilot8-b8-s250
+      id: artist-kv-lora-r32-svddown-repa-pilot8-b8-s250-v2
+  preview:
+    enabled: true
+    every_artists: 1
+    prompt_variant: full_quality
+    strengths: [1.0, 1.5]
+    steps: 30
+    flow_shift: 3.0
+    text_cfg: 4.0
+    seed: 20260823
+    tile_size: 320
+
 # The first 320 plans and weights are reused exactly.  The next 64 are chosen
 # by greedy cosine k-center over frozen four-reference Reader codes from all
 # 2,185 leakage-free candidates, rather than by another random prefix.
