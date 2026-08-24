@@ -20,7 +20,7 @@ from typing import Any
 
 import torch
 import torch.nn.functional as F
-from safetensors.torch import load_file
+from safetensors.torch import load_file, save_file
 
 from .detail_style_cross_attention import DetailPreservingTypedSlotReader
 from .dual_query_style_tokenizer import CachedTeacherReferenceLoader
@@ -153,6 +153,98 @@ def _visual_knn_coefficients(
     values, indices = similarity.topk(min(int(neighbors), train.shape[0]), dim=-1)
     local = F.softmax(values / float(temperature), dim=-1)
     return torch.zeros_like(similarity).scatter(-1, indices, local)
+
+
+def _average_reader_anchors_by_count(
+    codes: torch.Tensor,
+    reference_counts: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Reduce stochastic Reader views to one stable anchor per count/artist."""
+
+    counts = reference_counts.unique(sorted=True)
+    anchors = torch.stack([
+        codes[:, reference_counts == count].float().mean(dim=1)
+        for count in counts
+    ])
+    return anchors, counts
+
+
+@torch.no_grad()
+def cache_kv_lora_reader_anchors(
+    config: dict[str, Any], destination: Path
+) -> dict[str, Any]:
+    """Persist compact 1/2/4-reference Reader anchors for LoRA retrieval."""
+
+    cfg = dict(config["kv_lora_reader_anchor_cache"])
+    device = str(cfg.get("device", "cuda"))
+    seed = int(cfg.get("seed", 20260824))
+    lora_directory = destination / str(cfg["lora_directory"])
+    plan = json.loads((lora_directory / "plan.json").read_text(encoding="utf-8"))
+    artist_ids = [str(row["style_id"]) for row in plan["artists"]]
+    reader_state = torch.load(
+        destination / str(cfg["reader_checkpoint"]),
+        map_location="cpu",
+        weights_only=False,
+    )
+    oracle_cfg = dict(config["kv_lora_oracle_bootstrap"])
+    detail_cfg = _oracle_detail_config(config, oracle_cfg)
+    reader = DetailPreservingTypedSlotReader(**dict(detail_cfg["model"])).to(
+        device=device, dtype=torch.bfloat16
+    )
+    reader.load_state_dict(reader_state["reader"], strict=True)
+    reader.requires_grad_(False).eval()
+    checkpoint_step = int(reader_state.get("step", 0))
+    del reader_state
+    teacher_train_ids, _ = _teacher_image_split(lora_directory, artist_ids)
+    reference_images = int(cfg.get("reference_images", 8))
+    loader = CachedTeacherReferenceLoader(
+        destination / str(cfg["human_reference_cache"]),
+        split="train",
+        style_ids=artist_ids,
+        batch_size=int(cfg.get("materialization_artist_chunk", 16)),
+        references=reference_images,
+        seed=seed,
+        token_lru_shards=int(cfg.get("token_lru_shards", 8)),
+        strict_style_ids=True,
+        allowed_image_ids=teacher_train_ids,
+    )
+    codes, reference_counts = _materialize_reader_code_bank(
+        reader,
+        loader,
+        artist_ids,
+        reference_images=reference_images,
+        seed=seed ^ 0x414E4348,
+        device=device,
+        style_chunk_size=int(cfg.get("materialization_artist_chunk", 16)),
+    )
+    anchors, counts = _average_reader_anchors_by_count(codes, reference_counts)
+    output = destination / str(cfg["output_directory"])
+    output.mkdir(parents=True, exist_ok=True)
+    temporary = output / "anchors.tmp.safetensors"
+    final = output / "anchors.safetensors"
+    save_file(
+        {
+            "anchors": anchors.cpu().to(torch.bfloat16).contiguous(),
+            "reference_counts": counts.cpu().to(torch.int64).contiguous(),
+        },
+        temporary,
+    )
+    temporary.replace(final)
+    summary = {
+        "artists": len(artist_ids),
+        "artist_ids": artist_ids,
+        "reference_counts": [int(value) for value in counts.cpu()],
+        "anchor_shape": list(anchors.shape),
+        "reader_checkpoint": str(cfg["reader_checkpoint"]),
+        "reader_checkpoint_step": checkpoint_step,
+        "lora_directory": str(cfg["lora_directory"]),
+        "lora_plan_signature": str(plan.get("signature", "")),
+        "teacher_train_images_only": True,
+        "bytes": final.stat().st_size,
+        "path": str(final),
+    }
+    write_json(output / "summary.json", summary)
+    return summary
 
 
 def concatenate_weighted_lora_factors(

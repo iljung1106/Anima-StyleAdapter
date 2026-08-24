@@ -799,6 +799,17 @@ kv_activation_knn_mixture_sample:
   panel_tile_width: 416
   canonicalization_chunk_size: 64
 
+kv_lora_reader_anchor_cache:
+  output_directory: kv_lora_reader_anchors_rank16_320_reader_v3
+  lora_directory: artist_kv_lora_teachers_rank16_320_b2_v3
+  reader_checkpoint: kv_lora_oracle_bootstrap_v3_64_broad256x4/checkpoints/step-0001750.pt
+  human_reference_cache: dual_query_reference_tokens_v8_step10000
+  device: cuda
+  seed: 20260824
+  reference_images: 8
+  materialization_artist_chunk: 16
+  token_lru_shards: 8
+
 # Learn a visual metric over the persistent K/V-only LoRA dictionary instead
 # of inventing bilinear factors.  Source artists are progressively excluded,
 # making the selector approximate each training function from other artists.

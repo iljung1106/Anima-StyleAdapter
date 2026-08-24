@@ -22,6 +22,7 @@ from anima_style_data.kv_mixture_analysis import (
     _sparse_ridge_coefficients,
 )
 from anima_style_data.kv_generalizing_modulator import (
+    _average_reader_anchors_by_count,
     _stratified_view_indices,
     build_mixed_activation_batch,
     concatenate_weighted_lora_factors,
@@ -40,6 +41,22 @@ def test_generalizing_validation_samples_every_reference_count():
 
     assert selected.tolist() == [0, 3, 4, 5, 6]
     assert counts[selected].tolist() == [1.0, 1.0, 2.0, 2.0, 4.0]
+
+
+def test_reader_anchor_cache_averages_views_with_the_same_count():
+    codes = torch.tensor([
+        [[[1.0]], [[3.0]], [[10.0]], [[20.0]]],
+        [[[2.0]], [[4.0]], [[12.0]], [[24.0]]],
+    ])
+    counts = torch.tensor([1, 1, 2, 4])
+
+    anchors, unique = _average_reader_anchors_by_count(codes, counts)
+
+    assert unique.tolist() == [1, 2, 4]
+    torch.testing.assert_close(
+        anchors[:, :, 0, 0],
+        torch.tensor([[2.0, 3.0], [10.0, 12.0], [20.0, 24.0]]),
+    )
 
 
 def test_sparse_selector_coefficients_respect_topk_and_exclusion():

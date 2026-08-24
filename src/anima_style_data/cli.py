@@ -105,6 +105,7 @@ def build_parser() -> argparse.ArgumentParser:
         ("kv-activation-generalize-train", "Train artist-disjoint visual K/V modulation"),
         ("kv-activation-generalize-sample", "Render fresh-reference heldout K/V modulation"),
         ("kv-activation-knn-sample", "Render heldout sparse train-LoRA mixtures"),
+        ("kv-lora-reader-anchor-cache", "Cache compact Reader anchors for LoRA retrieval"),
         ("kv-sparse-mixture-smoke", "Smoke-test leave-one-out sparse LoRA selection"),
         ("kv-sparse-mixture-train", "Train leave-one-out sparse LoRA selection"),
         ("lora-functional-distill-smoke", "Smoke-test LoRA functional distillation"),
@@ -559,6 +560,7 @@ def main() -> None:
         "kv-activation-generalize-train",
         "kv-activation-generalize-sample",
         "kv-activation-knn-sample",
+        "kv-lora-reader-anchor-cache",
         "kv-sparse-mixture-smoke",
         "kv-sparse-mixture-train",
     }:
@@ -583,6 +585,7 @@ def main() -> None:
             smoke_test_generalizing_kv_activation_modulator,
             train_generalizing_kv_activation_modulator,
             sample_generalizing_kv_activation_modulator,
+            cache_kv_lora_reader_anchors,
         )
         from .kv_sparse_mixture_selector import (
             smoke_test_sparse_kv_lora_mixture_selector,
@@ -602,6 +605,7 @@ def main() -> None:
             "kv-activation-generalize-train": train_generalizing_kv_activation_modulator,
             "kv-activation-generalize-sample": sample_generalizing_kv_activation_modulator,
             "kv-activation-knn-sample": sample_knn_kv_mixture_generalization,
+            "kv-lora-reader-anchor-cache": cache_kv_lora_reader_anchors,
             "kv-sparse-mixture-smoke": smoke_test_sparse_kv_lora_mixture_selector,
             "kv-sparse-mixture-train": train_sparse_kv_lora_mixture_selector,
         }[args.command]
