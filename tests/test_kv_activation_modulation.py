@@ -16,6 +16,7 @@ from anima_style_data.kv_activation_modulation import (
 from anima_style_data.kv_activation_sampling import NativeKVFactorInjector
 from anima_style_data.kv_mixture_analysis import (
     _activation_from_coefficients,
+    _fixed_artist_holdout,
     _knn_coefficients,
     _mixture_rank_energy_retention,
     _sparse_ridge_coefficients,
@@ -90,6 +91,21 @@ def test_sparse_ridge_refits_only_selected_dictionary_atoms():
     common = train.mean(dim=0, keepdim=True)
     reconstructed = common + coefficients @ (train - common)
     assert F.cosine_similarity(reconstructed, query).item() > 0.95
+
+
+def test_expanded_dictionary_keeps_the_original_artist_holdout():
+    original = [f"artist-{index}" for index in range(8)]
+    expanded = original + ["artist-8", "artist-9"]
+
+    train, validation = _fixed_artist_holdout(
+        expanded, validation_count=3, source_artist_ids=original
+    )
+
+    assert [expanded[index] for index in validation] == [
+        "artist-0", "artist-4", "artist-7"
+    ]
+    assert set(train).isdisjoint(validation)
+    assert len(train) == 7
 
 
 def test_apply_kv_factors_matches_explicit_low_rank_linears():

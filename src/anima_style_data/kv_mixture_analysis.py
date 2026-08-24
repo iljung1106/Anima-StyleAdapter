@@ -139,6 +139,35 @@ def _effect_metrics(
     }
 
 
+def _fixed_artist_holdout(
+    artist_ids: list[str],
+    *,
+    validation_count: int,
+    source_artist_ids: list[str] | None = None,
+) -> tuple[list[int], list[int]]:
+    """Select a stable holdout from an earlier dictionary when expanding it."""
+
+    candidates = artist_ids if source_artist_ids is None else source_artist_ids
+    missing = sorted(set(candidates) - set(artist_ids))
+    if missing:
+        raise RuntimeError(
+            f"Expanded LoRA bank is missing source artists {missing[:4]}"
+        )
+    positions = torch.linspace(
+        0, len(candidates) - 1, validation_count
+    ).round().long().unique().tolist()
+    validation_ids = {candidates[int(position)] for position in positions}
+    validation = [
+        index for index, style_id in enumerate(artist_ids)
+        if style_id in validation_ids
+    ]
+    train = [
+        index for index, style_id in enumerate(artist_ids)
+        if style_id not in validation_ids
+    ]
+    return train, validation
+
+
 def _mixture_rank_energy_retention(
     down: torch.Tensor,
     up: torch.Tensor,
@@ -497,7 +526,9 @@ def analyze_generalizing_kv_mixture_signal(
     torch.cuda.manual_seed_all(seed)
     torch.backends.cuda.matmul.allow_tf32 = True
 
-    lora_directory = destination / str(general_cfg["lora_directory"])
+    lora_directory = destination / str(
+        cfg.get("lora_directory", general_cfg["lora_directory"])
+    )
     artist_ids, teacher_down, teacher_up = load_kv_lora_factor_bank(
         lora_directory, blocks=int(general_cfg.get("blocks", 28))
     )
@@ -570,17 +601,17 @@ def analyze_generalizing_kv_mixture_signal(
     torch.cuda.empty_cache()
 
     validation_count = int(training.get("validation_artists", 32))
-    validation_list = [
-        int(value)
-        for value in torch.linspace(0, len(artist_ids) - 1, validation_count)
-        .round()
-        .long()
-        .unique()
-    ]
-    validation_set = set(validation_list)
-    train_list = [
-        index for index in range(len(artist_ids)) if index not in validation_set
-    ]
+    source_artist_ids = None
+    if cfg.get("validation_source_lora_directory"):
+        source_artist_ids, _, _ = load_kv_lora_factor_bank(
+            destination / str(cfg["validation_source_lora_directory"]),
+            blocks=int(general_cfg.get("blocks", 28)),
+        )
+    train_list, validation_list = _fixed_artist_holdout(
+        artist_ids,
+        validation_count=validation_count,
+        source_artist_ids=source_artist_ids,
+    )
     train_indices = torch.tensor(train_list, device=device)
     validation_indices = torch.tensor(validation_list, device=device)
     rank_retention = _measure_mixture_rank_retention(
@@ -741,6 +772,9 @@ def analyze_generalizing_kv_mixture_signal(
     summary = {
         "train_artists": len(train_list),
         "validation_artists": len(validation_list),
+        "validation_style_ids": [artist_ids[index] for index in validation_list],
+        "dictionary_artists": len(train_list),
+        "fixed_holdout_source": cfg.get("validation_source_lora_directory"),
         "teacher_reference_images_disjoint": True,
         "evaluation_contexts": int(evaluation_contexts.shape[0]),
         "blocks": int(teacher_down.shape[1]),

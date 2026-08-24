@@ -754,7 +754,9 @@ kv_activation_generalizing_modulator:
       id: kv-activation-generalizing-modulator-v5-256-artist-holdout
 
 kv_activation_generalizing_signal_analysis:
-  output_directory: kv_activation_generalizing_signal_v2_224train_32heldout
+  output_directory: kv_activation_generalizing_signal_v3_288train_32fixedheldout
+  lora_directory: artist_kv_lora_teachers_rank16_320_b2_v3
+  validation_source_lora_directory: artist_kv_lora_teachers_rank16_256_b2_v2
   device: cuda
   seed: 20260824
   reference_counts: [1, 4]
