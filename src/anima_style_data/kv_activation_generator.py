@@ -569,6 +569,112 @@ def _centered_residual_loss(
     }
 
 
+def _functional_centered_attention_loss(
+    student: torch.Tensor,
+    teacher: torch.Tensor,
+    *,
+    centered_huber_weight: float,
+    direction_weight: float,
+    magnitude_weight: float,
+    relation_weight: float,
+    raw_huber_weight: float,
+    temperature: float,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Supervise only the K/V effect visible through native attention.
+
+    Every row in the controlled batch uses the same context and queries.  The
+    batch mean therefore represents the shared functional effect, while the
+    centered rows expose reference-specific differences.  This intentionally
+    avoids regressing pre-normalization K/V components that native
+    normalization, softmax, or O projection subsequently discard.
+    """
+
+    student_f = student.float()
+    teacher_f = teacher.detach().float()
+    if student_f.shape != teacher_f.shape or student_f.shape[0] < 2:
+        raise ValueError(
+            "Functional centered attention loss needs matching controlled rows"
+        )
+    student_common = student_f.mean(dim=0, keepdim=True)
+    teacher_common = teacher_f.mean(dim=0, keepdim=True)
+    student_centered = student_f - student_common
+    teacher_centered = teacher_f - teacher_common
+    reduce_dims = tuple(range(1, teacher_f.ndim))
+    row_shape = (-1,) + (1,) * (teacher_f.ndim - 1)
+    teacher_rms = (
+        teacher_centered.square().mean(dim=reduce_dims).sqrt().clamp_min(1e-5)
+    )
+    student_rms = (
+        student_centered.square().mean(dim=reduce_dims) + 1e-12
+    ).sqrt()
+    scale = teacher_rms.reshape(row_shape)
+    centered_huber = F.smooth_l1_loss(
+        student_centered / scale,
+        teacher_centered / scale,
+        beta=0.1,
+    )
+    cosine_rows = F.cosine_similarity(
+        student_centered.flatten(1), teacher_centered.flatten(1), dim=1
+    )
+    direction = (1.0 - cosine_rows).mean()
+    magnitude = F.smooth_l1_loss(
+        (student_rms / teacher_rms).clamp_min(1e-4).log().clamp(-4, 4),
+        torch.zeros_like(student_rms),
+        beta=0.1,
+    )
+    if temperature <= 0:
+        raise ValueError("Functional relation temperature must be positive")
+    student_unit = F.normalize(student_centered.flatten(1), dim=1)
+    teacher_unit = F.normalize(teacher_centered.flatten(1), dim=1)
+    logits = student_unit @ teacher_unit.t() / float(temperature)
+    labels = torch.arange(len(student_f), device=student_f.device)
+    relation = 0.5 * (
+        F.cross_entropy(logits, labels)
+        + F.cross_entropy(logits.t(), labels)
+    )
+    teacher_total_rms = teacher_f.square().mean().sqrt().clamp_min(1e-5)
+    raw_huber = F.smooth_l1_loss(
+        student_f / teacher_total_rms,
+        teacher_f / teacher_total_rms,
+        beta=0.1,
+    )
+    loss = (
+        float(centered_huber_weight) * centered_huber
+        + float(direction_weight) * direction
+        + float(magnitude_weight) * magnitude
+        + float(relation_weight) * relation
+        + float(raw_huber_weight) * raw_huber
+    )
+    positive = (logits.diagonal() * float(temperature)).mean()
+    wrong = logits.masked_fill(
+        torch.eye(len(student_f), device=student_f.device, dtype=torch.bool),
+        torch.finfo(logits.dtype).min,
+    ).max(dim=1).values.mul(float(temperature)).mean()
+    return loss, {
+        "functional_loss": loss.detach(),
+        "functional_centered_huber": centered_huber.detach(),
+        "functional_centered_cosine": cosine_rows.mean().detach(),
+        "functional_centered_magnitude": magnitude.detach(),
+        "functional_student_to_teacher_rms": (
+            student_rms / teacher_rms
+        ).mean().detach(),
+        "functional_relation_loss": relation.detach(),
+        "functional_relation_accuracy": (
+            logits.argmax(dim=1) == labels
+        ).float().mean().detach(),
+        "functional_relation_cosine_gap": (positive - wrong).detach(),
+        "functional_raw_huber": raw_huber.detach(),
+        "functional_student_common_ratio": (
+            student_common.square().mean().sqrt()
+            / student_f.square().mean().sqrt().clamp_min(1e-8)
+        ).detach(),
+        "functional_teacher_common_ratio": (
+            teacher_common.square().mean().sqrt()
+            / teacher_f.square().mean().sqrt().clamp_min(1e-8)
+        ).detach(),
+    }
+
+
 def prepare_kv_activation_mixture_specs(
     config: dict[str, Any], destination: Path
 ) -> dict[str, Any]:
@@ -753,9 +859,10 @@ def _save_training_state(
     model: nn.Module,
     optimizer: torch.optim.Optimizer,
     cfg: dict[str, Any],
+    reader: nn.Module | None = None,
 ) -> None:
     temporary = path.with_suffix(path.suffix + ".tmp")
-    torch.save({
+    state = {
         "step": int(step),
         "model": {key: value.detach().cpu() for key, value in model.state_dict().items()},
         "optimizer": optimizer.state_dict(),
@@ -763,7 +870,12 @@ def _save_training_state(
         "python_rng": random.getstate(),
         "torch_rng": torch.get_rng_state(),
         "cuda_rng": torch.cuda.get_rng_state_all(),
-    }, temporary)
+    }
+    if reader is not None:
+        state["reader"] = {
+            key: value.detach().cpu() for key, value in reader.state_dict().items()
+        }
+    torch.save(state, temporary)
     temporary.replace(path)
 
 
@@ -1209,6 +1321,455 @@ def train_reference_conditioned_kv_activation_generator(
     return summary
 
 
+_FUNCTIONAL_READER_PREFIXES = (
+    "set_query",
+    "set_norm",
+    "reference_identity_norm",
+    "reference_identity_projection",
+    "pool_type_embeddings",
+    "pool_type_preference",
+    "set_attention",
+    "set_ff_norm",
+    "set_ff",
+    "mixers",
+)
+
+
+def _open_functional_reader_pooling(
+    reader: DetailPreservingTypedSlotReader,
+) -> list[nn.Parameter]:
+    selected: list[nn.Parameter] = []
+    for name, parameter in reader.named_parameters():
+        trainable = any(
+            name == prefix or name.startswith(f"{prefix}.")
+            for prefix in _FUNCTIONAL_READER_PREFIXES
+        )
+        parameter.requires_grad_(trainable)
+        if trainable:
+            selected.append(parameter)
+    if not selected:
+        raise RuntimeError("No Reader pooling parameters were selected")
+    reader.train()
+    return selected
+
+
+@torch.no_grad()
+def _materialize_reference_token_bank(
+    loader: CachedTeacherReferenceLoader,
+    style_ids: list[str],
+    *,
+    references: int,
+    seed: int,
+    chunk_size: int,
+    device: str,
+) -> torch.Tensor:
+    """Keep cached frozen-Resampler tokens resident on the training GPU."""
+
+    chunks: list[torch.Tensor] = []
+    started = time.perf_counter()
+    for offset in range(0, len(style_ids), chunk_size):
+        ids = style_ids[offset : offset + chunk_size]
+        loaded = loader.load_styles(
+            ids,
+            references_per_style=references,
+            seed=seed + offset * 1_000_003,
+        )
+        chunks.append(
+            loaded["tokens"].to(
+                device=device, dtype=torch.bfloat16, non_blocking=True
+            )
+        )
+        if offset + len(ids) == len(style_ids) or (offset // chunk_size + 1) % 5 == 0:
+            print(
+                "materialized raw reference tokens "
+                f"{offset + len(ids)}/{len(style_ids)} "
+                f"({time.perf_counter() - started:.1f}s)",
+                flush=True,
+            )
+    if not chunks:
+        raise ValueError("Cannot materialize an empty reference bank")
+    return torch.cat(chunks, dim=0)
+
+
+def _select_reference_tokens(
+    bank: torch.Tensor,
+    artist_indices: list[int],
+    *,
+    reference_counts: list[int],
+    reference_start: int,
+    reference_stop: int,
+    rng: random.Random,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    maximum = max(reference_counts)
+    rows = []
+    mask = torch.zeros(
+        len(artist_indices), maximum, device=bank.device, dtype=torch.bool
+    )
+    for row, (artist, count) in enumerate(
+        zip(artist_indices, reference_counts, strict=True)
+    ):
+        choices = rng.sample(range(reference_start, reference_stop), count)
+        values = bank[artist, choices]
+        if count < maximum:
+            values = torch.cat(
+                [values, values.new_zeros(maximum - count, *values.shape[1:])]
+            )
+        rows.append(values)
+        mask[row, :count] = True
+    return torch.stack(rows), mask
+
+
+def train_functional_reference_kv_operator(
+    config: dict[str, Any],
+    destination: Path,
+    *,
+    steps_override: int | None = None,
+) -> dict[str, Any]:
+    """Train a visual rank operator in native-attention functional space.
+
+    No dataset-mean K/V operator is subtracted.  The exact rank-16 K/V LoRA
+    activation is retained only as a weak auxiliary target; native
+    normalization, attention softmax and O define the primary supervised
+    effect.  A controlled batch shares context and Q so artist centering is
+    meaningful, and Reader pooling remains trainable.
+    """
+
+    cfg = copy.deepcopy(config["kv_reference_functional_operator"])
+    training = dict(cfg["training"])
+    steps = int(steps_override or training.get("steps", 4000))
+    device = str(training.get("device", "cuda"))
+    seed = int(cfg.get("seed", 20260824))
+    random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.set_float32_matmul_precision("high")
+
+    artist_ids, teacher_down, teacher_up = load_kv_lora_factor_bank(
+        destination / str(cfg["lora_directory"]),
+        blocks=int(cfg.get("blocks", 28)),
+        dtype=torch.float16,
+    )
+    validation_artists = int(training.get("validation_artists", 32))
+    if not 1 <= validation_artists < len(artist_ids):
+        raise ValueError("validation_artists must leave training artists")
+    train_artist_count = len(artist_ids) - validation_artists
+    teacher_down = teacher_down.to(device=device, dtype=torch.bfloat16)
+    teacher_up = teacher_up.to(device=device, dtype=torch.bfloat16)
+
+    output = destination / str(cfg["output_directory"])
+    output.mkdir(parents=True, exist_ok=True)
+    visual_reader = _load_reader(config, destination, cfg, device)
+    reader_parameters = _open_functional_reader_pooling(visual_reader)
+    reference_images = int(training.get("materialized_reference_images", 12))
+    train_reference_images = int(training.get("train_reference_images", 8))
+    if reference_images <= train_reference_images:
+        raise ValueError("Reference materialization must reserve validation images")
+    chunk = int(training.get("materialization_style_chunk", 16))
+    reference_loader = CachedTeacherReferenceLoader(
+        destination / str(cfg["human_reference_cache"]),
+        split="train",
+        style_ids=artist_ids,
+        batch_size=chunk,
+        references=reference_images,
+        seed=seed ^ 0x48554D41,
+        token_lru_shards=int(training.get("token_lru_shards", 8)),
+        strict_style_ids=True,
+    )
+    reference_bank = _materialize_reference_token_bank(
+        reference_loader,
+        artist_ids,
+        references=reference_images,
+        seed=seed ^ 0x48554D41,
+        chunk_size=chunk,
+        device=device,
+    )
+
+    contexts = load_file(
+        destination / str(cfg["text_context_cache"]) / "base.safetensors",
+        device="cpu",
+    )["base_context"].to(device=device, dtype=torch.bfloat16)
+    heldout_contexts = int(training.get("heldout_contexts", 32))
+    train_context_count = len(contexts) - heldout_contexts
+    if train_context_count <= 0:
+        raise ValueError("heldout_contexts leaves no training context")
+    probes = _load_native_attention_probes(config, destination, device)
+
+    model_cfg = dict(cfg["model"])
+    architecture = str(model_cfg.pop("architecture", "bilinear_low_rank_operator"))
+    if architecture != "bilinear_low_rank_operator":
+        raise ValueError("Functional operator experiment requires bilinear operator")
+    model = ReferenceConditionedLowRankKVOperator(
+        style_dim=int(visual_reader.dim),
+        context_dim=int(teacher_down.shape[-1]),
+        output_dim=int(teacher_up.shape[-2]),
+        blocks=int(teacher_down.shape[1]),
+        **model_cfg,
+    ).to(device=device, dtype=torch.bfloat16)
+
+    operator_lr = float(training.get("operator_learning_rate", 2e-4))
+    reader_lr = float(training.get("reader_learning_rate", 2e-5))
+    optimizer = torch.optim.AdamW(
+        [
+            {"name": "operator", "params": list(model.parameters()), "lr": operator_lr},
+            {"name": "reader", "params": reader_parameters, "lr": reader_lr},
+        ],
+        betas=tuple(training.get("betas", [0.9, 0.95])),
+        eps=float(training.get("adam_eps", 1e-8)),
+        weight_decay=float(training.get("weight_decay", 0.01)),
+        fused=bool(training.get("fused_adamw", True)),
+    )
+    checkpoints = output / "checkpoints"
+    checkpoints.mkdir(parents=True, exist_ok=True)
+    state_path = output / "training_state.pt"
+    start_step = 0
+    if bool(training.get("resume", True)) and state_path.exists():
+        state = torch.load(state_path, map_location="cpu", weights_only=False)
+        model.load_state_dict(state["model"], strict=True)
+        visual_reader.load_state_dict(state["reader"], strict=True)
+        optimizer.load_state_dict(state["optimizer"])
+        start_step = int(state["step"])
+        random.setstate(state["python_rng"])
+        torch.set_rng_state(state["torch_rng"])
+        torch.cuda.set_rng_state_all(state["cuda_rng"])
+
+    batch = int(training.get("batch_size", 8))
+    blocks_per_step = int(training.get("blocks_per_step", 4))
+    reference_values = [int(value) for value in training.get("reference_counts", [1, 2, 4])]
+    reference_weights = [float(value) for value in training.get("reference_count_weights", [0.5, 0.3, 0.2])]
+    attention_queries = int(training.get("attention_queries", 64))
+    kv_aux_weight = float(training.get("kv_auxiliary_weight", 0.1))
+    functional_weight = float(training.get("functional_weight", 1.0))
+    loss_cfg = dict(training.get("functional_loss", {}))
+    warmup = int(training.get("warmup_steps", 100))
+    max_grad_norm = float(training.get("max_grad_norm", 1.0))
+    reader_max_grad_norm = float(training.get("reader_max_grad_norm", 0.25))
+    log_every = int(training.get("log_every", 10))
+    validation_every = int(training.get("validation_every", 250))
+    checkpoint_every = int(training.get("checkpoint_every", 250))
+
+    wandb_run = None
+    wandb_cfg = dict(training.get("wandb", {}))
+    if bool(wandb_cfg.get("enabled", True)):
+        import wandb
+
+        wandb_run = wandb.init(
+            project=str(wandb_cfg.get("project", "anima-style-adapter")),
+            name=str(wandb_cfg.get("name", "kv-reference-functional-operator")),
+            id=str(wandb_cfg.get("id", "kv-reference-functional-operator")),
+            resume="allow" if start_step else "never",
+            config={"kv_reference_functional_operator": cfg},
+        )
+
+    def functional_values(
+        style: torch.Tensor,
+        context: torch.Tensor,
+        indices: torch.Tensor,
+        block: int,
+        query_seed: int,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        student_delta = model(style, context, block)
+        teacher_delta = _mixture_target(
+            context,
+            teacher_down,
+            teacher_up,
+            indices[:, None],
+            torch.ones(len(indices), 1, device=device),
+            block,
+        )
+        probe = probes[block]
+        generator = torch.Generator(device=device).manual_seed(query_seed)
+        queries = torch.randn(
+            len(indices), attention_queries, probe.n_heads, probe.head_dim,
+            device=device, dtype=torch.bfloat16, generator=generator,
+        )
+        zero = torch.zeros_like(student_delta)
+        base_key, base_value = probe.project_context(context, zero)
+        student_key, student_value = probe.project_context(context, student_delta)
+        teacher_key, teacher_value = probe.project_context(context, teacher_delta)
+        base_output = probe.attend(queries, base_key, base_value)
+        student_effect = probe.attend(queries, student_key, student_value) - base_output
+        teacher_effect = probe.attend(queries, teacher_key, teacher_value) - base_output
+        functional_loss, values = _functional_centered_attention_loss(
+            student_effect,
+            teacher_effect,
+            centered_huber_weight=float(loss_cfg.get("centered_huber", 1.0)),
+            direction_weight=float(loss_cfg.get("direction", 1.0)),
+            magnitude_weight=float(loss_cfg.get("magnitude", 0.2)),
+            relation_weight=float(loss_cfg.get("relation", 0.5)),
+            raw_huber_weight=float(loss_cfg.get("raw_huber", 0.05)),
+            temperature=float(loss_cfg.get("temperature", 0.1)),
+        )
+        kv_loss, kv_values = _normalized_activation_loss(
+            student_delta,
+            teacher_delta,
+            direction_weight=float(training.get("kv_direction_weight", 0.1)),
+            magnitude_weight=float(training.get("kv_magnitude_weight", 0.02)),
+        )
+        values.update({f"kv_{key}": value for key, value in kv_values.items()})
+        values["weighted_functional"] = functional_loss.detach() * functional_weight
+        values["weighted_kv_auxiliary"] = kv_loss.detach() * kv_aux_weight
+        return functional_weight * functional_loss + kv_aux_weight * kv_loss, values
+
+    running: dict[str, list[float]] = defaultdict(list)
+    started = time.perf_counter()
+    try:
+        for step in range(start_step + 1, steps + 1):
+            rng = random.Random(seed + step * 1_000_003)
+            artists = rng.sample(range(train_artist_count), batch)
+            counts = rng.choices(reference_values, weights=reference_weights, k=batch)
+            references, reference_mask = _select_reference_tokens(
+                reference_bank,
+                artists,
+                reference_counts=counts,
+                reference_start=0,
+                reference_stop=train_reference_images,
+                rng=rng,
+            )
+            context_index = rng.randrange(train_context_count)
+            context = contexts[context_index : context_index + 1].expand(batch, -1, -1)
+            artist_tensor = torch.tensor(artists, device=device, dtype=torch.long)
+            first_block = ((step - 1) * blocks_per_step) % model.blocks
+            selected_blocks = [
+                (first_block + offset) % model.blocks
+                for offset in range(blocks_per_step)
+            ]
+            optimizer.zero_grad(set_to_none=True)
+            with torch.autocast("cuda", dtype=torch.bfloat16):
+                style = visual_reader(references, reference_mask).tokens
+                rows = [
+                    functional_values(
+                        style,
+                        context,
+                        artist_tensor,
+                        block,
+                        seed + step * 1_000_003 + block * 10_007,
+                    )
+                    for block in selected_blocks
+                ]
+                loss = torch.stack([row[0] for row in rows]).mean()
+            loss.backward()
+            operator_grad = torch.nn.utils.clip_grad_norm_(
+                model.parameters(), max_grad_norm, foreach=True
+            )
+            reader_grad = torch.nn.utils.clip_grad_norm_(
+                reader_parameters, reader_max_grad_norm, foreach=True
+            )
+            lr_scale = min(1.0, step / max(1, warmup))
+            optimizer.param_groups[0]["lr"] = operator_lr * lr_scale
+            optimizer.param_groups[1]["lr"] = reader_lr * lr_scale
+            optimizer.step()
+            running["loss"].append(float(loss.detach()))
+            running["operator_grad_norm"].append(float(operator_grad))
+            running["reader_grad_norm"].append(float(reader_grad))
+            running["reference_count"].append(sum(counts) / len(counts))
+            for key in rows[0][1]:
+                running[key].append(
+                    sum(float(row[1][key]) for row in rows) / len(rows)
+                )
+            if step % log_every == 0:
+                row = {key: sum(values) / len(values) for key, values in running.items()}
+                row["operator_lr"] = optimizer.param_groups[0]["lr"]
+                row["reader_lr"] = optimizer.param_groups[1]["lr"]
+                print(f"Functional K/V operator step={step}/{steps} {row}", flush=True)
+                if wandb_run is not None:
+                    wandb_run.log({f"train/{key}": value for key, value in row.items()}, step=step)
+                running.clear()
+
+            if validation_every > 0 and step % validation_every == 0:
+                model.eval()
+                visual_reader.eval()
+                val_rows: dict[str, list[float]] = defaultdict(list)
+                val_artists = list(range(train_artist_count, len(artist_ids)))
+                val_artists = val_artists[: min(16, len(val_artists))]
+                val_counts = [min(4, reference_images - train_reference_images)] * len(val_artists)
+                val_rng = random.Random(seed ^ step)
+                val_refs, val_mask = _select_reference_tokens(
+                    reference_bank,
+                    val_artists,
+                    reference_counts=val_counts,
+                    reference_start=train_reference_images,
+                    reference_stop=reference_images,
+                    rng=val_rng,
+                )
+                val_indices = torch.tensor(val_artists, device=device, dtype=torch.long)
+                with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
+                    val_style = visual_reader(val_refs, val_mask).tokens
+                    for context_index in range(train_context_count, min(len(contexts), train_context_count + 2)):
+                        val_context = contexts[context_index : context_index + 1].expand(len(val_artists), -1, -1)
+                        for block in range(model.blocks):
+                            _, values = functional_values(
+                                val_style,
+                                val_context,
+                                val_indices,
+                                block,
+                                seed ^ step ^ (context_index * 1009 + block * 9176),
+                            )
+                            for key, value in values.items():
+                                val_rows[key].append(float(value))
+                validation = {
+                    key: sum(values) / len(values)
+                    for key, values in val_rows.items()
+                }
+                print(f"Functional K/V operator validation step={step} {validation}", flush=True)
+                if wandb_run is not None:
+                    wandb_run.log({f"val/{key}": value for key, value in validation.items()}, step=step)
+                model.train()
+                visual_reader.train()
+
+            if step % checkpoint_every == 0 or step == steps:
+                for path in (state_path, checkpoints / f"step-{step:07d}.pt"):
+                    _save_training_state(
+                        path,
+                        step=step,
+                        model=model,
+                        reader=visual_reader,
+                        optimizer=optimizer,
+                        cfg=cfg,
+                    )
+    finally:
+        if wandb_run is not None:
+            wandb_run.finish()
+
+    summary = {
+        "steps": steps,
+        "start_step": start_step,
+        "artists": len(artist_ids),
+        "training_artists": train_artist_count,
+        "validation_artists": validation_artists,
+        "operator_rank": model.operator_rank,
+        "operator_parameters": sum(parameter.numel() for parameter in model.parameters()),
+        "reader_trainable_parameters": sum(parameter.numel() for parameter in reader_parameters),
+        "teacher_decomposition": "none",
+        "primary_objective": "native_attention_functional_centered",
+        "kv_auxiliary_weight": kv_aux_weight,
+        "elapsed_seconds": time.perf_counter() - started,
+    }
+    write_json(output / "summary.json", summary)
+    return summary
+
+
+def smoke_test_functional_reference_kv_operator(
+    config: dict[str, Any], destination: Path
+) -> dict[str, Any]:
+    effective = copy.deepcopy(config)
+    cfg = effective["kv_reference_functional_operator"]
+    cfg["output_directory"] = "kv_reference_functional_operator_smoke"
+    cfg["training"]["resume"] = False
+    cfg["training"]["wandb"]["enabled"] = False
+    cfg["training"]["validation_every"] = 0
+    cfg["training"]["checkpoint_every"] = 1
+    cfg["training"]["batch_size"] = 2
+    cfg["training"]["blocks_per_step"] = 1
+    cfg["training"]["materialized_reference_images"] = 5
+    cfg["training"]["train_reference_images"] = 4
+    cfg["training"]["reference_counts"] = [1]
+    cfg["training"]["reference_count_weights"] = [1.0]
+    return train_functional_reference_kv_operator(
+        effective, destination, steps_override=2
+    )
+
+
 def smoke_test_reference_conditioned_kv_activation_generator(
     config: dict[str, Any], destination: Path
 ) -> dict[str, Any]:
@@ -1323,6 +1884,8 @@ def sample_reference_conditioned_bilinear_kv_operator(
     )
 
     reader = _load_reader(config, destination, cfg, device)
+    if "reader" in checkpoint:
+        reader.load_state_dict(checkpoint["reader"], strict=True)
     operator = ReferenceConditionedLowRankKVOperator(
         style_dim=int(reader.dim),
         context_dim=int(teacher_down.shape[-1]),
@@ -1452,6 +2015,8 @@ def _sample_external_reference_bilinear_kv_operator(
         references.shape[:2], device=device, dtype=torch.bool
     )
     reader = _load_reader(config, destination, cfg, device)
+    if "reader" in checkpoint:
+        reader.load_state_dict(checkpoint["reader"], strict=True)
     _, teacher_down, teacher_up = load_kv_lora_factor_bank(
         destination / str(cfg["lora_directory"]),
         blocks=int(cfg.get("blocks", 28)),
@@ -1541,4 +2106,14 @@ def sample_external_reference_centered_bilinear_kv_operator(
         config,
         destination,
         config_key="kv_reference_centered_bilinear_fixed_sample",
+    )
+
+
+def sample_external_reference_functional_kv_operator(
+    config: dict[str, Any], destination: Path
+) -> dict[str, Any]:
+    return _sample_external_reference_bilinear_kv_operator(
+        config,
+        destination,
+        config_key="kv_reference_functional_operator_fixed_sample",
     )

@@ -931,6 +931,74 @@ kv_reference_centered_bilinear_operator:
       name: kv-reference-centered-bilinear-r32-r16-64-v1
       id: kv-reference-centered-bilinear-r32-r16-64-v1
 
+# Production-form direct visual operator experiment.  It uses all 320
+# completed K/V-only LoRAs, predicts each artist operator directly, and never
+# subtracts a dense dataset-mean operator.  Native attention output is the
+# primary target; exact pre-normalization K/V regression is only a weak
+# auxiliary.  The last 32 teacher artists and four references per artist are
+# held out from optimization.
+kv_reference_functional_operator:
+  output_directory: kv_reference_functional_operator_rank64_r16_320_v1
+  seed: 20260825
+  blocks: 28
+  lora_directory: artist_kv_lora_teachers_rank16_320_b2_v3
+  reader_checkpoint: kv_lora_oracle_bootstrap_v3_64_broad256x4/checkpoints/step-0001750.pt
+  human_reference_cache: dual_query_reference_tokens_v8_step10000
+  text_context_cache: kv_lora_functional_teacher_bank_rank16_64_v2_broad256x4
+  model:
+    architecture: bilinear_low_rank_operator
+    hidden_dim: 256
+    heads: 8
+    ff_dim: 1024
+    operator_layers: 2
+    operator_rank: 64
+    initial_sigma: 0.01
+    minimum_sigma: 0.000001
+    maximum_sigma: 1.0
+  training:
+    device: cuda
+    steps: 4000
+    batch_size: 8
+    blocks_per_step: 4
+    validation_artists: 32
+    materialized_reference_images: 12
+    train_reference_images: 8
+    materialization_style_chunk: 16
+    token_lru_shards: 8
+    reference_counts: [1, 2, 4]
+    reference_count_weights: [0.50, 0.30, 0.20]
+    heldout_contexts: 32
+    attention_queries: 64
+    functional_weight: 1.0
+    kv_auxiliary_weight: 0.10
+    kv_direction_weight: 0.10
+    kv_magnitude_weight: 0.02
+    functional_loss:
+      centered_huber: 1.0
+      direction: 1.0
+      magnitude: 0.20
+      relation: 0.50
+      raw_huber: 0.05
+      temperature: 0.10
+    operator_learning_rate: 0.0002
+    reader_learning_rate: 0.00002
+    warmup_steps: 100
+    betas: [0.9, 0.95]
+    adam_eps: 0.00000001
+    weight_decay: 0.01
+    max_grad_norm: 1.0
+    reader_max_grad_norm: 0.25
+    fused_adamw: true
+    log_every: 10
+    validation_every: 250
+    checkpoint_every: 250
+    resume: true
+    wandb:
+      enabled: true
+      project: anima-style-adapter
+      name: kv-reference-functional-operator-r64-r16-320-v1
+      id: kv-reference-functional-operator-r64-r16-320-v1
+
 kv_reference_bilinear_sample:
   checkpoint: kv_reference_bilinear_operator_rank32_r16_64_v1/checkpoints/step-0003000.pt
   output_directory: diagnostics/kv-reference-bilinear-r32-step3000
@@ -954,6 +1022,14 @@ kv_reference_bilinear_fixed_sample:
 kv_reference_centered_bilinear_fixed_sample:
   checkpoint: kv_reference_centered_bilinear_operator_rank32_r16_64_v1/checkpoints/step-0003000.pt
   output_directory: diagnostics/kv-reference-centered-bilinear-r32-step3000-fixed-reference
+  device: cuda
+  predicted_strengths: [1.0, 1.5]
+  batch_size: 4
+  panel_tile_width: 320
+
+kv_reference_functional_operator_fixed_sample:
+  checkpoint: kv_reference_functional_operator_rank64_r16_320_v1/checkpoints/step-0004000.pt
+  output_directory: diagnostics/kv-reference-functional-operator-r64-step4000-fixed-reference
   device: cuda
   predicted_strengths: [1.0, 1.5]
   batch_size: 4

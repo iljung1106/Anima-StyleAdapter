@@ -7,6 +7,7 @@ from anima_style_data.kv_activation_generator import (
     ReferenceConditionedLowRankKVOperator,
     _apply_dense_kv_operator,
     _centered_residual_loss,
+    _functional_centered_attention_loss,
     _mean_teacher_operator,
     _mixture_target,
 )
@@ -161,3 +162,34 @@ def test_centered_loss_rejects_common_collapse_and_tiny_output() -> None:
     assert matching < collapsed_loss
     assert matching_metrics["relation_accuracy"] == 1
     assert collapsed_metrics["student_to_teacher_rms"] < 0.01
+
+
+def test_functional_centered_loss_prefers_correct_artist_effects() -> None:
+    torch.manual_seed(37)
+    teacher = torch.randn(8, 6, 24)
+    common = torch.randn(1, 6, 24) * 0.5
+    teacher = teacher - teacher.mean(dim=0, keepdim=True) + common
+    matching, metrics = _functional_centered_attention_loss(
+        teacher,
+        teacher,
+        centered_huber_weight=1.0,
+        direction_weight=1.0,
+        magnitude_weight=0.2,
+        relation_weight=0.5,
+        raw_huber_weight=0.05,
+        temperature=0.1,
+    )
+    collapsed = teacher.mean(dim=0, keepdim=True).expand_as(teacher)
+    collapsed_loss, collapsed_metrics = _functional_centered_attention_loss(
+        collapsed,
+        teacher,
+        centered_huber_weight=1.0,
+        direction_weight=1.0,
+        magnitude_weight=0.2,
+        relation_weight=0.5,
+        raw_huber_weight=0.05,
+        temperature=0.1,
+    )
+    assert matching < collapsed_loss
+    assert metrics["functional_relation_accuracy"] == 1
+    assert collapsed_metrics["functional_student_to_teacher_rms"] < 0.01
