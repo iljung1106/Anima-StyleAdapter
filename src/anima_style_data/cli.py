@@ -90,9 +90,12 @@ def build_parser() -> argparse.ArgumentParser:
         ("artist-kv-lora-diverse-train", "Train the Reader-diverse K/V-LoRA expansion"),
         ("lora-reference-generate", "Generate image references from the LoRA teachers"),
         ("lora-reference-expansion-generate", "Generate references for added LoRA teachers"),
+        ("lora-functional-teacher-cache-512", "Cache 512-artist single and mixed LoRA effects"),
+        ("lora-mixture-reference-generate", "Generate actual merged-LoRA reference images"),
         ("kv-lora-reference-generate", "Generate references from K/V-only LoRAs"),
         ("lora-reference-token-cache", "Cache frozen Resampler tokens for LoRA images"),
         ("lora-reference-expansion-token-cache", "Cache Resampler tokens for added LoRA images"),
+        ("lora-mixture-reference-token-cache", "Cache Resampler tokens for merged-LoRA images"),
         ("kv-lora-reference-token-cache", "Cache Resampler tokens for K/V-only LoRA images"),
         ("lora-functional-teacher-cache", "Cache single and mixed LoRA functional effects"),
         ("kv-lora-functional-teacher-cache", "Cache K/V-only LoRA effects"),
@@ -473,6 +476,8 @@ def main() -> None:
     elif args.command in {
         "lora-reference-generate",
         "lora-reference-expansion-generate",
+        "lora-functional-teacher-cache-512",
+        "lora-mixture-reference-generate",
         "lora-functional-teacher-cache",
         "lora-functional-distill-smoke",
         "lora-functional-distill-train",
@@ -483,6 +488,7 @@ def main() -> None:
     }:
         from .lora_functional_distillation import (
             cache_lora_functional_teacher,
+            generate_lora_mixture_references,
             generate_lora_teacher_references,
             smoke_test_lora_functional_distillation,
             smoke_test_lora_functional_distillation_v2,
@@ -497,6 +503,10 @@ def main() -> None:
             "lora-reference-expansion-generate": lambda cfg, dst: generate_lora_teacher_references(
                 cfg, dst, config_key="lora_teacher_references_512_expansion"
             ),
+            "lora-functional-teacher-cache-512": lambda cfg, dst: cache_lora_functional_teacher(
+                cfg, dst, config_key="lora_functional_teacher_512"
+            ),
+            "lora-mixture-reference-generate": generate_lora_mixture_references,
             "lora-functional-teacher-cache": cache_lora_functional_teacher,
             "lora-functional-distill-smoke": smoke_test_lora_functional_distillation,
             "lora-functional-distill-train": train_lora_functional_distillation,
@@ -567,17 +577,20 @@ def main() -> None:
     elif args.command in {
         "lora-reference-token-cache",
         "lora-reference-expansion-token-cache",
+        "lora-mixture-reference-token-cache",
         "kv-lora-reference-token-cache",
     }:
         from .synthetic_reference_pipeline import (
             cache_kv_lora_teacher_dual_query_tokens,
             cache_lora_teacher_dual_query_tokens,
             cache_lora_teacher_expansion_dual_query_tokens,
+            cache_lora_mixture_dual_query_tokens,
         )
 
         stage = {
             "lora-reference-token-cache": cache_lora_teacher_dual_query_tokens,
             "lora-reference-expansion-token-cache": cache_lora_teacher_expansion_dual_query_tokens,
+            "lora-mixture-reference-token-cache": cache_lora_mixture_dual_query_tokens,
             "kv-lora-reference-token-cache": cache_kv_lora_teacher_dual_query_tokens,
         }[args.command]
         _run(stage, config, destination)

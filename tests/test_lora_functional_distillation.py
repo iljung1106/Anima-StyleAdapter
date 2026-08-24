@@ -7,6 +7,7 @@ from anima_style_data.lora_functional_distillation import (
     _configure_reader_trainable_scope,
     _cached_training_probe_bank,
     _initialize_fresh_adapter_strength,
+    _pack_materialized_mixture_references,
     _fewshot_prompt_signature,
     _select_fewshot_validation_styles,
     _teacher_decomposed_functional_objective,
@@ -44,6 +45,54 @@ def test_mixture_plan_is_normalized_and_unique():
     assert len(compound) == len(set(compound))
     assert all(abs(sum(spec.weights) - 1.0) < 1e-7 for spec in specs)
     assert all(all(weight > 0 for weight in spec.weights) for spec in specs)
+
+
+def test_mixture_plan_supports_bounded_amplification_and_signed_extrapolation():
+    specs = build_mixture_specs(
+        32,
+        pair_count=4,
+        triple_count=4,
+        amplified_count=8,
+        signed_count=8,
+        seed=29,
+    )
+    amplified = [value for value in specs if value.kind == "amplified"]
+    signed = [value for value in specs if value.kind == "signed"]
+    assert len(amplified) == len(signed) == 8
+    assert all(1.05 <= sum(value.weights) <= 1.35 for value in amplified)
+    assert all(min(value.weights) > 0 for value in amplified)
+    assert all(abs(sum(value.weights) - 1.0) < 1e-7 for value in signed)
+    assert all(-0.25 <= min(value.weights) <= -0.05 for value in signed)
+    assert all(
+        sum(abs(weight) for weight in value.weights) <= 1.5
+        for value in signed
+    )
+
+
+def test_materialized_signed_mixture_never_passes_coefficients_to_reader():
+    class Loader:
+        def load_styles(self, style_ids, *, references_per_style, seed):
+            del seed
+            return {
+                "tokens": torch.randn(
+                    len(style_ids), references_per_style, 84, 1024
+                )
+            }
+
+    rows = [{
+        "mixture_style_id": "lora-mixture-00001",
+        "weights": [1.2, -0.2],
+    }]
+    tokens, mask, weights = _pack_materialized_mixture_references(
+        Loader(),
+        rows,
+        references_per_mixture=2,
+        seed=7,
+        device="cpu",
+    )
+    assert tokens.shape == (1, 2, 84, 1024)
+    assert mask.all()
+    torch.testing.assert_close(weights, torch.full((1, 2), 0.5))
 
 
 def test_fewshot_prompt_signature_preserves_fixed_prompt_seed_contract():

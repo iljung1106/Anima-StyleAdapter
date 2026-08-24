@@ -706,6 +706,10 @@ def build_mixture_specs(
     *,
     pair_count: int,
     triple_count: int,
+    amplified_count: int = 0,
+    signed_count: int = 0,
+    amplified_sum_range: tuple[float, float] = (1.05, 1.35),
+    signed_beta_range: tuple[float, float] = (0.05, 0.25),
     seed: int,
 ) -> list[MixtureSpec]:
     if artists < 3:
@@ -741,6 +745,39 @@ def build_mixture_specs(
                 "triple",
                 components,
                 tuple(value / total for value in raw),
+            )
+        )
+    amplified_min, amplified_max = map(float, amplified_sum_range)
+    if not (1.0 <= amplified_min <= amplified_max):
+        raise ValueError("amplified_sum_range must be ordered and at least one")
+    for _ in range(amplified_count):
+        component_count = 2 if rng.random() < 0.5 else 3
+        components = sample_components(component_count)
+        raw = [rng.uniform(0.25, 1.0) for _ in range(component_count)]
+        target_sum = rng.uniform(amplified_min, amplified_max)
+        total = sum(raw)
+        specs.append(
+            MixtureSpec(
+                len(specs),
+                "amplified",
+                components,
+                tuple(target_sum * value / total for value in raw),
+            )
+        )
+    signed_min, signed_max = map(float, signed_beta_range)
+    if not (0.0 <= signed_min <= signed_max <= 0.5):
+        raise ValueError("signed_beta_range must lie within [0, 0.5]")
+    for _ in range(signed_count):
+        components = sample_components(2)
+        if rng.random() < 0.5:
+            components = (components[1], components[0])
+        beta = rng.uniform(signed_min, signed_max)
+        specs.append(
+            MixtureSpec(
+                len(specs),
+                "signed",
+                components,
+                (1.0 + beta, -beta),
             )
         )
     return specs
@@ -1012,6 +1049,200 @@ def generate_lora_teacher_references(
     return summary
 
 
+def generate_lora_mixture_references(
+    config: dict[str, Any],
+    destination: Path,
+    *,
+    config_key: str = "lora_mixture_references_512",
+) -> dict[str, Any]:
+    """Materialize merged-LoRA styles so the student never sees mixture weights."""
+
+    cfg = dict(config[config_key])
+    functional_cfg = dict(config[str(cfg["functional_config_key"])])
+    teacher_root = destination / str(
+        functional_cfg["teacher_cache"]["output_directory"]
+    )
+    mixture_rows = [
+        row
+        for row in read_records(teacher_root / "mixtures.parquet")
+        if str(row["kind"]) in set(
+            str(value)
+            for value in cfg.get(
+                "kinds", ["pair", "triple", "amplified", "signed"]
+            )
+        )
+        and bool(row.get("enabled", True))
+    ]
+    if not mixture_rows:
+        raise RuntimeError("No materialized mixture specifications were selected")
+    output = destination / str(cfg["output_directory"])
+    output.mkdir(parents=True, exist_ok=True)
+    (output / "images").mkdir(exist_ok=True)
+    (output / "latents").mkdir(exist_ok=True)
+    (output / "manifests").mkdir(exist_ok=True)
+    lora_root = destination / str(functional_cfg["lora_directory"])
+    plans = _load_lora_plan(lora_root)
+    weight_paths = _weight_paths(lora_root, plans)
+    source = destination / str(cfg["content_source_directory"])
+    content_rows, conditions, negative = _load_content_conditions(source)
+    images_per_mixture = int(cfg.get("images_per_mixture", 4))
+    if len(content_rows) < images_per_mixture:
+        raise RuntimeError("The source text bank has too few mixture prompts")
+    content_rows = content_rows[:images_per_mixture]
+    conditions = conditions[:images_per_mixture]
+    width, height = int(cfg.get("width", 512)), int(cfg.get("height", 512))
+    device = str(cfg.get("device", "cuda"))
+    anima = _resolve_anima_model(config, destination, device).requires_grad_(False).eval()
+    _optimize_frozen_anima(
+        anima, low_precision_rmsnorm=True, fuse_attention_projections=False
+    )
+    network_count = max(len(row["components"]) for row in mixture_rows)
+    networks = _create_lora_networks(
+        config,
+        anima,
+        network_count,
+        device,
+        dict(functional_cfg.get("network_selection", {})),
+    )
+    vae = _load_sampling_vae(config, destination).to(
+        device=device, dtype=torch.bfloat16
+    )
+    vae.requires_grad_(False).eval()
+    steps = int(cfg.get("steps", 20))
+    shift = float(cfg.get("flow_shift", 3.0))
+    sigmas = torch.linspace(1.0, 0.0, steps + 1, device=device, dtype=torch.float32)
+    sigmas = sigmas * shift / (1 + (shift - 1) * sigmas)
+    text_cfg = float(cfg.get("text_cfg", 4.0))
+    positive = conditions.to(device=device, dtype=torch.bfloat16)
+    negative = negative.to(device=device, dtype=torch.bfloat16).expand(
+        images_per_mixture, -1, -1
+    )
+    completed_rows: list[dict[str, Any]] = []
+    started = time.perf_counter()
+    for position, row in enumerate(mixture_rows):
+        mixture_index = int(row["index"])
+        part_path = output / "manifests" / f"part-{mixture_index:05d}.parquet"
+        if part_path.exists():
+            completed_rows.extend(read_records(part_path))
+            continue
+        for slot, network in enumerate(networks):
+            if slot < len(row["components"]):
+                component = int(row["components"][slot])
+                info = network.load_weights(str(weight_paths[component]))
+                if info.missing_keys or info.unexpected_keys:
+                    raise RuntimeError(f"LoRA mixture key mismatch: {info}")
+                network.set_multiplier(float(row["weights"][slot]))
+            else:
+                network.set_multiplier(0.0)
+        seeds = [
+            int(cfg.get("seed", 20260824))
+            + mixture_index * 100_003
+            + index * 1009
+            for index in range(images_per_mixture)
+        ]
+        noise = torch.stack([
+            torch.randn(
+                16,
+                1,
+                height // 8,
+                width // 8,
+                generator=torch.Generator(device=device).manual_seed(seed),
+                device=device,
+                dtype=torch.bfloat16,
+            )
+            for seed in seeds
+        ])
+        with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
+            latents = _sample_anima_batch(
+                anima,
+                noise,
+                positive,
+                negative,
+                sigmas,
+                text_cfg=text_cfg,
+                speed=None,
+                generation_seeds=seeds,
+            )
+            decoded = vae.decode_to_pixels(latents)
+        if not torch.isfinite(latents).all():
+            raise RuntimeError(f"Non-finite mixture latent at index {mixture_index}")
+        images = _preview_pixels(decoded)
+        latent_values = latents[:, :, 0].to(
+            "cpu", dtype=torch.float16
+        ).contiguous()
+        latent_name = f"part-{mixture_index:05d}.safetensors"
+        save_file({"latents": latent_values}, output / "latents" / latent_name)
+        style_id = str(row["mixture_style_id"])
+        mixture_dir = output / "images" / style_id
+        mixture_dir.mkdir(exist_ok=True)
+        rows = []
+        for content_index, (image, source_row, seed) in enumerate(
+            zip(images, content_rows, seeds, strict=True)
+        ):
+            image_path = mixture_dir / f"content-{content_index:02d}.webp"
+            image.save(
+                image_path, format="WEBP", quality=int(cfg.get("webp_quality", 95))
+            )
+            rows.append({
+                "id": int(cfg.get("image_id_base", 33_000_000_000))
+                + mixture_index * images_per_mixture
+                + content_index,
+                "kind": "lora_mixture",
+                "mixture_kind": str(row["kind"]),
+                "mixture_index": mixture_index,
+                "artist_index": mixture_index,
+                "artist": style_id,
+                "style_id": style_id,
+                "artist_split": "train",
+                "split": "train",
+                "content_index": content_index,
+                "generation_seed": seed,
+                "content_prompt": str(source_row["prompt"]),
+                "artist_prompt": str(source_row["prompt"]),
+                "artist_tag": "",
+                "components": list(row["components"]),
+                "weights": list(row["weights"]),
+                "local_path": str(image_path.resolve()),
+                "width": width,
+                "height": height,
+                "latent_height": height // 8,
+                "latent_width": width // 8,
+                "steps": steps,
+                "text_cfg": text_cfg,
+                "flow_shift": shift,
+                "attention_backend": str(cfg.get("attention_mode", "torch")),
+                "latent_shard": latent_name,
+                "latent_row": content_index,
+            })
+        write_records(part_path, rows)
+        completed_rows.extend(rows)
+        print(
+            f"LoRA mixture references {position + 1}/{len(mixture_rows)} "
+            f"kind={row['kind']} images={len(completed_rows)} "
+            f"elapsed={time.perf_counter() - started:.1f}s",
+            flush=True,
+        )
+    completed_rows.sort(key=lambda value: int(value["id"]))
+    write_records(output / "manifest.parquet", completed_rows)
+    summary = {
+        "mixtures": len(mixture_rows),
+        "images": len(completed_rows),
+        "images_per_mixture": images_per_mixture,
+        "kinds": {
+            kind: sum(str(row["kind"]) == kind for row in mixture_rows)
+            for kind in sorted({str(row["kind"]) for row in mixture_rows})
+        },
+        "functional_teacher_cache": str(teacher_root),
+        "inference_coefficients_exposed_to_student": False,
+        "elapsed_s": time.perf_counter() - started,
+    }
+    write_json(output / "generation_summary.json", summary)
+    del anima, networks, vae
+    gc.collect()
+    torch.cuda.empty_cache()
+    return summary
+
+
 def _source_probe_bank(
     source: Path, contents: int
 ) -> tuple[torch.Tensor, list[dict[str, Any]]]:
@@ -1235,18 +1466,30 @@ def cache_lora_functional_teacher(
         len(plans),
         pair_count=int(cache_cfg.get("pair_mixtures", 64)),
         triple_count=int(cache_cfg.get("triple_mixtures", 64)),
+        amplified_count=int(cache_cfg.get("amplified_mixtures", 0)),
+        signed_count=int(cache_cfg.get("signed_mixtures", 0)),
+        amplified_sum_range=tuple(
+            float(value)
+            for value in cache_cfg.get("amplified_sum_range", [1.05, 1.35])
+        ),
+        signed_beta_range=tuple(
+            float(value)
+            for value in cache_cfg.get("signed_beta_range", [0.05, 0.25])
+        ),
         seed=int(cache_cfg.get("seed", 20260823)),
     )
-    write_records(output / "mixtures.parquet", [
+    mixture_records = [
         {
             "index": spec.index,
             "kind": spec.kind,
             "components": list(spec.components),
             "weights": list(spec.weights),
             "style_ids": [plans[index].style_id for index in spec.components],
+            "mixture_style_id": f"lora-mixture-{spec.index:05d}",
         }
         for spec in specs
-    ])
+    ]
+    write_records(output / "mixtures.parquet", mixture_records)
     contents = int(cache_cfg.get("contents", 4))
     timesteps = [float(value) for value in cache_cfg.get("timesteps", [0.2, 0.45, 0.7, 0.9])]
     source_mode = str(cache_cfg.get("content_source_mode", "synthetic_teacher"))
@@ -1316,11 +1559,22 @@ def cache_lora_functional_teacher(
     }, output / "base.safetensors")
     shard_rows = int(cache_cfg.get("shard_mixtures", 16))
     completed = 0
+    effect_rms_by_index: dict[int, float] = {}
     started = time.perf_counter()
     for shard_index, offset in enumerate(range(0, len(specs), shard_rows)):
         shard_path = output / f"effects-{shard_index:05d}.safetensors"
         part = specs[offset : offset + shard_rows]
         if shard_path.exists():
+            existing = load_file(shard_path, device="cpu")
+            existing_rms = existing["effects"].float().square().mean(
+                dim=tuple(range(1, existing["effects"].ndim))
+            ).sqrt()
+            for mixture_index, rms in zip(
+                existing["mixture_indices"].tolist(),
+                existing_rms.tolist(),
+                strict=True,
+            ):
+                effect_rms_by_index[int(mixture_index)] = float(rms)
             completed += len(part)
             continue
         effect_rows = []
@@ -1345,27 +1599,68 @@ def cache_lora_functional_teacher(
                     contents, len(timesteps), *base.shape[1:]
                 ).to(dtype=torch.bfloat16)
             )
+        stacked_effects = torch.stack(effect_rows)
         save_file({
-            "effects": torch.stack(effect_rows),
+            "effects": stacked_effects,
             "mixture_indices": torch.tensor([spec.index for spec in part], dtype=torch.int64),
         }, shard_path)
+        effect_rms = stacked_effects.float().square().mean(
+            dim=tuple(range(1, stacked_effects.ndim))
+        ).sqrt()
+        for spec, rms in zip(part, effect_rms.tolist(), strict=True):
+            effect_rms_by_index[spec.index] = float(rms)
         completed += len(part)
         print(
             f"LoRA functional cache {completed}/{len(specs)} mixtures "
             f"elapsed={time.perf_counter() - started:.1f}s",
             flush=True,
         )
+    single_rms = torch.tensor(
+        [effect_rms_by_index[index] for index in range(len(plans))],
+        dtype=torch.float32,
+    )
+    single_median = float(single_rms.median())
+    ratio_min, ratio_max = (
+        float(value)
+        for value in cache_cfg.get("stable_effect_ratio_range", [0.5, 2.0])
+    )
+    effect_stats = []
+    for record in mixture_records:
+        rms = effect_rms_by_index[int(record["index"])]
+        ratio = rms / max(single_median, 1e-8)
+        enabled = str(record["kind"]) == "single" or (
+            ratio_min <= ratio <= ratio_max
+        )
+        record["effect_rms"] = rms
+        record["effect_to_single_median_ratio"] = ratio
+        record["enabled"] = enabled
+        effect_stats.append({
+            "index": int(record["index"]),
+            "kind": str(record["kind"]),
+            "effect_rms": rms,
+            "effect_to_single_median_ratio": ratio,
+            "enabled": enabled,
+        })
+    write_records(output / "mixtures.parquet", mixture_records)
+    write_records(output / "mixture_effect_stats.parquet", effect_stats)
     summary = {
         "mixtures": len(specs),
         "individual": len(plans),
         "pairs": sum(spec.kind == "pair" for spec in specs),
         "triples": sum(spec.kind == "triple" for spec in specs),
+        "amplified": sum(spec.kind == "amplified" for spec in specs),
+        "signed": sum(spec.kind == "signed" for spec in specs),
         "contents": contents,
         "timesteps": timesteps,
         "content_source_mode": source_mode,
         "condition_batch_rows": condition_batch_rows,
         "complete_mixtures": completed,
         "actual_merged_lora_forward": True,
+        "single_effect_rms_median": single_median,
+        "stable_effect_ratio_range": [ratio_min, ratio_max],
+        "disabled_unstable_mixtures": sum(
+            not bool(row["enabled"]) for row in effect_stats
+        ),
         "elapsed_s": time.perf_counter() - started,
     }
     write_json(summary_path, summary)
@@ -1521,9 +1816,14 @@ class FunctionalLoRATeacherBank:
         indices = torch.cat([part["mixture_indices"] for part in parts]).tolist()
         order = torch.tensor(sorted(range(len(indices)), key=indices.__getitem__), dtype=torch.long)
         self.effects = effects.index_select(0, order)
+        kinds = sorted({str(row["kind"]) for row in self.mixtures})
         self.by_kind = {
-            kind: [int(row["index"]) for row in self.mixtures if str(row["kind"]) == kind]
-            for kind in ("single", "pair", "triple")
+            kind: [
+                int(row["index"])
+                for row in self.mixtures
+                if str(row["kind"]) == kind and bool(row.get("enabled", True))
+            ]
+            for kind in kinds
         }
 
 
@@ -1736,6 +2036,35 @@ def _pack_mixture_references(
     return tokens, mask, reference_weights
 
 
+def _pack_materialized_mixture_references(
+    loader: CachedTeacherReferenceLoader,
+    rows: list[dict[str, Any]],
+    *,
+    references_per_mixture: int,
+    seed: int,
+    device: str,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Read actual merged-LoRA images; coefficients never enter the Reader."""
+
+    style_ids = [str(row["mixture_style_id"]) for row in rows]
+    loaded = loader.load_styles(
+        style_ids,
+        references_per_style=references_per_mixture,
+        seed=seed,
+    )
+    tokens = loaded["tokens"].to(
+        device=device, dtype=torch.bfloat16, non_blocking=True
+    )
+    mask = torch.ones(tokens.shape[:2], device=device, dtype=torch.bool)
+    reference_weights = torch.full(
+        tokens.shape[:2],
+        1.0 / references_per_mixture,
+        device=device,
+        dtype=torch.float32,
+    )
+    return tokens, mask, reference_weights
+
+
 def _lora_teacher_step(
     anima: torch.nn.Module,
     reader: DetailPreservingTypedSlotReader,
@@ -1748,6 +2077,7 @@ def _lora_teacher_step(
     step: int,
     device: str,
     training: dict[str, Any],
+    materialized_mixture: bool = False,
 ) -> dict[str, torch.Tensor]:
     candidates = bank.by_kind[kind]
     batch_rows = int(training.get("batch_rows", 4))
@@ -1777,13 +2107,25 @@ def _lora_teacher_step(
     references_per_component = rng.choices(
         reference_counts, weights=count_weights, k=1
     )[0]
-    references, mask, reference_weights = _pack_mixture_references(
-        loader,
-        rows,
-        references_per_component=references_per_component,
-        seed=int(training.get("seed", 20260823)) ^ (update * 7919),
-        device=device,
-    )
+    pack_seed = int(training.get("seed", 20260823)) ^ (update * 7919)
+    if materialized_mixture:
+        references, mask, reference_weights = (
+            _pack_materialized_mixture_references(
+                loader,
+                rows,
+                references_per_mixture=references_per_component,
+                seed=pack_seed,
+                device=device,
+            )
+        )
+    else:
+        references, mask, reference_weights = _pack_mixture_references(
+            loader,
+            rows,
+            references_per_component=references_per_component,
+            seed=pack_seed,
+            device=device,
+        )
     content_index = update % int(bank.base["noisy_inputs"].shape[0])
     timestep_index = (update // int(bank.base["noisy_inputs"].shape[0])) % int(
         bank.base["noisy_inputs"].shape[1]
@@ -1824,6 +2166,9 @@ def _lora_teacher_step(
     metrics.update({
         "reference_count": mask.sum(dim=1).float().mean().detach(),
         "timestep": timestep.float().detach(),
+        "materialized_mixture_reference": torch.tensor(
+            float(materialized_mixture), device=device
+        ),
     })
     return metrics
 
@@ -1926,14 +2271,38 @@ def train_lora_functional_distillation(
         ram_resident_tokens=bool(training.get("ram_resident_tokens", True)),
         strict_style_ids=True,
     )
+    synthetic_cache_value = cfg["synthetic_reference_cache"]
+    synthetic_cache_roots = (
+        [destination / str(value) for value in synthetic_cache_value]
+        if isinstance(synthetic_cache_value, list)
+        else destination / str(synthetic_cache_value)
+    )
     synthetic_loader = CachedTeacherReferenceLoader(
-        destination / str(cfg["synthetic_reference_cache"]),
+        synthetic_cache_roots,
         split="train", style_ids=style_ids, batch_size=int(training.get("batch_rows", 4)),
         references=max_refs, seed=seed ^ 0x53594E54,
         token_lru_shards=int(training.get("token_lru_shards", 8)),
         ram_resident_tokens=bool(training.get("ram_resident_tokens", True)),
         strict_style_ids=True,
     )
+    mixture_loader = None
+    if cfg.get("mixture_reference_cache"):
+        mixture_style_ids = [
+            str(row["mixture_style_id"])
+            for row in bank.mixtures
+            if str(row["kind"]) != "single" and bool(row.get("enabled", True))
+        ]
+        mixture_loader = CachedTeacherReferenceLoader(
+            destination / str(cfg["mixture_reference_cache"]),
+            split="train",
+            style_ids=mixture_style_ids,
+            batch_size=int(training.get("batch_rows", 4)),
+            references=max_refs,
+            seed=seed ^ 0x4D495854,
+            token_lru_shards=int(training.get("token_lru_shards", 8)),
+            ram_resident_tokens=bool(training.get("ram_resident_tokens", True)),
+            strict_style_ids=True,
+        )
     fewshot_validation = None
     if fewshot_prompt_cache is not None:
         fewshot_validation = _prepare_fewshot_validation(
@@ -2087,28 +2456,56 @@ def train_lora_functional_distillation(
                     step=step, probe_index=updates[category],
                 )
             else:
-                domain_schedule = tuple(
-                    str(value)
-                    for value in training.get(
-                        "lora_reference_domain_schedule", ("human", "synthetic")
-                    )
-                )
-                domain = scheduled_reference_domain(
-                    updates[category], domain_schedule
-                )
-                domain_loader = (
-                    human_loader if domain == "human" else synthetic_loader
-                )
                 kind = "single"
+                materialized_mixture = False
                 if category == "lora_mixture":
-                    kind = "triple" if updates[category] % 3 == 0 else "pair"
+                    configured_kinds = [
+                        str(value)
+                        for value in training.get(
+                            "mixture_kind_schedule", ["pair", "triple"]
+                        )
+                    ]
+                    if step < int(training.get("extrapolation_start_step", 0)):
+                        configured_kinds = [
+                            value
+                            for value in configured_kinds
+                            if value not in {"amplified", "signed"}
+                        ]
+                    available_kinds = [
+                        value
+                        for value in configured_kinds
+                        if value in bank.by_kind and bank.by_kind[value]
+                    ]
+                    if not available_kinds:
+                        raise RuntimeError("No configured LoRA mixture kind is available")
+                    kind = available_kinds[
+                        (updates[category] - 1) % len(available_kinds)
+                    ]
+                    materialized_mixture = mixture_loader is not None
+                if materialized_mixture:
+                    domain = "materialized_mixture"
+                    domain_loader = mixture_loader
+                else:
+                    domain_schedule = tuple(
+                        str(value)
+                        for value in training.get(
+                            "lora_reference_domain_schedule", ("human", "synthetic")
+                        )
+                    )
+                    domain = scheduled_reference_domain(
+                        updates[category], domain_schedule
+                    )
+                    domain_loader = (
+                        human_loader if domain == "human" else synthetic_loader
+                    )
                 metrics = _lora_teacher_step(
                     anima, reader, adapter, bank, domain_loader,
                     kind=kind, update=updates[category], step=step,
                     device=device, training={**training, "seed": seed},
+                    materialized_mixture=materialized_mixture,
                 )
                 metrics["domain_synthetic"] = torch.tensor(
-                    float(domain_loader is synthetic_loader), device=device
+                    float(domain != "human"), device=device
                 )
             adapter_parameters = [
                 parameter
