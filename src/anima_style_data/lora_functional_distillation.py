@@ -2524,9 +2524,7 @@ def train_lora_functional_distillation(
             optimizer.step()
             domain_name = None
             if category != "artist_tag":
-                domain_name = (
-                    "synthetic" if domain_loader is synthetic_loader else "human"
-                )
+                domain_name = str(domain)
             for key, value in metrics.items():
                 if torch.is_tensor(value) and value.numel() == 1:
                     running[f"{category}/{key}"].append(float(value.detach()))
@@ -2642,7 +2640,12 @@ def train_lora_functional_distillation(
         "elapsed_s": time.perf_counter() - started,
         "teacher_schedule_after_bootstrap": list(teacher_schedule) or "legacy",
         "teacher_schedule_during_bootstrap": list(bootstrap_teacher_schedule),
-        "lora_reference_domains": "human:synthetic=1:1",
+        "lora_reference_domain_schedule": list(
+            training.get("lora_reference_domain_schedule", ("human", "synthetic"))
+        ),
+        "mixture_kind_schedule": list(
+            training.get("mixture_kind_schedule", ("pair", "triple"))
+        ),
         "curriculum": curriculum,
         "common_frozen": freeze_common,
         "reader_frozen": freeze_reader,
