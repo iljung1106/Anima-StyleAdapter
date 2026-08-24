@@ -15,7 +15,8 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 import pyarrow.parquet as pq
-from PIL import Image, ImageDraw
+import numpy as np
+from PIL import Image, ImageDraw, ImageOps
 from safetensors.torch import load_file, save_file
 
 from .artist_lora_teachers import ArtistLoRAPlan
@@ -27,7 +28,9 @@ from .detail_style_cross_attention import (
 from .detail_style_teacher_context import NativeArtistContextCache
 from .detail_style_training import (
     _build_style_adapter,
+    _compose_separate_text_style_guidance,
     _controlled_teacher_forward,
+    _decode_latents,
     _generate_fixed_reference_sample,
     _save_state,
     _teacher_step,
@@ -37,6 +40,7 @@ from .dual_query_style_tokenizer import CachedTeacherReferenceLoader
 from .io import read_records, write_json, write_records
 from .native_centered_teacher import NativeCenteredTeacherBank
 from .same_q_style_adapter import attach_same_q_style_adapter
+from .style_calibration import _encode_prompts
 from .style_transfer import _optimize_frozen_anima, _resolve_anima_model
 from .synthetic_teacher import (
     _load_sampling_vae,
@@ -50,6 +54,513 @@ class MixtureSpec:
     kind: str
     components: tuple[int, ...]
     weights: tuple[float, ...]
+
+
+def _fewshot_prompt_signature(cfg: dict[str, Any]) -> dict[str, Any]:
+    cases = tuple(dict(value) for value in cfg.get("prompt_cases", ()))
+    if not cases:
+        raise ValueError("fewshot validation needs prompt_cases")
+    names = [str(value["name"]) for value in cases]
+    if len(set(names)) != len(names):
+        raise ValueError("fewshot prompt case names must be unique")
+    return {
+        "version": 1,
+        "prompt_cases": [
+            {
+                "name": str(value["name"]),
+                "prompt": str(value["prompt"]),
+                "seed": int(value["seed"]),
+            }
+            for value in cases
+        ],
+        "negative_prompt": str(cfg["negative_prompt"]),
+    }
+
+
+def _load_or_create_fewshot_prompt_cache(
+    config: dict[str, Any],
+    destination: Path,
+    cfg: dict[str, Any],
+    device: str,
+) -> dict[str, Any]:
+    """Encode a small, immutable prompt/seed suite before loading frozen Anima."""
+
+    signature = _fewshot_prompt_signature(cfg)
+    output = destination / str(cfg["cache_directory"])
+    output.mkdir(parents=True, exist_ok=True)
+    cache_path = output / "prompt_conditions.pt"
+    metadata_path = output / "prompt_conditions.json"
+    if cache_path.exists() and metadata_path.exists():
+        recorded = json.loads(metadata_path.read_text(encoding="utf-8"))
+        cached = torch.load(cache_path, map_location="cpu", weights_only=True)
+        if recorded == signature and tuple(cached["positive"].shape[:1]) == (
+            len(signature["prompt_cases"]),
+        ):
+            return {**signature, **cached}
+
+    prompts = [value["prompt"] for value in signature["prompt_cases"]]
+    encoded = _encode_prompts(
+        config,
+        destination,
+        prompts + [signature["negative_prompt"]],
+        device,
+        batch_size=len(prompts) + 1,
+    ).to("cpu", dtype=torch.float16)
+    payload = {
+        "positive": encoded[:-1].contiguous(),
+        "negative": encoded[-1:].contiguous(),
+    }
+    torch.save(payload, cache_path)
+    metadata_path.write_text(
+        json.dumps(signature, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    return {**signature, **payload}
+
+
+def _select_fewshot_validation_styles(
+    manifest_rows: list[dict[str, Any]],
+    *,
+    split: str,
+    artists: int,
+    references: int,
+    seed: int,
+) -> list[str]:
+    counts: dict[str, int] = defaultdict(int)
+    for row in manifest_rows:
+        if str(row.get("split", "train")) == str(split):
+            counts[str(row["style_id"])] += 1
+    eligible = sorted(
+        style_id for style_id, count in counts.items() if count >= int(references)
+    )
+    if len(eligible) < int(artists):
+        raise RuntimeError(
+            f"fewshot validation needs {artists} artists with {references} images; "
+            f"only {len(eligible)} are eligible"
+        )
+    random.Random(int(seed)).shuffle(eligible)
+    return eligible[: int(artists)]
+
+
+def _resolve_reference_paths(
+    destination: Path,
+    image_ids: tuple[tuple[int, ...], ...],
+) -> tuple[tuple[Path, ...], ...]:
+    by_id = {
+        int(row["id"]): Path(str(row["local_path"]))
+        for row in read_records(destination / "final_manifest.parquet")
+    }
+    resolved: list[tuple[Path, ...]] = []
+    for values in image_ids:
+        paths = []
+        for image_id in values:
+            path = by_id[int(image_id)]
+            if not path.is_absolute():
+                path = destination / path
+            if not path.exists():
+                raise FileNotFoundError(path)
+            paths.append(path)
+        resolved.append(tuple(paths))
+    return tuple(resolved)
+
+
+def _prepare_fewshot_validation(
+    destination: Path,
+    token_root: Path,
+    cfg: dict[str, Any],
+    prompt_cache: dict[str, Any],
+) -> dict[str, Any]:
+    artist_count = int(cfg.get("artist_count", 8))
+    max_references = int(cfg.get("max_references", 8))
+    manifest_rows = read_records(token_root / "manifest.parquet")
+    style_ids = _select_fewshot_validation_styles(
+        manifest_rows,
+        split=str(cfg.get("split", "validation")),
+        artists=artist_count,
+        references=max_references,
+        seed=int(cfg.get("selection_seed", 20260824)),
+    )
+    loader = CachedTeacherReferenceLoader(
+        token_root,
+        split=str(cfg.get("split", "validation")),
+        style_ids=style_ids,
+        batch_size=artist_count,
+        references=max_references,
+        seed=int(cfg.get("selection_seed", 20260824)),
+        token_lru_shards=int(cfg.get("token_lru_shards", 8)),
+        ram_resident_tokens=bool(cfg.get("ram_resident_tokens", True)),
+        strict_style_ids=True,
+    )
+    selected = loader.load_styles(
+        style_ids,
+        references_per_style=max_references,
+        seed=int(cfg.get("reference_seed", 2026082401)),
+    )
+    return {
+        "style_ids": tuple(style_ids),
+        "tokens": selected["tokens"],
+        "paths": _resolve_reference_paths(destination, selected["ids"]),
+        "prompt_cache": prompt_cache,
+        "cfg": cfg,
+    }
+
+
+def _fewshot_reference_collage(
+    paths: tuple[Path, ...], size: tuple[int, int]
+) -> Image.Image:
+    width, height = size
+    columns = 4
+    rows = 2
+    tile_size = (width // columns, height // rows)
+    canvas = Image.new("RGB", size, "white")
+    for index, path in enumerate(paths[: columns * rows]):
+        with Image.open(path) as image:
+            tile = ImageOps.pad(
+                image.convert("RGB"), tile_size, method=Image.Resampling.LANCZOS,
+                color="white",
+            )
+        canvas.paste(tile, ((index % columns) * tile_size[0], (index // columns) * tile_size[1]))
+    return canvas
+
+
+def _fewshot_label_cell(
+    size: tuple[int, int], lines: list[str]
+) -> Image.Image:
+    cell = Image.new("RGB", size, (24, 24, 28))
+    draw = ImageDraw.Draw(cell)
+    y = 24
+    for line in lines:
+        draw.text((24, y), str(line), fill="white")
+        y += 24
+    return cell
+
+
+def _annotate_fewshot_cell(image: Image.Image, lines: list[str]) -> Image.Image:
+    value = image.convert("RGB").copy()
+    draw = ImageDraw.Draw(value, "RGBA")
+    height = 22 * len(lines) + 18
+    draw.rectangle((0, 0, value.width, height), fill=(0, 0, 0, 176))
+    y = 8
+    for line in lines:
+        draw.text((10, y), str(line), fill=(255, 255, 255, 255))
+        y += 22
+    return value
+
+
+@torch.no_grad()
+def _fewshot_denoise(
+    anima: torch.nn.Module,
+    adapter: SeparatedCommonArtistKVStyleCrossAttention,
+    initial_noise: torch.Tensor,
+    positive: torch.Tensor,
+    negative: torch.Tensor,
+    *,
+    style: torch.Tensor | None,
+    cfg: dict[str, Any],
+    device: str,
+) -> torch.Tensor:
+    x = initial_noise.clone()
+    batch = int(x.shape[0])
+    negative_batch = negative.expand(batch, -1, -1)
+    sigmas = torch.linspace(
+        1.0,
+        0.0,
+        int(cfg["steps"]) + 1,
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    shift = float(cfg.get("flow_shift", 3.0))
+    sigmas = sigmas * shift / (1 + (shift - 1) * sigmas)
+    padding_mask = torch.zeros(
+        batch,
+        1,
+        x.shape[-2],
+        x.shape[-1],
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    text_cfg = float(cfg.get("cfg", 4.0))
+    with torch.autocast(
+        device_type=torch.device(device).type,
+        dtype=torch.bfloat16,
+        enabled=torch.device(device).type == "cuda",
+    ):
+        for index in range(len(sigmas) - 1):
+            timestep = sigmas[index].expand(batch)
+            adapter.clear_style_tokens()
+            negative_null = anima(
+                x,
+                timestep,
+                context=negative_batch,
+                padding_mask=padding_mask,
+                target_input_ids=None,
+            ).float()
+            positive_null = anima(
+                x,
+                timestep,
+                context=positive,
+                padding_mask=padding_mask,
+                target_input_ids=None,
+            ).float()
+            if style is None:
+                velocity = negative_null + text_cfg * (
+                    positive_null - negative_null
+                )
+            else:
+                adapter.set_style_context(style, strength=1.0)
+                adapter.set_timesteps(timestep)
+                positive_style = anima(
+                    x,
+                    timestep,
+                    context=positive,
+                    padding_mask=padding_mask,
+                    target_input_ids=None,
+                ).float()
+                velocity = _compose_separate_text_style_guidance(
+                    negative_null,
+                    positive_null,
+                    positive_style,
+                    text_cfg=text_cfg,
+                    style_strength=1.0,
+                )
+            x = (
+                x.float()
+                + velocity * (sigmas[index + 1] - sigmas[index]).float()
+            ).to(torch.bfloat16)
+    adapter.clear_style_tokens()
+    return x.to("cpu")
+
+
+def _fewshot_effect_metrics(
+    baseline: list[Image.Image], styled: list[Image.Image]
+) -> dict[str, float]:
+    base = np.stack(
+        [np.asarray(image, dtype=np.float32) / 255.0 for image in baseline]
+    )
+    current = np.stack(
+        [np.asarray(image, dtype=np.float32) / 255.0 for image in styled]
+    )
+    effects = current - base
+    effect_rms = np.sqrt(np.mean(np.square(effects), axis=(1, 2, 3)))
+    total_rms = float(np.sqrt(np.mean(np.square(effects))))
+    common_rms = float(np.sqrt(np.mean(np.square(effects.mean(axis=0)))))
+    pairwise = []
+    for left in range(len(effects)):
+        for right in range(left + 1, len(effects)):
+            pairwise.append(
+                float(np.sqrt(np.mean(np.square(effects[left] - effects[right]))))
+            )
+    return {
+        "mean_effect_pixel_rms": float(effect_rms.mean()),
+        "minimum_effect_pixel_rms": float(effect_rms.min()),
+        "maximum_effect_pixel_rms": float(effect_rms.max()),
+        "common_effect_ratio": common_rms / max(total_rms, 1e-8),
+        "mean_pairwise_centered_effect_rms": float(np.mean(pairwise)),
+    }
+
+
+@torch.no_grad()
+def _generate_fewshot_reference_sweep(
+    prepared: dict[str, Any],
+    config: dict[str, Any],
+    destination: Path,
+    anima: torch.nn.Module,
+    reader: DetailPreservingTypedSlotReader,
+    adapter: SeparatedCommonArtistKVStyleCrossAttention,
+    output: Path,
+    device: str,
+    step: int,
+    *,
+    mode: str,
+    reference_counts: tuple[int, ...],
+    artist_limit: int | None = None,
+) -> dict[str, Any]:
+    """Render nested 1/2/4/8-reference validation with one shared baseline pass."""
+
+    if mode not in {"controlled", "diverse"}:
+        raise ValueError("fewshot validation mode must be controlled or diverse")
+    cfg = dict(prepared["cfg"])
+    generation = dict(cfg["generation"])
+    tokens = prepared["tokens"]
+    style_ids = prepared["style_ids"]
+    paths = prepared["paths"]
+    artist_count = len(style_ids) if artist_limit is None else min(
+        len(style_ids), int(artist_limit)
+    )
+    tokens = tokens[:artist_count]
+    style_ids = style_ids[:artist_count]
+    paths = paths[:artist_count]
+    maximum = int(tokens.shape[1])
+    counts = tuple(int(value) for value in reference_counts)
+    if not counts or any(value <= 0 or value > maximum for value in counts):
+        raise ValueError(f"reference counts must be within 1..{maximum}")
+
+    prompt_cache = prepared["prompt_cache"]
+    cases = prompt_cache["prompt_cases"]
+    positives = prompt_cache["positive"]
+    negative = prompt_cache["negative"].to(
+        device, dtype=torch.bfloat16, non_blocking=True
+    )
+    if mode == "controlled":
+        case_indices = [0] * artist_count
+    else:
+        case_indices = [index % len(cases) for index in range(artist_count)]
+    positive = torch.stack(
+        [positives[index] for index in case_indices]
+    ).to(device, dtype=torch.bfloat16, non_blocking=True)
+    seeds = [int(cases[index]["seed"]) for index in case_indices]
+    width = int(generation["width"])
+    height = int(generation["height"])
+    noise = torch.cat(
+        [
+            torch.randn(
+                1,
+                16,
+                1,
+                height // 8,
+                width // 8,
+                generator=torch.Generator(device="cpu").manual_seed(seed),
+                dtype=torch.float32,
+            )
+            for seed in seeds
+        ]
+    ).to(device, dtype=torch.bfloat16)
+    batch_size = max(1, int(generation.get("batch_size", 4)))
+
+    reader_was_training = reader.training
+    adapter_was_training = adapter.training
+    reader.eval()
+    adapter.eval()
+    anima.eval()
+    latent_groups: dict[str, torch.Tensor] = {}
+    try:
+        base_parts = []
+        for offset in range(0, artist_count, batch_size):
+            end = min(artist_count, offset + batch_size)
+            base_parts.append(
+                _fewshot_denoise(
+                    anima,
+                    adapter,
+                    noise[offset:end],
+                    positive[offset:end],
+                    negative,
+                    style=None,
+                    cfg=generation,
+                    device=device,
+                )
+            )
+        latent_groups["base"] = torch.cat(base_parts)
+        for count in counts:
+            references = tokens[:, :count].to(
+                device, dtype=torch.bfloat16, non_blocking=True
+            )
+            mask = torch.ones(
+                artist_count, count, device=device, dtype=torch.bool
+            )
+            with torch.autocast(
+                device_type=torch.device(device).type,
+                dtype=torch.bfloat16,
+                enabled=torch.device(device).type == "cuda",
+            ):
+                style_tokens = reader(references, mask).tokens
+            styled_parts = []
+            for offset in range(0, artist_count, batch_size):
+                end = min(artist_count, offset + batch_size)
+                styled_parts.append(
+                    _fewshot_denoise(
+                        anima,
+                        adapter,
+                        noise[offset:end],
+                        positive[offset:end],
+                        negative,
+                        style=style_tokens[offset:end],
+                        cfg=generation,
+                        device=device,
+                    )
+                )
+            latent_groups[f"r{count}"] = torch.cat(styled_parts)
+            del references, mask, style_tokens
+    finally:
+        adapter.clear_style_tokens()
+        if reader_was_training:
+            reader.train()
+        if adapter_was_training:
+            adapter.train()
+
+    decoded = _decode_latents(
+        config,
+        destination,
+        latent_groups,
+        device,
+        int(generation.get("vae_batch_size", 4)),
+    )
+    size = (width, height)
+    rows = 2 + len(counts)
+    sheet = Image.new(
+        "RGB", ((artist_count + 1) * width, rows * height), "white"
+    )
+    sheet.paste(
+        _fewshot_label_cell(
+            size,
+            [
+                f"{mode.upper()} FEW-SHOT",
+                f"step {step}",
+                f"references {list(counts)}",
+            ],
+        ),
+        (0, 0),
+    )
+    sheet.paste(_fewshot_label_cell(size, ["FROZEN ANIMA", "NO STYLE"]), (0, height))
+    for row_index, count in enumerate(counts, start=2):
+        sheet.paste(
+            _fewshot_label_cell(size, [f"STYLE ADAPTER", f"{count} reference(s)"]),
+            (0, row_index * height),
+        )
+    for artist_index, (style_id, artist_paths) in enumerate(
+        zip(style_ids, paths, strict=True), start=1
+    ):
+        case = cases[case_indices[artist_index - 1]]
+        reference = _annotate_fewshot_cell(
+            _fewshot_reference_collage(artist_paths, size),
+            [str(style_id), "8 fixed validation references"],
+        )
+        sheet.paste(reference, (artist_index * width, 0))
+        baseline = _annotate_fewshot_cell(
+            decoded["base"][artist_index - 1],
+            [str(case["name"]), f"seed {case['seed']}"],
+        )
+        sheet.paste(baseline, (artist_index * width, height))
+        for row_index, count in enumerate(counts, start=2):
+            current = _annotate_fewshot_cell(
+                decoded[f"r{count}"][artist_index - 1],
+                [str(style_id), f"references {count}"],
+            )
+            sheet.paste(current, (artist_index * width, row_index * height))
+
+    sample_dir = output / "fewshot_validation" / f"step-{step:07d}-{mode}"
+    sample_dir.mkdir(parents=True, exist_ok=True)
+    sheet_path = sample_dir / f"fewshot-{mode}.png"
+    sheet.save(sheet_path, compress_level=4)
+    metrics = {
+        f"r{count}": _fewshot_effect_metrics(
+            decoded["base"], decoded[f"r{count}"]
+        )
+        for count in counts
+    }
+    summary = {
+        "step": int(step),
+        "mode": mode,
+        "sheet": str(sheet_path),
+        "style_ids": list(style_ids),
+        "reference_counts": list(counts),
+        "prompt_cases": [cases[index] for index in case_indices],
+        "metrics": metrics,
+    }
+    write_json(sample_dir / "summary.json", summary)
+    del latent_groups, decoded, noise, positive, negative
+    gc.collect()
+    if device.startswith("cuda"):
+        torch.cuda.empty_cache()
+    return summary
 
 
 def teacher_category(step: int, *, single_only_steps: int) -> str:
@@ -373,6 +884,17 @@ def generate_lora_teacher_references(
     lora_root = destination / str(cfg["lora_directory"])
     plans = _load_lora_plan(lora_root)
     weights = _weight_paths(lora_root, plans)
+    artist_start = int(cfg.get("artist_start_index", 0))
+    artist_stop = int(cfg.get("artist_stop_index", len(plans)))
+    if not (0 <= artist_start < artist_stop <= len(plans)):
+        raise ValueError(
+            f"Invalid artist range [{artist_start}, {artist_stop}) for {len(plans)} plans"
+        )
+    selected = list(zip(
+        plans[artist_start:artist_stop],
+        weights[artist_start:artist_stop],
+        strict=True,
+    ))
     source = destination / str(cfg["content_source_directory"])
     content_rows, conditions, negative = _load_content_conditions(source)
     images_per_artist = int(cfg.get("images_per_artist", 8))
@@ -398,7 +920,8 @@ def generate_lora_teacher_references(
     negative = negative.to(device=device, dtype=torch.bfloat16).expand(images_per_artist, -1, -1)
     completed_rows: list[dict[str, Any]] = []
     started = time.perf_counter()
-    for artist_index, (plan, weight_path) in enumerate(zip(plans, weights, strict=True)):
+    for selected_index, (plan, weight_path) in enumerate(selected):
+        artist_index = int(plan.index)
         part_path = output / "manifests" / f"part-{artist_index:05d}.parquet"
         if part_path.exists():
             completed_rows.extend(read_records(part_path))
@@ -465,14 +988,18 @@ def generate_lora_teacher_references(
         write_records(part_path, rows)
         completed_rows.extend(rows)
         print(
-            f"LoRA references artist={artist_index + 1}/{len(plans)} "
+            f"LoRA references artist={selected_index + 1}/{len(selected)} "
+            f"plan_index={artist_index} "
             f"images={len(completed_rows)} elapsed={time.perf_counter() - started:.1f}s",
             flush=True,
         )
     completed_rows.sort(key=lambda row: int(row["id"]))
     write_records(output / "manifest.parquet", completed_rows)
     summary = {
-        "artists": len(plans),
+        "artists": len(selected),
+        "artist_start_index": artist_start,
+        "artist_stop_index": artist_stop,
+        "teacher_bank_artists": len(plans),
         "images": len(completed_rows),
         "images_per_artist": images_per_artist,
         "elapsed_s": time.perf_counter() - started,
@@ -1321,6 +1848,13 @@ def train_lora_functional_distillation(
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.set_float32_matmul_precision("high")
 
+    fewshot_cfg = dict(training.get("fewshot_validation", {}))
+    fewshot_prompt_cache = None
+    if bool(fewshot_cfg.get("enabled", False)):
+        fewshot_prompt_cache = _load_or_create_fewshot_prompt_cache(
+            config, destination, fewshot_cfg, device
+        )
+
     anima = _resolve_anima_model(config, destination, device).requires_grad_(False).eval()
     _optimize_frozen_anima(anima, low_precision_rmsnorm=True, fuse_attention_projections=True)
     detail_cfg = copy.deepcopy(config["detail_preserving_style_cross_attention"])
@@ -1400,6 +1934,14 @@ def train_lora_functional_distillation(
         ram_resident_tokens=bool(training.get("ram_resident_tokens", True)),
         strict_style_ids=True,
     )
+    fewshot_validation = None
+    if fewshot_prompt_cache is not None:
+        fewshot_validation = _prepare_fewshot_validation(
+            destination,
+            destination / str(cfg["human_reference_cache"]),
+            fewshot_cfg,
+            fewshot_prompt_cache,
+        )
     native_bank = NativeCenteredTeacherBank.load(
         config, destination, config_key=str(cfg["native_teacher"]["bank_config_key"])
     )
@@ -1638,6 +2180,60 @@ def train_lora_functional_distillation(
                             sample["sheet"], caption=f"step {step}"
                         )
                     }, step=step)
+            if fewshot_validation is not None:
+                quick_every = int(fewshot_cfg.get("quick_every", 500))
+                full_every = int(fewshot_cfg.get("full_every", 1000))
+                full_due = full_every > 0 and step % full_every == 0
+                quick_due = quick_every > 0 and step % quick_every == 0
+                sweeps: list[tuple[str, tuple[int, ...], int | None]] = []
+                if full_due:
+                    counts = tuple(
+                        int(value)
+                        for value in fewshot_cfg.get(
+                            "full_reference_counts", (1, 2, 4, 8)
+                        )
+                    )
+                    sweeps.extend(
+                        (("controlled", counts, None), ("diverse", counts, None))
+                    )
+                elif quick_due:
+                    sweeps.append((
+                        "diverse",
+                        tuple(
+                            int(value)
+                            for value in fewshot_cfg.get(
+                                "quick_reference_counts", (1, 4)
+                            )
+                        ),
+                        int(fewshot_cfg.get("quick_artist_count", 4)),
+                    ))
+                for mode, counts, artist_limit in sweeps:
+                    result = _generate_fewshot_reference_sweep(
+                        fewshot_validation,
+                        config,
+                        destination,
+                        anima,
+                        reader,
+                        adapter,
+                        output,
+                        device,
+                        step,
+                        mode=mode,
+                        reference_counts=counts,
+                        artist_limit=artist_limit,
+                    )
+                    if wandb_run is not None:
+                        import wandb
+
+                        payload: dict[str, Any] = {
+                            f"val/fewshot/{mode}/sheet": wandb.Image(
+                                result["sheet"], caption=f"step {step} {mode}"
+                            )
+                        }
+                        for count, values in result["metrics"].items():
+                            for name, value in values.items():
+                                payload[f"val/fewshot/{mode}/{count}/{name}"] = value
+                        wandb_run.log(payload, step=step)
     finally:
         if wandb_run is not None:
             wandb_run.finish()

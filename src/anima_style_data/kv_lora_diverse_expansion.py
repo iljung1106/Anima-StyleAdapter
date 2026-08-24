@@ -27,9 +27,14 @@ from .lora_oracle_bootstrap import (
 )
 
 
-def _target_teacher_config(config: dict[str, Any]) -> dict[str, Any]:
-    cfg = dict(config["artist_kv_lora_diverse_expansion"])
-    target = copy.deepcopy(config["artist_kv_lora_teachers"])
+def _target_teacher_config(
+    config: dict[str, Any],
+    *,
+    expansion_config_key: str,
+    teacher_config_key: str,
+) -> dict[str, Any]:
+    cfg = dict(config[expansion_config_key])
+    target = copy.deepcopy(config[teacher_config_key])
     target.update({
         "output_directory": str(cfg["output_directory"]),
         "reuse_completed_prefix_directory": str(cfg["base_lora_directory"]),
@@ -42,11 +47,19 @@ def _target_teacher_config(config: dict[str, Any]) -> dict[str, Any]:
 
 
 @torch.no_grad()
-def prepare_diverse_kv_lora_expansion(
-    config: dict[str, Any], destination: Path
+def _prepare_diverse_lora_expansion(
+    config: dict[str, Any],
+    destination: Path,
+    *,
+    expansion_config_key: str,
+    teacher_config_key: str,
 ) -> dict[str, Any]:
-    cfg = dict(config["artist_kv_lora_diverse_expansion"])
-    target_cfg = _target_teacher_config(config)
+    cfg = dict(config[expansion_config_key])
+    target_cfg = _target_teacher_config(
+        config,
+        expansion_config_key=expansion_config_key,
+        teacher_config_key=teacher_config_key,
+    )
     output = destination / str(target_cfg["output_directory"])
     output.mkdir(parents=True, exist_ok=True)
     plan_path = output / "plan.json"
@@ -206,14 +219,71 @@ def prepare_diverse_kv_lora_expansion(
     }
 
 
-def train_diverse_kv_lora_expansion(
-    config: dict[str, Any], destination: Path
+def _train_diverse_lora_expansion(
+    config: dict[str, Any],
+    destination: Path,
+    *,
+    expansion_config_key: str,
+    teacher_config_key: str,
 ) -> dict[str, Any]:
-    prepare_diverse_kv_lora_expansion(config, destination)
+    _prepare_diverse_lora_expansion(
+        config,
+        destination,
+        expansion_config_key=expansion_config_key,
+        teacher_config_key=teacher_config_key,
+    )
     effective = copy.deepcopy(config)
-    effective["artist_kv_lora_teachers"] = _target_teacher_config(config)
+    effective[teacher_config_key] = _target_teacher_config(
+        config,
+        expansion_config_key=expansion_config_key,
+        teacher_config_key=teacher_config_key,
+    )
     return train_artist_lora_teachers(
         effective,
         destination,
-        config_key="artist_kv_lora_teachers",
+        config_key=teacher_config_key,
+    )
+
+
+def prepare_diverse_kv_lora_expansion(
+    config: dict[str, Any], destination: Path
+) -> dict[str, Any]:
+    return _prepare_diverse_lora_expansion(
+        config,
+        destination,
+        expansion_config_key="artist_kv_lora_diverse_expansion",
+        teacher_config_key="artist_kv_lora_teachers",
+    )
+
+
+def train_diverse_kv_lora_expansion(
+    config: dict[str, Any], destination: Path
+) -> dict[str, Any]:
+    return _train_diverse_lora_expansion(
+        config,
+        destination,
+        expansion_config_key="artist_kv_lora_diverse_expansion",
+        teacher_config_key="artist_kv_lora_teachers",
+    )
+
+
+def prepare_diverse_artist_lora_expansion(
+    config: dict[str, Any], destination: Path
+) -> dict[str, Any]:
+    return _prepare_diverse_lora_expansion(
+        config,
+        destination,
+        expansion_config_key="artist_lora_diverse_expansion",
+        teacher_config_key="artist_lora_teachers",
+    )
+
+
+def train_diverse_artist_lora_expansion(
+    config: dict[str, Any], destination: Path
+) -> dict[str, Any]:
+    return _train_diverse_lora_expansion(
+        config,
+        destination,
+        expansion_config_key="artist_lora_diverse_expansion",
+        teacher_config_key="artist_lora_teachers",
     )

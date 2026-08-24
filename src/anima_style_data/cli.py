@@ -81,14 +81,18 @@ def build_parser() -> argparse.ArgumentParser:
         ("artist-lora-plan", "Select the 64 persistent Anima LoRA teacher artists"),
         ("artist-lora-smoke", "Run two real persistent Anima LoRA teacher steps"),
         ("artist-lora-train", "Train independent persistent Anima LoRA teachers"),
+        ("artist-lora-diverse-plan", "Select a Reader-diverse full-LoRA expansion"),
+        ("artist-lora-diverse-train", "Train the Reader-diverse full-LoRA expansion"),
         ("artist-kv-lora-plan", "Select the K/V-only LoRA pilot artists"),
         ("artist-kv-lora-smoke", "Smoke-test a K/V-only artist LoRA"),
         ("artist-kv-lora-train", "Train K/V-only artist LoRA teachers"),
         ("artist-kv-lora-diverse-plan", "Select a Reader-diverse K/V-LoRA expansion"),
         ("artist-kv-lora-diverse-train", "Train the Reader-diverse K/V-LoRA expansion"),
-        ("lora-reference-generate", "Generate image references from the 64 LoRA teachers"),
+        ("lora-reference-generate", "Generate image references from the LoRA teachers"),
+        ("lora-reference-expansion-generate", "Generate references for added LoRA teachers"),
         ("kv-lora-reference-generate", "Generate references from K/V-only LoRAs"),
         ("lora-reference-token-cache", "Cache frozen Resampler tokens for LoRA images"),
+        ("lora-reference-expansion-token-cache", "Cache Resampler tokens for added LoRA images"),
         ("kv-lora-reference-token-cache", "Cache Resampler tokens for K/V-only LoRA images"),
         ("lora-functional-teacher-cache", "Cache single and mixed LoRA functional effects"),
         ("kv-lora-functional-teacher-cache", "Cache K/V-only LoRA effects"),
@@ -394,6 +398,20 @@ def main() -> None:
     elif args.command == "anima-cache-validate":
         _run(validate_anima_caches, config, destination)
     elif args.command in {
+        "artist-lora-diverse-plan",
+        "artist-lora-diverse-train",
+    }:
+        from .kv_lora_diverse_expansion import (
+            prepare_diverse_artist_lora_expansion,
+            train_diverse_artist_lora_expansion,
+        )
+
+        stage = {
+            "artist-lora-diverse-plan": prepare_diverse_artist_lora_expansion,
+            "artist-lora-diverse-train": train_diverse_artist_lora_expansion,
+        }[args.command]
+        _run(stage, config, destination)
+    elif args.command in {
         "lora-image-flow-cache",
         "lora-image-flow-oracle-smoke",
         "lora-image-flow-oracle-train",
@@ -454,6 +472,7 @@ def main() -> None:
         _run(stage, config, destination)
     elif args.command in {
         "lora-reference-generate",
+        "lora-reference-expansion-generate",
         "lora-functional-teacher-cache",
         "lora-functional-distill-smoke",
         "lora-functional-distill-train",
@@ -475,6 +494,9 @@ def main() -> None:
 
         stage = {
             "lora-reference-generate": generate_lora_teacher_references,
+            "lora-reference-expansion-generate": lambda cfg, dst: generate_lora_teacher_references(
+                cfg, dst, config_key="lora_teacher_references_512_expansion"
+            ),
             "lora-functional-teacher-cache": cache_lora_functional_teacher,
             "lora-functional-distill-smoke": smoke_test_lora_functional_distillation,
             "lora-functional-distill-train": train_lora_functional_distillation,
@@ -544,15 +566,18 @@ def main() -> None:
         _run(stage, config, destination)
     elif args.command in {
         "lora-reference-token-cache",
+        "lora-reference-expansion-token-cache",
         "kv-lora-reference-token-cache",
     }:
         from .synthetic_reference_pipeline import (
             cache_kv_lora_teacher_dual_query_tokens,
             cache_lora_teacher_dual_query_tokens,
+            cache_lora_teacher_expansion_dual_query_tokens,
         )
 
         stage = {
             "lora-reference-token-cache": cache_lora_teacher_dual_query_tokens,
+            "lora-reference-expansion-token-cache": cache_lora_teacher_expansion_dual_query_tokens,
             "kv-lora-reference-token-cache": cache_kv_lora_teacher_dual_query_tokens,
         }[args.command]
         _run(stage, config, destination)

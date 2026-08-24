@@ -7,6 +7,8 @@ from anima_style_data.lora_functional_distillation import (
     _configure_reader_trainable_scope,
     _cached_training_probe_bank,
     _initialize_fresh_adapter_strength,
+    _fewshot_prompt_signature,
+    _select_fewshot_validation_styles,
     _teacher_decomposed_functional_objective,
     build_mixture_specs,
     decompose_teacher_effects,
@@ -42,6 +44,41 @@ def test_mixture_plan_is_normalized_and_unique():
     assert len(compound) == len(set(compound))
     assert all(abs(sum(spec.weights) - 1.0) < 1e-7 for spec in specs)
     assert all(all(weight > 0 for weight in spec.weights) for spec in specs)
+
+
+def test_fewshot_prompt_signature_preserves_fixed_prompt_seed_contract():
+    signature = _fewshot_prompt_signature({
+        "negative_prompt": "bad",
+        "prompt_cases": [
+            {"name": "portrait", "prompt": "1girl", "seed": 11},
+            {"name": "action", "prompt": "running", "seed": 12},
+        ],
+    })
+    assert [row["name"] for row in signature["prompt_cases"]] == [
+        "portrait",
+        "action",
+    ]
+    assert [row["seed"] for row in signature["prompt_cases"]] == [11, 12]
+
+
+def test_fewshot_validation_selects_only_artist_disjoint_eligible_styles():
+    rows = []
+    for style_id, count, split in (
+        ("train", 8, "train"),
+        ("short", 3, "validation"),
+        ("valid_a", 8, "validation"),
+        ("valid_b", 9, "validation"),
+        ("valid_c", 10, "validation"),
+    ):
+        rows.extend(
+            {"style_id": style_id, "split": split, "id": index}
+            for index in range(count)
+        )
+    selected = _select_fewshot_validation_styles(
+        rows, split="validation", artists=2, references=8, seed=7
+    )
+    assert len(selected) == 2
+    assert set(selected) <= {"valid_a", "valid_b", "valid_c"}
 
 
 def test_teacher_decomposition_preserves_effects_and_centers_artist_part():
