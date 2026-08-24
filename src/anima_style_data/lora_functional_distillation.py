@@ -2547,6 +2547,7 @@ def train_lora_functional_distillation(
                     else teacher_category(step, single_only_steps=single_only)
                 )
             updates[category] += 1
+            mixture_kind = None
             if category == "artist_tag":
                 native_training = {
                     **training,
@@ -2603,6 +2604,7 @@ def train_lora_functional_distillation(
                     kind = available_kinds[
                         (updates[category] - 1) % len(available_kinds)
                     ]
+                    mixture_kind = kind
                     materialized_mixture = mixture_loader is not None
                 if materialized_mixture:
                     domain = "materialized_mixture"
@@ -2652,6 +2654,10 @@ def train_lora_functional_distillation(
                     running[f"{category}/{key}"].append(float(value.detach()))
                     if domain_name is not None:
                         running[f"{category}/{domain_name}/{key}"].append(
+                            float(value.detach())
+                        )
+                    if mixture_kind is not None:
+                        running[f"{category}/kind/{mixture_kind}/{key}"].append(
                             float(value.detach())
                         )
             running["optimizer/grad_norm"].append(float(grad_norm))
