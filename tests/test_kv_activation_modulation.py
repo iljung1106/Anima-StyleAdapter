@@ -641,6 +641,12 @@ def test_count_aware_adapter_routes_single_and_multi_reference_rows():
     assert adapter.injector.down.shape[0] == 2
     assert adapter.injector.down.shape[-2] == 4
     assert not torch.equal(styled, baseline)
+    adapter.set_common_scale(0.25)
+    _, centered_down, _, centered_retrieval = adapter.encode_reference_tokens(
+        references[:1], mask[:1]
+    )
+    assert centered_retrieval[0]["common_scale"] == 0.25
+    assert centered_down.shape[-2] <= 6
     adapter.close()
 
 

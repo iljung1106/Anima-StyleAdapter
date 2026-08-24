@@ -825,14 +825,17 @@ kv_lora_count_aware_adapter:
   ridge_regularization: 0.05
   ridge_rank: 64
   ridge_gain: 1.5
+  common_scale: 1.0
+  convex_rank: 128
   compression_oversample: 16
   compression_power_iterations: 1
   compression_seed: 20260824
 
 kv_lora_count_aware_raw_sample:
-  output_directory: kv_lora_count_aware_raw_fixed_samples_v1
+  output_directory: kv_lora_count_aware_raw_fixed_samples_common_ablation_v2
   device: cuda
   strengths: [1.0]
+  common_scales: [0.0, 0.25, 0.5, 1.0]
   batch_size: 4
   panel_tile_width: 320
 

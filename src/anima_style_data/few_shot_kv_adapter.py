@@ -169,6 +169,9 @@ def sample_count_aware_raw_references(
     device = str(cfg.get("device", "cuda"))
     batch_size = int(cfg.get("batch_size", 4))
     strengths = [float(value) for value in cfg.get("strengths", [1.0])]
+    common_scales = [
+        float(value) for value in cfg.get("common_scales", [1.0])
+    ]
     output = destination / str(cfg["output_directory"])
     output.mkdir(parents=True, exist_ok=True)
     prepared = load_dual_query_external_sample(config, destination)
@@ -189,9 +192,6 @@ def sample_count_aware_raw_references(
     )
     adapter = CountAwareRetrievalFewShotKVStyleAdapter.from_cache(
         config, destination, anima, device=device
-    )
-    style_codes, down, up, retrieval = adapter.encode_reference_tokens(
-        reference_tokens
     )
     width = int(sample_cfg["width"])
     height = int(sample_cfg["height"])
@@ -244,9 +244,23 @@ def sample_count_aware_raw_references(
         return torch.cat(values)
 
     baseline = denoise(None, 0.0)
-    predictions = {strength: denoise((down, up), strength) for strength in strengths}
+    predictions: dict[tuple[float, float], torch.Tensor] = {}
+    retrieval_by_common: dict[str, Any] = {}
+    style_codes = None
+    for common_scale in common_scales:
+        adapter.set_common_scale(common_scale)
+        style_codes, down, up, retrieval = adapter.encode_reference_tokens(
+            reference_tokens
+        )
+        retrieval_by_common[f"{common_scale:g}"] = retrieval
+        for strength in strengths:
+            predictions[(common_scale, strength)] = denoise(
+                (down, up), strength
+            )
+        del down, up
+    assert style_codes is not None
     adapter.close()
-    del anima, adapter, down, up
+    del anima, adapter
     torch.cuda.empty_cache()
 
     vae = _load_sampling_vae(config, destination).to(
@@ -256,7 +270,10 @@ def sample_count_aware_raw_references(
     latent_groups = {
         "Frozen Anima": baseline.expand(len(names), -1, -1, -1, -1)
     }
-    latent_groups.update({f"Few-shot {value:g}x": latent for value, latent in predictions.items()})
+    latent_groups.update({
+        f"Few-shot common={common:g} strength={strength:g}": latent
+        for (common, strength), latent in predictions.items()
+    })
     images: dict[str, list[Image.Image]] = {}
     for label, latent in latent_groups.items():
         decoded: list[Image.Image] = []
@@ -316,7 +333,7 @@ def sample_count_aware_raw_references(
 
     baseline_rows = baseline.float().expand(len(names), -1, -1, -1, -1)
     metrics: dict[str, Any] = {}
-    for strength, latent in predictions.items():
+    for (common_scale, strength), latent in predictions.items():
         effect = (latent.float() - baseline_rows).flatten(1)
         common = effect.mean(dim=0, keepdim=True)
         centered = effect - common
@@ -324,7 +341,7 @@ def sample_count_aware_raw_references(
         normalized = torch.nn.functional.normalize(effect, dim=-1)
         pairwise = normalized @ normalized.t()
         mask = ~torch.eye(len(names), dtype=torch.bool)
-        metrics[f"{strength:g}x"] = {
+        metrics[f"common={common_scale:g},strength={strength:g}"] = {
             "effect_rms": float(individual_rms.mean()),
             "common_output_ratio": float(
                 common.square().mean().sqrt() / individual_rms.mean()
@@ -342,8 +359,9 @@ def sample_count_aware_raw_references(
         "steps": steps,
         "text_cfg": text_cfg,
         "strengths": strengths,
+        "common_scales": common_scales,
         "style_code_shape": list(style_codes.shape),
-        "retrieval": retrieval,
+        "retrieval": retrieval_by_common,
         "metrics": metrics,
         "panel": str(panel),
     }
@@ -752,6 +770,8 @@ class CountAwareRetrievalFewShotKVStyleAdapter(
         ridge_regularization: float = 0.05,
         ridge_rank: int = 64,
         ridge_gain: float = 1.5,
+        common_scale: float = 1.0,
+        convex_rank: int = 128,
         compression_oversample: int = 16,
         compression_power_iterations: int = 1,
         compression_seed: int = 20260824,
@@ -782,6 +802,8 @@ class CountAwareRetrievalFewShotKVStyleAdapter(
         self.ridge_regularization = float(ridge_regularization)
         self.ridge_rank = int(ridge_rank)
         self.ridge_gain = float(ridge_gain)
+        self.common_scale = float(common_scale)
+        self.convex_rank = int(convex_rank)
         self.compression_oversample = int(compression_oversample)
         self.compression_power_iterations = int(compression_power_iterations)
         self.compression_seed = int(compression_seed)
@@ -810,12 +832,29 @@ class CountAwareRetrievalFewShotKVStyleAdapter(
             self.teacher_up[global_indices][None],
             weights.cpu(),
         )
-        return down[0], up[0], {
+        down = down[0]
+        up = up[0]
+        if self.common_scale != 1.0:
+            down = down.to(self.device)
+            up = up.to(self.device)
+            down, up = compress_lora_factors(
+                torch.cat((self.ridge_common_down, down), dim=-2),
+                torch.cat((
+                    self.ridge_common_up * (self.common_scale - 1.0),
+                    up,
+                ), dim=-1),
+                target_rank=self.convex_rank,
+                oversample=self.compression_oversample,
+                power_iterations=self.compression_power_iterations,
+                seed=self.compression_seed ^ 0x434F4E56,
+            )
+        return down, up, {
             "route": "convex_knn",
             "artist_indices": global_indices.tolist(),
             "artist_ids": [self.artist_ids[int(index)] for index in global_indices],
             "weights": weights[0].cpu().tolist(),
             "effective_gain": 1.0,
+            "common_scale": self.common_scale,
         }
 
     def _ridge_factors(
@@ -848,7 +887,7 @@ class CountAwareRetrievalFewShotKVStyleAdapter(
         ).permute(1, 2, 3, 0, 4).reshape(
             blocks, kinds, output_dim, neighbors * teacher_rank
         )
-        common_weight = 1.0 - weights.sum()
+        common_weight = self.common_scale - weights.sum()
         combined_down = torch.cat((self.ridge_common_down, selected_down), dim=-2)
         combined_up = torch.cat((
             self.ridge_common_up * common_weight.to(self.ridge_common_up),
@@ -871,6 +910,7 @@ class CountAwareRetrievalFewShotKVStyleAdapter(
             "weights": weights.tolist(),
             "common_weight": float(common_weight),
             "effective_gain": self.ridge_gain,
+            "common_scale": self.common_scale,
         }
 
     @staticmethod
@@ -952,6 +992,9 @@ class CountAwareRetrievalFewShotKVStyleAdapter(
             retrieval,
         )
 
+    def set_common_scale(self, common_scale: float) -> None:
+        self.common_scale = float(common_scale)
+
     @classmethod
     def from_cache(
         cls,
@@ -1017,6 +1060,8 @@ class CountAwareRetrievalFewShotKVStyleAdapter(
             ridge_regularization=float(cfg.get("ridge_regularization", 0.05)),
             ridge_rank=int(cfg.get("ridge_rank", 64)),
             ridge_gain=float(cfg.get("ridge_gain", 1.5)),
+            common_scale=float(cfg.get("common_scale", 1.0)),
+            convex_rank=int(cfg.get("convex_rank", 128)),
             compression_oversample=int(cfg.get("compression_oversample", 16)),
             compression_power_iterations=int(
                 cfg.get("compression_power_iterations", 1)
