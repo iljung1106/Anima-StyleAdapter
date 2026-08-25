@@ -4,6 +4,7 @@ import torch
 from safetensors.torch import save_file
 
 from anima_style_data.lora_functional_distillation import (
+    FunctionalLoRATeacherBank,
     _artist_only_fixed_population_objective,
     _configure_reader_trainable_scope,
     _cached_training_probe_bank,
@@ -25,6 +26,51 @@ from anima_style_data.detail_style_cross_attention import (
     SeparatedCommonArtistKVStyleCrossAttention,
 )
 from anima_style_data.io import write_records
+
+
+def test_teacher_bank_filters_effect_kinds_and_reuses_population_mean(tmp_path):
+    save_file(
+        {
+            "noisy_inputs": torch.zeros(1, 1, 1),
+            "base_predictions": torch.zeros(1, 1, 1),
+            "base_context": torch.zeros(1, 1, 1),
+            "timesteps": torch.zeros(1),
+        },
+        tmp_path / "base.safetensors",
+    )
+    write_records(
+        tmp_path / "mixtures.parquet",
+        [
+            {"index": 0, "kind": "single", "enabled": True},
+            {"index": 1, "kind": "pair", "enabled": True},
+            {"index": 2, "kind": "single", "enabled": True},
+        ],
+    )
+    save_file(
+        {
+            "effects": torch.tensor([1.0, 50.0, 5.0]).reshape(3, 1, 1, 1),
+            "mixture_indices": torch.tensor([0, 1, 2]),
+        },
+        tmp_path / "effects-00000.safetensors",
+    )
+
+    bank = FunctionalLoRATeacherBank(tmp_path, load_kinds={"single"})
+
+    assert bank.effect_indices == [0, 2]
+    assert bank.by_kind["pair"] == []
+    assert torch.equal(bank.effect_rows([2, 0], 0, 0).flatten(), torch.tensor([5.0, 1.0]))
+    assert torch.equal(bank.single_population_mean.flatten(), torch.tensor([3.0]))
+    assert (tmp_path / "single_population_mean.safetensors").exists()
+
+    save_file(
+        {
+            "effects": torch.tensor([11.0, 50.0, 15.0]).reshape(3, 1, 1, 1),
+            "mixture_indices": torch.tensor([0, 1, 2]),
+        },
+        tmp_path / "effects-00000.safetensors",
+    )
+    reused = FunctionalLoRATeacherBank(tmp_path, load_kinds={"single"})
+    assert torch.equal(reused.single_population_mean.flatten(), torch.tensor([3.0]))
 
 
 def test_artist_only_population_objective_anchors_common_offset_and_spread():

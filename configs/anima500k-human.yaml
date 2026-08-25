@@ -6472,6 +6472,11 @@ detail_style_artist_only_fixed_population_bootstrap:
   reader_checkpoint: null
   adapter:
     architecture: artist_only_shared_base
+  loader:
+    # Bootstrap uses native-teacher batches; keep validation/sample tokens in
+    # the bounded LRU instead of preloading the full 25 GB reference cache.
+    ram_resident_tokens: false
+    token_lru_shards: 8
   training:
     steps: 1000
     native_bootstrap:
@@ -6557,7 +6562,7 @@ detail_style_artist_only_fixed_population_bootstrap:
       reference_count_weights: [0.60, 0.30, 0.10]
       references_per_component: 4
       token_lru_shards: 8
-      ram_resident_tokens: true
+      ram_resident_tokens: false
       loss_weights:
         pair_huber: 1.0
         pair_direction: 0.75

@@ -3,6 +3,7 @@ from __future__ import annotations
 import gc
 import hashlib
 import json
+import os
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -517,10 +518,22 @@ class NativeCenteredTeacherBank:
     tensors: dict[str, torch.Tensor]
     summary: dict[str, Any]
     artist_to_index: dict[str, int]
+    root: Path
 
     def train_population_offset(self) -> torch.Tensor:
         cached = self.tensors.get("train_population_offset")
         if cached is not None:
+            return cached
+        cache_path = self.root / "train_population_offset.safetensors"
+        if cache_path.exists():
+            cached = load_file(cache_path, device="cpu")["train_population_offset"]
+            expected_shape = tuple(self.tensors["centered_teacher"].shape[1:])
+            if tuple(cached.shape) != expected_shape:
+                raise RuntimeError(
+                    "Native population offset cache shape does not match teacher bank"
+                )
+            self.tensors["train_population_offset"] = cached
+            print(f"reused native train-population offset {cache_path}", flush=True)
             return cached
         indices = [
             self.artist_to_index[str(value)]
@@ -534,7 +547,13 @@ class NativeCenteredTeacherBank:
             part = torch.tensor(indices[offset : offset + 16], dtype=torch.long)
             total.add_(source.index_select(0, part).float().sum(dim=0))
         cached = (total / len(indices)).to(torch.float16)
+        temporary = cache_path.with_name(
+            f".{cache_path.name}.tmp-{os.getpid()}"
+        )
+        save_file({"train_population_offset": cached.contiguous()}, temporary)
+        temporary.replace(cache_path)
         self.tensors["train_population_offset"] = cached
+        print(f"cached native train-population offset {cache_path}", flush=True)
         return cached
 
     @classmethod
@@ -554,4 +573,5 @@ class NativeCenteredTeacherBank:
             tensors=tensors,
             summary=summary,
             artist_to_index={value: index for index, value in enumerate(style_ids)},
+            root=root,
         )

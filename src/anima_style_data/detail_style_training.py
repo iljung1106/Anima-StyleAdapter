@@ -3772,6 +3772,8 @@ def train_detail_style_cross_attention(
     lora_teacher_schedule: tuple[str, ...] = ()
     lora_teacher_domains: tuple[str, ...] = ()
     lora_teacher_update = 0
+    lora_teacher_root: Path | None = None
+    lora_teacher_load_kinds: set[str] | None = None
     if lora_teacher_enabled:
         # Kept as an optional runtime dependency: the LoRA module already uses
         # this trainer's frozen-Anima forward helpers, so importing it at module
@@ -3781,9 +3783,7 @@ def train_detail_style_cross_attention(
             _load_lora_plan,
         )
 
-        lora_teacher_bank = FunctionalLoRATeacherBank(
-            destination / str(lora_teacher_cfg["teacher_cache"])
-        )
+        lora_teacher_root = destination / str(lora_teacher_cfg["teacher_cache"])
         lora_plans = _load_lora_plan(
             destination / str(lora_teacher_cfg["lora_directory"])
         )
@@ -3833,18 +3833,23 @@ def train_detail_style_cross_attention(
             value not in lora_teacher_loaders for value in lora_teacher_domains
         ):
             raise ValueError("Invalid LoRA functional reference-domain schedule")
-        unavailable = [
-            kind for kind in set(lora_teacher_schedule)
-            if kind not in lora_teacher_bank.by_kind
-            or not lora_teacher_bank.by_kind[kind]
-        ]
-        if unavailable:
-            raise ValueError(f"Unavailable LoRA functional teacher kinds: {unavailable}")
         lora_every = max(1, int(lora_training.get("every", 2)))
+        lora_start = int(lora_training.get("start_step", 1))
+        lora_end = int(lora_training.get("end_step", steps))
+        lora_teacher_load_kinds = set(lora_teacher_schedule)
+        if lora_start <= min(
+            lora_end, int(lora_training.get("single_only_steps", 500))
+        ):
+            lora_teacher_load_kinds.add("single")
+        if lora_start <= 1:
+            lora_teacher_bank = FunctionalLoRATeacherBank(
+                lora_teacher_root, load_kinds=lora_teacher_load_kinds
+            )
         print(
             "detail-style added LoRA functional teacher "
             f"styles={len(lora_style_ids)} schedule={lora_teacher_schedule} "
-            f"domains={lora_teacher_domains} every={lora_every}",
+            f"domains={lora_teacher_domains} every={lora_every} "
+            f"load_at_step={max(1, lora_start)}",
             flush=True,
         )
     main_common_output_penalty = None
@@ -4525,9 +4530,17 @@ def train_detail_style_cross_attention(
                 and step % lora_every == 0
             )
             if lora_due:
-                from .lora_functional_distillation import _lora_teacher_step
+                from .lora_functional_distillation import (
+                    FunctionalLoRATeacherBank,
+                    _lora_teacher_step,
+                )
 
-                assert lora_teacher_bank is not None
+                if lora_teacher_bank is None:
+                    assert lora_teacher_root is not None
+                    lora_teacher_bank = FunctionalLoRATeacherBank(
+                        lora_teacher_root,
+                        load_kinds=lora_teacher_load_kinds,
+                    )
                 assert isinstance(
                     adapter,
                     (
@@ -4544,6 +4557,10 @@ def train_detail_style_cross_attention(
                     else lora_teacher_schedule
                 )
                 kind = active_schedule[lora_teacher_update % len(active_schedule)]
+                if not lora_teacher_bank.by_kind.get(kind):
+                    raise ValueError(
+                        f"Unavailable LoRA functional teacher kind: {kind}"
+                    )
                 domain = lora_teacher_domains[
                     lora_teacher_update % len(lora_teacher_domains)
                 ]
@@ -4587,10 +4604,15 @@ def train_detail_style_cross_attention(
                         ) else []
                     ),
                     "artist_kv_gradient_rms": _gradient_rms(
-                        adapter.artist_parameters()
+                        adapter.kv_parameters()
+                        if isinstance(
+                            adapter, ArtistOnlySharedBaseKVStyleCrossAttention
+                        )
+                        else adapter.artist_parameters()
                         if isinstance(
                             adapter, SeparatedCommonArtistKVStyleCrossAttention
-                        ) else []
+                        )
+                        else []
                     ),
                     "null_context_gradient_rms": _gradient_rms(
                         adapter.null_parameters()

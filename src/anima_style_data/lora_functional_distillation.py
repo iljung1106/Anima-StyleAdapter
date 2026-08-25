@@ -4,6 +4,7 @@ import copy
 import gc
 import json
 import math
+import os
 import random
 import sys
 import time
@@ -1939,34 +1940,98 @@ def compare_kv_lora_fixed_prompt(
 
 
 class FunctionalLoRATeacherBank:
-    def __init__(self, root: Path):
+    def __init__(self, root: Path, *, load_kinds: set[str] | None = None):
         self.root = root
         self.base = load_file(root / "base.safetensors", device="cpu")
         self.mixtures = read_records(root / "mixtures.parquet")
-        parts = [load_file(path, device="cpu") for path in sorted(root.glob("effects-*.safetensors"))]
-        effects = torch.cat([part["effects"] for part in parts])
-        indices = torch.cat([part["mixture_indices"] for part in parts]).tolist()
-        order = torch.tensor(sorted(range(len(indices)), key=indices.__getitem__), dtype=torch.long)
+        kind_by_index = {
+            int(row["index"]): str(row["kind"]) for row in self.mixtures
+        }
+        selected_effects = []
+        selected_indices: list[int] = []
+        for path in sorted(root.glob("effects-*.safetensors")):
+            part = load_file(path, device="cpu")
+            part_indices = [int(value) for value in part["mixture_indices"].tolist()]
+            positions = [
+                index for index, mixture_index in enumerate(part_indices)
+                if load_kinds is None or kind_by_index[mixture_index] in load_kinds
+            ]
+            if positions:
+                selection = torch.tensor(positions, dtype=torch.long)
+                selected_effects.append(part["effects"].index_select(0, selection))
+                selected_indices.extend(part_indices[index] for index in positions)
+        if not selected_effects:
+            raise RuntimeError(f"No enabled LoRA teacher effects found in {root}")
+        effects = torch.cat(selected_effects)
+        order_values = sorted(range(len(selected_indices)), key=selected_indices.__getitem__)
+        order = torch.tensor(order_values, dtype=torch.long)
         self.effects = effects.index_select(0, order)
+        self.effect_indices = [selected_indices[index] for index in order_values]
+        self.effect_position_by_index = {
+            mixture_index: position
+            for position, mixture_index in enumerate(self.effect_indices)
+        }
         kinds = sorted({str(row["kind"]) for row in self.mixtures})
         self.by_kind = {
             kind: [
                 int(row["index"])
                 for row in self.mixtures
-                if str(row["kind"]) == kind and bool(row.get("enabled", True))
+                if (
+                    str(row["kind"]) == kind
+                    and bool(row.get("enabled", True))
+                    and int(row["index"]) in self.effect_position_by_index
+                )
             ]
             for kind in kinds
         }
         single_indices = self.by_kind.get("single", [])
         self.single_population_mean = None
         if len(single_indices) >= 2:
-            total = torch.zeros_like(self.effects[0], dtype=torch.float32)
-            for offset in range(0, len(single_indices), 16):
-                part = torch.tensor(
-                    single_indices[offset : offset + 16], dtype=torch.long
+            cache_path = root / "single_population_mean.safetensors"
+            if cache_path.exists():
+                population_mean = load_file(cache_path, device="cpu")[
+                    "single_population_mean"
+                ]
+                if tuple(population_mean.shape) != tuple(self.effects.shape[1:]):
+                    raise RuntimeError(
+                        "LoRA population mean cache shape does not match teacher bank"
+                    )
+                print(f"reused LoRA single-population mean {cache_path}", flush=True)
+            else:
+                total = torch.zeros_like(self.effects[0], dtype=torch.float32)
+                for offset in range(0, len(single_indices), 16):
+                    positions = torch.tensor([
+                        self.effect_position_by_index[index]
+                        for index in single_indices[offset : offset + 16]
+                    ], dtype=torch.long)
+                    total.add_(
+                        self.effects.index_select(0, positions).float().sum(dim=0)
+                    )
+                population_mean = total / len(single_indices)
+                temporary = cache_path.with_name(
+                    f".{cache_path.name}.tmp-{os.getpid()}"
                 )
-                total.add_(self.effects.index_select(0, part).float().sum(dim=0))
-            self.single_population_mean = total / len(single_indices)
+                save_file(
+                    {"single_population_mean": population_mean.contiguous()},
+                    temporary,
+                )
+                temporary.replace(cache_path)
+                print(f"cached LoRA single-population mean {cache_path}", flush=True)
+            self.single_population_mean = population_mean
+
+    def effect_rows(
+        self,
+        indices: list[int],
+        content_index: int,
+        timestep_index: int,
+    ) -> torch.Tensor:
+        positions = torch.tensor(
+            [self.effect_position_by_index[index] for index in indices],
+            dtype=torch.long,
+        )
+        return self.effects.index_select(0, positions)[
+            :, content_index, timestep_index
+        ]
 
 
 def _functional_objective(
@@ -2579,7 +2644,7 @@ def _lora_teacher_step(
     timestep = bank.base["timesteps"][timestep_index].to(
         device=device, dtype=torch.bfloat16
     )
-    teacher = bank.effects[indices, content_index, timestep_index].to(
+    teacher = bank.effect_rows(indices, content_index, timestep_index).to(
         device=device, dtype=torch.float32, non_blocking=True
     )
     objective = str(training.get("functional_objective", "legacy_raw"))

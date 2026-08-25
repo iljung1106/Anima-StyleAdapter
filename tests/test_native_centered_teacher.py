@@ -1,7 +1,41 @@
 from __future__ import annotations
 
+import torch
+
 from anima_style_data.io import write_records
-from anima_style_data.native_centered_teacher import _teacher_spec
+from anima_style_data.native_centered_teacher import (
+    NativeCenteredTeacherBank,
+    _teacher_spec,
+)
+
+
+def test_train_population_offset_is_persisted_and_reused(tmp_path):
+    source = torch.tensor([1.0, 3.0, 9.0], dtype=torch.float16).reshape(3, 1, 1)
+    summary = {"train_style_ids": ["artist:0", "artist:1"]}
+    artist_to_index = {"artist:0": 0, "artist:1": 1, "artist:2": 2}
+    bank = NativeCenteredTeacherBank(
+        tensors={"centered_teacher": source},
+        summary=summary,
+        artist_to_index=artist_to_index,
+        root=tmp_path,
+    )
+
+    assert torch.equal(
+        bank.train_population_offset(),
+        torch.tensor([[2.0]], dtype=torch.float16),
+    )
+    assert (tmp_path / "train_population_offset.safetensors").exists()
+
+    replacement = NativeCenteredTeacherBank(
+        tensors={"centered_teacher": source + 100},
+        summary=summary,
+        artist_to_index=artist_to_index,
+        root=tmp_path,
+    )
+    assert torch.equal(
+        replacement.train_population_offset(),
+        torch.tensor([[2.0]], dtype=torch.float16),
+    )
 
 
 def test_teacher_spec_can_pair_full_artist_manifest_with_probe_controls(tmp_path):
