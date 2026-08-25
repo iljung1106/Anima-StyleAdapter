@@ -101,6 +101,8 @@ def build_parser() -> argparse.ArgumentParser:
         ("lora-mixture-reference-generate", "Generate actual merged-LoRA reference images"),
         ("v2d-diverse-functional-teacher-cache", "Cache v2d diverse-mixture LoRA effects"),
         ("v2d-diverse-mixture-reference-generate", "Generate v2d diverse merged-LoRA references"),
+        ("artist-only-mixture-functional-cache", "Cache bounded Artist-only mixture effects"),
+        ("artist-only-mixture-reference-generate", "Generate bounded Artist-only mixture references"),
         ("kv-lora-reference-generate", "Generate references from K/V-only LoRAs"),
         ("kv-lora-reference-320-generate", "Generate 320-teacher K/V-only references"),
         ("kv-activation-mixture-prepare", "Prepare stable signed/amplified K/V mixtures"),
@@ -109,6 +111,7 @@ def build_parser() -> argparse.ArgumentParser:
         ("lora-reference-expansion-token-cache", "Cache Resampler tokens for added LoRA images"),
         ("lora-mixture-reference-token-cache", "Cache Resampler tokens for merged-LoRA images"),
         ("v2d-diverse-mixture-reference-token-cache", "Cache v2d diverse-mixture Resampler tokens"),
+        ("artist-only-mixture-reference-token-cache", "Cache bounded Artist-only mixture tokens"),
         ("kv-lora-reference-token-cache", "Cache Resampler tokens for K/V-only LoRA images"),
         ("kv-lora-reference-320-token-cache", "Cache 320-teacher K/V-only reference tokens"),
         ("kv-activation-mixture-reference-token-cache", "Cache Resampler tokens for K/V mixture images"),
@@ -223,6 +226,10 @@ def build_parser() -> argparse.ArgumentParser:
         (
             "detail-style-artist-only-bootstrap-smoke",
             "Smoke-test fixed-population Artist-only functional bootstrap",
+        ),
+        (
+            "detail-style-artist-only-mixture-train",
+            "Continue Artist-only training with bounded materialized mixtures",
         ),
         (
             "detail-style-reader-pretrain",
@@ -553,6 +560,8 @@ def main() -> None:
         "lora-mixture-reference-generate",
         "v2d-diverse-functional-teacher-cache",
         "v2d-diverse-mixture-reference-generate",
+        "artist-only-mixture-functional-cache",
+        "artist-only-mixture-reference-generate",
         "lora-functional-teacher-cache",
         "lora-functional-distill-smoke",
         "lora-functional-distill-train",
@@ -569,8 +578,10 @@ def main() -> None:
         from .lora_functional_distillation import (
             cache_lora_functional_teacher,
             cache_v2d_diverse_functional_teacher,
+            cache_artist_only_mixture_functional_teacher,
             generate_lora_mixture_references,
             generate_v2d_diverse_mixture_references,
+            generate_artist_only_mixture_references,
             generate_lora_teacher_references,
             smoke_test_lora_functional_distillation,
             smoke_test_lora_functional_distillation_v2,
@@ -596,6 +607,8 @@ def main() -> None:
             "lora-mixture-reference-generate": generate_lora_mixture_references,
             "v2d-diverse-functional-teacher-cache": cache_v2d_diverse_functional_teacher,
             "v2d-diverse-mixture-reference-generate": generate_v2d_diverse_mixture_references,
+            "artist-only-mixture-functional-cache": cache_artist_only_mixture_functional_teacher,
+            "artist-only-mixture-reference-generate": generate_artist_only_mixture_references,
             "lora-functional-teacher-cache": cache_lora_functional_teacher,
             "lora-functional-distill-smoke": smoke_test_lora_functional_distillation,
             "lora-functional-distill-train": train_lora_functional_distillation,
@@ -679,6 +692,7 @@ def main() -> None:
         "lora-reference-expansion-token-cache",
         "lora-mixture-reference-token-cache",
         "v2d-diverse-mixture-reference-token-cache",
+        "artist-only-mixture-reference-token-cache",
         "kv-lora-reference-token-cache",
         "kv-lora-reference-320-token-cache",
         "kv-activation-mixture-reference-token-cache",
@@ -691,6 +705,7 @@ def main() -> None:
             cache_lora_teacher_expansion_dual_query_tokens,
             cache_lora_mixture_dual_query_tokens,
             cache_v2d_diverse_mixture_dual_query_tokens,
+            cache_artist_only_mixture_dual_query_tokens,
         )
 
         stage = {
@@ -698,6 +713,7 @@ def main() -> None:
             "lora-reference-expansion-token-cache": cache_lora_teacher_expansion_dual_query_tokens,
             "lora-mixture-reference-token-cache": cache_lora_mixture_dual_query_tokens,
             "v2d-diverse-mixture-reference-token-cache": cache_v2d_diverse_mixture_dual_query_tokens,
+            "artist-only-mixture-reference-token-cache": cache_artist_only_mixture_dual_query_tokens,
             "kv-lora-reference-token-cache": cache_kv_lora_teacher_dual_query_tokens,
             "kv-lora-reference-320-token-cache": cache_kv_lora_teacher_320_dual_query_tokens,
             "kv-activation-mixture-reference-token-cache": cache_kv_activation_mixture_dual_query_tokens,
@@ -919,6 +935,7 @@ def main() -> None:
         "detail-style-v34-lora-joint-smoke",
         "detail-style-artist-only-bootstrap-train",
         "detail-style-artist-only-bootstrap-smoke",
+        "detail-style-artist-only-mixture-train",
         "detail-style-reader-pretrain",
         "detail-style-block-similarity",
         "detail-style-fixed-samples",
@@ -942,6 +959,7 @@ def main() -> None:
             train_detail_style_cross_attention,
             train_detail_style_v34_lora_joint,
             train_artist_only_fixed_population_bootstrap,
+            train_artist_only_mixture_continuation,
         )
         from .block_similarity import analyze_anima_block_similarity
         from .detail_style_gradient_diagnostics import (
@@ -967,6 +985,9 @@ def main() -> None:
             ),
             "detail-style-artist-only-bootstrap-smoke": (
                 smoke_test_artist_only_fixed_population_bootstrap
+            ),
+            "detail-style-artist-only-mixture-train": (
+                train_artist_only_mixture_continuation
             ),
             "detail-style-reader-pretrain": pretrain_detail_style_reader,
             "detail-style-block-similarity": analyze_anima_block_similarity,

@@ -1802,6 +1802,16 @@ def generate_v2d_diverse_mixture_references(
     )
 
 
+def generate_artist_only_mixture_references(
+    config: dict[str, Any], destination: Path
+) -> dict[str, Any]:
+    return generate_lora_mixture_references(
+        config,
+        destination,
+        config_key="lora_mixture_references_artist_only_1p5",
+    )
+
+
 def cache_kv_lora_functional_teacher(
     config: dict[str, Any], destination: Path
 ) -> dict[str, Any]:
@@ -1816,6 +1826,16 @@ def cache_v2d_diverse_functional_teacher(
     return cache_lora_functional_teacher(
         config, destination,
         config_key="lora_functional_teacher_v2d_diverse",
+    )
+
+
+def cache_artist_only_mixture_functional_teacher(
+    config: dict[str, Any], destination: Path
+) -> dict[str, Any]:
+    return cache_lora_functional_teacher(
+        config,
+        destination,
+        config_key="lora_functional_teacher_artist_only_mixture_1p5",
     )
 
 
@@ -2419,8 +2439,13 @@ def _artist_only_fixed_population_objective(
         raise ValueError("Artist-only population objective needs matching rows")
     if population_mean.shape == teacher.shape[1:]:
         population_mean = population_mean.unsqueeze(0)
-    if population_mean.shape != (1, *teacher.shape[1:]):
-        raise ValueError("Population mean must contain one controlled effect")
+    if population_mean.shape not in {
+        (1, *teacher.shape[1:]),
+        teacher.shape,
+    }:
+        raise ValueError(
+            "Population mean must contain one shared or one per-row controlled effect"
+        )
 
     beta = float(weights.get("population_common_beta", 0.0))
     teacher_residual = teacher - population_mean
@@ -2580,6 +2605,7 @@ def _lora_teacher_step(
     training: dict[str, Any],
     materialized_mixture: bool = False,
     backward_scale: float = 1.0,
+    backward: bool = True,
 ) -> dict[str, torch.Tensor]:
     candidates = bank.by_kind[kind]
     batch_rows = int(training.get("batch_rows", 4))
@@ -2710,14 +2736,30 @@ def _lora_teacher_step(
         population_mean = bank.single_population_mean[
             content_index, timestep_index
         ].to(device=device, dtype=torch.float32, non_blocking=True)
+        coefficient_sums = torch.tensor(
+            [sum(float(value) for value in row["weights"]) for row in rows],
+            device=device,
+            dtype=torch.float32,
+        )
+        coefficient_shape = (-1,) + (1,) * population_mean.ndim
+        population_mean = (
+            population_mean.unsqueeze(0)
+            * coefficient_sums.reshape(coefficient_shape)
+        )
         loss, metrics = _artist_only_fixed_population_objective(
             student, teacher, population_mean, loss_weights
         )
+        metrics.update({
+            "coefficient_sum_mean": coefficient_sums.mean().detach(),
+            "coefficient_sum_min": coefficient_sums.min().detach(),
+            "coefficient_sum_max": coefficient_sums.max().detach(),
+        })
     else:
         loss, metrics = _functional_objective(student, teacher, loss_weights)
     if backward_scale < 0:
         raise ValueError("backward_scale must be non-negative")
-    (float(backward_scale) * loss).backward()
+    if backward:
+        (float(backward_scale) * loss).backward()
     metrics.update({
         "backward_scale": loss.new_tensor(float(backward_scale)),
         "weighted_loss": (float(backward_scale) * loss).detach(),

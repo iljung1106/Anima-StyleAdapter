@@ -25,6 +25,7 @@ from anima_style_data.detail_style_cross_attention import (
     DetailPreservingTypedSlotReader,
     SeparatedCommonArtistKVStyleCrossAttention,
 )
+from anima_style_data.detail_style_training import _lora_teacher_schedule_for_step
 from anima_style_data.io import write_records
 
 
@@ -101,6 +102,50 @@ def test_artist_only_population_objective_anchors_common_offset_and_spread():
     assert float(collapsed_loss) > float(exact_loss) + 0.5
     assert float(exact_metrics["pair_cosine"]) > 0.999
     assert float(collapsed_metrics["pair_student_to_teacher_rms"]) < 1e-5
+
+
+def test_artist_only_population_objective_scales_common_for_amplification():
+    population = torch.full((1, 3), 0.4)
+    coefficient_sums = torch.tensor([1.0, 1.2, 1.5]).reshape(3, 1, 1)
+    residual = torch.eye(3).reshape(3, 1, 3)
+    teacher = residual + coefficient_sums * population
+    per_row_population = coefficient_sums * population
+    weights = {
+        "pair_huber": 1.0,
+        "pair_direction": 0.75,
+        "pair_magnitude": 0.25,
+        "absolute_anchor": 0.10,
+        "functional_infonce": 0.0,
+    }
+
+    exact_loss, _ = _artist_only_fixed_population_objective(
+        residual, teacher, per_row_population, weights
+    )
+    unscaled_loss, _ = _artist_only_fixed_population_objective(
+        residual, teacher, population, weights
+    )
+
+    assert float(exact_loss) < 1e-6
+    assert float(unscaled_loss) > float(exact_loss)
+
+
+def test_detail_lora_teacher_curriculum_opens_bounded_mixtures_in_stages():
+    training = {
+        "single_only_steps": 0,
+        "teacher_kind_curriculum": [
+            {"end_step": 250, "schedule": ["single", "pair"]},
+            {"end_step": 500, "schedule": ["single", "pair", "triple"]},
+        ],
+    }
+    default = ("single", "pair", "triple", "amplified", "signed")
+
+    assert _lora_teacher_schedule_for_step(training, 100, default) == (
+        "single", "pair"
+    )
+    assert _lora_teacher_schedule_for_step(training, 400, default) == (
+        "single", "pair", "triple"
+    )
+    assert _lora_teacher_schedule_for_step(training, 700, default) == default
 
 
 def test_teacher_schedule_becomes_exact_three_way_cycle():

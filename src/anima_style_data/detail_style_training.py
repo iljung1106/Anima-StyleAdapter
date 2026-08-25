@@ -45,7 +45,7 @@ from .external_style_tokenizer_sheet import (
     _make_sheet,
     _pixel_rms_from_baseline,
 )
-from .io import write_json
+from .io import read_records, write_json
 from .native_centered_teacher import NativeCenteredTeacherBank
 from .pure_token_injection import (
     _reference_batch,
@@ -86,6 +86,33 @@ def _build_style_adapter(cfg: dict[str, Any]) -> FreshKVStyleCrossAttention:
     if architecture == "fresh_per_block":
         return FreshKVStyleCrossAttention(**adapter_cfg)
     raise ValueError(f"Unsupported style adapter architecture: {architecture}")
+
+
+def _lora_teacher_schedule_for_step(
+    training: dict[str, Any],
+    step: int,
+    default_schedule: tuple[str, ...],
+) -> tuple[str, ...]:
+    """Resolve the staged mixture curriculum for a continuation step."""
+
+    if step <= int(training.get("single_only_steps", 0)):
+        return ("single",)
+    curriculum = list(training.get("teacher_kind_curriculum", []))
+    previous_end = int(training.get("single_only_steps", 0))
+    for stage in curriculum:
+        end_step = int(stage["end_step"])
+        schedule = tuple(str(value) for value in stage["schedule"])
+        if end_step <= previous_end or not schedule:
+            raise ValueError(
+                "LoRA teacher_kind_curriculum needs increasing end_step values "
+                "and non-empty schedules"
+            )
+        if step <= end_step:
+            return schedule
+        previous_end = end_step
+    if not default_schedule:
+        raise ValueError("LoRA functional teacher schedule cannot be empty")
+    return default_schedule
 
 
 def _teacher_domain_update(
@@ -3769,6 +3796,7 @@ def train_detail_style_cross_attention(
     teacher_domain_schedule = tuple(weighted_teacher_domains)
     lora_teacher_bank = None
     lora_teacher_loaders: dict[str, CachedTeacherReferenceLoader] = {}
+    lora_mixture_loader: CachedTeacherReferenceLoader | None = None
     lora_teacher_schedule: tuple[str, ...] = ()
     lora_teacher_domains: tuple[str, ...] = ()
     lora_teacher_update = 0
@@ -3837,10 +3865,44 @@ def train_detail_style_cross_attention(
         lora_start = int(lora_training.get("start_step", 1))
         lora_end = int(lora_training.get("end_step", steps))
         lora_teacher_load_kinds = set(lora_teacher_schedule)
+        for stage in lora_training.get("teacher_kind_curriculum", []):
+            lora_teacher_load_kinds.update(
+                str(value) for value in stage.get("schedule", [])
+            )
         if lora_start <= min(
             lora_end, int(lora_training.get("single_only_steps", 500))
         ):
             lora_teacher_load_kinds.add("single")
+        mixture_kinds = lora_teacher_load_kinds - {"single"}
+        mixture_reference_cache = lora_teacher_cfg.get(
+            "mixture_reference_cache"
+        )
+        if mixture_kinds and not mixture_reference_cache:
+            raise ValueError(
+                "Non-single LoRA teachers require a materialized "
+                "mixture_reference_cache"
+            )
+        if mixture_reference_cache:
+            mixture_rows = read_records(lora_teacher_root / "mixtures.parquet")
+            mixture_style_ids = [
+                str(row["mixture_style_id"])
+                for row in mixture_rows
+                if str(row["kind"]) in mixture_kinds
+                and bool(row.get("enabled", True))
+            ]
+            lora_mixture_loader = CachedTeacherReferenceLoader(
+                destination / str(mixture_reference_cache),
+                split="train",
+                style_ids=mixture_style_ids,
+                batch_size=int(lora_training.get("batch_rows", 4)),
+                references=lora_references,
+                seed=seed ^ 0x4D495854,
+                token_lru_shards=int(lora_training.get("token_lru_shards", 8)),
+                ram_resident_tokens=bool(
+                    lora_training.get("ram_resident_tokens", True)
+                ),
+                strict_style_ids=True,
+            )
         if lora_start <= 1:
             lora_teacher_bank = FunctionalLoRATeacherBank(
                 lora_teacher_root, load_kinds=lora_teacher_load_kinds
@@ -3849,6 +3911,7 @@ def train_detail_style_cross_attention(
             "detail-style added LoRA functional teacher "
             f"styles={len(lora_style_ids)} schedule={lora_teacher_schedule} "
             f"domains={lora_teacher_domains} every={lora_every} "
+            f"materialized_mixtures={len(lora_mixture_loader.styles) if lora_mixture_loader else 0} "
             f"load_at_step={max(1, lora_start)}",
             flush=True,
         )
@@ -4548,33 +4611,39 @@ def train_detail_style_cross_attention(
                         ArtistOnlySharedBaseKVStyleCrossAttention,
                     ),
                 )
-                bootstrap_end = int(
-                    lora_training.get("single_only_steps", 500)
-                )
-                active_schedule = (
-                    ("single",)
-                    if step <= bootstrap_end
-                    else lora_teacher_schedule
+                active_schedule = _lora_teacher_schedule_for_step(
+                    lora_training, step, lora_teacher_schedule
                 )
                 kind = active_schedule[lora_teacher_update % len(active_schedule)]
                 if not lora_teacher_bank.by_kind.get(kind):
                     raise ValueError(
                         f"Unavailable LoRA functional teacher kind: {kind}"
                     )
-                domain = lora_teacher_domains[
-                    lora_teacher_update % len(lora_teacher_domains)
-                ]
+                materialized_mixture = kind != "single"
+                if materialized_mixture:
+                    if lora_mixture_loader is None:
+                        raise RuntimeError(
+                            "Materialized LoRA mixture loader is unavailable"
+                        )
+                    domain = "materialized_mixture"
+                    lora_loader = lora_mixture_loader
+                else:
+                    domain = lora_teacher_domains[
+                        lora_teacher_update % len(lora_teacher_domains)
+                    ]
+                    lora_loader = lora_teacher_loaders[domain]
                 lora_metrics = _lora_teacher_step(
                     anima,
                     reader,
                     adapter,
                     lora_teacher_bank,
-                    lora_teacher_loaders[domain],
+                    lora_loader,
                     kind=kind,
                     update=lora_teacher_update,
                     step=step,
                     device=device,
                     training={**lora_training, "seed": seed},
+                    materialized_mixture=materialized_mixture,
                     backward_scale=float(
                         lora_training.get("backward_scale", 0.25)
                     ),
@@ -4585,6 +4654,11 @@ def train_detail_style_cross_attention(
                 })
                 metric_rows[-1]["lora_teacher_domain_synthetic"] = (
                     torch.tensor(float(domain == "synthetic"), device=device)
+                )
+                metric_rows[-1]["lora_teacher_domain_materialized_mixture"] = (
+                    torch.tensor(
+                        float(domain == "materialized_mixture"), device=device
+                    )
                 )
                 metric_rows[-1]["lora_teacher_kind_index"] = torch.tensor(
                     float(lora_teacher_schedule.index(kind))
@@ -4782,6 +4856,72 @@ def train_detail_style_cross_attention(
                         ),
                         seed=seed ^ 0xA47157,
                     )
+                if lora_teacher_enabled and lora_teacher_bank is not None:
+                    from .lora_functional_distillation import _lora_teacher_step
+
+                    validation_kinds = tuple(
+                        str(value)
+                        for value in lora_training.get(
+                            "validation_kinds",
+                            ["single", "pair", "triple", "amplified", "signed"],
+                        )
+                        if lora_teacher_bank.by_kind.get(str(value))
+                    )
+                    validation_metrics: dict[str, float] = {}
+                    validation_training = {
+                        **lora_training,
+                        "seed": seed ^ 0x4C4F5241,
+                        "batch_rows": int(
+                            lora_training.get("validation_batch_rows", 6)
+                        ),
+                        "reference_counts": [int(
+                            lora_training.get("validation_reference_count", 2)
+                        )],
+                        "reference_count_weights": [1.0],
+                    }
+                    reported_metrics = {
+                        "loss",
+                        "pair_cosine",
+                        "pair_student_to_teacher_rms",
+                        "functional_infonce_accuracy",
+                        "functional_infonce_cosine_gap",
+                        "student_population_mean_to_teacher_residual_rms",
+                        "coefficient_sum_mean",
+                        "reference_count",
+                    }
+                    with torch.no_grad():
+                        for kind_index, kind in enumerate(validation_kinds):
+                            materialized = kind != "single"
+                            validation_loader_for_kind = (
+                                lora_mixture_loader
+                                if materialized
+                                else lora_teacher_loaders["human"]
+                            )
+                            if validation_loader_for_kind is None:
+                                raise RuntimeError(
+                                    f"Validation loader unavailable for {kind}"
+                                )
+                            kind_metrics = _lora_teacher_step(
+                                anima,
+                                reader,
+                                adapter,
+                                lora_teacher_bank,
+                                validation_loader_for_kind,
+                                kind=kind,
+                                update=step * 101 + kind_index,
+                                step=step,
+                                device=device,
+                                training=validation_training,
+                                materialized_mixture=materialized,
+                                backward_scale=0.0,
+                                backward=False,
+                            )
+                            validation_metrics.update({
+                                f"{kind}/{key}": float(value)
+                                for key, value in kind_metrics.items()
+                                if key in reported_metrics
+                            })
+                    validation["lora_teacher_kinds"] = validation_metrics
                 curriculum_metrics, curriculum_changed = (
                     _update_performance_curriculum(
                         training,
@@ -5013,6 +5153,16 @@ def train_artist_only_fixed_population_bootstrap(
         config,
         destination,
         config_key="detail_style_artist_only_fixed_population_bootstrap",
+    )
+
+
+def train_artist_only_mixture_continuation(
+    config: dict[str, Any], destination: Path
+) -> dict[str, Any]:
+    return train_detail_style_cross_attention(
+        config,
+        destination,
+        config_key="detail_style_artist_only_mixture_continuation",
     )
 
 

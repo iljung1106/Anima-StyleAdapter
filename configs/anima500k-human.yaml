@@ -6574,6 +6574,151 @@ detail_style_artist_only_fixed_population_bootstrap:
         functional_infonce_temperature: 0.10
         population_common_beta: 0.0
 
+# Bounded materialized-mixture continuation of the verified 1000-step
+# Artist-only bootstrap. The first 384 functional rows (single/pair/triple)
+# intentionally keep the v3 seed and ordering so their existing shards can be
+# reused; only amplified/signed rows need new frozen-Anima teacher forwards.
+lora_functional_teacher_artist_only_mixture_1p5:
+  lora_directory: artist_lora_teachers_rank16_256_b2_v5
+  teacher_cache:
+    output_directory: lora_functional_teacher_bank_rank16_256_mixture_1p5_v1
+    content_source_mode: cached_training
+    latent_cache_directory: anima_latent_cache_qwen_2d
+    text_cache_directory: anima_text_cache_post_llm_multimode_v1
+    device: cuda
+    seed: 20260823
+    contents: 12
+    content_variants:
+      - full
+      - full_quality
+      - tag_dropout
+      - tag_dropout_quality
+      - short
+      - short_quality
+    probe_latent_shape: [128, 96]
+    text_conditioning_length: 512
+    condition_batch_rows: 72
+    timesteps: [0.10, 0.25, 0.45, 0.65, 0.82, 0.95]
+    pair_mixtures: 64
+    triple_mixtures: 64
+    amplified_mixtures: 64
+    signed_mixtures: 64
+    amplified_sum_range: [1.05, 1.50]
+    amplified_triple_probability: 0.50
+    signed_beta_range: [0.05, 0.25]
+    signed_triple_probability: 0.50
+    signed_l1_maximum: 1.50
+    stable_effect_ratio_range: [0.40, 2.50]
+    shard_mixtures: 16
+
+lora_mixture_references_artist_only_1p5:
+  output_directory: lora_mixture_references_rank16_256x4_1p5_v1
+  functional_config_key: lora_functional_teacher_artist_only_mixture_1p5
+  content_source_directory: synthetic_teacher_500x16
+  random_content_per_mixture: true
+  content_seed: 20260825
+  kinds: [pair, triple, amplified, signed]
+  seed: 20260823
+  image_id_base: 38000000000
+  images_per_mixture: 4
+  width: 512
+  height: 512
+  steps: 20
+  flow_shift: 3.0
+  text_cfg: 4.0
+  device: cuda
+  attention_mode: torch
+  webp_quality: 95
+  dual_query_token_cache:
+    output_directory: dual_query_reference_tokens_v8_step10000
+    resampler_checkpoint: dual_query_resampler_bprime_v8/checkpoints/step-010000.pt
+    device: cuda
+    batch_size: 32
+    shard_rows: 512
+    reader_workers: 16
+    prefetch_batches: 8
+    writer_workers: 2
+    pending_writes: 2
+    latent_lru_shards: 4
+    amp_dtype: bfloat16
+    semantic_dim: 1536
+    vae_channels: 16
+    preprocess:
+      max_side: 512
+      max_pixels: 262144
+
+detail_style_artist_only_mixture_continuation:
+  extends: detail_style_artist_only_fixed_population_bootstrap
+  output_directory: detail_style_artist_only_mixture_continuation_1p5_v1
+  initial_checkpoint: >-
+    detail_style_artist_only_fixed_population_bootstrap_v1/checkpoints/step-0001000.pt
+  resume_checkpoint: null
+  training:
+    steps: 1000
+    warmup_steps: 100
+    native_bootstrap:
+      enabled: true
+      minimum_steps: 2000
+    teacher_reference_count_weights: [0.60, 0.30, 0.0, 0.10]
+    teacher_reference_count_curriculum:
+      start_step: 1
+      end_step: 1
+      before_weights: [0.60, 0.30, 0.0, 0.10]
+      start_weights: [0.60, 0.30, 0.0, 0.10]
+      end_weights: [0.60, 0.30, 0.0, 0.10]
+    validation_every: 250
+    validation_batches: 2
+    checkpoint_every: 250
+    state_every: 250
+    fixed_sample_every: 250
+    fixed_sample_strengths: [1.0, 1.5, 2.0]
+    wandb:
+      enabled: true
+      project: anima-style-adapter
+      name: artist-only-mixture-continuation-1p5-v1
+      id: artist-only-mixture-continuation-1p5-v1
+  lora_functional_teacher:
+    enabled: true
+    lora_directory: artist_lora_teachers_rank16_256_b2_v5
+    teacher_cache: lora_functional_teacher_bank_rank16_256_mixture_1p5_v1
+    human_reference_cache: dual_query_reference_tokens_v8_step10000
+    synthetic_reference_cache: >-
+      lora_teacher_references_rank16_256x8_v2/dual_query_reference_tokens_v8_step10000
+    mixture_reference_cache: >-
+      lora_mixture_references_rank16_256x4_1p5_v1/dual_query_reference_tokens_v8_step10000
+    training:
+      start_step: 1
+      end_step: 1000
+      every: 2
+      single_only_steps: 0
+      teacher_schedule: [single, single, pair, pair, triple, triple, amplified, signed]
+      teacher_kind_curriculum:
+        - end_step: 250
+          schedule: [single, single, single, pair, pair, triple]
+        - end_step: 500
+          schedule: [single, single, pair, pair, triple, triple]
+      reference_domain_schedule: [human, synthetic]
+      functional_objective: artist_only_fixed_population
+      backward_scale: 0.50
+      batch_rows: 6
+      reference_counts: [1, 2, 4]
+      reference_count_weights: [0.60, 0.30, 0.10]
+      validation_kinds: [single, pair, triple, amplified, signed]
+      validation_batch_rows: 6
+      validation_reference_count: 2
+      token_lru_shards: 8
+      ram_resident_tokens: false
+      loss_weights:
+        pair_huber: 1.0
+        pair_direction: 0.75
+        pair_magnitude: 0.25
+        pair_magnitude_floor: 0.25
+        pair_magnitude_upper: 1.25
+        absolute_anchor: 0.10
+        functional_infonce: 0.25
+        functional_infonce_temperature: 0.10
+        population_common_beta: 0.0
+
 # Detail-preserving typed-slot, separate-softmax Style Cross-Attention v1.
 # Contract: docs/detail_preserving_style_cross_attention_plan.md
 fresh_v34_low_target_kv_lora_joint:
