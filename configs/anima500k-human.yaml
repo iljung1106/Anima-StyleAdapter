@@ -6812,6 +6812,38 @@ detail_style_artist_only_fixed_population_mixture_one_stage:
         functional_infonce_temperature: 0.10
         population_common_beta: 0.0
 
+# Long fresh run with an explicit fixed-population mean-error constraint.  The
+# constraint matches Student and Teacher means on identical sampled rows; it
+# does not force a finite artist batch itself to have zero mean.
+detail_style_artist_only_fixed_population_mixture_8k:
+  extends: detail_style_artist_only_fixed_population_mixture_one_stage
+  output_directory: detail_style_artist_only_fixed_population_mixture_8k_v1
+  initial_checkpoint: null
+  resume_checkpoint: null
+  reader_checkpoint: null
+  training:
+    steps: 8000
+    warmup_steps: 200
+    fixed_population_mean_weight: 1.0
+    fixed_population_mean_huber_beta: 0.10
+    teacher_every_step_until: 8000
+    teacher_end_step: 8000
+    validation_every: 250
+    checkpoint_every: 500
+    state_every: 250
+    sample_every: 250
+    fixed_sample_every: 250
+    wandb:
+      enabled: true
+      project: anima-style-adapter
+      name: artist-only-fixed-population-mixture-8k-v1
+      id: artist-only-fixed-population-mixture-8k-v1
+  lora_functional_teacher:
+    training:
+      end_step: 8000
+      loss_weights:
+        population_mean_anchor: 1.0
+
 # Detail-preserving typed-slot, separate-softmax Style Cross-Attention v1.
 # Contract: docs/detail_preserving_style_cross_attention_plan.md
 fresh_v34_low_target_kv_lora_joint:

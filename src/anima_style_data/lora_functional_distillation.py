@@ -2539,6 +2539,18 @@ def _artist_only_fixed_population_objective(
         target / target_rms.reshape(row_shape),
         beta=0.10,
     )
+    # Do not force the sampled artist mean to zero: a finite batch can have a
+    # legitimate non-zero mean even though the frozen population is centered.
+    # Instead, match Student and fixed-population Teacher means for the same
+    # rows.  A reference-independent Student offset survives this subtraction
+    # exactly, while genuine sampled-population variation cancels.
+    population_scale = target.square().mean().sqrt().clamp_min(1e-4)
+    population_mean_error = (student - target).mean(dim=0, keepdim=True)
+    population_mean_anchor = F.smooth_l1_loss(
+        population_mean_error / population_scale,
+        torch.zeros_like(population_mean_error),
+        beta=0.10,
+    )
 
     paired_student = student - student.roll(1, dims=0)
     paired_teacher = teacher_residual - teacher_residual.roll(1, dims=0)
@@ -2585,6 +2597,9 @@ def _artist_only_fixed_population_objective(
         "pair_magnitude": float(weights.get("pair_magnitude", 0.25))
         * pair_magnitude,
         "absolute_anchor": float(weights.get("absolute_anchor", 0.10)) * anchor,
+        "population_mean_anchor": float(
+            weights.get("population_mean_anchor", 0.0)
+        ) * population_mean_anchor,
         "functional_infonce": float(weights.get("functional_infonce", 0.25))
         * infonce,
     }
@@ -2598,6 +2613,10 @@ def _artist_only_fixed_population_objective(
         "pair_magnitude_loss": pair_magnitude.detach(),
         "pair_student_to_teacher_rms": pair_ratio.mean().detach(),
         "absolute_anchor_loss": anchor.detach(),
+        "population_mean_anchor_loss": population_mean_anchor.detach(),
+        "population_mean_error_to_teacher_rms": (
+            population_mean_error.square().mean().sqrt() / population_scale
+        ).detach(),
         "population_common_beta": student.new_tensor(beta),
         "functional_infonce_loss": infonce.detach(),
         "functional_infonce_accuracy": (

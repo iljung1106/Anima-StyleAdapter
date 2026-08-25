@@ -236,6 +236,10 @@ def build_parser() -> argparse.ArgumentParser:
             "Train Artist-only fixed-population native and mixture teachers jointly",
         ),
         (
+            "detail-style-artist-only-mixture-8k-train",
+            "Train Artist-only fixed-population mixtures for 8000 steps",
+        ),
+        (
             "detail-style-reader-pretrain",
             "Pretrain the typed-slot Reader with per-reference and pooled reconstruction",
         ),
@@ -941,6 +945,7 @@ def main() -> None:
         "detail-style-artist-only-bootstrap-smoke",
         "detail-style-artist-only-mixture-train",
         "detail-style-artist-only-one-stage-train",
+        "detail-style-artist-only-mixture-8k-train",
         "detail-style-reader-pretrain",
         "detail-style-block-similarity",
         "detail-style-fixed-samples",
@@ -966,6 +971,7 @@ def main() -> None:
             train_artist_only_fixed_population_bootstrap,
             train_artist_only_mixture_continuation,
             train_artist_only_mixture_one_stage,
+            train_artist_only_fixed_population_mixture_8k,
         )
         from .block_similarity import analyze_anima_block_similarity
         from .detail_style_gradient_diagnostics import (
@@ -997,6 +1003,9 @@ def main() -> None:
             ),
             "detail-style-artist-only-one-stage-train": (
                 train_artist_only_mixture_one_stage
+            ),
+            "detail-style-artist-only-mixture-8k-train": (
+                train_artist_only_fixed_population_mixture_8k
             ),
             "detail-style-reader-pretrain": pretrain_detail_style_reader,
             "detail-style-block-similarity": analyze_anima_block_similarity,

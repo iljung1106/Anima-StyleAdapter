@@ -2779,11 +2779,34 @@ def _teacher_step(
         adapter.set_post_gate_centers(
             adapter.finish_post_gate_center_collection()
         )
-    student_center = torch.cat(detached_students, dim=0).mean(dim=0, keepdim=True)
+    sampled_student_mean = torch.cat(detached_students, dim=0).mean(
+        dim=0, keepdim=True
+    )
+    student_center = sampled_student_mean
+    fixed_population_mean_gradient = None
+    fixed_population_mean_loss = teacher.new_zeros(())
+    fixed_population_mean_weight = 0.0
     if artist_only_fixed_population:
-        # Fixed population residuals already have an externally defined zero.
-        # Do not make the Student target depend on the sampled minibatch.
-        student_center = torch.zeros_like(student_center)
+        # Preserve the legitimate mean of the sampled fixed-population Teacher
+        # rows and isolate only the Student's extra reference-independent
+        # offset.  Subtracting the raw minibatch mean here would incorrectly
+        # erase real artist sampling variation.
+        sampled_teacher_mean = teacher.mean(dim=0, keepdim=True)
+        population_mean_error = sampled_student_mean - sampled_teacher_mean
+        student_center = population_mean_error
+        population_scale = teacher.square().mean().sqrt().clamp_min(1e-4)
+        population_proxy = sampled_student_mean.float().requires_grad_(True)
+        fixed_population_mean_loss = F.smooth_l1_loss(
+            (population_proxy - sampled_teacher_mean) / population_scale,
+            torch.zeros_like(population_proxy),
+            beta=float(training.get("fixed_population_mean_huber_beta", 0.10)),
+        )
+        fixed_population_mean_gradient = torch.autograd.grad(
+            fixed_population_mean_loss, population_proxy
+        )[0].detach()
+        fixed_population_mean_weight = float(
+            training.get("fixed_population_mean_weight", 1.0)
+        )
     objective_cfg = _native_teacher_objective_config(training)
     separated_cfg = dict(training.get("separated_component_bootstrap", {}))
     common_objective_cfg = dict(objective_cfg)
@@ -2863,7 +2886,10 @@ def _teacher_step(
             adapter.set_bootstrap_phase(previous_phase)
         common_surrogate_weight = 0.0
     metric_rows: list[dict[str, torch.Tensor]] = []
-    detached_total = common_objective_weight * common_loss.detach()
+    detached_total = (
+        common_objective_weight * common_loss.detach()
+        + fixed_population_mean_weight * fixed_population_mean_loss.detach()
+    )
     for offset in range(0, rows, microbatch_rows):
         stop = min(rows, offset + microbatch_rows)
         row_fraction = (stop - offset) / rows
@@ -2896,13 +2922,36 @@ def _teacher_step(
         common_surrogate = (
             student.float() * common_gradient
         ).sum() / rows
+        fixed_population_mean_surrogate = student.new_zeros(())
+        if fixed_population_mean_gradient is not None:
+            fixed_population_mean_surrogate = (
+                student.float() * fixed_population_mean_gradient
+            ).sum() / rows
         main_loss = global_weight * timestep_weight * (
             row_fraction * (
                 artist_objective_weight * final_loss
                 + infonce_weight * infonce_loss
             )
             + common_surrogate_weight * common_surrogate
+            + fixed_population_mean_weight * fixed_population_mean_surrogate
         )
+        if fixed_population_mean_gradient is not None:
+            metrics.update({
+                "native_teacher_fixed_population_mean_loss": (
+                    fixed_population_mean_loss.detach()
+                ),
+                "native_teacher_fixed_population_mean_weight": (
+                    main_loss.new_tensor(fixed_population_mean_weight)
+                ),
+                "native_teacher_fixed_population_mean_weighted_loss": (
+                    fixed_population_mean_weight
+                    * fixed_population_mean_loss.detach()
+                ),
+                "native_teacher_fixed_population_mean_error_ratio": (
+                    population_mean_error.square().mean().sqrt()
+                    / population_scale
+                ).detach(),
+            })
         post_gate_loss = None
         if post_gate_active:
             post_gate_loss, post_gate_metrics = adapter.post_gate_teacher_loss(
@@ -5220,6 +5269,16 @@ def train_artist_only_mixture_one_stage(
         config,
         destination,
         config_key="detail_style_artist_only_fixed_population_mixture_one_stage",
+    )
+
+
+def train_artist_only_fixed_population_mixture_8k(
+    config: dict[str, Any], destination: Path
+) -> dict[str, Any]:
+    return train_detail_style_cross_attention(
+        config,
+        destination,
+        config_key="detail_style_artist_only_fixed_population_mixture_8k",
     )
 
 

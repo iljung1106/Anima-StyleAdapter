@@ -198,6 +198,32 @@ def test_fourfold_absolute_anchor_fourfolds_common_offset_penalty():
     assert torch.isclose(strengthened, 4.0 * previous)
 
 
+def test_population_mean_anchor_targets_shared_error_not_sampled_artist_mean():
+    teacher = torch.eye(4).reshape(4, 1, 4) + 0.3
+    population = teacher.mean(dim=0)
+    residual = teacher - population
+    weights = {
+        "pair_huber": 0.0,
+        "pair_direction": 0.0,
+        "pair_magnitude": 0.0,
+        "absolute_anchor": 0.0,
+        "population_mean_anchor": 1.0,
+        "functional_infonce": 0.0,
+    }
+
+    exact, exact_metrics = _artist_only_fixed_population_objective(
+        residual, teacher, population, weights
+    )
+    shifted, shifted_metrics = _artist_only_fixed_population_objective(
+        residual + 0.5, teacher, population, weights
+    )
+
+    assert float(exact) < 1e-7
+    assert float(exact_metrics["population_mean_error_to_teacher_rms"]) < 1e-7
+    assert float(shifted) > 0.0
+    assert float(shifted_metrics["population_mean_error_to_teacher_rms"]) > 0.0
+
+
 def test_teacher_schedule_becomes_exact_three_way_cycle():
     assert [teacher_category(step, single_only_steps=2) for step in range(1, 9)] == [
         "lora_single",

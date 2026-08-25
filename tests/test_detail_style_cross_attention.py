@@ -1202,6 +1202,41 @@ def test_centered_teacher_magnitude_has_a_weak_upper_bound():
     assert float(excessive_loss) > float(aligned_loss)
 
 
+def test_fixed_population_error_center_prevents_shared_magnitude_shortcut():
+    torch.manual_seed(1281)
+    teacher = torch.randn(4, 3, 5)
+    shared_error = torch.full((1, 3, 5), 2.0)
+    student = teacher + shared_error
+    config = {
+        "artist_direction_weight": 1.0,
+        "artist_huber_weight": 1.0,
+        "magnitude_weight": 1.0,
+        "magnitude_floor_start": 1.0,
+        "magnitude_floor_end": 1.0,
+        "magnitude_upper": 1.25,
+    }
+
+    corrected_loss, corrected_metrics = _minimal_native_teacher_objective(
+        student,
+        teacher,
+        config,
+        step=1,
+        student_center=shared_error,
+        teacher_center=torch.zeros_like(shared_error),
+    )
+    raw_loss, _ = _minimal_native_teacher_objective(
+        student, teacher, config, step=1,
+        student_center=torch.zeros_like(shared_error),
+        teacher_center=torch.zeros_like(shared_error),
+    )
+
+    assert float(corrected_loss) == pytest.approx(0.0, abs=1e-6)
+    assert float(corrected_metrics["native_teacher_artist_rms_ratio"]) == (
+        pytest.approx(1.0, abs=1e-6)
+    )
+    assert float(raw_loss) > float(corrected_loss)
+
+
 def test_common_teacher_objective_aligns_direction_and_magnitude():
     torch.manual_seed(129)
     teacher = torch.randn(1, 3, 8, 8)
