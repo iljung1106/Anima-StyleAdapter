@@ -2942,9 +2942,18 @@ def train_lora_functional_distillation(
                             "full_reference_counts", (1, 2, 4, 8)
                         )
                     )
-                    sweeps.extend(
-                        (("controlled", counts, None), ("diverse", counts, None))
+                    full_modes = tuple(
+                        str(value)
+                        for value in fewshot_cfg.get(
+                            "full_modes", ("controlled", "diverse")
+                        )
                     )
+                    unknown_modes = set(full_modes) - {"controlled", "diverse"}
+                    if unknown_modes:
+                        raise ValueError(
+                            f"Unknown full few-shot modes: {sorted(unknown_modes)}"
+                        )
+                    sweeps.extend((mode, counts, None) for mode in full_modes)
                 elif quick_due:
                     sweeps.append((
                         "diverse",

@@ -6424,7 +6424,7 @@ fresh_v34_low_target_kv_lora_joint:
       common_ratio_margin: 0.03
     log_every: 10
     checkpoint_every: 250
-    sample_every: 250
+    sample_every: 500
     panel_sample_every: 500
     fixed_sample_strengths: [1.0, 2.0]
     fewshot_validation:
@@ -6437,11 +6437,14 @@ fresh_v34_low_target_kv_lora_joint:
       reference_seed: 2026082801
       token_lru_shards: 8
       ram_resident_tokens: true
-      quick_every: 500
+      # Fixed-reference and functional panels already cover the frequent
+      # visual check. Keep one compact controlled few-shot sheet per 1k steps.
+      quick_every: 0
       quick_artist_count: 4
       quick_reference_counts: [1, 4]
       full_every: 1000
-      full_reference_counts: [1, 2, 4, 8]
+      full_modes: [controlled]
+      full_reference_counts: [1, 4]
       negative_prompt: >-
         worst quality, low quality, score_1, score_2, score_3,
         artist name, blurry, jpeg artifacts
