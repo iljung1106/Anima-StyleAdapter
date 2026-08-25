@@ -22,6 +22,7 @@ from safetensors.torch import load_file, save_file
 from .artist_lora_teachers import ArtistLoRAPlan
 from .artist_lora_teachers import _selected_lora_modules, _serialize_lora_patterns
 from .detail_style_cross_attention import (
+    ArtistOnlySharedBaseKVStyleCrossAttention,
     DetailPreservingTypedSlotReader,
     SeparatedCommonArtistKVStyleCrossAttention,
 )
@@ -1956,6 +1957,16 @@ class FunctionalLoRATeacherBank:
             ]
             for kind in kinds
         }
+        single_indices = self.by_kind.get("single", [])
+        self.single_population_mean = None
+        if len(single_indices) >= 2:
+            total = torch.zeros_like(self.effects[0], dtype=torch.float32)
+            for offset in range(0, len(single_indices), 16):
+                part = torch.tensor(
+                    single_indices[offset : offset + 16], dtype=torch.long
+                )
+                total.add_(self.effects.index_select(0, part).float().sum(dim=0))
+            self.single_population_mean = total / len(single_indices)
 
 
 def _functional_objective(
@@ -2328,6 +2339,109 @@ def _separated_component_functional_objective(
     }
 
 
+def _artist_only_fixed_population_objective(
+    student: torch.Tensor,
+    teacher: torch.Tensor,
+    population_mean: torch.Tensor,
+    weights: dict[str, float],
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Match fixed-population Artist residuals without a Common branch."""
+
+    student = student.float()
+    teacher = teacher.detach().float()
+    population_mean = population_mean.detach().float()
+    if student.shape != teacher.shape or student.shape[0] < 2:
+        raise ValueError("Artist-only population objective needs matching rows")
+    if population_mean.shape == teacher.shape[1:]:
+        population_mean = population_mean.unsqueeze(0)
+    if population_mean.shape != (1, *teacher.shape[1:]):
+        raise ValueError("Population mean must contain one controlled effect")
+
+    beta = float(weights.get("population_common_beta", 0.0))
+    teacher_residual = teacher - population_mean
+    target = teacher_residual + beta * population_mean
+    dimensions = tuple(range(1, student.ndim))
+    row_shape = (-1,) + (1,) * (student.ndim - 1)
+    target_rms = target.square().mean(dim=dimensions).sqrt().clamp_min(1e-4)
+    anchor = F.smooth_l1_loss(
+        student / target_rms.reshape(row_shape),
+        target / target_rms.reshape(row_shape),
+        beta=0.10,
+    )
+
+    paired_student = student - student.roll(1, dims=0)
+    paired_teacher = teacher_residual - teacher_residual.roll(1, dims=0)
+    paired_teacher_rms = (
+        paired_teacher.square().mean(dim=dimensions).sqrt().clamp_min(1e-4)
+    )
+    paired_student_rms = (
+        paired_student.square().mean(dim=dimensions) + 1e-12
+    ).sqrt()
+    pair_huber = F.smooth_l1_loss(
+        paired_student / paired_teacher_rms.reshape(row_shape),
+        paired_teacher / paired_teacher_rms.reshape(row_shape),
+        beta=0.10,
+    )
+    pair_cosine = F.cosine_similarity(
+        paired_student.flatten(1), paired_teacher.flatten(1), dim=1
+    ).mean()
+    pair_ratio = paired_student_rms / paired_teacher_rms
+    magnitude_floor = float(weights.get("pair_magnitude_floor", 0.25))
+    magnitude_upper = float(weights.get("pair_magnitude_upper", 1.25))
+    pair_magnitude = (
+        F.relu(magnitude_floor - pair_ratio).square().mean()
+        + 0.25 * F.relu(pair_ratio - magnitude_upper).square().mean()
+    )
+
+    temperature = float(weights.get("functional_infonce_temperature", 0.10))
+    student_unit = F.normalize(student.flatten(1), dim=1, eps=1e-8)
+    teacher_unit = F.normalize(teacher_residual.flatten(1), dim=1, eps=1e-8)
+    logits = student_unit @ teacher_unit.t() / temperature
+    labels = torch.arange(student.shape[0], device=student.device)
+    infonce = 0.5 * (
+        F.cross_entropy(logits, labels) + F.cross_entropy(logits.t(), labels)
+    )
+    positive = logits.diagonal() * temperature
+    wrong = logits.masked_fill(
+        torch.eye(student.shape[0], device=student.device, dtype=torch.bool),
+        torch.finfo(logits.dtype).min,
+    ).max(dim=1).values * temperature
+
+    weighted = {
+        "pair_huber": float(weights.get("pair_huber", 1.0)) * pair_huber,
+        "pair_direction": float(weights.get("pair_direction", 0.75))
+        * (1.0 - pair_cosine),
+        "pair_magnitude": float(weights.get("pair_magnitude", 0.25))
+        * pair_magnitude,
+        "absolute_anchor": float(weights.get("absolute_anchor", 0.10)) * anchor,
+        "functional_infonce": float(weights.get("functional_infonce", 0.25))
+        * infonce,
+    }
+    total = sum(weighted.values())
+    student_mean_rms = student.mean(dim=0).square().mean().sqrt()
+    teacher_residual_scale = teacher_residual.square().mean().sqrt().clamp_min(1e-8)
+    return total, {
+        "loss": total.detach(),
+        "pair_huber": pair_huber.detach(),
+        "pair_cosine": pair_cosine.detach(),
+        "pair_magnitude_loss": pair_magnitude.detach(),
+        "pair_student_to_teacher_rms": pair_ratio.mean().detach(),
+        "absolute_anchor_loss": anchor.detach(),
+        "population_common_beta": student.new_tensor(beta),
+        "functional_infonce_loss": infonce.detach(),
+        "functional_infonce_accuracy": (
+            logits.argmax(dim=1) == labels
+        ).float().mean().detach(),
+        "functional_infonce_positive_cosine": positive.mean().detach(),
+        "functional_infonce_hardest_wrong_cosine": wrong.mean().detach(),
+        "functional_infonce_cosine_gap": (positive - wrong).mean().detach(),
+        "student_population_mean_to_teacher_residual_rms": (
+            student_mean_rms / teacher_residual_scale
+        ).detach(),
+        **{f"weighted_{name}": value.detach() for name, value in weighted.items()},
+    }
+
+
 def _pack_mixture_references(
     loader: CachedTeacherReferenceLoader,
     rows: list[dict[str, Any]],
@@ -2390,7 +2504,7 @@ def _pack_materialized_mixture_references(
 def _lora_teacher_step(
     anima: torch.nn.Module,
     reader: DetailPreservingTypedSlotReader,
-    adapter: SeparatedCommonArtistKVStyleCrossAttention,
+    adapter: SeparatedCommonArtistKVStyleCrossAttention | ArtistOnlySharedBaseKVStyleCrossAttention,
     bank: FunctionalLoRATeacherBank,
     loader: CachedTeacherReferenceLoader,
     *,
@@ -2470,10 +2584,11 @@ def _lora_teacher_step(
     )
     objective = str(training.get("functional_objective", "legacy_raw"))
     if objective not in {
-        "legacy_raw", "teacher_decomposed", "separated_components"
+        "legacy_raw", "teacher_decomposed", "separated_components",
+        "artist_only_fixed_population",
     }:
         raise ValueError(f"Unsupported functional objective: {objective}")
-    previous_phase = adapter.bootstrap_phase
+    previous_phase = getattr(adapter, "bootstrap_phase", None)
     try:
         common_student = None
         if objective == "separated_components":
@@ -2493,14 +2608,17 @@ def _lora_teacher_step(
             else:
                 with torch.no_grad():
                     common_student = _controlled_teacher_forward(*common_args)
-        adapter.set_bootstrap_phase("combined")
+        if isinstance(adapter, SeparatedCommonArtistKVStyleCrossAttention):
+            adapter.set_bootstrap_phase("combined")
         student = _controlled_teacher_forward(
             anima, reader, adapter, references, mask,
             noisy, base, context, timestep, device,
             reference_weights=reference_weights,
         )
     finally:
-        adapter.set_bootstrap_phase(previous_phase)
+        if isinstance(adapter, SeparatedCommonArtistKVStyleCrossAttention):
+            assert previous_phase is not None
+            adapter.set_bootstrap_phase(previous_phase)
 
     loss_weights = dict(training.get("loss_weights", {}))
     floor_start = float(training.get("artist_magnitude_floor_start", 0.0))
@@ -2518,6 +2636,17 @@ def _lora_teacher_step(
     elif objective == "teacher_decomposed":
         loss, metrics = _teacher_decomposed_functional_objective(
             student, teacher, loss_weights
+        )
+    elif objective == "artist_only_fixed_population":
+        if bank.single_population_mean is None:
+            raise RuntimeError(
+                "Artist-only population objective needs at least two single teachers"
+            )
+        population_mean = bank.single_population_mean[
+            content_index, timestep_index
+        ].to(device=device, dtype=torch.float32, non_blocking=True)
+        loss, metrics = _artist_only_fixed_population_objective(
+            student, teacher, population_mean, loss_weights
         )
     else:
         loss, metrics = _functional_objective(student, teacher, loss_weights)

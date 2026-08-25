@@ -4,6 +4,7 @@ import torch
 from safetensors.torch import save_file
 
 from anima_style_data.lora_functional_distillation import (
+    _artist_only_fixed_population_objective,
     _configure_reader_trainable_scope,
     _cached_training_probe_bank,
     _initialize_fresh_adapter_strength,
@@ -24,6 +25,36 @@ from anima_style_data.detail_style_cross_attention import (
     SeparatedCommonArtistKVStyleCrossAttention,
 )
 from anima_style_data.io import write_records
+
+
+def test_artist_only_population_objective_anchors_common_offset_and_spread():
+    teacher = torch.eye(4).reshape(4, 1, 4) + 0.3
+    population = teacher.mean(dim=0)
+    residual = teacher - population
+    weights = {
+        "pair_huber": 1.0,
+        "pair_direction": 0.75,
+        "pair_magnitude": 0.25,
+        "absolute_anchor": 0.10,
+        "functional_infonce": 0.0,
+        "population_common_beta": 0.0,
+    }
+
+    exact_loss, exact_metrics = _artist_only_fixed_population_objective(
+        residual, teacher, population, weights
+    )
+    leaked_loss, _ = _artist_only_fixed_population_objective(
+        residual + 0.5, teacher, population, weights
+    )
+    collapsed_loss, collapsed_metrics = _artist_only_fixed_population_objective(
+        torch.zeros_like(residual), teacher, population, weights
+    )
+
+    assert float(exact_loss) < 1e-6
+    assert float(leaked_loss) > float(exact_loss)
+    assert float(collapsed_loss) > float(exact_loss) + 0.5
+    assert float(exact_metrics["pair_cosine"]) > 0.999
+    assert float(collapsed_metrics["pair_student_to_teacher_rms"]) < 1e-5
 
 
 def test_teacher_schedule_becomes_exact_three_way_cycle():

@@ -217,6 +217,14 @@ def build_parser() -> argparse.ArgumentParser:
             "Smoke-test original v31/v34 curriculum plus K/V-LoRA distillation",
         ),
         (
+            "detail-style-artist-only-bootstrap-train",
+            "Train fixed-population Artist-only functional bootstrap",
+        ),
+        (
+            "detail-style-artist-only-bootstrap-smoke",
+            "Smoke-test fixed-population Artist-only functional bootstrap",
+        ),
+        (
             "detail-style-reader-pretrain",
             "Pretrain the typed-slot Reader with per-reference and pooled reconstruction",
         ),
@@ -909,6 +917,8 @@ def main() -> None:
         "detail-style-train",
         "detail-style-v34-lora-joint-train",
         "detail-style-v34-lora-joint-smoke",
+        "detail-style-artist-only-bootstrap-train",
+        "detail-style-artist-only-bootstrap-smoke",
         "detail-style-reader-pretrain",
         "detail-style-block-similarity",
         "detail-style-fixed-samples",
@@ -928,8 +938,10 @@ def main() -> None:
             profile_detail_style_block_timestep_strength,
             smoke_test_detail_style_cross_attention,
             smoke_test_detail_style_v34_lora_joint,
+            smoke_test_artist_only_fixed_population_bootstrap,
             train_detail_style_cross_attention,
             train_detail_style_v34_lora_joint,
+            train_artist_only_fixed_population_bootstrap,
         )
         from .block_similarity import analyze_anima_block_similarity
         from .detail_style_gradient_diagnostics import (
@@ -949,6 +961,12 @@ def main() -> None:
             ),
             "detail-style-v34-lora-joint-smoke": (
                 smoke_test_detail_style_v34_lora_joint
+            ),
+            "detail-style-artist-only-bootstrap-train": (
+                train_artist_only_fixed_population_bootstrap
+            ),
+            "detail-style-artist-only-bootstrap-smoke": (
+                smoke_test_artist_only_fixed_population_bootstrap
             ),
             "detail-style-reader-pretrain": pretrain_detail_style_reader,
             "detail-style-block-similarity": analyze_anima_block_similarity,

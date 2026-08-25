@@ -23,6 +23,7 @@ from .artist_effect_losses import (
     episodic_artist_prototype_loss,
 )
 from .detail_style_cross_attention import (
+    ArtistOnlySharedBaseKVStyleCrossAttention,
     DetailPreservingTypedSlotReader,
     FreshKVStyleCrossAttention,
     SeparatedCommonArtistKVStyleCrossAttention,
@@ -70,6 +71,16 @@ def _build_style_adapter(cfg: dict[str, Any]) -> FreshKVStyleCrossAttention:
     architecture = str(adapter_cfg.pop("architecture", "fresh_per_block"))
     if architecture == "separated_common_artist_shared_base":
         return SeparatedCommonArtistKVStyleCrossAttention(**adapter_cfg)
+    if architecture == "artist_only_shared_base":
+        for name in (
+            "common_tokens",
+            "artist_null_residual",
+            "artist_residual_gain",
+            "common_residual_gain",
+            "common_combined_gradient_scale",
+        ):
+            adapter_cfg.pop(name, None)
+        return ArtistOnlySharedBaseKVStyleCrossAttention(**adapter_cfg)
     if architecture == "shared_base_lora":
         return SharedBaseKVStyleCrossAttention(**adapter_cfg)
     if architecture == "fresh_per_block":
@@ -1082,7 +1093,17 @@ def _minimal_native_teacher_objective(
     magnitude_weight = float(training.get("magnitude_weight", 0.10))
     weighted_direction = direction_weight * direction
     weighted_magnitude = magnitude_weight * magnitude
-    total = weighted_direction + weighted_magnitude
+    scale = teacher_rms.reshape(-1, *([1] * (teacher.ndim - 1)))
+    absolute_huber = F.smooth_l1_loss(
+        student / scale,
+        teacher / scale,
+        beta=float(training.get("artist_huber_beta", 0.10)),
+        reduction="none",
+    ).mean(dim=dimensions)
+    absolute_huber = weighted_mean(absolute_huber)
+    absolute_huber_weight = float(training.get("artist_huber_weight", 0.0))
+    weighted_absolute_huber = absolute_huber_weight * absolute_huber
+    total = weighted_direction + weighted_magnitude + weighted_absolute_huber
     return total, {
         "native_teacher_final_direction_loss": direction.detach(),
         "native_teacher_final_direction_weight": direction.new_tensor(
@@ -1099,6 +1120,13 @@ def _minimal_native_teacher_objective(
         "native_teacher_magnitude_band_loss": magnitude.detach(),
         "native_teacher_magnitude_weight": direction.new_tensor(magnitude_weight),
         "native_teacher_magnitude_weighted_loss": weighted_magnitude.detach(),
+        "native_teacher_absolute_huber_loss": absolute_huber.detach(),
+        "native_teacher_absolute_huber_weight": direction.new_tensor(
+            absolute_huber_weight
+        ),
+        "native_teacher_absolute_huber_weighted_loss": (
+            weighted_absolute_huber.detach()
+        ),
         "native_teacher_artist_rms_ratio": rms_ratio.detach().mean(),
         "native_teacher_projection_coefficient": coefficient.detach().mean(),
         "native_teacher_projection_positive_fraction": (
@@ -2634,6 +2662,14 @@ def _teacher_step(
     teacher = tensors["centered_teacher"][
         artist_indices, content_index, timestep_index
     ].to(device=device, dtype=torch.float32, non_blocking=True)
+    artist_only_fixed_population = isinstance(
+        adapter, ArtistOnlySharedBaseKVStyleCrossAttention
+    ) and bool(training.get("fixed_population_artist_only", False))
+    if artist_only_fixed_population:
+        population_offset = bank.train_population_offset()[
+            content_index, timestep_index
+        ].to(device=device, dtype=torch.float32, non_blocking=True)
+        teacher = teacher - population_offset.unsqueeze(0)
     # The bank is centered over every cached artist, not over this sampled
     # sixteen-row batch. Keep those artist targets intact. Recover the removed
     # global native component once per content/timestep from one tagged native
@@ -2666,7 +2702,9 @@ def _teacher_step(
     )
     common_key = (content_index, timestep_index)
     teacher_common = native_common_cache.get(common_key)
-    if teacher_common is None:
+    if artist_only_fixed_population:
+        teacher_common = teacher.new_zeros((1, *teacher.shape[1:]))
+    elif teacher_common is None:
         raw_teacher = _native_final_teacher_forward(
             anima, adapter, noisy, base, tagged[:1], timestep, device
         )
@@ -2699,6 +2737,10 @@ def _teacher_step(
             adapter.finish_post_gate_center_collection()
         )
     student_center = torch.cat(detached_students, dim=0).mean(dim=0, keepdim=True)
+    if artist_only_fixed_population:
+        # Fixed population residuals already have an externally defined zero.
+        # Do not make the Student target depend on the sampled minibatch.
+        student_center = torch.zeros_like(student_center)
     objective_cfg = _native_teacher_objective_config(training)
     separated_cfg = dict(training.get("separated_component_bootstrap", {}))
     common_objective_cfg = dict(objective_cfg)
@@ -3821,10 +3863,14 @@ def train_detail_style_cross_attention(
     reader = DetailPreservingTypedSlotReader(**dict(cfg["model"])).to(device)
     adapter = _build_style_adapter(cfg).to(device)
     if lora_teacher_enabled and not isinstance(
-        adapter, SeparatedCommonArtistKVStyleCrossAttention
+        adapter,
+        (
+            SeparatedCommonArtistKVStyleCrossAttention,
+            ArtistOnlySharedBaseKVStyleCrossAttention,
+        ),
     ):
         raise TypeError(
-            "LoRA functional augmentation requires the separated Common/Artist adapter"
+            "LoRA functional augmentation requires a component-aware adapter"
         )
     attach_same_q_style_adapter(anima, adapter)
 
@@ -4053,13 +4099,14 @@ def train_detail_style_cross_attention(
                 "name": "null_context",
                 "weight_decay": 0.0,
             },
-            {
+        ])
+        if adapter.gain_parameters():
+            optimizer_groups.append({
                 "params": adapter.gain_parameters(),
                 "lr": float(training.get("component_gain_learning_rate", 1e-2)),
                 "name": "component_gains",
                 "weight_decay": 0.0,
-            },
-        ])
+            })
     else:
         optimizer_groups.append({
             "params": kv_parameters,
@@ -4482,7 +4529,11 @@ def train_detail_style_cross_attention(
 
                 assert lora_teacher_bank is not None
                 assert isinstance(
-                    adapter, SeparatedCommonArtistKVStyleCrossAttention
+                    adapter,
+                    (
+                        SeparatedCommonArtistKVStyleCrossAttention,
+                        ArtistOnlySharedBaseKVStyleCrossAttention,
+                    ),
                 )
                 bootstrap_end = int(
                     lora_training.get("single_only_steps", 500)
@@ -4930,6 +4981,16 @@ def train_detail_style_v34_lora_joint(
         config,
         destination,
         config_key="detail_preserving_style_cross_attention_v34_lora_joint",
+    )
+
+
+def train_artist_only_fixed_population_bootstrap(
+    config: dict[str, Any], destination: Path
+) -> dict[str, Any]:
+    return train_detail_style_cross_attention(
+        config,
+        destination,
+        config_key="detail_style_artist_only_fixed_population_bootstrap",
     )
 
 
@@ -5452,6 +5513,41 @@ def smoke_test_detail_style_v34_lora_joint(
         "every": 1,
         "batch_rows": 2,
         "single_only_steps": 2,
+        "reference_counts": [1],
+        "reference_count_weights": [1.0],
+    })
+    smoke["detail_preserving_style_cross_attention"] = cfg
+    return train_detail_style_cross_attention(smoke, destination, steps_override=2)
+
+
+def smoke_test_artist_only_fixed_population_bootstrap(
+    config: dict[str, Any], destination: Path
+) -> dict[str, Any]:
+    smoke = copy.deepcopy(config)
+    cfg = _merge_detail_style_config(
+        smoke, "detail_style_artist_only_fixed_population_bootstrap"
+    )
+    cfg["output_directory"] = str(cfg["output_directory"]) + "_smoke"
+    cfg.setdefault("data_mixture", {})["enabled"] = False
+    cfg["loader"]["batch_size"] = 2
+    cfg["training"].update({
+        "steps": 2,
+        "validation_every": 2,
+        "validation_batches": 1,
+        "checkpoint_every": 2,
+        "state_every": 2,
+        "sample_every": 0,
+        "fixed_sample_every": 0,
+        "resume": False,
+        "alpha_calibration_batches": 1,
+        "teacher_batch_rows": 4,
+        "teacher_microbatch_rows": 2,
+    })
+    cfg["training"].setdefault("wandb", {})["enabled"] = False
+    cfg["lora_functional_teacher"]["training"].update({
+        "start_step": 1,
+        "every": 1,
+        "batch_rows": 2,
         "reference_counts": [1],
         "reference_count_weights": [1.0],
     })

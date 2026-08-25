@@ -518,6 +518,25 @@ class NativeCenteredTeacherBank:
     summary: dict[str, Any]
     artist_to_index: dict[str, int]
 
+    def train_population_offset(self) -> torch.Tensor:
+        cached = self.tensors.get("train_population_offset")
+        if cached is not None:
+            return cached
+        indices = [
+            self.artist_to_index[str(value)]
+            for value in self.summary["train_style_ids"]
+        ]
+        if len(indices) < 2:
+            raise RuntimeError("Native population Common needs at least two train artists")
+        source = self.tensors["centered_teacher"]
+        total = torch.zeros_like(source[0], dtype=torch.float32)
+        for offset in range(0, len(indices), 16):
+            part = torch.tensor(indices[offset : offset + 16], dtype=torch.long)
+            total.add_(source.index_select(0, part).float().sum(dim=0))
+        cached = (total / len(indices)).to(torch.float16)
+        self.tensors["train_population_offset"] = cached
+        return cached
+
     @classmethod
     def load(
         cls,

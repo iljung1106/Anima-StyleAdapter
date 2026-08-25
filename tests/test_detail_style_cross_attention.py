@@ -8,6 +8,7 @@ import torch.nn.functional as F  # noqa: E402
 from torch import nn  # noqa: E402
 
 from anima_style_data.detail_style_cross_attention import (  # noqa: E402
+    ArtistOnlySharedBaseKVStyleCrossAttention,
     DetailPreservingTypedSlotReader,
     FreshKVStyleCrossAttention,
     SeparatedCommonArtistKVStyleCrossAttention,
@@ -55,6 +56,27 @@ from anima_style_data.detail_style_gradient_diagnostics import (  # noqa: E402
     _gradient_sample_plan,
     _measure_gradient_sketches,
 )
+
+
+def test_artist_only_adapter_subtracts_null_without_readding_common():
+    adapter = ArtistOnlySharedBaseKVStyleCrossAttention(
+        context_dim=8,
+        blocks=1,
+        shared_bases=1,
+        medoid_blocks=(0,),
+        block_to_base=(0,),
+        delta_rank=2,
+        null_tokens=1,
+    )
+    style = torch.tensor([[[3.0, 5.0]]])
+    null = torch.tensor([[[1.0, 2.0]]])
+
+    effective, common, artist = adapter._combine_style_components(style, null)
+
+    torch.testing.assert_close(effective, style - null)
+    torch.testing.assert_close(artist, style - null)
+    torch.testing.assert_close(common, torch.zeros_like(null))
+    assert adapter.gain_parameters() == []
 
 
 def test_auxiliary_gradient_scale_only_changes_gradients_inside_region():

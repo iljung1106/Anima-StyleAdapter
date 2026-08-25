@@ -2398,6 +2398,55 @@ class SharedBaseKVStyleCrossAttention(FreshKVStyleCrossAttention):
         return result
 
 
+class ArtistOnlySharedBaseKVStyleCrossAttention(
+    SharedBaseKVStyleCrossAttention
+):
+    """Reference-conditioned K/V residual with no shared Common branch.
+
+    The learned null context fixes the Artist gauge in attention space.  Its
+    output is subtracted, never added back, so every injected residual remains
+    reference-conditioned and inference strength scales the complete adapter
+    effect.
+    """
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        kwargs.update(common_gain=1.0, artist_gain=1.0, gain_maximum=2.0)
+        super().__init__(*args, **kwargs)
+        self.log_common_gain.requires_grad_(False)
+        self.log_artist_gain.requires_grad_(False)
+
+    def gain_parameters(self) -> list[nn.Parameter]:
+        return []
+
+    def kv_parameters(self) -> list[nn.Parameter]:
+        return (
+            self.shared_parameters()
+            + self.delta_parameters()
+            + self.mixing_parameters()
+            + self.null_parameters()
+        )
+
+    def _component_gains(self) -> tuple[torch.Tensor, torch.Tensor]:
+        zero = self.alpha.new_zeros(())
+        return zero, self.alpha.new_ones(())
+
+    def _combine_style_components(
+        self,
+        style_attended: torch.Tensor,
+        common_attended: torch.Tensor,
+        artist_null_attended: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if artist_null_attended is not None:
+            raise RuntimeError("Artist-only adapter uses one shared null path")
+        artist_component = style_attended - common_attended
+        return artist_component, torch.zeros_like(common_attended), artist_component
+
+    def runtime_stats(self) -> dict[str, float]:
+        result = super().runtime_stats()
+        result["style_artist_only"] = 1.0
+        return result
+
+
 class SeparatedCommonArtistKVStyleCrossAttention(
     SharedBaseKVStyleCrossAttention
 ):

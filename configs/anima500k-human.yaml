@@ -6462,6 +6462,113 @@ detail_preserving_style_cross_attention_v34_lora_joint:
         common_ratio_excess: 0.25
         common_ratio_margin: 0.05
 
+# Clean Artist-only bootstrap. The adapter has no reference-free Common K/V;
+# Native and LoRA targets are centered against fixed training populations.
+detail_style_artist_only_fixed_population_bootstrap:
+  extends: detail_preserving_style_cross_attention
+  output_directory: detail_style_artist_only_fixed_population_bootstrap_v1
+  initial_checkpoint: null
+  resume_checkpoint: null
+  reader_checkpoint: null
+  adapter:
+    architecture: artist_only_shared_base
+  training:
+    steps: 1000
+    native_bootstrap:
+      enabled: true
+      minimum_steps: 2000
+      final_cosine: 0.0
+      final_projection: 0.0
+      common_cosine: 0.0
+      common_projection: 0.0
+      infonce_gap: 0.0
+      consecutive_validations: 2
+    fixed_population_artist_only: true
+    separated_component_bootstrap:
+      enabled: false
+      artist_objective_weight: 1.0
+      artist_mean_weight: 0.0
+      common_objective_weight: 0.0
+      artist_objective:
+        artist_direction_weight: 0.75
+        artist_huber_weight: 1.0
+        artist_huber_beta: 0.10
+        magnitude_weight: 0.25
+        magnitude_floor_start_step: 1
+        magnitude_floor_end_step: 750
+        magnitude_floor_start: 0.25
+        magnitude_floor_end: 0.60
+        magnitude_upper: 1.25
+        magnitude_upper_weight: 0.25
+    teacher_global_weight: 1.0
+    teacher_every_step_until: 1000
+    teacher_every_after_bootstrap: 1
+    teacher_end_step: 1000
+    teacher_reader_gradient_scale: 1.0
+    teacher_infonce_weight: 0.25
+    teacher_infonce_weight_by_reference_count: [0.25, 0.25, 0.25, 0.25]
+    teacher_reference_count_weights: [1.0, 0.0, 0.0, 0.0]
+    teacher_reference_count_curriculum:
+      start_step: 751
+      end_step: 1000
+      before_weights: [1.0, 0.0, 0.0, 0.0]
+      start_weights: [1.0, 0.0, 0.0, 0.0]
+      end_weights: [0.60, 0.30, 0.0, 0.10]
+    reconstruction_weight: 0.0
+    reconstruction_final_weight: 0.0
+    controlled_magnitude_weight: 0.0
+    controlled_contrastive_weight: 0.0
+    functional_weight: 0.0
+    artist_effect_weight: 0.0
+    common_output_weight: 0.0
+    main_common_output_weight: 0.0
+    artist_magnitude_weight: 0.0
+    artist_prototype_weight: 0.0
+    validation_every: 250
+    validation_batches: 2
+    checkpoint_every: 250
+    state_every: 250
+    sample_every: 0
+    fixed_sample_every: 250
+    fixed_sample_strengths: [1.0, 2.0]
+    wandb:
+      enabled: true
+      project: anima-style-adapter
+      name: artist-only-fixed-population-bootstrap-v1
+      id: artist-only-fixed-population-bootstrap-v1
+  lora_functional_teacher:
+    enabled: true
+    lora_directory: artist_lora_teachers_rank16_256_b2_v5
+    teacher_cache: lora_functional_teacher_bank_rank16_256_v3_broad12x6
+    human_reference_cache: dual_query_reference_tokens_v8_step10000
+    synthetic_reference_cache: >-
+      lora_teacher_references_rank16_256x8_v2/dual_query_reference_tokens_v8_step10000
+    training:
+      start_step: 251
+      end_step: 1000
+      every: 2
+      single_only_steps: 1000
+      teacher_schedule: [single]
+      reference_domain_schedule: [human, synthetic]
+      functional_objective: artist_only_fixed_population
+      backward_scale: 0.25
+      batch_rows: 6
+      reference_counts: [1, 2, 4]
+      reference_count_weights: [0.60, 0.30, 0.10]
+      references_per_component: 4
+      token_lru_shards: 8
+      ram_resident_tokens: true
+      loss_weights:
+        pair_huber: 1.0
+        pair_direction: 0.75
+        pair_magnitude: 0.25
+        pair_magnitude_floor: 0.25
+        pair_magnitude_upper: 1.25
+        absolute_anchor: 0.10
+        functional_infonce: 0.25
+        functional_infonce_temperature: 0.10
+        population_common_beta: 0.0
+
 # Detail-preserving typed-slot, separate-softmax Style Cross-Attention v1.
 # Contract: docs/detail_preserving_style_cross_attention_plan.md
 fresh_v34_low_target_kv_lora_joint:
