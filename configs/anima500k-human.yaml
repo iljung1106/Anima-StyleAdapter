@@ -6726,6 +6726,86 @@ detail_style_artist_only_mixture_continuation:
         functional_infonce_temperature: 0.10
         population_common_beta: 0.0
 
+# Fresh one-stage Artist-only training. Native fixed-population supervision and
+# every bounded LoRA mixture kind are active from the beginning; only the LoRA
+# backward contribution ramps, rather than opening a second curriculum phase.
+detail_style_artist_only_fixed_population_mixture_one_stage:
+  extends: detail_style_artist_only_fixed_population_bootstrap
+  output_directory: detail_style_artist_only_fixed_population_mixture_one_stage_v1
+  initial_checkpoint: null
+  resume_checkpoint: null
+  reader_checkpoint: null
+  training:
+    steps: 2000
+    warmup_steps: 100
+    # Continuation measured pre-clip P95 norms of 21.93 (Reader) and 7.48
+    # (Adapter). Leave headroom so clipping is an outlier guard, not the normal
+    # update rule, and log a per-step clipped flag for each parameter group.
+    reader_max_grad_norm: 30.0
+    adapter_max_grad_norm: 10.0
+    null_context_max_grad_norm: 0.1
+    component_gain_max_grad_norm: 1.0
+    native_bootstrap:
+      enabled: true
+      minimum_steps: 3000
+    teacher_every_step_until: 2000
+    teacher_every_after_bootstrap: 1
+    teacher_end_step: 2000
+    validation_every: 250
+    validation_batches: 2
+    checkpoint_every: 250
+    state_every: 250
+    sample_every: 250
+    fixed_sample_every: 250
+    fixed_sample_strengths: [1.0, 1.5, 2.0]
+    wandb:
+      enabled: true
+      project: anima-style-adapter
+      name: artist-only-fixed-population-mixture-one-stage-v1
+      id: artist-only-fixed-population-mixture-one-stage-v1
+  lora_functional_teacher:
+    enabled: true
+    lora_directory: artist_lora_teachers_rank16_256_b2_v5
+    teacher_cache: lora_functional_teacher_bank_rank16_256_mixture_1p5_v1
+    human_reference_cache: dual_query_reference_tokens_v8_step10000
+    synthetic_reference_cache: >-
+      lora_teacher_references_rank16_256x8_v2/dual_query_reference_tokens_v8_step10000
+    mixture_reference_cache: >-
+      lora_mixture_references_rank16_256x4_1p5_v1/dual_query_reference_tokens_v8_step10000
+    training:
+      start_step: 1
+      end_step: 2000
+      every: 2
+      single_only_steps: 0
+      teacher_schedule: [single, single, pair, pair, triple, triple, amplified, signed]
+      teacher_kind_curriculum: []
+      reference_domain_schedule: [human, synthetic]
+      functional_objective: artist_only_fixed_population
+      backward_scale_start: 0.10
+      backward_scale: 0.50
+      backward_scale_ramp_steps: 250
+      batch_rows: 6
+      reference_counts: [1, 2, 4]
+      reference_count_weights: [0.60, 0.30, 0.10]
+      references_per_component: 4
+      validation_kinds: [single, pair, triple, amplified, signed]
+      validation_batch_rows: 6
+      validation_reference_count: 2
+      token_lru_shards: 8
+      ram_resident_tokens: false
+      loss_weights:
+        pair_huber: 1.0
+        pair_direction: 0.75
+        pair_magnitude: 0.25
+        pair_magnitude_floor: 0.25
+        pair_magnitude_upper: 1.25
+        # Four times the previous weight. This is the only term that directly
+        # rejects an additive reference-independent direction.
+        absolute_anchor: 0.40
+        functional_infonce: 0.25
+        functional_infonce_temperature: 0.10
+        population_common_beta: 0.0
+
 # Detail-preserving typed-slot, separate-softmax Style Cross-Attention v1.
 # Contract: docs/detail_preserving_style_cross_attention_plan.md
 fresh_v34_low_target_kv_lora_joint:

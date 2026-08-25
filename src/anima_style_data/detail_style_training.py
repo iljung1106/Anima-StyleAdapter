@@ -115,6 +115,22 @@ def _lora_teacher_schedule_for_step(
     return default_schedule
 
 
+def _lora_backward_scale_for_step(
+    training: dict[str, Any], step: int
+) -> float:
+    """Ramp the auxiliary LoRA backward contribution without staging teachers."""
+
+    final = float(training.get("backward_scale", 0.25))
+    initial = float(training.get("backward_scale_start", final))
+    ramp_steps = int(training.get("backward_scale_ramp_steps", 0))
+    if initial < 0 or final < 0:
+        raise ValueError("LoRA backward scales must be non-negative")
+    if ramp_steps <= 1:
+        return final
+    progress = min(1.0, max(0.0, (int(step) - 1) / (ramp_steps - 1)))
+    return initial + progress * (final - initial)
+
+
 def _teacher_domain_update(
     weighted_domains: tuple[int, ...], update: int
 ) -> tuple[int, int]:
@@ -4644,8 +4660,8 @@ def train_detail_style_cross_attention(
                     device=device,
                     training={**lora_training, "seed": seed},
                     materialized_mixture=materialized_mixture,
-                    backward_scale=float(
-                        lora_training.get("backward_scale", 0.25)
+                    backward_scale=_lora_backward_scale_for_step(
+                        lora_training, step
                     ),
                 )
                 metric_rows[-1].update({
@@ -4700,21 +4716,33 @@ def train_detail_style_cross_attention(
                         adapter.gain_parameters()
                     ),
                 })
+            reader_max_grad_norm = float(
+                training.get("reader_max_grad_norm", 1.0)
+            )
+            adapter_max_grad_norm = float(
+                training.get("adapter_max_grad_norm", 1.0)
+            )
+            null_max_grad_norm = float(
+                training.get("null_context_max_grad_norm", 0.1)
+            )
+            gain_max_grad_norm = float(
+                training.get("component_gain_max_grad_norm", 1.0)
+            )
             reader_grad_norm = torch.nn.utils.clip_grad_norm_(
                 reader_parameters,
-                float(training.get("reader_max_grad_norm", 1.0)),
+                reader_max_grad_norm,
             )
             adapter_grad_norm = torch.nn.utils.clip_grad_norm_(
                 adapter_core_parameters,
-                float(training.get("adapter_max_grad_norm", 1.0)),
+                adapter_max_grad_norm,
             )
             null_grad_norm = torch.nn.utils.clip_grad_norm_(
                 adapter.null_parameters(),
-                float(training.get("null_context_max_grad_norm", 0.1)),
+                null_max_grad_norm,
             )
             gain_grad_norm = torch.nn.utils.clip_grad_norm_(
                 adapter.gain_parameters(),
-                float(training.get("component_gain_max_grad_norm", 1.0)),
+                gain_max_grad_norm,
             )
             grad_norm = torch.stack([
                 value.to(device=device, dtype=torch.float32)
@@ -4730,6 +4758,18 @@ def train_detail_style_cross_attention(
                 "adapter_grad_norm": adapter_grad_norm.detach(),
                 "null_context_grad_norm": null_grad_norm.detach(),
                 "component_gain_grad_norm": gain_grad_norm.detach(),
+                "reader_grad_clipped": (
+                    reader_grad_norm > reader_max_grad_norm
+                ).float().detach(),
+                "adapter_grad_clipped": (
+                    adapter_grad_norm > adapter_max_grad_norm
+                ).float().detach(),
+                "null_context_grad_clipped": (
+                    null_grad_norm > null_max_grad_norm
+                ).float().detach(),
+                "component_gain_grad_clipped": (
+                    gain_grad_norm > gain_max_grad_norm
+                ).float().detach(),
             })
             if not bool(torch.isfinite(grad_norm)):
                 nonfinite = []
@@ -5163,6 +5203,16 @@ def train_artist_only_mixture_continuation(
         config,
         destination,
         config_key="detail_style_artist_only_mixture_continuation",
+    )
+
+
+def train_artist_only_mixture_one_stage(
+    config: dict[str, Any], destination: Path
+) -> dict[str, Any]:
+    return train_detail_style_cross_attention(
+        config,
+        destination,
+        config_key="detail_style_artist_only_fixed_population_mixture_one_stage",
     )
 
 

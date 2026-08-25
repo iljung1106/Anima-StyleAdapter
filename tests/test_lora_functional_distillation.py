@@ -25,7 +25,10 @@ from anima_style_data.detail_style_cross_attention import (
     DetailPreservingTypedSlotReader,
     SeparatedCommonArtistKVStyleCrossAttention,
 )
-from anima_style_data.detail_style_training import _lora_teacher_schedule_for_step
+from anima_style_data.detail_style_training import (
+    _lora_backward_scale_for_step,
+    _lora_teacher_schedule_for_step,
+)
 from anima_style_data.io import write_records
 
 
@@ -146,6 +149,43 @@ def test_detail_lora_teacher_curriculum_opens_bounded_mixtures_in_stages():
         "single", "pair", "triple"
     )
     assert _lora_teacher_schedule_for_step(training, 700, default) == default
+
+
+def test_detail_lora_backward_scale_ramps_without_teacher_staging():
+    training = {
+        "backward_scale_start": 0.10,
+        "backward_scale": 0.50,
+        "backward_scale_ramp_steps": 250,
+    }
+
+    assert _lora_backward_scale_for_step(training, 1) == 0.10
+    assert 0.29 < _lora_backward_scale_for_step(training, 125) < 0.31
+    assert _lora_backward_scale_for_step(training, 250) == 0.50
+    assert _lora_backward_scale_for_step(training, 1000) == 0.50
+
+
+def test_fourfold_absolute_anchor_fourfolds_common_offset_penalty():
+    teacher = torch.eye(4).reshape(4, 1, 4) + 0.3
+    population = teacher.mean(dim=0)
+    residual = teacher - population
+    common_offset_student = residual + 0.5
+    weights = {
+        "pair_huber": 1.0,
+        "pair_direction": 0.75,
+        "pair_magnitude": 0.25,
+        "absolute_anchor": 0.10,
+        "functional_infonce": 0.0,
+        "population_common_beta": 0.0,
+    }
+    previous, _ = _artist_only_fixed_population_objective(
+        common_offset_student, teacher, population, weights
+    )
+    weights["absolute_anchor"] = 0.40
+    strengthened, _ = _artist_only_fixed_population_objective(
+        common_offset_student, teacher, population, weights
+    )
+
+    assert torch.isclose(strengthened, 4.0 * previous)
 
 
 def test_teacher_schedule_becomes_exact_three_way_cycle():
