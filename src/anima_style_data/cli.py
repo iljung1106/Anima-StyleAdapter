@@ -209,6 +209,14 @@ def build_parser() -> argparse.ArgumentParser:
             "Train detail-preserving typed-slot Style Cross-Attention",
         ),
         (
+            "detail-style-v34-lora-joint-train",
+            "Train original v31/v34 curriculum with auxiliary K/V-LoRA distillation",
+        ),
+        (
+            "detail-style-v34-lora-joint-smoke",
+            "Smoke-test original v31/v34 curriculum plus K/V-LoRA distillation",
+        ),
+        (
             "detail-style-reader-pretrain",
             "Pretrain the typed-slot Reader with per-reference and pooled reconstruction",
         ),
@@ -899,6 +907,8 @@ def main() -> None:
     elif args.command in {
         "detail-style-teacher-context-cache",
         "detail-style-train",
+        "detail-style-v34-lora-joint-train",
+        "detail-style-v34-lora-joint-smoke",
         "detail-style-reader-pretrain",
         "detail-style-block-similarity",
         "detail-style-fixed-samples",
@@ -917,7 +927,9 @@ def main() -> None:
             evaluate_detail_style_reference_counts,
             profile_detail_style_block_timestep_strength,
             smoke_test_detail_style_cross_attention,
+            smoke_test_detail_style_v34_lora_joint,
             train_detail_style_cross_attention,
+            train_detail_style_v34_lora_joint,
         )
         from .block_similarity import analyze_anima_block_similarity
         from .detail_style_gradient_diagnostics import (
@@ -932,6 +944,12 @@ def main() -> None:
                 cache_detail_style_teacher_contexts
             ),
             "detail-style-train": train_detail_style_cross_attention,
+            "detail-style-v34-lora-joint-train": (
+                train_detail_style_v34_lora_joint
+            ),
+            "detail-style-v34-lora-joint-smoke": (
+                smoke_test_detail_style_v34_lora_joint
+            ),
             "detail-style-reader-pretrain": pretrain_detail_style_reader,
             "detail-style-block-similarity": analyze_anima_block_similarity,
             "detail-style-fixed-samples": backfill_detail_style_fixed_samples,

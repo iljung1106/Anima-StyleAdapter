@@ -3585,11 +3585,40 @@ def _compose_separate_text_style_guidance(
     )
 
 
-def train_detail_style_cross_attention(
-    config: dict[str, Any], destination: Path, *, steps_override: int | None = None
+def _merge_detail_style_config(
+    config: dict[str, Any], config_key: str
 ) -> dict[str, Any]:
-    cfg = copy.deepcopy(config["detail_preserving_style_cross_attention"])
+    """Resolve a detail-style experiment without duplicating the large base config."""
+
+    value = copy.deepcopy(config[config_key])
+    base_key = value.pop("extends", None)
+    if base_key is None:
+        return value
+    base = _merge_detail_style_config(config, str(base_key))
+
+    def merge(left: dict[str, Any], right: dict[str, Any]) -> dict[str, Any]:
+        for key, replacement in right.items():
+            if isinstance(left.get(key), dict) and isinstance(replacement, dict):
+                left[key] = merge(dict(left[key]), replacement)
+            else:
+                left[key] = replacement
+        return left
+
+    return merge(base, value)
+
+
+def train_detail_style_cross_attention(
+    config: dict[str, Any], destination: Path, *, steps_override: int | None = None,
+    config_key: str = "detail_preserving_style_cross_attention",
+) -> dict[str, Any]:
+    cfg = _merge_detail_style_config(config, config_key)
+    # Existing loaders and samplers intentionally share one production config
+    # contract. Install the resolved experiment as that contract for this run.
+    config = copy.deepcopy(config)
+    config["detail_preserving_style_cross_attention"] = cfg
     training = dict(cfg["training"])
+    lora_teacher_cfg = dict(cfg.get("lora_functional_teacher", {}))
+    lora_teacher_enabled = bool(lora_teacher_cfg.get("enabled", False))
     exact_self_flow_only = bool(training.get("exact_self_flow_only", False))
     native_bootstrap_cfg = dict(training.get("native_bootstrap", {}))
     native_bootstrap_only = bool(native_bootstrap_cfg.get("enabled", False))
@@ -3696,6 +3725,86 @@ def train_detail_style_cross_attention(
         )
         timestep_weighting = _build_native_effect_timestep_weighting(bank, training)
     teacher_domain_schedule = tuple(weighted_teacher_domains)
+    lora_teacher_bank = None
+    lora_teacher_loaders: dict[str, CachedTeacherReferenceLoader] = {}
+    lora_teacher_schedule: tuple[str, ...] = ()
+    lora_teacher_domains: tuple[str, ...] = ()
+    lora_teacher_update = 0
+    if lora_teacher_enabled:
+        # Kept as an optional runtime dependency: the LoRA module already uses
+        # this trainer's frozen-Anima forward helpers, so importing it at module
+        # import time would create a circular dependency.
+        from .lora_functional_distillation import (
+            FunctionalLoRATeacherBank,
+            _load_lora_plan,
+        )
+
+        lora_teacher_bank = FunctionalLoRATeacherBank(
+            destination / str(lora_teacher_cfg["teacher_cache"])
+        )
+        lora_plans = _load_lora_plan(
+            destination / str(lora_teacher_cfg["lora_directory"])
+        )
+        lora_style_ids = [plan.style_id for plan in lora_plans]
+        lora_training = dict(lora_teacher_cfg.get("training", {}))
+        lora_references = max(
+            int(value)
+            for value in lora_training.get("reference_counts", [4])
+        )
+        for domain, cache_value in {
+            "human": lora_teacher_cfg["human_reference_cache"],
+            "synthetic": lora_teacher_cfg["synthetic_reference_cache"],
+        }.items():
+            cache_roots = (
+                [destination / str(value) for value in cache_value]
+                if isinstance(cache_value, list)
+                else destination / str(cache_value)
+            )
+            lora_teacher_loaders[domain] = CachedTeacherReferenceLoader(
+                cache_roots,
+                split="train",
+                style_ids=lora_style_ids,
+                batch_size=int(lora_training.get("batch_rows", 4)),
+                references=lora_references,
+                seed=seed ^ (0x48554D41 if domain == "human" else 0x53594E54),
+                token_lru_shards=int(lora_training.get("token_lru_shards", 8)),
+                ram_resident_tokens=bool(
+                    lora_training.get("ram_resident_tokens", True)
+                ),
+                strict_style_ids=True,
+            )
+        lora_teacher_schedule = tuple(
+            str(value)
+            for value in lora_training.get(
+                "teacher_schedule", ["single", "single", "pair", "triple"]
+            )
+        )
+        lora_teacher_domains = tuple(
+            str(value)
+            for value in lora_training.get(
+                "reference_domain_schedule", ["human", "synthetic"]
+            )
+        )
+        if not lora_teacher_schedule:
+            raise ValueError("LoRA functional teacher schedule cannot be empty")
+        if not lora_teacher_domains or any(
+            value not in lora_teacher_loaders for value in lora_teacher_domains
+        ):
+            raise ValueError("Invalid LoRA functional reference-domain schedule")
+        unavailable = [
+            kind for kind in set(lora_teacher_schedule)
+            if kind not in lora_teacher_bank.by_kind
+            or not lora_teacher_bank.by_kind[kind]
+        ]
+        if unavailable:
+            raise ValueError(f"Unavailable LoRA functional teacher kinds: {unavailable}")
+        lora_every = max(1, int(lora_training.get("every", 2)))
+        print(
+            "detail-style added LoRA functional teacher "
+            f"styles={len(lora_style_ids)} schedule={lora_teacher_schedule} "
+            f"domains={lora_teacher_domains} every={lora_every}",
+            flush=True,
+        )
     main_common_output_penalty = None
     if (
         not exact_self_flow_only
@@ -3711,6 +3820,12 @@ def train_detail_style_cross_attention(
     )
     reader = DetailPreservingTypedSlotReader(**dict(cfg["model"])).to(device)
     adapter = _build_style_adapter(cfg).to(device)
+    if lora_teacher_enabled and not isinstance(
+        adapter, SeparatedCommonArtistKVStyleCrossAttention
+    ):
+        raise TypeError(
+            "LoRA functional augmentation requires the separated Common/Artist adapter"
+        )
     attach_same_q_style_adapter(anima, adapter)
 
     output = destination / str(cfg["output_directory"])
@@ -3855,6 +3970,16 @@ def train_detail_style_cross_attention(
                 flush=True,
             )
 
+    if lora_teacher_enabled:
+        lora_training = dict(lora_teacher_cfg.get("training", {}))
+        lora_every = max(1, int(lora_training.get("every", 2)))
+        lora_start = int(lora_training.get("start_step", 1))
+        lora_teacher_update = sum(
+            1
+            for prior_step in range(lora_start, start_step + 1)
+            if prior_step % lora_every == 0
+        )
+
     reader_parameters = [value for value in reader.parameters() if value.requires_grad]
     kv_parameters = adapter.kv_parameters()
     null_parameter_ids = {id(value) for value in adapter.null_parameters()}
@@ -3986,7 +4111,7 @@ def train_detail_style_cross_attention(
             id=str(wandb_cfg.get("id", "detail-style-cross-attention-v1")),
             resume="allow" if start_step else "never",
             config={
-                "detail_preserving_style_cross_attention": cfg,
+                config_key: cfg,
                 "reader_parameters": reader_count,
                 "style_adapter_parameters": kv_count,
             },
@@ -4343,6 +4468,62 @@ def train_detail_style_cross_attention(
                 })
                 teacher_update += 1
                 performance_curriculum["teacher_update"] = teacher_update
+            lora_training = dict(lora_teacher_cfg.get("training", {}))
+            lora_every = max(1, int(lora_training.get("every", 2)))
+            lora_start = int(lora_training.get("start_step", 1))
+            lora_end = int(lora_training.get("end_step", steps))
+            lora_due = bool(
+                lora_teacher_enabled
+                and lora_start <= step <= lora_end
+                and step % lora_every == 0
+            )
+            if lora_due:
+                from .lora_functional_distillation import _lora_teacher_step
+
+                assert lora_teacher_bank is not None
+                assert isinstance(
+                    adapter, SeparatedCommonArtistKVStyleCrossAttention
+                )
+                bootstrap_end = int(
+                    lora_training.get("single_only_steps", 500)
+                )
+                active_schedule = (
+                    ("single",)
+                    if step <= bootstrap_end
+                    else lora_teacher_schedule
+                )
+                kind = active_schedule[lora_teacher_update % len(active_schedule)]
+                domain = lora_teacher_domains[
+                    lora_teacher_update % len(lora_teacher_domains)
+                ]
+                lora_metrics = _lora_teacher_step(
+                    anima,
+                    reader,
+                    adapter,
+                    lora_teacher_bank,
+                    lora_teacher_loaders[domain],
+                    kind=kind,
+                    update=lora_teacher_update,
+                    step=step,
+                    device=device,
+                    training={**lora_training, "seed": seed},
+                    backward_scale=float(
+                        lora_training.get("backward_scale", 0.25)
+                    ),
+                )
+                metric_rows[-1].update({
+                    f"lora_teacher_{key}": value
+                    for key, value in lora_metrics.items()
+                })
+                metric_rows[-1]["lora_teacher_domain_synthetic"] = (
+                    torch.tensor(float(domain == "synthetic"), device=device)
+                )
+                metric_rows[-1]["lora_teacher_kind_index"] = torch.tensor(
+                    float(lora_teacher_schedule.index(kind))
+                    if kind in lora_teacher_schedule else -1.0,
+                    device=device,
+                )
+                lora_teacher_update += 1
             if not metric_rows:
                 raise RuntimeError("Training step produced no objective")
             if step == 1 or step % log_every == 0:
@@ -4740,6 +4921,16 @@ def train_detail_style_cross_attention(
     }
     write_json(output / "summary.json", result)
     return result
+
+
+def train_detail_style_v34_lora_joint(
+    config: dict[str, Any], destination: Path
+) -> dict[str, Any]:
+    return train_detail_style_cross_attention(
+        config,
+        destination,
+        config_key="detail_preserving_style_cross_attention_v34_lora_joint",
+    )
 
 
 @torch.no_grad()
@@ -5226,6 +5417,45 @@ def smoke_test_detail_style_cross_attention(
         "artist_prototype_every": 1,
     })
     cfg["training"].setdefault("wandb", {})["enabled"] = False
+    return train_detail_style_cross_attention(smoke, destination, steps_override=2)
+
+
+def smoke_test_detail_style_v34_lora_joint(
+    config: dict[str, Any], destination: Path
+) -> dict[str, Any]:
+    smoke = copy.deepcopy(config)
+    cfg = _merge_detail_style_config(
+        smoke, "detail_preserving_style_cross_attention_v34_lora_joint"
+    )
+    cfg["output_directory"] = str(cfg["output_directory"]) + "_smoke"
+    cfg["initial_checkpoint"] = None
+    cfg.setdefault("data_mixture", {})["enabled"] = False
+    cfg["loader"]["batch_size"] = 2
+    cfg["training"].update({
+        "steps": 2,
+        "gradient_accumulation_steps": 1,
+        "validation_every": 2,
+        "validation_batches": 1,
+        "checkpoint_every": 2,
+        "state_every": 2,
+        "sample_every": 0,
+        "fixed_sample_every": 0,
+        "resume": False,
+        "alpha_calibration_batches": 1,
+        "teacher_batch_rows": 4,
+        "teacher_microbatch_rows": 2,
+        "artist_effect_validation_batches": 1,
+        "artist_effect_validation_timesteps": [0.45],
+    })
+    cfg["training"].setdefault("wandb", {})["enabled"] = False
+    cfg["lora_functional_teacher"]["training"].update({
+        "every": 1,
+        "batch_rows": 2,
+        "single_only_steps": 2,
+        "reference_counts": [1],
+        "reference_count_weights": [1.0],
+    })
+    smoke["detail_preserving_style_cross_attention"] = cfg
     return train_detail_style_cross_attention(smoke, destination, steps_override=2)
 
 

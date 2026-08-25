@@ -6350,6 +6350,118 @@ real_artist_teacher:
       name: real-artist-5000-reference-head-batch64-gpu-cache-v6
       id: real-artist-5000-reference-head-batch64-gpu-cache-v6
 
+# Controlled comparison: restore the original v31 -> v34 training contract and
+# add K/V-only LoRA functional distillation as an auxiliary backward pass. The
+# LoRA teacher never replaces human flow, disjoint-view, anti-common, or native
+# artist-tag supervision.
+detail_preserving_style_cross_attention_v34_lora_joint:
+  extends: detail_preserving_style_cross_attention
+  output_directory: detail_preserving_style_cross_attention_v34_lora_joint_v1
+  initial_checkpoint: detail_preserving_style_cross_attention_v31_artist_null_residual/checkpoints/step-0003500.pt
+  resume_checkpoint: null
+  loader:
+    prompt_modes:
+      full: 0.30
+      tag_dropout: 0.40
+      short: 0.20
+      empty: 0.10
+  adapter:
+    common_combined_gradient_scale: 1.0
+  training:
+    steps: 3000
+    learning_rate: 0.00010
+    common_kv_learning_rate: 0.00030
+    lr_decay_start_step: 2500
+    reconstruction_weight: 0.0
+    reconstruction_final_weight: 0.0
+    reference_schedule:
+      - name: exact_single
+        end_step: 250
+        min_references: 1
+        max_references: 1
+        reference_count_weights: [1.0]
+      - name: target_included_1_2_4
+        end_step: 1000
+        min_references: 1
+        max_references: 4
+        reference_count_weights: [0.55, 0.30, 0.0, 0.15]
+      - name: target_anneal_1_2_4_8
+        end_step: 2000
+        min_references: 1
+        max_references: 8
+        reference_count_weights: [0.45, 0.30, 0.0, 0.17, 0.0, 0.0, 0.0, 0.08]
+    curriculum:
+      target_mix_end_step: 1000
+      target_mix_end_probability: 0.50
+      target_anneal_end: 2000
+    separated_component_bootstrap:
+      artist_mean_weight: 0.0
+      common_objective:
+        magnitude_weight: 0.75
+        magnitude_floor_start_step: 1
+        magnitude_floor_end_step: 750
+        magnitude_floor_start: 0.50
+        magnitude_floor_end: 0.90
+        magnitude_upper: 1.25
+        magnitude_upper_weight: 0.50
+    train_common_in_combined: false
+    separated_teacher_gradients: false
+    controlled_magnitude_weight: 0.10
+    controlled_contrastive_weight: 0.05
+    artist_effect_full_step: 750
+    artist_effect_weight: 0.08
+    artist_effect_contrastive_mode: symmetric_nce
+    artist_effect_repeatability_weight: 0.50
+    common_output_weight: 0.10
+    main_common_output_weight: 0.05
+    artist_magnitude_weight: 0.02
+    teacher_every_after_bootstrap: 8
+    teacher_end_step: 2000
+    teacher_reader_gradient_scale: 1.0
+    teacher_global_weight: 0.50
+    teacher_infonce_weight: 0.20
+    teacher_infonce_weight_by_reference_count: [0.50, 0.40, 0.30, 0.25]
+    fixed_sample_every: 500
+    fixed_sample_backfill_steps: [4000]
+    fixed_sample_backfill_component_modes: [common_only, artist_only]
+    fixed_sample_backfill_strengths: [1.0]
+    wandb:
+      enabled: true
+      project: anima-style-adapter
+      name: detail-style-v34-lora-joint-v1
+      id: detail-style-v34-lora-joint-v1
+  lora_functional_teacher:
+    enabled: true
+    lora_directory: artist_lora_teachers_rank16_256_b2_v5
+    teacher_cache: lora_functional_teacher_bank_rank16_256_v3_broad12x6
+    human_reference_cache: dual_query_reference_tokens_v8_step10000
+    synthetic_reference_cache: lora_teacher_references_rank16_256x8_v2/dual_query_reference_tokens_v8_step10000
+    training:
+      start_step: 1
+      end_step: 3000
+      every: 2
+      single_only_steps: 500
+      teacher_schedule: [single, single, pair, triple]
+      reference_domain_schedule: [human, synthetic]
+      functional_objective: teacher_decomposed
+      backward_scale: 0.25
+      batch_rows: 6
+      reference_counts: [1, 2, 4]
+      reference_count_weights: [0.60, 0.30, 0.10]
+      references_per_component: 4
+      token_lru_shards: 8
+      ram_resident_tokens: true
+      loss_weights:
+        centered_huber: 1.0
+        centered_direction: 0.75
+        centered_magnitude: 0.20
+        functional_infonce: 0.25
+        functional_infonce_temperature: 0.10
+        common_huber: 0.05
+        common_direction: 0.025
+        common_ratio_excess: 0.25
+        common_ratio_margin: 0.05
+
 # Detail-preserving typed-slot, separate-softmax Style Cross-Attention v1.
 # Contract: docs/detail_preserving_style_cross_attention_plan.md
 fresh_v34_low_target_kv_lora_joint:

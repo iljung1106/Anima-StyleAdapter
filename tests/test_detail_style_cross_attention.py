@@ -31,6 +31,7 @@ from anima_style_data.detail_style_training import (  # noqa: E402
     _initial_performance_curriculum_state,
     _main_flow_total_magnitude_loss,
     _main_flow_projection_floor_loss,
+    _merge_detail_style_config,
     _minimal_native_teacher_objective,
     _native_effect_scales_for_timesteps,
     _native_bootstrap_status,
@@ -75,6 +76,28 @@ def test_teacher_domains_follow_weighted_schedule_with_local_indices():
         (0, 0), (0, 1), (0, 2), (1, 0),
         (0, 3), (0, 4), (0, 5), (1, 1),
     ]
+
+
+def test_detail_style_experiment_recursively_overrides_base_config():
+    config = {
+        "base": {
+            "output_directory": "base-output",
+            "training": {"steps": 3000, "optimizer": {"lr": 1e-4}},
+        },
+        "experiment": {
+            "extends": "base",
+            "output_directory": "experiment-output",
+            "training": {"optimizer": {"lr": 2e-4}},
+        },
+    }
+
+    merged = _merge_detail_style_config(config, "experiment")
+
+    assert merged == {
+        "output_directory": "experiment-output",
+        "training": {"steps": 3000, "optimizer": {"lr": 2e-4}},
+    }
+    assert config["base"]["training"]["optimizer"]["lr"] == 1e-4
 
 
 def test_fixed_reference_batch_accepts_one_or_many_references():
