@@ -2157,6 +2157,20 @@ direct_reference_kv_distillation_v2d_diverse:
       project: anima-style-adapter
       name: direct-reference-kv-v2d-diverse-mixture-v1
       id: direct-reference-kv-v2d-diverse-mixture-v1
+  fewshot_evaluation:
+    source_config_key: direct_reference_kv_distillation
+    checkpoint_steps: [6000, 8000]
+    modes: [controlled]
+    reference_counts: [1, 2, 4, 8]
+    cache_directory: fewshot_validation_prompt_cache_v2d_diverse_v1
+    split: validation
+    artist_count: 8
+    max_references: 8
+    selection_seed: 20260827
+    reference_seed: 2026082701
+    prompt_seed_base: 2026082701
+    token_lru_shards: 8
+    ram_resident_tokens: true
 
 direct_reference_kv_distillation:
   output_directory: direct_reference_kv_distillation_v3_512_materialized_mixtures

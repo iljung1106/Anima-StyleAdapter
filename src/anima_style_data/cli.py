@@ -161,6 +161,7 @@ def build_parser() -> argparse.ArgumentParser:
         ("direct-reference-kv-train", "Train reference-conditioned per-block K/V directly"),
         ("v2d-diverse-smoke", "Smoke-test preserved v2d with diverse mixtures"),
         ("v2d-diverse-train", "Train preserved v2d with diverse mixtures"),
+        ("v2d-diverse-fewshot-eval", "Evaluate finished v2d checkpoints on held-out few-shot styles"),
         ("lora-image-flow-cache", "Cache LoRA-generated x0 latents and text contexts"),
         ("lora-image-flow-oracle-smoke", "Smoke-test direct LoRA image-flow oracle"),
         ("lora-image-flow-oracle-train", "Train direct LoRA image-flow oracle"),
@@ -543,6 +544,7 @@ def main() -> None:
         "direct-reference-kv-train",
         "v2d-diverse-smoke",
         "v2d-diverse-train",
+        "v2d-diverse-fewshot-eval",
     }:
         from .lora_functional_distillation import (
             cache_lora_functional_teacher,
@@ -558,6 +560,7 @@ def main() -> None:
             train_lora_functional_distillation_v2,
             smoke_test_v2d_diverse_mixture_distillation,
             train_v2d_diverse_mixture_distillation,
+            evaluate_v2d_diverse_fewshot,
         )
 
         stage = {
@@ -580,6 +583,7 @@ def main() -> None:
             "direct-reference-kv-train": train_direct_reference_kv_distillation,
             "v2d-diverse-smoke": smoke_test_v2d_diverse_mixture_distillation,
             "v2d-diverse-train": train_v2d_diverse_mixture_distillation,
+            "v2d-diverse-fewshot-eval": evaluate_v2d_diverse_fewshot,
         }[args.command]
         _run(stage, config, destination)
     elif args.command in {

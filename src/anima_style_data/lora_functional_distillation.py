@@ -2884,6 +2884,109 @@ def train_v2d_diverse_mixture_distillation(
     )
 
 
+def evaluate_v2d_diverse_fewshot(
+    config: dict[str, Any], destination: Path
+) -> dict[str, Any]:
+    """Render artist-disjoint 1/2/4/8-reference sweeps from finished v2d checkpoints."""
+
+    cfg = copy.deepcopy(config["direct_reference_kv_distillation_v2d_diverse"])
+    evaluation = dict(cfg["fewshot_evaluation"])
+    source_key = str(
+        evaluation.pop("source_config_key", "direct_reference_kv_distillation")
+    )
+    fewshot_cfg = copy.deepcopy(
+        config[source_key]["training"]["fewshot_validation"]
+    )
+    checkpoint_steps = tuple(
+        int(value) for value in evaluation.pop("checkpoint_steps", (8000,))
+    )
+    modes = tuple(str(value) for value in evaluation.pop("modes", ("controlled",)))
+    reference_counts = tuple(
+        int(value)
+        for value in evaluation.pop("reference_counts", (1, 2, 4, 8))
+    )
+    prompt_seed_base = evaluation.pop("prompt_seed_base", None)
+    fewshot_cfg.update(evaluation)
+    if prompt_seed_base is not None:
+        for index, case in enumerate(fewshot_cfg["prompt_cases"]):
+            case["seed"] = int(prompt_seed_base) + index
+
+    device = str(cfg["training"].get("device", "cuda"))
+    output = destination / str(cfg["output_directory"])
+    checkpoint_root = output / "checkpoints"
+    prompt_cache = _load_or_create_fewshot_prompt_cache(
+        config, destination, fewshot_cfg, device
+    )
+    prepared = _prepare_fewshot_validation(
+        destination,
+        destination / str(cfg["human_reference_cache"]),
+        fewshot_cfg,
+        prompt_cache,
+    )
+
+    anima = _resolve_anima_model(config, destination, device).requires_grad_(False).eval()
+    _optimize_frozen_anima(
+        anima, low_precision_rmsnorm=True, fuse_attention_projections=True
+    )
+    detail_cfg = copy.deepcopy(config["detail_preserving_style_cross_attention"])
+    detail_cfg["adapter"].update(dict(cfg.get("adapter_overrides", {})))
+    reader = DetailPreservingTypedSlotReader(**dict(detail_cfg["model"])).to(device).eval()
+    adapter = _build_style_adapter(detail_cfg).to(device).eval()
+    if not isinstance(adapter, SeparatedCommonArtistKVStyleCrossAttention):
+        raise TypeError("v2d few-shot evaluation requires the separated adapter")
+    attach_same_q_style_adapter(anima, adapter)
+
+    results = []
+    try:
+        for step in checkpoint_steps:
+            checkpoint = checkpoint_root / f"step-{step:07d}.pt"
+            if not checkpoint.exists():
+                raise FileNotFoundError(checkpoint)
+            state = torch.load(checkpoint, map_location="cpu", weights_only=False)
+            reader.load_state_dict(state["reader"], strict=True)
+            adapter.load_state_dict(state["adapter"], strict=True)
+            adapter.restore_timestep_strength_state()
+            del state
+            for mode in modes:
+                result = _generate_fewshot_reference_sweep(
+                    prepared,
+                    config,
+                    destination,
+                    anima,
+                    reader,
+                    adapter,
+                    output,
+                    device,
+                    step,
+                    mode=mode,
+                    reference_counts=reference_counts,
+                )
+                results.append(result)
+                print(
+                    f"v2d few-shot evaluation step={step} mode={mode} "
+                    f"sheet={result['sheet']}",
+                    flush=True,
+                )
+    finally:
+        adapter.clear_style_tokens()
+
+    summary = {
+        "checkpoint_steps": list(checkpoint_steps),
+        "modes": list(modes),
+        "reference_counts": list(reference_counts),
+        "split": str(fewshot_cfg.get("split", "validation")),
+        "selection_seed": int(fewshot_cfg["selection_seed"]),
+        "reference_seed": int(fewshot_cfg["reference_seed"]),
+        "prompt_seed_base": (
+            None if prompt_seed_base is None else int(prompt_seed_base)
+        ),
+        "artist_ids": list(prepared["style_ids"]),
+        "results": results,
+    }
+    write_json(output / "fewshot_validation" / "evaluation_summary.json", summary)
+    return summary
+
+
 def smoke_test_v2d_diverse_mixture_distillation(
     config: dict[str, Any], destination: Path
 ) -> dict[str, Any]:
