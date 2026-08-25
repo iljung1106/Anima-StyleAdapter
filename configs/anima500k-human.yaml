@@ -6425,6 +6425,7 @@ fresh_v34_low_target_kv_lora_joint:
     log_every: 10
     checkpoint_every: 250
     sample_every: 250
+    panel_sample_every: 500
     fixed_sample_strengths: [1.0, 2.0]
     fewshot_validation:
       enabled: true

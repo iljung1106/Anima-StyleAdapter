@@ -41,8 +41,13 @@ from .detail_style_training import (
 )
 from .dual_query_external_samples import load_dual_query_external_sample
 from .dual_query_style_tokenizer import CachedTeacherReferenceLoader
+from .global_query_style_tokenizer import MultiPromptDualQueryCachedStyleLoader
 from .io import read_records, write_json, write_records
 from .native_centered_teacher import NativeCenteredTeacherBank
+from .query_style_tokenizer import (
+    _sample_query_style_tokenizer,
+    _select_sample_episodes,
+)
 from .same_q_style_adapter import attach_same_q_style_adapter
 from .style_calibration import _encode_prompts
 from .style_transfer import _optimize_frozen_anima, _resolve_anima_model
@@ -2343,6 +2348,8 @@ def train_lora_functional_distillation(
     human_flow_enabled = bool(human_flow.get("enabled", False))
     flow_training: dict[str, Any] = {}
     flow_loader = None
+    flow_sample_train_loader = None
+    flow_validation_loader = None
     flow_accumulation = 0
     if human_flow_enabled:
         flow_training = copy.deepcopy(dict(human_flow["training"]))
@@ -2360,11 +2367,19 @@ def train_lora_functional_distillation(
             split=str(flow_detail_cfg.get("train_split", "train")),
         )
         flow_loader_cfg["gradient_accumulation_steps"] = flow_accumulation
-        _, flow_loader = _training_loader(
+        flow_sample_train_loader, flow_loader = _training_loader(
             destination, flow_detail_cfg, flow_loader_cfg
         )
         for loader in getattr(flow_loader, "loaders", (flow_loader,)):
             _audit_student_prompts(loader)
+        flow_validation_cfg = _loader_config(
+            config,
+            flow_detail_cfg,
+            split=str(flow_detail_cfg.get("validation_split", "validation")),
+        )
+        flow_validation_loader = MultiPromptDualQueryCachedStyleLoader(
+            destination, flow_validation_cfg
+        )
     reader = DetailPreservingTypedSlotReader(**dict(detail_cfg["model"])).to(device)
     adapter = _build_style_adapter(detail_cfg).to(device)
     if not isinstance(adapter, SeparatedCommonArtistKVStyleCrossAttention):
@@ -2550,6 +2565,32 @@ def train_lora_functional_distillation(
             config={config_key: cfg},
         )
     fixed = load_dual_query_external_sample(config, destination)
+    panel_sample_requests = []
+    if flow_sample_train_loader is not None and flow_validation_loader is not None:
+        sample_seed = int(
+            detail_cfg.get("sampling", {}).get("seed", seed ^ 0x5A17)
+        )
+        panel_sample_requests = [
+            (
+                "train",
+                flow_sample_train_loader,
+                episode,
+                sample_seed + index * 10_007,
+            )
+            for index, episode in enumerate(
+                _select_sample_episodes(flow_sample_train_loader, 4)
+            )
+        ] + [
+            (
+                "validation",
+                flow_validation_loader,
+                episode,
+                sample_seed + (index + 4) * 10_007,
+            )
+            for index, episode in enumerate(
+                _select_sample_episodes(flow_validation_loader, 4)
+            )
+        ]
     single_only = int(training.get("single_only_steps", 500))
     artist_intro = int(training.get("artist_intro_steps", 0))
     curriculum = str(training.get("curriculum", "legacy"))
@@ -2559,6 +2600,7 @@ def train_lora_functional_distillation(
     log_every = int(training.get("log_every", 10))
     checkpoint_every = int(training.get("checkpoint_every", 250))
     sample_every = int(training.get("sample_every", 1000))
+    panel_sample_every = int(training.get("panel_sample_every", sample_every))
     max_grad_norm = float(training.get("max_grad_norm", 1.0))
     reader_max_grad_norm = float(
         training.get("reader_max_grad_norm", max_grad_norm)
@@ -2568,6 +2610,7 @@ def train_lora_functional_distillation(
     native_common_cache: dict[tuple[int, int], torch.Tensor] = {}
     started = time.perf_counter()
     flow_prefetched = None
+    panel_vae = None
     if flow_loader is not None:
         flow_prefetched = flow_loader.prefetch(
             start_step * flow_accumulation,
@@ -2817,6 +2860,38 @@ def train_lora_functional_distillation(
                             sample["sheet"], caption=f"step {step}"
                         )
                     }, step=step)
+            if (
+                panel_sample_every > 0
+                and panel_sample_requests
+                and step % panel_sample_every == 0
+            ):
+                sample_records, panel_vae = _sample_query_style_tokenizer(
+                    anima,
+                    adapter,
+                    reader,
+                    panel_sample_requests,
+                    config,
+                    destination,
+                    output,
+                    device,
+                    step,
+                    panel_vae,
+                    config_section="detail_preserving_style_cross_attention",
+                )
+                print(
+                    f"LoRA distill functional panel step={step} "
+                    f"samples={len(sample_records)}",
+                    flush=True,
+                )
+                if wandb_run is not None:
+                    import wandb
+
+                    wandb_run.log({
+                        "val/functional/panel": [
+                            wandb.Image(str(path), caption=label)
+                            for label, path in sample_records
+                        ]
+                    }, step=step)
             if fewshot_validation is not None:
                 quick_every = int(fewshot_cfg.get("quick_every", 500))
                 full_every = int(fewshot_cfg.get("full_every", 1000))
@@ -2892,6 +2967,8 @@ def train_lora_functional_distillation(
         "common_frozen": freeze_common,
         "common_freeze_step": int(training.get("common_freeze_step", 0)),
         "human_flow_enabled": human_flow_enabled,
+        "functional_panel_enabled": bool(panel_sample_requests),
+        "panel_sample_every": panel_sample_every,
         "reader_frozen": freeze_reader,
         "reader_trainable_scope": reader_scope,
         "initialization": initialization,

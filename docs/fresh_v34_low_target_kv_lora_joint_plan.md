@@ -43,7 +43,9 @@ LoRA reference는 human/synthetic 도메인을 교대로 쓰며 Artist ID를 모
 
 ## 실행 및 선택
 
-- 총 8,000 step, 250 step마다 체크포인트와 고정 샘플을 저장한다.
+- 총 8,000 step, 250 step마다 체크포인트와 fixed-reference 샘플을 저장한다.
+- 500 step마다 train 4명과 validation 4명의 target/reference/frozen-Anima/
+  styled 결과를 묶은 `val/functional/panel`을 생성한다.
 - 500 step마다 heldout few-shot 1/4-reference quick panel, 1,000 step마다
   1/2/4/8-reference full panel을 생성한다.
 - 주 선택 기준은 heldout 작가 분리, single-reference 재현, reference 수 증가 시
