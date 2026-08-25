@@ -3921,7 +3921,11 @@ def train_detail_style_cross_attention(
             )
         if lora_start <= 1:
             lora_teacher_bank = FunctionalLoRATeacherBank(
-                lora_teacher_root, load_kinds=lora_teacher_load_kinds
+                lora_teacher_root,
+                load_kinds=lora_teacher_load_kinds,
+                effect_slice_lru_entries=int(
+                    lora_training.get("effect_slice_lru_entries", 0)
+                ),
             )
         print(
             "detail-style added LoRA functional teacher "
@@ -4619,6 +4623,9 @@ def train_detail_style_cross_attention(
                     lora_teacher_bank = FunctionalLoRATeacherBank(
                         lora_teacher_root,
                         load_kinds=lora_teacher_load_kinds,
+                        effect_slice_lru_entries=int(
+                            lora_training.get("effect_slice_lru_entries", 0)
+                        ),
                     )
                 assert isinstance(
                     adapter,

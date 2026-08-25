@@ -6713,6 +6713,9 @@ detail_style_artist_only_mixture_continuation:
       validation_kinds: [single, pair, triple, amplified, signed]
       validation_batch_rows: 6
       validation_reference_count: 2
+      # Read only the requested content/timestep slice and retain two recent
+      # slices instead of concatenating the complete 512-row effect bank.
+      effect_slice_lru_entries: 2
       token_lru_shards: 8
       ram_resident_tokens: false
       loss_weights:
@@ -6791,6 +6794,9 @@ detail_style_artist_only_fixed_population_mixture_one_stage:
       validation_kinds: [single, pair, triple, amplified, signed]
       validation_batch_rows: 6
       validation_reference_count: 2
+      # Read only the requested content/timestep slice and retain two recent
+      # slices instead of concatenating the complete 512-row effect bank.
+      effect_slice_lru_entries: 2
       token_lru_shards: 8
       ram_resident_tokens: false
       loss_weights:

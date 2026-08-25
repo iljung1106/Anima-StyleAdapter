@@ -76,6 +76,16 @@ def test_teacher_bank_filters_effect_kinds_and_reuses_population_mean(tmp_path):
     reused = FunctionalLoRATeacherBank(tmp_path, load_kinds={"single"})
     assert torch.equal(reused.single_population_mean.flatten(), torch.tensor([3.0]))
 
+    lazy = FunctionalLoRATeacherBank(
+        tmp_path, load_kinds={"single"}, effect_slice_lru_entries=1
+    )
+    assert lazy.effects is None
+    assert torch.equal(
+        lazy.effect_rows([2, 0], 0, 0).flatten(),
+        torch.tensor([15.0, 11.0]),
+    )
+    assert len(lazy._effect_shards) == 1
+
 
 def test_artist_only_population_objective_anchors_common_offset_and_spread():
     teacher = torch.eye(4).reshape(4, 1, 4) + 0.3

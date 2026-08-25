@@ -8,7 +8,7 @@ import os
 import random
 import sys
 import time
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -18,6 +18,7 @@ import torch.nn.functional as F
 import pyarrow.parquet as pq
 import numpy as np
 from PIL import Image, ImageDraw, ImageOps
+from safetensors import safe_open
 from safetensors.torch import load_file, save_file
 
 from .artist_lora_teachers import ArtistLoRAPlan
@@ -1960,33 +1961,80 @@ def compare_kv_lora_fixed_prompt(
 
 
 class FunctionalLoRATeacherBank:
-    def __init__(self, root: Path, *, load_kinds: set[str] | None = None):
+    def __init__(
+        self,
+        root: Path,
+        *,
+        load_kinds: set[str] | None = None,
+        effect_slice_lru_entries: int = 0,
+    ):
         self.root = root
         self.base = load_file(root / "base.safetensors", device="cpu")
         self.mixtures = read_records(root / "mixtures.parquet")
         kind_by_index = {
             int(row["index"]): str(row["kind"]) for row in self.mixtures
         }
+        self.effect_slice_lru_entries = max(0, int(effect_slice_lru_entries))
+        self._effect_shards: OrderedDict[
+            tuple[Path, int, int], torch.Tensor
+        ] = OrderedDict()
+        self._effect_locations: dict[int, tuple[Path, int]] = {}
         selected_effects = []
         selected_indices: list[int] = []
+        effect_shape: tuple[int, ...] | None = None
         for path in sorted(root.glob("effects-*.safetensors")):
-            part = load_file(path, device="cpu")
-            part_indices = [int(value) for value in part["mixture_indices"].tolist()]
+            if self.effect_slice_lru_entries:
+                with safe_open(str(path), framework="pt", device="cpu") as handle:
+                    part_indices = [
+                        int(value)
+                        for value in handle.get_tensor("mixture_indices").tolist()
+                    ]
+                    shard_shape = tuple(handle.get_slice("effects").get_shape())
+                if effect_shape is None:
+                    effect_shape = shard_shape[1:]
+                elif effect_shape != shard_shape[1:]:
+                    raise RuntimeError("LoRA teacher effect shards have inconsistent shapes")
+            else:
+                part = load_file(path, device="cpu")
+                part_indices = [
+                    int(value) for value in part["mixture_indices"].tolist()
+                ]
+                if effect_shape is None:
+                    effect_shape = tuple(part["effects"].shape[1:])
             positions = [
                 index for index, mixture_index in enumerate(part_indices)
                 if load_kinds is None or kind_by_index[mixture_index] in load_kinds
             ]
             if positions:
-                selection = torch.tensor(positions, dtype=torch.long)
-                selected_effects.append(part["effects"].index_select(0, selection))
+                if self.effect_slice_lru_entries:
+                    for position in positions:
+                        self._effect_locations[part_indices[position]] = (
+                            path,
+                            position,
+                        )
+                else:
+                    selection = torch.tensor(positions, dtype=torch.long)
+                    selected_effects.append(
+                        part["effects"].index_select(0, selection)
+                    )
                 selected_indices.extend(part_indices[index] for index in positions)
-        if not selected_effects:
+        if not selected_indices or effect_shape is None:
             raise RuntimeError(f"No enabled LoRA teacher effects found in {root}")
-        effects = torch.cat(selected_effects)
         order_values = sorted(range(len(selected_indices)), key=selected_indices.__getitem__)
-        order = torch.tensor(order_values, dtype=torch.long)
-        self.effects = effects.index_select(0, order)
         self.effect_indices = [selected_indices[index] for index in order_values]
+        self.effect_shape = effect_shape
+        if self.effect_slice_lru_entries:
+            self.effects = None
+            print(
+                "lazy LoRA functional teacher bank "
+                f"rows={len(self.effect_indices)} "
+                f"slice_lru_entries={self.effect_slice_lru_entries}",
+                flush=True,
+            )
+        else:
+            effects = torch.cat(selected_effects)
+            order = torch.tensor(order_values, dtype=torch.long)
+            self.effects = effects.index_select(0, order)
         self.effect_position_by_index = {
             mixture_index: position
             for position, mixture_index in enumerate(self.effect_indices)
@@ -2012,20 +2060,18 @@ class FunctionalLoRATeacherBank:
                 population_mean = load_file(cache_path, device="cpu")[
                     "single_population_mean"
                 ]
-                if tuple(population_mean.shape) != tuple(self.effects.shape[1:]):
+                if tuple(population_mean.shape) != self.effect_shape:
                     raise RuntimeError(
                         "LoRA population mean cache shape does not match teacher bank"
                     )
                 print(f"reused LoRA single-population mean {cache_path}", flush=True)
             else:
-                total = torch.zeros_like(self.effects[0], dtype=torch.float32)
+                total = torch.zeros(self.effect_shape, dtype=torch.float32)
                 for offset in range(0, len(single_indices), 16):
-                    positions = torch.tensor([
-                        self.effect_position_by_index[index]
-                        for index in single_indices[offset : offset + 16]
-                    ], dtype=torch.long)
                     total.add_(
-                        self.effects.index_select(0, positions).float().sum(dim=0)
+                        self._full_effect_rows(
+                            single_indices[offset : offset + 16]
+                        ).float().sum(dim=0)
                     )
                 population_mean = total / len(single_indices)
                 temporary = cache_path.with_name(
@@ -2039,19 +2085,54 @@ class FunctionalLoRATeacherBank:
                 print(f"cached LoRA single-population mean {cache_path}", flush=True)
             self.single_population_mean = population_mean
 
+    def _load_effect_slice(
+        self, path: Path, content_index: int, timestep_index: int
+    ) -> torch.Tensor:
+        key = (path, int(content_index), int(timestep_index))
+        cached = self._effect_shards.pop(key, None)
+        if cached is None:
+            with safe_open(str(path), framework="pt", device="cpu") as handle:
+                cached = handle.get_slice("effects")[
+                    :, content_index, timestep_index
+                ]
+        self._effect_shards[key] = cached
+        while len(self._effect_shards) > self.effect_slice_lru_entries:
+            self._effect_shards.popitem(last=False)
+        return cached
+
+    def _full_effect_rows(self, indices: list[int]) -> torch.Tensor:
+        if self.effects is not None:
+            positions = torch.tensor(
+                [self.effect_position_by_index[index] for index in indices],
+                dtype=torch.long,
+            )
+            return self.effects.index_select(0, positions)
+        rows = []
+        for index in indices:
+            path, position = self._effect_locations[index]
+            with safe_open(str(path), framework="pt", device="cpu") as handle:
+                rows.append(handle.get_slice("effects")[position : position + 1])
+        return torch.cat(rows)
+
     def effect_rows(
         self,
         indices: list[int],
         content_index: int,
         timestep_index: int,
     ) -> torch.Tensor:
-        positions = torch.tensor(
-            [self.effect_position_by_index[index] for index in indices],
-            dtype=torch.long,
-        )
-        return self.effects.index_select(0, positions)[
-            :, content_index, timestep_index
-        ]
+        if self.effects is not None:
+            return self._full_effect_rows(indices)[
+                :, content_index, timestep_index
+            ]
+        rows = []
+        for index in indices:
+            path, position = self._effect_locations[index]
+            rows.append(
+                self._load_effect_slice(path, content_index, timestep_index)[
+                    position : position + 1
+                ]
+            )
+        return torch.cat(rows)
 
 
 def _functional_objective(
