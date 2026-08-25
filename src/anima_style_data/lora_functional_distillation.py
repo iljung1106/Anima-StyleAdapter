@@ -2618,7 +2618,44 @@ def train_lora_functional_distillation(
             workers=int(human_flow.get("prefetch_workers", 2)),
             depth=int(human_flow.get("prefetch_batches", 6)),
         )
+    resumed_panel_summary = (
+        output / "samples" / f"step-{start_step:07d}" / "summary.json"
+    )
     try:
+        if (
+            start_step > 0
+            and panel_sample_every > 0
+            and panel_sample_requests
+            and start_step % panel_sample_every == 0
+            and not resumed_panel_summary.exists()
+        ):
+            sample_records, panel_vae = _sample_query_style_tokenizer(
+                anima,
+                adapter,
+                reader,
+                panel_sample_requests,
+                config,
+                destination,
+                output,
+                device,
+                start_step,
+                panel_vae,
+                config_section="detail_preserving_style_cross_attention",
+            )
+            print(
+                f"LoRA distill resumed functional panel step={start_step} "
+                f"samples={len(sample_records)}",
+                flush=True,
+            )
+            if wandb_run is not None:
+                import wandb
+
+                wandb_run.log({
+                    "val/functional/panel": [
+                        wandb.Image(str(path), caption=label)
+                        for label, path in sample_records
+                    ]
+                }, step=start_step)
         for step in range(start_step + 1, steps + 1):
             if step <= warmup:
                 lr_scale = step / max(1, warmup)
