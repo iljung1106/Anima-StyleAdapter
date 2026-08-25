@@ -6352,6 +6352,175 @@ real_artist_teacher:
 
 # Detail-preserving typed-slot, separate-softmax Style Cross-Attention v1.
 # Contract: docs/detail_preserving_style_cross_attention_plan.md
+fresh_v34_low_target_kv_lora_joint:
+  output_directory: fresh_v34_low_target_kv_lora_joint_v1
+  seed: 20260828
+  lora_directory: artist_lora_teachers_rank16_256_b2_v5
+  # Fresh means no v31/v34 Reader or Adapter weights. The frozen dual-query
+  # Resampler feature cache remains the visual input contract.
+  initial_checkpoint: null
+  reader_checkpoint: null
+  initial_strength_profile: diagnostics/detail_style_block_timestep_strength_v1/profile.json
+  initial_strength_multiplier: 1.0
+  initial_strength_minimum: 0.0001
+  initial_strength_maximum: 1.0
+  adapter_overrides:
+    artist_null_residual: true
+    artist_residual_gain: 1.0
+    common_residual_gain: 1.0
+  human_reference_cache: dual_query_reference_tokens_v8_step10000
+  synthetic_reference_cache: >-
+    lora_teacher_references_rank16_256x8_v2/dual_query_reference_tokens_v8_step10000
+  teacher_cache:
+    output_directory: lora_functional_teacher_bank_rank16_256_v3_broad12x6
+  training:
+    device: cuda
+    steps: 8000
+    single_only_steps: 8000
+    bootstrap_teacher_schedule: [lora_single]
+    teacher_schedule: [lora_single]
+    lora_reference_domain_schedule: [human, synthetic]
+    curriculum: fresh_v34_low_target_kv_lora_joint
+    functional_objective: teacher_decomposed
+    teacher_backward_scale: 1.0
+    freeze_reader: false
+    reader_trainable_scope: all
+    freeze_common: false
+    # The Q-conditioned Common scaffold learns only during early alignment;
+    # the reference-conditioned Artist branch owns the remaining capacity.
+    common_freeze_step: 500
+    batch_rows: 6
+    references_per_component: 4
+    reference_counts: [1, 2, 4]
+    reference_count_weights: [0.60, 0.30, 0.10]
+    reader_learning_rate: 0.00010
+    reader_max_grad_norm: 0.50
+    shared_learning_rate: 0.00010
+    common_learning_rate: 0.00030
+    delta_learning_rate: 0.00020
+    mix_learning_rate: 0.00004
+    null_learning_rate: 0.00020
+    global_gain_start: 0.25
+    global_gain_end: 1.0
+    global_gain_ramp_steps: 500
+    warmup_steps: 200
+    lr_decay_start_step: 6500
+    minimum_lr_ratio: 0.10
+    betas: [0.9, 0.95]
+    adam_eps: 0.00000001
+    weight_decay: 0.01
+    max_grad_norm: 1.0
+    token_lru_shards: 8
+    ram_resident_tokens: true
+    loss_weights:
+      centered_huber: 1.0
+      centered_direction: 0.5
+      centered_magnitude: 0.1
+      functional_infonce: 0.25
+      functional_infonce_temperature: 0.10
+      common_huber: 0.5
+      common_direction: 0.25
+      common_ratio_excess: 2.0
+      common_ratio_margin: 0.03
+    log_every: 10
+    checkpoint_every: 250
+    sample_every: 250
+    fixed_sample_strengths: [1.0, 2.0]
+    fewshot_validation:
+      enabled: true
+      cache_directory: fresh_v34_fewshot_prompt_cache_v1
+      split: validation
+      artist_count: 8
+      max_references: 8
+      selection_seed: 20260828
+      reference_seed: 2026082801
+      token_lru_shards: 8
+      ram_resident_tokens: true
+      quick_every: 500
+      quick_artist_count: 4
+      quick_reference_counts: [1, 4]
+      full_every: 1000
+      full_reference_counts: [1, 2, 4, 8]
+      negative_prompt: >-
+        worst quality, low quality, score_1, score_2, score_3,
+        artist name, blurry, jpeg artifacts
+      prompt_cases:
+        - name: portrait
+          seed: 2026082801
+          prompt: >-
+            masterpiece, best quality, score_7, safe, 1girl, upper body,
+            close up, looking at viewer, soft smile
+        - name: action
+          seed: 2026082802
+          prompt: >-
+            masterpiece, best quality, score_7, safe, 1girl, full body,
+            dynamic pose, running on a city street, daylight
+        - name: interior
+          seed: 2026082803
+          prompt: >-
+            masterpiece, best quality, score_7, safe, 1girl, sitting at a
+            cafe table, warm interior lighting, detailed background
+        - name: night
+          seed: 2026082804
+          prompt: >-
+            masterpiece, best quality, score_7, safe, 1girl, cowboy shot,
+            rainy night, neon city, dramatic lighting
+      generation:
+        width: 832
+        height: 1024
+        cfg: 4.0
+        steps: 30
+        flow_shift: 3.0
+        batch_size: 4
+        vae_batch_size: 4
+    resume: true
+    wandb:
+      enabled: true
+      project: anima-style-adapter
+      name: fresh-v34-low-target-kv-lora-joint-v1
+      id: fresh-v34-low-target-kv-lora-joint-v1
+  human_flow:
+    enabled: true
+    gradient_accumulation_steps: 1
+    weight_start: 0.25
+    weight_end: 1.0
+    weight_ramp_steps: 500
+    prefetch_workers: 2
+    prefetch_batches: 6
+    loader:
+      batch_size: 4
+      min_references: 1
+      max_references: 4
+      prompt_modes:
+        full: 0.30
+        tag_dropout: 0.40
+        short: 0.20
+        empty: 0.10
+      quality_probability: 0.50
+      reference_count_weights_by_phase:
+        exact_self: [0.60, 0.30, 0.0, 0.10]
+        target_mix: [0.60, 0.30, 0.0, 0.10]
+        target_excluded: [0.60, 0.30, 0.0, 0.10]
+    training:
+      timestep_sampling: shift
+      sigmoid_scale: 1.0
+      sigmoid_bias: 0.0
+      discrete_flow_shift: 3.0
+      empty_prompt_forces_target: true
+      curriculum:
+        gate_only_steps: 0
+        self_reference_steps: 0
+        target_mix_end_step: 1
+        target_mix_end_probability: 0.20
+        target_anneal_end: 4000
+        oracle_distill_end: 0
+        target_mix_min_references: 1
+        target_mix_max_references: 4
+        target_anneal_min_references: 1
+        target_anneal_max_references: 4
+        reference_count_weights: [0.60, 0.30, 0.0, 0.10]
+
+
 detail_preserving_style_cross_attention:
   output_directory: detail_preserving_style_cross_attention_v37b_v34_diversity_warmstart
   seed: 20260819

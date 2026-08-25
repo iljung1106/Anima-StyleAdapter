@@ -27,13 +27,17 @@ from .detail_style_cross_attention import (
 )
 from .detail_style_teacher_context import NativeArtistContextCache
 from .detail_style_training import (
+    _audit_student_prompts,
     _build_style_adapter,
     _compose_separate_text_style_guidance,
     _controlled_teacher_forward,
     _decode_latents,
+    _flow_step,
     _generate_fixed_reference_sample,
+    _loader_config,
     _save_state,
     _teacher_step,
+    _training_loader,
 )
 from .dual_query_external_samples import load_dual_query_external_sample
 from .dual_query_style_tokenizer import CachedTeacherReferenceLoader
@@ -2200,6 +2204,7 @@ def _lora_teacher_step(
     device: str,
     training: dict[str, Any],
     materialized_mixture: bool = False,
+    backward_scale: float = 1.0,
 ) -> dict[str, torch.Tensor]:
     candidates = bank.by_kind[kind]
     batch_rows = int(training.get("batch_rows", 4))
@@ -2284,8 +2289,12 @@ def _lora_teacher_step(
     loss, metrics = objective_fn(
         student, teacher, dict(training.get("loss_weights", {}))
     )
-    loss.backward()
+    if backward_scale < 0:
+        raise ValueError("backward_scale must be non-negative")
+    (float(backward_scale) * loss).backward()
     metrics.update({
+        "backward_scale": loss.new_tensor(float(backward_scale)),
+        "weighted_loss": (float(backward_scale) * loss).detach(),
         "reference_count": mask.sum(dim=1).float().mean().detach(),
         "timestep": timestep.float().detach(),
         "materialized_mixture_reference": torch.tensor(
@@ -2326,6 +2335,36 @@ def train_lora_functional_distillation(
     _optimize_frozen_anima(anima, low_precision_rmsnorm=True, fuse_attention_projections=True)
     detail_cfg = copy.deepcopy(config["detail_preserving_style_cross_attention"])
     detail_cfg["adapter"].update(dict(cfg.get("adapter_overrides", {})))
+
+    # Optional low-target human flow runs beside the cached functional LoRA
+    # teacher.  This keeps the production image objective in the same
+    # optimizer step without changing the established teacher-only runners.
+    human_flow = dict(cfg.get("human_flow", {}))
+    human_flow_enabled = bool(human_flow.get("enabled", False))
+    flow_training: dict[str, Any] = {}
+    flow_loader = None
+    flow_accumulation = 0
+    if human_flow_enabled:
+        flow_training = copy.deepcopy(dict(human_flow["training"]))
+        flow_training["steps"] = steps
+        flow_detail_cfg = copy.deepcopy(detail_cfg)
+        flow_detail_cfg["training"] = flow_training
+        flow_detail_cfg["data_mixture"] = {"enabled": False}
+        flow_detail_cfg["loader"].update(dict(human_flow.get("loader", {})))
+        flow_accumulation = int(human_flow.get("gradient_accumulation_steps", 1))
+        if flow_accumulation <= 0:
+            raise ValueError("human_flow gradient_accumulation_steps must be positive")
+        flow_loader_cfg = _loader_config(
+            config,
+            flow_detail_cfg,
+            split=str(flow_detail_cfg.get("train_split", "train")),
+        )
+        flow_loader_cfg["gradient_accumulation_steps"] = flow_accumulation
+        _, flow_loader = _training_loader(
+            destination, flow_detail_cfg, flow_loader_cfg
+        )
+        for loader in getattr(flow_loader, "loaders", (flow_loader,)):
+            _audit_student_prompts(loader)
     reader = DetailPreservingTypedSlotReader(**dict(detail_cfg["model"])).to(device)
     adapter = _build_style_adapter(detail_cfg).to(device)
     if not isinstance(adapter, SeparatedCommonArtistKVStyleCrossAttention):
@@ -2433,22 +2472,33 @@ def train_lora_functional_distillation(
             fewshot_cfg,
             fewshot_prompt_cache,
         )
-    native_bank = NativeCenteredTeacherBank.load(
-        config, destination, config_key=str(cfg["native_teacher"]["bank_config_key"])
-    )
-    contexts = NativeArtistContextCache(
-        destination / str(cfg["native_teacher"]["context_cache"]),
-        capacity=int(cfg["native_teacher"].get("context_lru_shards", 8)),
-    )
-    native_loader = CachedTeacherReferenceLoader(
-        [destination / str(value) for value in cfg["native_teacher"]["reference_caches"]],
-        split="train", style_ids=list(native_bank.summary["train_style_ids"]),
-        batch_size=int(training.get("native_batch_rows", 8)),
-        references=int(training.get("native_references", 4)),
-        seed=seed ^ 0x4E415449,
-        token_lru_shards=int(training.get("token_lru_shards", 8)),
-        strict_style_ids=False,
-    )
+    scheduled_categories = set(teacher_schedule) | set(bootstrap_teacher_schedule)
+    native_bank = None
+    contexts = None
+    native_loader = None
+    if "artist_tag" in scheduled_categories:
+        native_bank = NativeCenteredTeacherBank.load(
+            config,
+            destination,
+            config_key=str(cfg["native_teacher"]["bank_config_key"]),
+        )
+        contexts = NativeArtistContextCache(
+            destination / str(cfg["native_teacher"]["context_cache"]),
+            capacity=int(cfg["native_teacher"].get("context_lru_shards", 8)),
+        )
+        native_loader = CachedTeacherReferenceLoader(
+            [
+                destination / str(value)
+                for value in cfg["native_teacher"]["reference_caches"]
+            ],
+            split="train",
+            style_ids=list(native_bank.summary["train_style_ids"]),
+            batch_size=int(training.get("native_batch_rows", 8)),
+            references=int(training.get("native_references", 4)),
+            seed=seed ^ 0x4E415449,
+            token_lru_shards=int(training.get("token_lru_shards", 8)),
+            strict_style_ids=False,
+        )
 
     groups = [
         {"params": adapter.shared_parameters(), "lr": float(training.get("shared_learning_rate", 1e-4)), "name": "shared_kv"},
@@ -2517,6 +2567,14 @@ def train_lora_functional_distillation(
     updates = defaultdict(int)
     native_common_cache: dict[tuple[int, int], torch.Tensor] = {}
     started = time.perf_counter()
+    flow_prefetched = None
+    if flow_loader is not None:
+        flow_prefetched = flow_loader.prefetch(
+            start_step * flow_accumulation,
+            (steps - start_step) * flow_accumulation,
+            workers=int(human_flow.get("prefetch_workers", 2)),
+            depth=int(human_flow.get("prefetch_batches", 6)),
+        )
     try:
         for step in range(start_step + 1, steps + 1):
             if step <= warmup:
@@ -2528,7 +2586,58 @@ def train_lora_functional_distillation(
                 lr_scale = min_lr + (1 - min_lr) * 0.5 * (1 + math.cos(math.pi * progress))
             for group in optimizer.param_groups:
                 group["lr"] = base_lrs[str(group["name"])] * lr_scale
+            common_freeze_step = int(training.get("common_freeze_step", 0))
+            common_frozen_now = bool(
+                freeze_common
+                or (common_freeze_step > 0 and step > common_freeze_step)
+            )
+            for parameter in adapter.common_parameters():
+                parameter.requires_grad_(not common_frozen_now)
+            for group in optimizer.param_groups:
+                if str(group["name"]) == "common" and common_frozen_now:
+                    group["lr"] = 0.0
+            gain_start = float(training.get("global_gain_start", 1.0))
+            gain_end = float(training.get("global_gain_end", gain_start))
+            gain_steps = max(1, int(training.get("global_gain_ramp_steps", 1)))
+            gain_progress = min(1.0, max(0.0, (step - 1) / gain_steps))
+            adapter.global_gain = gain_start + gain_progress * (gain_end - gain_start)
             optimizer.zero_grad(set_to_none=True)
+
+            if flow_prefetched is not None:
+                flow_start = float(human_flow.get("weight_start", 0.25))
+                flow_end = float(human_flow.get("weight_end", 1.0))
+                flow_ramp_steps = max(1, int(human_flow.get("weight_ramp_steps", 500)))
+                flow_progress = min(1.0, max(0.0, (step - 1) / flow_ramp_steps))
+                flow_weight = flow_start + flow_progress * (flow_end - flow_start)
+                flow_rows: list[dict[str, torch.Tensor]] = []
+                for micro in range(flow_accumulation):
+                    flow_batch = next(flow_prefetched)
+                    generator = torch.Generator(device=device).manual_seed(
+                        seed ^ 0x464C4F57 ^ (step * 100_003 + micro)
+                    )
+                    flow_loss, flow_metrics, _ = _flow_step(
+                        anima,
+                        reader,
+                        adapter,
+                        flow_batch,
+                        device,
+                        flow_training,
+                        None,
+                        generator=generator,
+                        step=step,
+                        mode="curriculum",
+                        train_auxiliaries=False,
+                        measure_base=(step % int(training.get("log_every", 10)) == 0),
+                    )
+                    (flow_weight * flow_loss / flow_accumulation).backward()
+                    flow_rows.append(flow_metrics)
+                for key in set().union(*(row.keys() for row in flow_rows)):
+                    values = [row[key] for row in flow_rows if key in row]
+                    if values and all(value.numel() == 1 for value in values):
+                        running[f"human_flow/{key}"].append(
+                            float(torch.stack(values).mean().detach())
+                        )
+                running["human_flow/weight"].append(flow_weight)
             if teacher_schedule:
                 category = scheduled_teacher_category(
                     step,
@@ -2549,6 +2658,9 @@ def train_lora_functional_distillation(
             updates[category] += 1
             mixture_kind = None
             if category == "artist_tag":
+                assert native_bank is not None
+                assert contexts is not None
+                assert native_loader is not None
                 native_training = {
                     **training,
                     "teacher_batch_rows": int(training.get("native_batch_rows", 8)),
@@ -2627,6 +2739,7 @@ def train_lora_functional_distillation(
                     kind=kind, update=updates[category], step=step,
                     device=device, training={**training, "seed": seed},
                     materialized_mixture=materialized_mixture,
+                    backward_scale=float(training.get("teacher_backward_scale", 1.0)),
                 )
                 metrics["domain_synthetic"] = torch.tensor(
                     float(domain != "human"), device=device
@@ -2670,7 +2783,8 @@ def train_lora_functional_distillation(
                 for group in optimizer.param_groups:
                     row[f"optimizer/lr/{group['name']}"] = float(group["lr"])
                 row["progress/category"] = {"artist_tag": 0, "lora_single": 1, "lora_mixture": 2}[category]
-                row["progress/common_frozen"] = float(freeze_common)
+                row["progress/common_frozen"] = float(common_frozen_now)
+                row["progress/global_gain"] = float(adapter.global_gain)
                 print(f"LoRA distill step={step}/{steps} category={category} {row}", flush=True)
                 if wandb_run is not None:
                     wandb_run.log({f"train/{key}": value for key, value in row.items()}, step=step)
@@ -2776,6 +2890,8 @@ def train_lora_functional_distillation(
         ),
         "curriculum": curriculum,
         "common_frozen": freeze_common,
+        "common_freeze_step": int(training.get("common_freeze_step", 0)),
+        "human_flow_enabled": human_flow_enabled,
         "reader_frozen": freeze_reader,
         "reader_trainable_scope": reader_scope,
         "initialization": initialization,
@@ -2834,6 +2950,42 @@ def smoke_test_lora_functional_distillation_v2(
         destination,
         steps_override=3,
         config_key="lora_functional_distillation_v2",
+    )
+
+
+def train_fresh_v34_low_target_kv_lora_joint(
+    config: dict[str, Any], destination: Path
+) -> dict[str, Any]:
+    """Train fresh v34 topology from low-target flow and K/V-only LoRA teachers."""
+
+    return train_lora_functional_distillation(
+        config,
+        destination,
+        config_key="fresh_v34_low_target_kv_lora_joint",
+    )
+
+
+def smoke_test_fresh_v34_low_target_kv_lora_joint(
+    config: dict[str, Any], destination: Path
+) -> dict[str, Any]:
+    effective = copy.deepcopy(config)
+    cfg = effective["fresh_v34_low_target_kv_lora_joint"]
+    cfg["output_directory"] = str(
+        Path(cfg["output_directory"]).with_name(
+            "fresh_v34_low_target_kv_lora_joint_smoke"
+        )
+    )
+    cfg["training"]["wandb"]["enabled"] = False
+    cfg["training"]["resume"] = False
+    cfg["training"]["checkpoint_every"] = 1
+    cfg["training"]["sample_every"] = 0
+    cfg["training"]["fewshot_validation"]["enabled"] = False
+    cfg["human_flow"]["prefetch_batches"] = 2
+    return train_lora_functional_distillation(
+        effective,
+        destination,
+        steps_override=2,
+        config_key="fresh_v34_low_target_kv_lora_joint",
     )
 
 
