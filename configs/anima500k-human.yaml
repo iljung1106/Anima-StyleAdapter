@@ -6656,6 +6656,13 @@ detail_style_artist_only_mixture_continuation:
   training:
     steps: 1000
     warmup_steps: 100
+    # The first 500 continuation steps measured pre-clip P95 norms of 21.93
+    # for the Reader and 7.48 for the Adapter. Clip only that upper tail;
+    # Null stayed below its existing 0.1 limit and component gain is frozen.
+    reader_max_grad_norm: 22.0
+    adapter_max_grad_norm: 7.5
+    null_context_max_grad_norm: 0.1
+    component_gain_max_grad_norm: 1.0
     native_bootstrap:
       enabled: true
       minimum_steps: 2000
