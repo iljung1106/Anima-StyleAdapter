@@ -10,6 +10,7 @@ from anima_style_data.lora_functional_distillation import (
     _pack_materialized_mixture_references,
     _fewshot_prompt_signature,
     _select_fewshot_validation_styles,
+    _separated_component_functional_objective,
     _teacher_decomposed_functional_objective,
     build_mixture_specs,
     decompose_teacher_effects,
@@ -333,6 +334,67 @@ def test_functional_infonce_identifies_matching_centered_teacher():
     )
     assert float(metrics["functional_infonce_accuracy"]) == 1.0
     assert float(metrics["functional_infonce_cosine_gap"]) > 1.0
+
+
+def test_separated_component_objective_penalizes_artist_common_leakage():
+    teacher = torch.eye(4).reshape(4, 1, 4) + 0.2
+    teacher_common, teacher_centered = decompose_teacher_effects(teacher)
+    weights = {
+        "centered_huber": 1.0,
+        "centered_direction": 0.0,
+        "centered_magnitude": 0.0,
+        "functional_infonce": 0.0,
+        "artist_common_leakage": 1.0,
+        "common_huber": 1.0,
+        "common_direction": 0.0,
+        "common_magnitude": 0.0,
+    }
+    exact_combined = teacher_common + teacher_centered
+    exact_loss, exact_metrics = _separated_component_functional_objective(
+        teacher_common, exact_combined, teacher, weights
+    )
+    leaked = torch.full_like(teacher_centered, 0.5)
+    common_student = teacher_common.clone().requires_grad_(True)
+    leaked_combined = (
+        teacher_common + teacher_centered + leaked
+    ).clone().requires_grad_(True)
+    leaked_loss, leaked_metrics = _separated_component_functional_objective(
+        common_student, leaked_combined, teacher, weights
+    )
+
+    assert float(exact_loss) < 1e-6
+    assert float(exact_metrics["artist_common_leakage_loss"]) < 1e-6
+    assert float(leaked_loss) > float(exact_loss) + 0.1
+    assert float(leaked_metrics["artist_common_leakage_loss"]) > 0.1
+    # Leakage is isolated from the correctly matched centered Artist effect.
+    assert float(leaked_metrics["centered_cosine"]) > 0.999
+    leaked_loss.backward()
+    torch.testing.assert_close(common_student.grad, torch.zeros_like(common_student))
+    assert float(leaked_combined.grad.abs().sum()) > 0
+
+
+def test_separated_component_objective_rejects_zero_artist_shortcut():
+    teacher = torch.eye(4).reshape(4, 1, 4) + 0.2
+    teacher_common, _ = decompose_teacher_effects(teacher)
+    collapsed = teacher_common.expand_as(teacher).clone().requires_grad_(True)
+    loss, metrics = _separated_component_functional_objective(
+        teacher_common,
+        collapsed,
+        teacher,
+        {
+            "functional_infonce": 0.5,
+            "artist_common_leakage": 1.0,
+            "artist_magnitude_floor": 1.0,
+            "artist_magnitude_floor_ratio": 0.75,
+        },
+    )
+
+    assert float(metrics["centered_student_to_teacher_rms"]) < 1e-5
+    assert float(metrics["artist_magnitude_floor_loss"]) > 0.5
+    assert float(metrics["artist_magnitude_floor_violation_fraction"]) == 1.0
+    assert float(loss) > 0.5
+    loss.backward()
+    assert torch.isfinite(collapsed.grad).all()
 
 
 def test_cached_probe_preserves_exact_latent_shape_and_values(tmp_path):

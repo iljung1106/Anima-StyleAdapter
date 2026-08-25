@@ -2137,6 +2137,197 @@ def _teacher_decomposed_functional_objective(
     }
 
 
+def _separated_component_functional_objective(
+    common_student: torch.Tensor,
+    combined_student: torch.Tensor,
+    teacher: torch.Tensor,
+    weights: dict[str, float],
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Supervise Common and reference-dependent Artist effects separately.
+
+    ``common_student`` is produced by a reference-free Common-only forward.
+    ``combined_student`` uses the same Q/content/timestep with both paths.  The
+    incremental Artist effect is therefore the functional difference between
+    those two full-Anima predictions, including downstream block interactions.
+    This prevents a reference-insensitive Artist output from hiding inside the
+    combined batch mean.
+    """
+
+    common_student = common_student.float()
+    combined_student = combined_student.float()
+    teacher = teacher.detach().float()
+    if (
+        combined_student.shape != teacher.shape
+        or common_student.shape[1:] != teacher.shape[1:]
+        or common_student.shape[0] not in {1, teacher.shape[0]}
+        or teacher.shape[0] < 2
+    ):
+        raise ValueError(
+            "Separated component supervision needs matching tensors and at "
+            "least two controlled artists"
+        )
+
+    rows = teacher.shape[0]
+    common_rows = common_student.expand(rows, *common_student.shape[1:])
+    common_effect = common_rows.mean(dim=0, keepdim=True)
+    # Common is updated exclusively by its explicit teacher target.  Detach
+    # here so Artist losses cannot change Common through the subtraction.
+    artist_effect = combined_student - common_rows.detach()
+    artist_common, artist_centered = decompose_teacher_effects(artist_effect)
+    teacher_common, teacher_centered = decompose_teacher_effects(teacher)
+    reduce_dims = tuple(range(1, teacher.ndim))
+    row_shape = (-1,) + (1,) * (teacher.ndim - 1)
+
+    teacher_centered_rms = (
+        teacher_centered.square().mean(dim=reduce_dims).sqrt().clamp_min(1e-4)
+    )
+    artist_centered_rms = (
+        artist_centered.square().mean(dim=reduce_dims) + 1e-12
+    ).sqrt()
+    centered_scale = teacher_centered_rms.reshape(row_shape)
+    centered_huber = F.smooth_l1_loss(
+        artist_centered / centered_scale,
+        teacher_centered / centered_scale,
+        beta=0.10,
+    )
+    centered_cosine = F.cosine_similarity(
+        artist_centered.flatten(1), teacher_centered.flatten(1), dim=1
+    ).mean()
+    centered_magnitude = F.smooth_l1_loss(
+        (artist_centered_rms / teacher_centered_rms)
+        .clamp_min(1e-4).log().clamp(-4, 4),
+        torch.zeros_like(artist_centered_rms),
+        beta=0.10,
+    )
+    centered_rms_ratio = artist_centered_rms / teacher_centered_rms
+    magnitude_floor_ratio = float(
+        weights.get("artist_magnitude_floor_ratio", 0.0)
+    )
+    if magnitude_floor_ratio < 0:
+        raise ValueError("artist_magnitude_floor_ratio must be non-negative")
+    magnitude_floor_violation = F.relu(
+        magnitude_floor_ratio - centered_rms_ratio
+    )
+    magnitude_floor = magnitude_floor_violation.square().mean()
+
+    temperature = float(weights.get("functional_infonce_temperature", 0.10))
+    if temperature <= 0:
+        raise ValueError("functional_infonce_temperature must be positive")
+    student_unit = F.normalize(artist_centered.flatten(1), dim=1)
+    teacher_unit = F.normalize(teacher_centered.flatten(1), dim=1)
+    logits = student_unit @ teacher_unit.t() / temperature
+    labels = torch.arange(rows, device=teacher.device)
+    infonce = 0.5 * (
+        F.cross_entropy(logits, labels) + F.cross_entropy(logits.t(), labels)
+    )
+    positive = logits.diagonal() * temperature
+    wrong = logits.masked_fill(
+        torch.eye(rows, device=teacher.device, dtype=torch.bool),
+        torch.finfo(logits.dtype).min,
+    ).max(dim=1).values * temperature
+
+    centered_native_scale = teacher_centered.square().mean().sqrt().clamp_min(1e-4)
+    artist_common_leakage = F.smooth_l1_loss(
+        artist_common / centered_native_scale,
+        torch.zeros_like(artist_common),
+        beta=0.10,
+    )
+    artist_common_rms = artist_common.square().mean().sqrt()
+    artist_total_rms = artist_effect.square().mean().sqrt().clamp_min(1e-8)
+
+    teacher_common_rms = teacher_common.square().mean().sqrt().clamp_min(1e-4)
+    common_student_rms = common_effect.square().mean().sqrt()
+    common_huber = F.smooth_l1_loss(
+        common_effect / teacher_common_rms,
+        teacher_common / teacher_common_rms,
+        beta=0.10,
+    )
+    common_cosine = F.cosine_similarity(
+        common_effect.flatten(), teacher_common.flatten(), dim=0
+    )
+    common_magnitude = F.smooth_l1_loss(
+        (common_student_rms / teacher_common_rms).clamp_min(1e-4).log().clamp(-4, 4),
+        torch.zeros_like(common_student_rms),
+        beta=0.10,
+    )
+
+    combined_common = combined_student.mean(dim=0, keepdim=True)
+    combined_total_rms = combined_student.square().mean().sqrt().clamp_min(1e-8)
+    teacher_total_rms = teacher.square().mean().sqrt().clamp_min(1e-8)
+    teacher_common_ratio = teacher_common_rms / teacher_total_rms
+    combined_common_ratio = (
+        combined_common.square().mean().sqrt() / combined_total_rms
+    )
+
+    weighted = {
+        "centered_huber": float(weights.get("centered_huber", 1.0))
+        * centered_huber,
+        "centered_direction": float(weights.get("centered_direction", 0.75))
+        * (1 - centered_cosine),
+        "centered_magnitude": float(weights.get("centered_magnitude", 0.25))
+        * centered_magnitude,
+        "artist_magnitude_floor": float(
+            weights.get("artist_magnitude_floor", 1.0)
+        ) * magnitude_floor,
+        "functional_infonce": float(weights.get("functional_infonce", 0.50))
+        * infonce,
+        "artist_common_leakage": float(
+            weights.get("artist_common_leakage", 1.0)
+        ) * artist_common_leakage,
+        "common_huber": float(weights.get("common_huber", 0.25)) * common_huber,
+        "common_direction": float(weights.get("common_direction", 0.10))
+        * (1 - common_cosine),
+        "common_magnitude": float(weights.get("common_magnitude", 0.10))
+        * common_magnitude,
+    }
+    total = sum(weighted.values())
+    return total, {
+        "loss": total.detach(),
+        "centered_huber": centered_huber.detach(),
+        "centered_cosine": centered_cosine.detach(),
+        "centered_magnitude_loss": centered_magnitude.detach(),
+        "centered_student_to_teacher_rms": (
+            centered_rms_ratio
+        ).mean().detach(),
+        "artist_magnitude_floor_ratio": teacher.new_tensor(
+            magnitude_floor_ratio
+        ),
+        "artist_magnitude_floor_loss": magnitude_floor.detach(),
+        "artist_magnitude_floor_violation_fraction": (
+            centered_rms_ratio < magnitude_floor_ratio
+        ).float().mean().detach(),
+        "functional_infonce_loss": infonce.detach(),
+        "functional_infonce_accuracy": (
+            logits.argmax(dim=1) == labels
+        ).float().mean().detach(),
+        "functional_infonce_positive_cosine": positive.mean().detach(),
+        "functional_infonce_hardest_wrong_cosine": wrong.mean().detach(),
+        "functional_infonce_cosine_gap": (positive - wrong).mean().detach(),
+        "artist_common_leakage_loss": artist_common_leakage.detach(),
+        "artist_common_leakage_rms_to_teacher_centered": (
+            artist_common_rms / centered_native_scale
+        ).detach(),
+        "artist_common_output_ratio": (
+            artist_common_rms / artist_total_rms
+        ).detach(),
+        "common_huber": common_huber.detach(),
+        "common_cosine": common_cosine.detach(),
+        "common_magnitude_loss": common_magnitude.detach(),
+        "common_student_to_teacher_rms": (
+            common_student_rms / teacher_common_rms
+        ).detach(),
+        "common_output_ratio": combined_common_ratio.detach(),
+        "teacher_common_output_ratio": teacher_common_ratio.detach(),
+        "student_to_teacher_rms": (
+            combined_total_rms / teacher_total_rms
+        ).detach(),
+        **{
+            f"weighted_{name}": value.detach()
+            for name, value in weighted.items()
+        },
+    }
+
+
 def _pack_mixture_references(
     loader: CachedTeacherReferenceLoader,
     rows: list[dict[str, Any]],
@@ -2277,23 +2468,59 @@ def _lora_teacher_step(
     teacher = bank.effects[indices, content_index, timestep_index].to(
         device=device, dtype=torch.float32, non_blocking=True
     )
-    adapter.set_bootstrap_phase("combined")
-    student = _controlled_teacher_forward(
-        anima, reader, adapter, references, mask,
-        noisy, base, context, timestep, device,
-        reference_weights=reference_weights,
-    )
     objective = str(training.get("functional_objective", "legacy_raw"))
-    objective_fn = (
-        _teacher_decomposed_functional_objective
-        if objective == "teacher_decomposed"
-        else _functional_objective
-    )
-    if objective not in {"legacy_raw", "teacher_decomposed"}:
+    if objective not in {
+        "legacy_raw", "teacher_decomposed", "separated_components"
+    }:
         raise ValueError(f"Unsupported functional objective: {objective}")
-    loss, metrics = objective_fn(
-        student, teacher, dict(training.get("loss_weights", {}))
+    previous_phase = adapter.bootstrap_phase
+    try:
+        common_student = None
+        if objective == "separated_components":
+            adapter.set_bootstrap_phase("common_only")
+            # Every controlled row has the same x_t, timestep, prompt and Q.
+            # The reference-free Common effect is therefore identical across
+            # rows; one row is sufficient and keeps the extra forward cheap.
+            common_args = (
+                anima, reader, adapter, references[:1], mask[:1],
+                noisy, base, context, timestep, device,
+            )
+            if any(
+                parameter.requires_grad
+                for parameter in adapter.common_parameters()
+            ):
+                common_student = _controlled_teacher_forward(*common_args)
+            else:
+                with torch.no_grad():
+                    common_student = _controlled_teacher_forward(*common_args)
+        adapter.set_bootstrap_phase("combined")
+        student = _controlled_teacher_forward(
+            anima, reader, adapter, references, mask,
+            noisy, base, context, timestep, device,
+            reference_weights=reference_weights,
+        )
+    finally:
+        adapter.set_bootstrap_phase(previous_phase)
+
+    loss_weights = dict(training.get("loss_weights", {}))
+    floor_start = float(training.get("artist_magnitude_floor_start", 0.0))
+    floor_end = float(training.get("artist_magnitude_floor_end", floor_start))
+    floor_steps = max(1, int(training.get("artist_magnitude_floor_ramp_steps", 1)))
+    floor_progress = min(1.0, max(0.0, (step - 1) / floor_steps))
+    loss_weights["artist_magnitude_floor_ratio"] = (
+        floor_start + floor_progress * (floor_end - floor_start)
     )
+    if objective == "separated_components":
+        assert common_student is not None
+        loss, metrics = _separated_component_functional_objective(
+            common_student, student, teacher, loss_weights
+        )
+    elif objective == "teacher_decomposed":
+        loss, metrics = _teacher_decomposed_functional_objective(
+            student, teacher, loss_weights
+        )
+    else:
+        loss, metrics = _functional_objective(student, teacher, loss_weights)
     if backward_scale < 0:
         raise ValueError("backward_scale must be non-negative")
     (float(backward_scale) * loss).backward()

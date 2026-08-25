@@ -51,4 +51,30 @@ LoRA reference는 human/synthetic 도메인을 교대로 쓰며 Artist ID를 모
   비교한다. 별도 quick/diverse sheet는 생성하지 않는다.
 - 주 선택 기준은 heldout 작가 분리, single-reference 재현, reference 수 증가 시
   개선, 그리고 frozen Anima의 형상 보존이다. Training teacher 회귀값만으로 모델을
-선택하지 않는다.
+  선택하지 않는다.
+
+## v2: Common/Artist functional 분리
+
+직전 v1의 결합 출력 batch mean 규제는 Common K/V와 Artist K/V 중 어느
+경로가 공통 출력을 만들었는지 구분하지 못했다. v2는 이전 체크포인트를
+재사용하지 않고 새 Reader와 Adapter로 시작하며, 동일한 controlled
+`x_t`·timestep·prompt·Q에서 다음 두 full-Anima 출력을 계산한다.
+
+- `Common-only`: reference-free Common K/V만 활성화하며 동일 조건이므로
+  한 행만 계산한다.
+- `Combined`: Common과 reference-conditioned Artist K/V를 모두 활성화한다.
+
+최종 velocity 공간의 Artist effect를 `Combined - Common-only`로 정의한다.
+Common-only는 teacher artist batch 평균의 방향·크기만 학습하고, Artist
+effect에는 batch mean 누출을 직접 0으로 만드는 loss와 centered
+Huber·direction·magnitude·all-wrong InfoNCE를 적용한다. Combined forward의
+Common gradient scale은 0으로 두어 Artist/flow loss가 Common 경로를
+재사용하거나 상쇄하지 못하게 한다. Common은 500 step 이후 동결한다.
+Artist centered RMS에는 teacher centered RMS의 0.25에서 0.75까지 500 step
+동안 올라가는 one-sided 하한을 추가한다. 대칭 magnitude 회귀와 별도로
+작동하므로 작은 출력 shortcut을 허용하지 않되, 공통 출력이나 직교 잡음을
+크기로 인정하지 않는다.
+
+Frozen Anima의 기본 flow가 이미 강해 reference 출력 0을 선호하는 충돌을
+줄이기 위해 human flow MSE 가중치는 1,000 step 동안 0.10에서 0.50까지만
+올린다. functional teacher는 매 step 그대로 사용한다.

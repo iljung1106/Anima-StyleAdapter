@@ -6353,7 +6353,7 @@ real_artist_teacher:
 # Detail-preserving typed-slot, separate-softmax Style Cross-Attention v1.
 # Contract: docs/detail_preserving_style_cross_attention_plan.md
 fresh_v34_low_target_kv_lora_joint:
-  output_directory: fresh_v34_low_target_kv_lora_joint_v1
+  output_directory: fresh_v34_low_target_kv_lora_joint_v2_component_separated
   seed: 20260828
   lora_directory: artist_lora_teachers_rank16_256_b2_v5
   # Fresh means no v31/v34 Reader or Adapter weights. The frozen dual-query
@@ -6368,6 +6368,9 @@ fresh_v34_low_target_kv_lora_joint:
     artist_null_residual: true
     artist_residual_gain: 1.0
     common_residual_gain: 1.0
+    # Common receives gradients only from its explicit Common-only target.
+    # Artist/flow objectives must not repurpose it as a combined-path shortcut.
+    common_combined_gradient_scale: 0.0
   human_reference_cache: dual_query_reference_tokens_v8_step10000
   synthetic_reference_cache: >-
     lora_teacher_references_rank16_256x8_v2/dual_query_reference_tokens_v8_step10000
@@ -6381,7 +6384,7 @@ fresh_v34_low_target_kv_lora_joint:
     teacher_schedule: [lora_single]
     lora_reference_domain_schedule: [human, synthetic]
     curriculum: fresh_v34_low_target_kv_lora_joint
-    functional_objective: teacher_decomposed
+    functional_objective: separated_components
     teacher_backward_scale: 1.0
     freeze_reader: false
     reader_trainable_scope: all
@@ -6403,6 +6406,9 @@ fresh_v34_low_target_kv_lora_joint:
     global_gain_start: 0.25
     global_gain_end: 1.0
     global_gain_ramp_steps: 500
+    artist_magnitude_floor_start: 0.25
+    artist_magnitude_floor_end: 0.75
+    artist_magnitude_floor_ramp_steps: 500
     warmup_steps: 200
     lr_decay_start_step: 6500
     minimum_lr_ratio: 0.10
@@ -6414,14 +6420,15 @@ fresh_v34_low_target_kv_lora_joint:
     ram_resident_tokens: true
     loss_weights:
       centered_huber: 1.0
-      centered_direction: 0.5
-      centered_magnitude: 0.1
-      functional_infonce: 0.25
+      centered_direction: 0.75
+      centered_magnitude: 0.25
+      artist_magnitude_floor: 1.0
+      functional_infonce: 0.50
       functional_infonce_temperature: 0.10
-      common_huber: 0.5
-      common_direction: 0.25
-      common_ratio_excess: 2.0
-      common_ratio_margin: 0.03
+      artist_common_leakage: 1.0
+      common_huber: 0.25
+      common_direction: 0.10
+      common_magnitude: 0.10
     log_every: 10
     checkpoint_every: 250
     sample_every: 500
@@ -6481,14 +6488,16 @@ fresh_v34_low_target_kv_lora_joint:
     wandb:
       enabled: true
       project: anima-style-adapter
-      name: fresh-v34-low-target-kv-lora-joint-v1
-      id: fresh-v34-low-target-kv-lora-joint-v1
+      name: fresh-v34-component-separated-joint-v2
+      id: fresh-v34-component-separated-joint-v2
   human_flow:
     enabled: true
     gradient_accumulation_steps: 1
-    weight_start: 0.25
-    weight_end: 1.0
-    weight_ramp_steps: 500
+    # Frozen Anima already has a strong base-flow predictor. Keep this
+    # regularizer subordinate while the reference-specific path is learned.
+    weight_start: 0.10
+    weight_end: 0.50
+    weight_ramp_steps: 1000
     prefetch_workers: 2
     prefetch_batches: 6
     loader:
