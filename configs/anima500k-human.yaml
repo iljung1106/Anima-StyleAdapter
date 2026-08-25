@@ -6519,6 +6519,12 @@ fresh_v34_low_target_kv_lora_joint:
         target_anneal_min_references: 1
         target_anneal_max_references: 4
         reference_count_weights: [0.60, 0.30, 0.0, 0.10]
+      reference_schedule:
+        - name: low_target_1_2_4
+          end_step: 8000
+          min_references: 1
+          max_references: 4
+          reference_count_weights: [0.60, 0.30, 0.0, 0.10]
 
 
 detail_preserving_style_cross_attention:
