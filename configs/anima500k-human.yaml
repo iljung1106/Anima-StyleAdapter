@@ -861,7 +861,10 @@ kv_reference_direct_delta_320:
     hidden_dim: 256
     heads: 8
     ff_dim: 1024
-    output_init_scale: 0.02
+    # Removing sample-wise normalization exposes the Reader's native scale.
+    # Match initial residual RMS to the teacher instead of inheriting the
+    # normalized-memory initializer used by the old 64-teacher pilot.
+    output_init_scale: 0.0005
     normalize_style: false
     normalize_attended: false
   training:

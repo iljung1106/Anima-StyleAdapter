@@ -2000,6 +2000,10 @@ def smoke_test_direct_reference_kv_delta_320(
     cfg["training"]["wandb"]["enabled"] = False
     cfg["training"]["validation_every"] = 50
     cfg["training"]["checkpoint_every"] = 100
+    # Measure the true distribution first; the production config is tightened
+    # to its p99 after this calibration run.
+    cfg["training"]["max_grad_norm"] = 1.0e9
+    cfg["training"]["reader_max_grad_norm"] = 1.0e9
     return train_direct_reference_kv_delta_320(
         effective, destination, steps_override=100
     )
