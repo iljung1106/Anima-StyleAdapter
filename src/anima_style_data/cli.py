@@ -117,6 +117,7 @@ def build_parser() -> argparse.ArgumentParser:
         ("kv-activation-mixture-reference-token-cache", "Cache Resampler tokens for K/V mixture images"),
         ("lora-functional-teacher-cache", "Cache single and mixed LoRA functional effects"),
         ("kv-lora-functional-teacher-cache", "Cache K/V-only LoRA effects"),
+        ("kv-lora-functional-teacher-320-cache", "Cache all 320 K/V-only LoRA and mixture effects"),
         ("kv-lora-fixed-teacher-compare", "Compare K/V LoRAs on one prompt and seed"),
         ("kv-lora-oracle-bootstrap-smoke", "Smoke-test K/V-only LoRA oracle capacity"),
         ("kv-lora-oracle-bootstrap-train", "Train K/V-only LoRA oracle capacity"),
@@ -639,10 +640,12 @@ def main() -> None:
         "kv-lora-reference-320-generate",
         "kv-activation-mixture-reference-generate",
         "kv-lora-functional-teacher-cache",
+        "kv-lora-functional-teacher-320-cache",
         "kv-lora-fixed-teacher-compare",
     }:
         from .lora_functional_distillation import (
             cache_kv_lora_functional_teacher,
+            cache_kv_lora_functional_teacher_320,
             compare_kv_lora_fixed_prompt,
             generate_kv_activation_mixture_references,
             generate_kv_lora_teacher_references,
@@ -654,6 +657,7 @@ def main() -> None:
             "kv-lora-reference-320-generate": generate_kv_lora_teacher_references_320,
             "kv-activation-mixture-reference-generate": generate_kv_activation_mixture_references,
             "kv-lora-functional-teacher-cache": cache_kv_lora_functional_teacher,
+            "kv-lora-functional-teacher-320-cache": cache_kv_lora_functional_teacher_320,
             "kv-lora-fixed-teacher-compare": compare_kv_lora_fixed_prompt,
         }[args.command]
         _run(stage, config, destination)

@@ -723,6 +723,40 @@ kv_lora_functional_teacher:
     triple_mixtures: 0
     shard_mixtures: 4
 
+# Compact whole-Anima velocity effects for every current K/V-only teacher and
+# the exact pair/triple/amplified/signed mixtures that already have reference
+# images. Base/noisy conditions use the same cached-training contract as the
+# earlier 64-teacher bank, but 16 contents are sufficient for the 10k run.
+kv_lora_functional_teacher_320:
+  lora_directory: artist_kv_lora_teachers_rank16_320_b2_v3
+  network_selection:
+    exclude_patterns: [".*"]
+    include_patterns: ["blocks\\.\\d+\\.cross_attn\\.(k_proj|v_proj)"]
+    required_module_patterns: ["blocks\\.\\d+\\.cross_attn\\.(k_proj|v_proj)"]
+    expected_module_count: 56
+  teacher_cache:
+    output_directory: kv_lora_functional_teacher_bank_rank16_320_mixtures_compact16x4_v1
+    mixture_manifest: kv_activation_mixture_specs_rank16_64_v1/mixtures.parquet
+    content_source_mode: cached_training
+    latent_cache_directory: anima_latent_cache_qwen_2d
+    text_cache_directory: anima_text_cache_post_llm_multimode_v1
+    device: cuda
+    seed: 20260826
+    contents: 16
+    content_variants:
+      - full
+      - full_quality
+      - tag_dropout
+      - tag_dropout_quality
+      - short
+      - short_quality
+    probe_latent_shape: [128, 96]
+    text_conditioning_length: 512
+    condition_batch_rows: 64
+    timesteps: [0.12, 0.40, 0.68, 0.90]
+    stable_effect_ratio_range: [0.20, 2.00]
+    shard_mixtures: 8
+
 # Reference-only K/V Activation Generator pilot.  The lightweight Teacher
 # manifest measures exact native text K/V deltas and never builds a full-DiT
 # flow cache. Materialized pair/triple/amplified/signed images make the target

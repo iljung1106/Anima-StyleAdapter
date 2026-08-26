@@ -811,6 +811,67 @@ def build_mixture_specs(
     return specs
 
 
+def _functional_teacher_specs(
+    plans: list[ArtistLoRAPlan],
+    cache_cfg: dict[str, Any],
+    destination: Path,
+) -> tuple[list[MixtureSpec], dict[int, dict[str, Any]]]:
+    """Build singles plus either generated or externally materialized mixtures."""
+
+    manifest = cache_cfg.get("mixture_manifest")
+    if not manifest:
+        return build_mixture_specs(
+            len(plans),
+            pair_count=int(cache_cfg.get("pair_mixtures", 64)),
+            triple_count=int(cache_cfg.get("triple_mixtures", 64)),
+            amplified_count=int(cache_cfg.get("amplified_mixtures", 0)),
+            signed_count=int(cache_cfg.get("signed_mixtures", 0)),
+            amplified_sum_range=tuple(
+                float(value)
+                for value in cache_cfg.get("amplified_sum_range", [1.05, 1.35])
+            ),
+            signed_beta_range=tuple(
+                float(value)
+                for value in cache_cfg.get("signed_beta_range", [0.05, 0.25])
+            ),
+            amplified_triple_probability=float(
+                cache_cfg.get("amplified_triple_probability", 0.5)
+            ),
+            signed_triple_probability=float(
+                cache_cfg.get("signed_triple_probability", 0.0)
+            ),
+            signed_l1_maximum=float(cache_cfg.get("signed_l1_maximum", 1.5)),
+            seed=int(cache_cfg.get("seed", 20260823)),
+        ), {}
+
+    index_by_style = {plan.style_id: index for index, plan in enumerate(plans)}
+    specs = [
+        MixtureSpec(index, "single", (index,), (1.0,))
+        for index in range(len(plans))
+    ]
+    source_rows: dict[int, dict[str, Any]] = {}
+    for row in read_records(destination / str(manifest)):
+        kind = str(row["kind"])
+        if kind not in {"pair", "triple", "amplified", "signed"}:
+            continue
+        style_ids = tuple(str(value) for value in row["style_ids"])
+        missing = [value for value in style_ids if value not in index_by_style]
+        if missing:
+            raise RuntimeError(
+                f"Functional mixture styles are absent from the LoRA bank: {missing[:4]}"
+            )
+        components = tuple(index_by_style[value] for value in style_ids)
+        weights = tuple(float(value) for value in row["weights"])
+        if len(components) != len(weights):
+            raise RuntimeError("Functional mixture components and weights disagree")
+        index = len(specs)
+        specs.append(MixtureSpec(index, kind, components, weights))
+        source_rows[index] = row
+    if not source_rows:
+        raise RuntimeError("External functional mixture manifest has no mixtures")
+    return specs, source_rows
+
+
 def decompose_teacher_effects(
     effects: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -1536,28 +1597,8 @@ def cache_lora_functional_teacher(
     lora_root = destination / str(cfg["lora_directory"])
     plans = _load_lora_plan(lora_root)
     weight_paths = _weight_paths(lora_root, plans)
-    specs = build_mixture_specs(
-        len(plans),
-        pair_count=int(cache_cfg.get("pair_mixtures", 64)),
-        triple_count=int(cache_cfg.get("triple_mixtures", 64)),
-        amplified_count=int(cache_cfg.get("amplified_mixtures", 0)),
-        signed_count=int(cache_cfg.get("signed_mixtures", 0)),
-        amplified_sum_range=tuple(
-            float(value)
-            for value in cache_cfg.get("amplified_sum_range", [1.05, 1.35])
-        ),
-        signed_beta_range=tuple(
-            float(value)
-            for value in cache_cfg.get("signed_beta_range", [0.05, 0.25])
-        ),
-        amplified_triple_probability=float(
-            cache_cfg.get("amplified_triple_probability", 0.5)
-        ),
-        signed_triple_probability=float(
-            cache_cfg.get("signed_triple_probability", 0.0)
-        ),
-        signed_l1_maximum=float(cache_cfg.get("signed_l1_maximum", 1.5)),
-        seed=int(cache_cfg.get("seed", 20260823)),
+    specs, external_rows = _functional_teacher_specs(
+        plans, cache_cfg, destination
     )
     mixture_records = [
         {
@@ -1569,7 +1610,13 @@ def cache_lora_functional_teacher(
             "coefficient_sum": sum(spec.weights),
             "coefficient_l1": sum(abs(value) for value in spec.weights),
             "style_ids": [plans[index].style_id for index in spec.components],
-            "mixture_style_id": f"lora-mixture-{spec.index:05d}",
+            "mixture_style_id": str(
+                external_rows.get(spec.index, {}).get(
+                    "mixture_style_id", f"lora-mixture-{spec.index:05d}"
+                )
+            ),
+            "source_mixture_index": external_rows.get(spec.index, {}).get("index"),
+            "source_enabled": external_rows.get(spec.index, {}).get("enabled"),
         }
         for spec in specs
     ]
@@ -1818,6 +1865,14 @@ def cache_kv_lora_functional_teacher(
 ) -> dict[str, Any]:
     return cache_lora_functional_teacher(
         config, destination, config_key="kv_lora_functional_teacher"
+    )
+
+
+def cache_kv_lora_functional_teacher_320(
+    config: dict[str, Any], destination: Path
+) -> dict[str, Any]:
+    return cache_lora_functional_teacher(
+        config, destination, config_key="kv_lora_functional_teacher_320"
     )
 
 

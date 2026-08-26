@@ -1,10 +1,12 @@
 import json
+from types import SimpleNamespace
 
 import torch
 from safetensors.torch import save_file
 
 from anima_style_data.lora_functional_distillation import (
     FunctionalLoRATeacherBank,
+    MixtureSpec,
     _artist_only_fixed_population_objective,
     _configure_reader_trainable_scope,
     _cached_training_probe_bank,
@@ -15,6 +17,7 @@ from anima_style_data.lora_functional_distillation import (
     _separated_component_functional_objective,
     _teacher_decomposed_functional_objective,
     build_mixture_specs,
+    _functional_teacher_specs,
     decompose_teacher_effects,
     scheduled_teacher_category,
     scheduled_reference_domain,
@@ -658,3 +661,32 @@ def test_cached_probe_preserves_exact_latent_shape_and_values(tmp_path):
     }
     assert contexts.shape == (2, 3, 8)
     assert all(row["latent_transform"] == "none" for row in rows)
+def test_functional_teacher_specs_reuse_exact_external_mixtures(tmp_path):
+    plans = [SimpleNamespace(style_id=value) for value in ("a", "b", "c")]
+    write_records(
+        tmp_path / "mixtures.parquet",
+        [
+            {
+                "index": 7,
+                "kind": "single",
+                "style_ids": ["a"],
+                "weights": [1.0],
+            },
+            {
+                "index": 11,
+                "kind": "pair",
+                "style_ids": ["c", "a"],
+                "weights": [0.25, 0.75],
+                "mixture_style_id": "exact-pair",
+                "enabled": False,
+            },
+        ],
+    )
+
+    specs, rows = _functional_teacher_specs(
+        plans, {"mixture_manifest": "mixtures.parquet"}, tmp_path
+    )
+
+    assert len(specs) == 4
+    assert specs[-1] == MixtureSpec(3, "pair", (2, 0), (0.25, 0.75))
+    assert rows[3]["mixture_style_id"] == "exact-pair"
