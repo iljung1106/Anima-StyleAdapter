@@ -69,8 +69,8 @@ class ReferenceConditionedKVActivationGenerator(nn.Module):
         super().__init__()
         if hidden_dim % heads:
             raise ValueError("hidden_dim must be divisible by heads")
-        if output_init_scale <= 0:
-            raise ValueError("output_init_scale must be positive")
+        if output_init_scale < 0:
+            raise ValueError("output_init_scale must be non-negative")
         self.style_dim = int(style_dim)
         self.context_dim = int(context_dim)
         self.output_dim = int(output_dim)
@@ -2148,6 +2148,7 @@ def train_direct_reference_kv_delta_320(
                     residual_cosine = F.cosine_similarity(
                         student_effect.flatten(1), desired_effect.flatten(1), dim=-1
                     ).mean()
+                    flow_mse = correct_rows.mean()
                     constraint_progress = min(
                         1.0,
                         relative_step
@@ -2204,13 +2205,19 @@ def train_direct_reference_kv_delta_320(
                         pair_mask=cross_style_mask,
                     )
                     flow_loss = (
-                        residual_huber
+                        float(
+                            human_flow.get(
+                                "flow_mse_weight",
+                                human_flow.get("absolute_mse_weight", 0.1),
+                            )
+                        )
+                        * flow_mse
+                        + float(human_flow.get("residual_huber_weight", 1.0))
+                        * residual_huber
                         + float(human_flow.get("direction_weight", 1.0))
                         * (1.0 - residual_cosine)
                         + float(human_flow.get("output_band_weight", 1.0))
                         * residual_band
-                        + float(human_flow.get("absolute_mse_weight", 0.1))
-                        * correct_rows.mean()
                     )
                     weighted_flow = (
                         float(human_flow.get("flow_loss_weight", 1.0))
@@ -2218,36 +2225,41 @@ def train_direct_reference_kv_delta_320(
                     )
                 (weighted_flow / accumulation_steps).backward()
                 del prediction, flow_style
-                with torch.autocast("cuda", dtype=torch.bfloat16):
-                    wrong_style = reader(
-                        flow_references.roll(1, dims=0),
-                        flow_mask.roll(1, dims=0),
-                    ).tokens
-                    flow_injector.set_style(wrong_style)
-                    wrong_prediction = anima(
-                        noisy.unsqueeze(2),
-                        timesteps.to(latents.dtype),
-                        context=flow_context,
-                        padding_mask=padding,
-                        target_input_ids=None,
-                    ).squeeze(2).float()
-                    flow_injector.disable()
-                    wrong_rows = (
-                        wrong_prediction - target
-                    ).square().mean(dim=dimensions)
-                    denominator = base_rows.detach().clamp_min(1e-6)
-                    correct_gain = (base_rows - correct_rows) / denominator
-                    wrong_gain = (base_rows - wrong_rows) / denominator
-                    ranking = F.relu(
-                        float(human_flow.get("wrong_reference_margin", 0.02))
-                        + wrong_gain
-                        - correct_gain.detach()
-                    ).mean()
-                    weighted_ranking = (
-                        float(human_flow.get("wrong_reference_weight", 0.1))
-                        * ranking
-                    )
-                (weighted_ranking / accumulation_steps).backward()
+                denominator = base_rows.detach().clamp_min(1e-6)
+                correct_gain = (base_rows - correct_rows) / denominator
+                wrong_weight = float(
+                    human_flow.get("wrong_reference_weight", 0.1)
+                )
+                ranking = weighted_flow.new_zeros(())
+                wrong_gain = None
+                wrong_rows = None
+                weighted_ranking = weighted_flow.new_zeros(())
+                if wrong_weight > 0:
+                    with torch.autocast("cuda", dtype=torch.bfloat16):
+                        wrong_style = reader(
+                            flow_references.roll(1, dims=0),
+                            flow_mask.roll(1, dims=0),
+                        ).tokens
+                        flow_injector.set_style(wrong_style)
+                        wrong_prediction = anima(
+                            noisy.unsqueeze(2),
+                            timesteps.to(latents.dtype),
+                            context=flow_context,
+                            padding_mask=padding,
+                            target_input_ids=None,
+                        ).squeeze(2).float()
+                        flow_injector.disable()
+                        wrong_rows = (
+                            wrong_prediction - target
+                        ).square().mean(dim=dimensions)
+                        wrong_gain = (base_rows - wrong_rows) / denominator
+                        ranking = F.relu(
+                            float(human_flow.get("wrong_reference_margin", 0.02))
+                            + wrong_gain
+                            - correct_gain.detach()
+                        ).mean()
+                        weighted_ranking = wrong_weight * ranking
+                    (weighted_ranking / accumulation_steps).backward()
                 loss = weighted_flow.detach() + weighted_ranking.detach()
                 if accumulation_last:
                     generator_grad, generator_clip_used = _clip_outlier_grad_norm(
@@ -2272,18 +2284,26 @@ def train_direct_reference_kv_delta_320(
                 flow_update_index += 1
                 running["loss"].append(float(loss.detach()))
                 running["human_flow/loss"].append(float(flow_loss.detach()))
-                running["human_flow/wrong_reference_ranking"].append(
-                    float(ranking.detach())
+                running["human_flow/flow_mse"].append(float(flow_mse.detach()))
+                running["human_flow/base_mse"].append(
+                    float(base_rows.mean().detach())
                 )
-                running["human_flow/correct_minus_wrong_mse"].append(
-                    float((correct_rows - wrong_rows).mean().detach())
+                running["human_flow/residual_huber"].append(
+                    float(residual_huber.detach())
                 )
                 running["human_flow/correct_gain"].append(
                     float(correct_gain.mean().detach())
                 )
-                running["human_flow/wrong_gain"].append(
-                    float(wrong_gain.mean().detach())
-                )
+                if wrong_rows is not None and wrong_gain is not None:
+                    running["human_flow/wrong_reference_ranking"].append(
+                        float(ranking.detach())
+                    )
+                    running["human_flow/correct_minus_wrong_mse"].append(
+                        float((correct_rows - wrong_rows).mean().detach())
+                    )
+                    running["human_flow/wrong_gain"].append(
+                        float(wrong_gain.mean().detach())
+                    )
                 running["human_flow/residual_cosine"].append(
                     float(residual_cosine.detach())
                 )

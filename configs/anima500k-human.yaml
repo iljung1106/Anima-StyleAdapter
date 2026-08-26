@@ -883,7 +883,7 @@ kv_reference_activation_generator:
 # existing 64-teacher materialized mixtures remain compositional examples;
 # their component artists are forced into the 256-artist training split.
 kv_reference_direct_delta_320:
-  output_directory: kv_reference_direct_delta_r16_320_flow_only_5k_v2
+  output_directory: kv_reference_direct_delta_r16_320_flow_matching_5k_v1
   # Fresh generator and optimizer. Reader alone is initialized from bootstrap.
   seed: 20260826
   blocks: 28
@@ -900,10 +900,10 @@ kv_reference_direct_delta_320:
     hidden_dim: 256
     heads: 8
     ff_dim: 1024
-    # Removing sample-wise normalization exposes the Reader's native scale.
-    # Match initial residual RMS to the teacher instead of inheriting the
-    # normalized-memory initializer used by the old 64-teacher pilot.
-    output_init_scale: 0.0005
+    # Removing sample-wise normalization preserves the Reader's native scale.
+    # Start as the exact frozen base model; standard flow matching then learns
+    # only corrections that lower the real velocity error.
+    output_init_scale: 0.0
     normalize_style: false
     normalize_attended: false
     use_block_embedding: false
@@ -972,22 +972,26 @@ kv_reference_direct_delta_320:
       cycle: 1
       slots: [0]
       flow_loss_weight: 1.0
-      absolute_mse_weight: 0.1
-      direction_weight: 1.0
-      output_band_weight: 1.0
-      # First learn the actual flow direction, then tighten collapse/scale
-      # constraints over the first 1k updates without any batch-mean removal.
+      # Ordinary flow matching is the primary and only positive target.
+      flow_mse_weight: 1.0
+      residual_huber_weight: 0.0
+      direction_weight: 0.0
+      # Regularizers are hinges only: they prevent collapse/explosion but do
+      # not force the adapter to reproduce an image-specific base error.
+      output_band_weight: 0.1
       constraint_ramp_steps: 1000
-      common_cap_start: 0.65
+      common_cap_start: 0.30
       common_cap_end: 0.30
       common_cap_weight: 1.0
-      rms_lower_start: 0.40
-      rms_upper_start: 1.80
-      rms_lower: 0.75
+      rms_lower_start: 0.0
+      rms_upper_start: 1.50
+      rms_lower: 0.0
       rms_upper: 1.25
       rms_band_weight: 1.0
       rms_floor: 0.0001
-      wrong_reference_weight: 0.10
+      # Ranking is neither standard flow matching nor needed for the first
+      # capacity test; disabling it also removes a full DiT backward pass.
+      wrong_reference_weight: 0.0
       wrong_reference_margin: 0.02
       min_references: 1
       max_references: 4
@@ -997,10 +1001,10 @@ kv_reference_direct_delta_320:
       discrete_flow_shift: 3.0
       prefetch_workers: 4
       prefetch_batches: 8
-    # The unnormalized direct head starts at 5e-4 weight scale; Adam updates
-    # at the old 1e-4 LR overwhelmed that initializer within twenty steps.
-    generator_learning_rate: 0.000002
-    reader_learning_rate: 0.0000004
+    # A conservative flow LR is sufficient because gradients pass through the
+    # full frozen DiT; Reader remains at one fifth of the generator LR.
+    generator_learning_rate: 0.00001
+    reader_learning_rate: 0.000002
     # Penalize student pairwise cosine only when it exceeds the corresponding
     # teacher geometry. Inference has no Common branch or mean subtraction.
     common_direction_weight: 1.0
@@ -1022,18 +1026,18 @@ kv_reference_direct_delta_320:
     validation_every: 0
     validation_tokens: 64
     validation_blocks: [0, 4, 8, 12, 16, 20, 24, 27]
-    checkpoint_every: 500
+    checkpoint_every: 250
     sample_every: 0
-    sample_steps: [500, 1000, 2000, 5000]
-    sample_output_root: diagnostics/kv-reference-direct-delta-r16-320-flow-only-5k-v2
+    sample_steps: [250, 500, 1000, 2000, 5000]
+    sample_output_root: diagnostics/kv-reference-direct-delta-r16-320-flow-matching-5k-v1
     # The output directory is new, so the first segment is fresh. Subsequent
-    # 500 -> 1k -> 2k -> 5k sampling segments resume only this same run.
+    # 250 -> 500 -> 1k -> 2k -> 5k segments resume only this same run.
     resume: true
     wandb:
       enabled: true
       project: anima-style-adapter
-      name: kv-reference-direct-delta-r16-320-flow-only-5k-v2
-      id: kv-reference-direct-delta-r16-320-flow-only-5k-v2
+      name: kv-reference-direct-delta-r16-320-flow-matching-5k-v1
+      id: kv-reference-direct-delta-r16-320-flow-matching-5k-v1
 
 kv_reference_direct_delta_320_sample:
   checkpoint: kv_reference_direct_delta_r16_320_joint_flow_v1/checkpoints/step-0100000.pt
