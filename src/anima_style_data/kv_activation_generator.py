@@ -2178,10 +2178,11 @@ def sample_direct_reference_kv_delta_320(
         **{f"Predicted {strength:g}x": value for strength, value in predicted.items()},
     }
     images: dict[str, list[Image.Image]] = {}
+    reference_cache = destination / str(cfg["synthetic_reference_cache"])
     manifest = {
         int(row["id"]): row
         for row in read_records(
-            destination / str(cfg["synthetic_reference_cache"]) / "manifest.parquet"
+            reference_cache.parent / "manifest.parquet"
         )
     }
     images["Styled references"] = [
