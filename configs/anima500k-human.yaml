@@ -910,11 +910,11 @@ kv_reference_direct_delta_320:
   training:
     device: cuda
     steps: 10000
-    # Use the largest measured-safe single-pass batch. Batch eight reached
-    # 79.0/79.18 GiB in the frozen DiT backward graph; batch seven preserves
-    # about 8 GiB of headroom while removing the second microstep gap.
-    batch_size: 7
-    gradient_accumulation_steps: 1
+    # Preserve the original effective batch eight. The full functional teacher
+    # now occupies otherwise-unused GPU headroom, eliminating per-step CPU
+    # gathers and host-to-device copies rather than inflating activations.
+    batch_size: 4
+    gradient_accumulation_steps: 2
     blocks_per_step: 4
     # Defines the fixed 64-artist diagnostic cohort; whole-model mode still
     # optimizes all 320 single teachers.
@@ -943,6 +943,7 @@ kv_reference_direct_delta_320:
       # sixteen random (shard, content, timestep) slices caused synchronous
       # safetensors reads between every DiT pass and left the GPU idle.
       effect_slice_lru_entries: 0
+      gpu_resident_effects: true
       huber_beta: 0.10
       direction_weight: 1.0
       constraint_weight: 1.0
@@ -1023,8 +1024,8 @@ kv_reference_direct_delta_320:
     wandb:
       enabled: true
       project: anima-style-adapter
-      name: kv-reference-direct-delta-r16-320-whole-functional-10k-v1-common4x-b7-from2k
-      id: kv-reference-direct-delta-r16-320-whole-functional-10k-v1-common4x-b7-from2k
+      name: kv-reference-direct-delta-r16-320-whole-functional-10k-v1-common4x-gputeacher-from2k
+      id: kv-reference-direct-delta-r16-320-whole-functional-10k-v1-common4x-gputeacher-from2k
 
 kv_reference_direct_delta_320_sample:
   checkpoint: kv_reference_direct_delta_r16_320_joint_flow_v1/checkpoints/step-0100000.pt

@@ -2163,6 +2163,7 @@ class FunctionalLoRATeacherBank:
         if self.effects is not None:
             positions = torch.tensor(
                 [self.effect_position_by_index[index] for index in indices],
+                device=self.effects.device,
                 dtype=torch.long,
             )
             return self.effects.index_select(0, positions)
@@ -2185,6 +2186,7 @@ class FunctionalLoRATeacherBank:
             # requested rows even though the caller consumes only one slice.
             positions = torch.tensor(
                 [self.effect_position_by_index[index] for index in indices],
+                device=self.effects.device,
                 dtype=torch.long,
             )
             return self.effects[:, content_index, timestep_index].index_select(

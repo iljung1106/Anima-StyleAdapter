@@ -1856,6 +1856,17 @@ def train_direct_reference_kv_delta_320(
             ),
             load_population_mean=False,
         )
+        if bool(whole_model.get("gpu_resident_effects", False)):
+            if functional_bank.effects is None:
+                raise ValueError(
+                    "gpu_resident_effects requires effect_slice_lru_entries=0"
+                )
+            functional_bank.effects = functional_bank.effects.to(device=device)
+            print(
+                "moved full LoRA functional teacher effects to "
+                f"{functional_bank.effects.device}",
+                flush=True,
+            )
         if len(functional_bank.effect_indices) != len(functional_bank.mixtures):
             raise RuntimeError(
                 "Functional teacher cache is incomplete: "
