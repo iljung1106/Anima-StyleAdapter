@@ -896,7 +896,10 @@ kv_reference_direct_delta_320:
     attention_ramp_steps: 500
     human_flow:
       enabled: true
-      batch_size: 4
+      # Two rows leave safe headroom for the frozen DiT backward graph plus
+      # resident teacher/reference banks. Thousands of flow events provide
+      # the required sample count without a risky batch-four peak.
+      batch_size: 2
       # During the first 1k continuation updates, repair the image objective
       # more quickly; afterwards one strong flow update replaces every 20th
       # cheap teacher-distillation update.
