@@ -910,8 +910,11 @@ kv_reference_direct_delta_320:
   training:
     device: cuda
     steps: 10000
-    batch_size: 4
-    gradient_accumulation_steps: 2
+    # Preserve effective batch eight while replacing two batch-four
+    # microsteps with one batch-eight pass. The 80 GB device has sufficient
+    # headroom and this halves fixed host/optimizer gaps between DiT passes.
+    batch_size: 8
+    gradient_accumulation_steps: 1
     blocks_per_step: 4
     # Defines the fixed 64-artist diagnostic cohort; whole-model mode still
     # optimizes all 320 single teachers.
@@ -1020,8 +1023,8 @@ kv_reference_direct_delta_320:
     wandb:
       enabled: true
       project: anima-style-adapter
-      name: kv-reference-direct-delta-r16-320-whole-functional-10k-v1-common4x-from2k
-      id: kv-reference-direct-delta-r16-320-whole-functional-10k-v1-common4x-from2k
+      name: kv-reference-direct-delta-r16-320-whole-functional-10k-v1-common4x-b8-from2k
+      id: kv-reference-direct-delta-r16-320-whole-functional-10k-v1-common4x-b8-from2k
 
 kv_reference_direct_delta_320_sample:
   checkpoint: kv_reference_direct_delta_r16_320_joint_flow_v1/checkpoints/step-0100000.pt
