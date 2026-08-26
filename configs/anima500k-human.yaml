@@ -937,8 +937,16 @@ kv_reference_direct_delta_320:
       direction_weight: 1.0
       constraint_weight: 1.0
       relative_common_weight: 0.5
-      # Fixed for the entire run; it is not estimated from a training batch.
-      common_cap: 0.35
+      # Fixed for the entire run and never estimated from a training batch.
+      # Convex mixtures legitimately share more direction than single/signed
+      # teachers, so each category uses its teacher-calibrated ceiling.
+      common_cap: 0.55
+      common_cap_by_kind:
+        single: 0.30
+        pair: 0.55
+        triple: 0.55
+        amplified: 0.50
+        signed: 0.35
       rms_floor: 0.0001
     human_flow:
       enabled: true

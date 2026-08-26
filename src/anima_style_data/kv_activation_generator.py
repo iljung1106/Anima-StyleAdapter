@@ -2238,9 +2238,8 @@ def train_direct_reference_kv_delta_320(
             selected_blocks = [
                 (first_block + offset) % model.blocks for offset in range(blocks_per_step)
             ] if not whole_enabled or curriculum["block_weight"] > 0 else []
-            active_attention = (
-                attention_weight * min(1.0, relative_step / max(1, attention_ramp))
-                * (curriculum["block_weight"] if whole_enabled else 1.0)
+            active_attention = attention_weight * min(
+                1.0, relative_step / max(1, attention_ramp)
             )
             if accumulation_index == 0:
                 optimizer.zero_grad(set_to_none=True)
@@ -2305,7 +2304,11 @@ def train_direct_reference_kv_delta_320(
                     ).mean()
                     constraint_loss, constraint_metrics = _final_effect_constraints(
                         final_student, final_teacher,
-                        common_cap=float(whole_model.get("common_cap", 0.35)),
+                        common_cap=float(
+                            dict(whole_model.get("common_cap_by_kind", {})).get(
+                                category, whole_model.get("common_cap", 0.55)
+                            )
+                        ),
                         rms_lower=curriculum["rms_lower"],
                         rms_upper=curriculum["rms_upper"],
                         rms_floor=float(whole_model.get("rms_floor", 1e-4)),
@@ -2418,7 +2421,9 @@ def train_direct_reference_kv_delta_320(
                         first_student.float() / scale,
                         beta=0.1,
                     )
-                    loss = loss + consistency_weight * consistency
+                    loss = loss + consistency_weight * consistency * (
+                        curriculum["block_weight"] if whole_enabled else 1.0
+                    )
             (loss / accumulation_steps).backward()
             if accumulation_last:
                 generator_grad, generator_clip_used = _clip_outlier_grad_norm(
@@ -2467,6 +2472,7 @@ def train_direct_reference_kv_delta_320(
                     )
             for key, value in whole_metrics.items():
                 running[key].append(float(value))
+                running[f"{key}_by_kind/{category}"].append(float(value))
             if accumulation_last and step % log_every == 0:
                 row = {key: sum(values) / len(values) for key, values in running.items()}
                 row["generator_lr"] = optimizer.param_groups[0]["lr"]
@@ -2589,7 +2595,11 @@ def train_direct_reference_kv_delta_320(
                         ).mean()
                         _, final_values = _final_effect_constraints(
                             final_student, final_teacher,
-                            common_cap=float(whole_model.get("common_cap", 0.35)),
+                            common_cap=float(
+                                dict(whole_model.get("common_cap_by_kind", {})).get(
+                                    "single", whole_model.get("common_cap", 0.55)
+                                )
+                            ),
                             rms_lower=curriculum["rms_lower"],
                             rms_upper=curriculum["rms_upper"],
                             rms_floor=float(whole_model.get("rms_floor", 1e-4)),

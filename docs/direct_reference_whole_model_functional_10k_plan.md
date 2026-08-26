@@ -89,8 +89,10 @@ L_common_cap = ReLU(C_student - C_max)^2
 따라서 teacher가 실제로 공유하는 방향은 허용하고 student가 그보다 더 한
 방향으로 붕괴하는 경우만 벌점으로 준다. 동시에 `C_max`는 학습 batch의
 평균으로 정하지 않는 고정 상한이며, teacher population 진단으로 정한 뒤 한
-run 동안 변경하지 않는다. 두 항 모두 pairwise cosine을 직접 계산하며 batch
-mean subtraction은 손실 계산 어디에도 사용하지 않는다.
+run 동안 변경하지 않는다. Convex pair/triple teacher가 본래 갖는 공유 방향을
+단일 작가와 같은 상한으로 훼손하지 않도록 `single/pair/triple/amplified/signed`
+범주마다 고정된 `C_max`를 사용한다. 두 항 모두 pairwise cosine을 직접
+계산하며 batch mean subtraction은 손실 계산 어디에도 사용하지 않는다.
 
 출력 크기는 점추정으로 teacher RMS에 강제로 붙이지 않고 허용 구간 안에
 유지한다.
