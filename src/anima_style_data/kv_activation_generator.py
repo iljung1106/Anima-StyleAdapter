@@ -2040,19 +2040,20 @@ def smoke_test_direct_reference_kv_delta_320(
 def sample_direct_reference_kv_delta_320(
     config: dict[str, Any], destination: Path
 ) -> dict[str, Any]:
-    """Render held-out teachers against direct activation predictions."""
+    """Render the historical fixed references and deterministic 4+4 panel."""
 
     from PIL import Image
 
-    from .kv_activation_sampling import (
-        NativeKVActivationInjector,
-        NativeKVFactorInjector,
-        _save_panel,
-    )
+    from .detail_style_training import _loader_config
+    from .global_query_style_tokenizer import MultiPromptDualQueryCachedStyleLoader
+    from .kv_activation_sampling import NativeKVActivationInjector, _save_panel
     from .lora_functional_distillation import _preview_pixels
+    from .query_style_tokenizer import _sampling_reference_inputs, _select_sample_episodes
     from .style_transfer import (
         _load_sampling_vae,
+        _make_sample_sheet,
         _optimize_frozen_anima,
+        _pad_text_conditions,
         _resolve_anima_model,
     )
     from .synthetic_teacher import _sample_anima_batch
@@ -2063,25 +2064,6 @@ def sample_direct_reference_kv_delta_320(
     checkpoint_path = destination / str(sample_cfg["checkpoint"])
     checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     cfg = dict(checkpoint["config"])
-    training = dict(cfg["training"])
-    artist_ids, teacher_down, teacher_up = load_kv_lora_factor_bank(
-        destination / str(cfg["lora_directory"]),
-        blocks=int(cfg.get("blocks", 28)), dtype=torch.float16,
-    )
-    mixture_rows = [
-        row
-        for row in read_records(destination / str(cfg["mixture_manifest"]))
-        if str(row["kind"]) in {"pair", "triple", "amplified", "signed"}
-        and bool(row.get("enabled", True))
-    ]
-    _, validation_artists, _ = _direct_delta_artist_split(
-        artist_ids, mixture_rows,
-        training_artists=int(training.get("training_artists", 256)),
-    )
-    artist_count = min(int(sample_cfg.get("artists", 8)), len(validation_artists))
-    selected = validation_artists[:artist_count]
-    selected_ids = [artist_ids[index] for index in selected]
-
     reader = _load_reader(config, destination, cfg, device)
     reader.load_state_dict(checkpoint["reader"], strict=True)
     reader.requires_grad_(False).eval()
@@ -2089,156 +2071,226 @@ def sample_direct_reference_kv_delta_320(
     architecture = str(model_cfg.pop("architecture", "direct_cross_attention"))
     if architecture != "direct_cross_attention":
         raise RuntimeError("Direct-delta sample received a different architecture")
+    model_state = checkpoint["model"]
     model = ReferenceConditionedKVActivationGenerator(
-        style_dim=int(reader.dim),
-        context_dim=int(teacher_down.shape[-1]),
-        output_dim=int(teacher_up.shape[-2]),
-        blocks=int(teacher_down.shape[1]),
+        style_dim=int(model_state["style_key.weight"].shape[1]),
+        context_dim=int(model_state["context_query.0.weight"].shape[1]),
+        output_dim=int(model_state["output_head.0.weight"].shape[0] // 2),
+        blocks=int(cfg.get("blocks", 28)),
         **model_cfg,
     ).to(device=device, dtype=torch.bfloat16)
-    model.load_state_dict(checkpoint["model"], strict=True)
+    model.load_state_dict(model_state, strict=True)
     model.requires_grad_(False).eval()
-    references = int(sample_cfg.get("references", 4))
-    loader = CachedTeacherReferenceLoader(
-        destination / str(cfg["synthetic_reference_cache"]),
-        split="train", style_ids=selected_ids, batch_size=artist_count,
-        references=int(training.get("single_reference_images", 8)),
-        seed=int(sample_cfg.get("seed", 20260826)),
-        token_lru_shards=int(training.get("token_lru_shards", 8)),
-        strict_style_ids=True,
-    )
-    loaded = loader.load_styles(
-        selected_ids,
-        references_per_style=references,
-        seed=int(sample_cfg.get("reference_seed", 20260826)),
-    )
-    reference_tokens = loaded["tokens"].to(
-        device=device, dtype=torch.bfloat16, non_blocking=True
-    )
-    reference_mask = torch.ones(
-        reference_tokens.shape[:2], device=device, dtype=torch.bool
-    )
-    with torch.autocast("cuda", dtype=torch.bfloat16):
-        style_memory = reader(reference_tokens, reference_mask).tokens
-
-    prepared = load_dual_query_external_sample(config, destination)
-    generation = dict(prepared["cfg"])
-    positive = prepared["positive"].to(device=device, dtype=torch.bfloat16)
-    negative = prepared["negative"].to(device=device, dtype=torch.bfloat16)
-    if positive.ndim == 2:
-        positive = positive[None]
-    if negative.ndim == 2:
-        negative = negative[None]
     anima = _resolve_anima_model(config, destination, device).requires_grad_(False).eval()
     _optimize_frozen_anima(
         anima, low_precision_rmsnorm=True, fuse_attention_projections=True
     )
-    factor_injector = NativeKVFactorInjector(anima)
     activation_injector = NativeKVActivationInjector(anima, model)
-    width, height = int(generation["width"]), int(generation["height"])
-    seed = int(generation["seed"])
-    steps = int(generation["steps"])
-    shift = float(generation.get("flow_shift", 3.0))
-    text_cfg = float(generation["cfg"])
-    sigmas = torch.linspace(1.0, 0.0, steps + 1, device=device, dtype=torch.float32)
-    sigmas = sigmas * shift / (1 + (shift - 1) * sigmas)
-    noise = torch.randn(
-        1, 16, 1, height // 8, width // 8,
-        generator=torch.Generator(device="cpu").manual_seed(seed),
-        dtype=torch.float32,
-    ).to(device=device, dtype=torch.bfloat16)
     batch_size = int(sample_cfg.get("batch_size", 4))
+    strengths = [float(value) for value in sample_cfg.get("strengths", [1.0, 2.0])]
 
-    def denoise(mode: str, strength: float = 1.0) -> torch.Tensor:
+    def denoise(
+        style_memory: torch.Tensor,
+        positive: torch.Tensor,
+        negative: torch.Tensor,
+        noise: torch.Tensor,
+        sigmas: torch.Tensor,
+        seeds: list[int],
+        *,
+        text_cfg: float,
+        strength: float | None,
+    ) -> torch.Tensor:
         values = []
-        for start in range(0, artist_count, batch_size):
-            stop = min(artist_count, start + batch_size)
-            rows = stop - start
-            if mode == "base":
-                factor_injector.disable()
+        for start in range(0, len(seeds), batch_size):
+            stop = min(len(seeds), start + batch_size)
+            if strength is None:
                 activation_injector.disable()
-            elif mode == "teacher":
-                activation_injector.disable()
-                factor_injector.set_factors(
-                    teacher_down[selected[start:stop]].to(
-                        device=device, dtype=torch.bfloat16
-                    ),
-                    teacher_up[selected[start:stop]].to(
-                        device=device, dtype=torch.bfloat16
-                    ),
-                    strength=strength,
-                )
-            elif mode == "predicted":
-                factor_injector.disable()
+            else:
                 activation_injector.set_style(
                     style_memory[start:stop], strength=strength
                 )
-            else:
-                raise ValueError(f"Unknown direct-delta sample mode: {mode}")
             with torch.autocast("cuda", dtype=torch.bfloat16):
                 values.append(_sample_anima_batch(
                     anima,
-                    noise.repeat(rows, 1, 1, 1, 1),
-                    positive.expand(rows, -1, -1),
-                    negative.expand(rows, -1, -1),
+                    noise[start:stop],
+                    positive[start:stop],
+                    negative[start:stop],
                     sigmas,
                     text_cfg=text_cfg,
                     speed=None,
-                    generation_seeds=[seed] * rows,
+                    generation_seeds=seeds[start:stop],
                 ).cpu())
         return torch.cat(values)
-
-    baseline = denoise("base")
-    teacher = denoise("teacher")
-    strengths = [float(value) for value in sample_cfg.get("strengths", [1.0, 2.0])]
-    predicted = {strength: denoise("predicted", strength) for strength in strengths}
-    factor_injector.close()
-    activation_injector.close()
-    torch.cuda.empty_cache()
 
     vae = _load_sampling_vae(config, destination).to(
         device=device, dtype=torch.bfloat16
     ).requires_grad_(False).eval()
-    latent_groups = {
-        "Frozen Anima": baseline,
-        "Teacher K/V-LoRA 1x": teacher,
-        **{f"Predicted {strength:g}x": value for strength, value in predicted.items()},
-    }
-    images: dict[str, list[Image.Image]] = {}
-    reference_cache = destination / str(cfg["synthetic_reference_cache"])
-    manifest = {
-        int(row["id"]): row
-        for row in read_records(
-            reference_cache.parent / "manifest.parquet"
-        )
-    }
-    images["Styled references"] = [
-        Image.open(manifest[int(ids[0])]["local_path"]).convert("RGB")
-        for ids in loaded["ids"]
-    ]
-    for label, latents in latent_groups.items():
+
+    def decode(latents: torch.Tensor) -> list[Image.Image]:
         decoded = []
-        for start in range(0, artist_count, batch_size):
+        for start in range(0, len(latents), batch_size):
             with torch.autocast("cuda", dtype=torch.bfloat16):
                 decoded.extend(_preview_pixels(
                     vae.decode_to_pixels(latents[start : start + batch_size].to(device))
                 ))
-        images[label] = decoded
+        return decoded
+
     output = destination / str(sample_cfg["output_directory"])
     output.mkdir(parents=True, exist_ok=True)
-    panel = _save_panel(
-        output, selected_ids, images, list(images),
+
+    prepared = load_dual_query_external_sample(config, destination)
+    generation = dict(prepared["cfg"])
+    fixed_tokens = prepared["reference_tokens"][:, None].to(
+        device=device, dtype=torch.bfloat16
+    )
+    fixed_mask = torch.ones(fixed_tokens.shape[:2], device=device, dtype=torch.bool)
+    with torch.autocast("cuda", dtype=torch.bfloat16):
+        fixed_memory = reader(fixed_tokens, fixed_mask).tokens
+    fixed_rows = int(fixed_tokens.shape[0])
+    fixed_positive = prepared["positive"]
+    fixed_negative = prepared["negative"]
+    if fixed_positive.ndim == 2:
+        fixed_positive = fixed_positive[None]
+    if fixed_negative.ndim == 2:
+        fixed_negative = fixed_negative[None]
+    fixed_positive = fixed_positive.to(device=device, dtype=torch.bfloat16).expand(fixed_rows, -1, -1)
+    fixed_negative = fixed_negative.to(device=device, dtype=torch.bfloat16).expand(fixed_rows, -1, -1)
+    fixed_seed = int(generation["seed"])
+    fixed_seeds = [fixed_seed] * fixed_rows
+    width, height = int(generation["width"]), int(generation["height"])
+    fixed_noise = torch.randn(
+        1, 16, 1, height // 8, width // 8,
+        generator=torch.Generator(device="cpu").manual_seed(fixed_seed),
+        dtype=torch.float32,
+    ).to(device=device, dtype=torch.bfloat16).expand(fixed_rows, -1, -1, -1, -1)
+    steps = int(generation["steps"])
+    shift = float(generation.get("flow_shift", 3.0))
+    fixed_sigmas = torch.linspace(1.0, 0.0, steps + 1, device=device)
+    fixed_sigmas = fixed_sigmas * shift / (1 + (shift - 1) * fixed_sigmas)
+    fixed_base = denoise(
+        fixed_memory, fixed_positive, fixed_negative, fixed_noise, fixed_sigmas,
+        fixed_seeds, text_cfg=float(generation["cfg"]), strength=None,
+    )
+    fixed_predicted = {
+        strength: denoise(
+            fixed_memory, fixed_positive, fixed_negative, fixed_noise, fixed_sigmas,
+            fixed_seeds, text_cfg=float(generation["cfg"]), strength=strength,
+        )
+        for strength in strengths
+    }
+    fixed_images: dict[str, list[Image.Image]] = {
+        "Fixed reference": [Image.open(path).convert("RGB") for path in prepared["paths"]],
+        "Frozen Anima": decode(fixed_base),
+        **{f"Predicted {strength:g}x": decode(values) for strength, values in fixed_predicted.items()},
+    }
+    fixed_output = output / "fixed-reference"
+    fixed_output.mkdir(parents=True, exist_ok=True)
+    fixed_panel = _save_panel(
+        fixed_output, [f"TestSample{index + 1}" for index in range(fixed_rows)],
+        fixed_images, list(fixed_images),
         tile_width=int(sample_cfg.get("panel_tile_width", 384)),
     )
+
+    detail_cfg = dict(config["detail_preserving_style_cross_attention"])
+    panel_loaders = []
+    for split in (str(detail_cfg.get("train_split", "train")), str(detail_cfg.get("validation_split", "validation"))):
+        loader_cfg = _loader_config(config, detail_cfg, split=split)
+        loader_cfg["ram_resident_tokens"] = False
+        panel_loaders.append(MultiPromptDualQueryCachedStyleLoader(destination, loader_cfg))
+    panel_sampling = dict(detail_cfg.get("sampling", {}))
+    panel_seed = int(panel_sampling.get("seed", detail_cfg.get("seed", 0) ^ 0x5A17))
+    requests = [
+        ("train", panel_loaders[0], episode, panel_seed + index * 10_007)
+        for index, episode in enumerate(_select_sample_episodes(panel_loaders[0], 4))
+    ] + [
+        ("validation", panel_loaders[1], episode, panel_seed + (index + 4) * 10_007)
+        for index, episode in enumerate(_select_sample_episodes(panel_loaders[1], 4))
+    ]
+    batches = [loader.load_step(episode) for _, loader, episode, _ in requests]
+    panel_memory = []
+    for batch in batches:
+        references, mask = _sampling_reference_inputs(batch, device, "heldout")
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            panel_memory.append(reader(references, mask).tokens[:1])
+    panel_memory_tensor = torch.cat(panel_memory)
+    panel_positive = torch.cat([batch["conditioning"][:1] for batch in batches]).to(device=device, dtype=torch.bfloat16)
+    null_text = load_file(requests[0][1].text_root / "null_conditioning.safetensors", device="cpu")["empty_prompt"]
+    if null_text.ndim == 3:
+        null_text = null_text[0]
+    panel_negative = _pad_text_conditions(
+        [null_text] * len(requests), requests[0][1].text_conditioning_length
+    ).to(device=device, dtype=torch.bfloat16)
+    panel_width = int(panel_sampling.get("width", 768))
+    panel_height = int(panel_sampling.get("height", 768))
+    panel_seeds = [seed for _, _, _, seed in requests]
+    panel_noise = torch.cat([
+        torch.randn(
+            1, 16, 1, panel_height // 8, panel_width // 8,
+            generator=torch.Generator(device="cpu").manual_seed(seed), dtype=torch.float32,
+        )
+        for seed in panel_seeds
+    ]).to(device=device, dtype=torch.bfloat16)
+    panel_steps = int(panel_sampling.get("steps", 30))
+    panel_shift = float(panel_sampling.get("flow_shift", 3.0))
+    panel_sigmas = torch.linspace(1.0, 0.0, panel_steps + 1, device=device)
+    panel_sigmas = panel_sigmas * panel_shift / (1 + (panel_shift - 1) * panel_sigmas)
+    panel_base = denoise(
+        panel_memory_tensor, panel_positive, panel_negative, panel_noise, panel_sigmas,
+        panel_seeds, text_cfg=float(panel_sampling.get("text_cfg", 4.0)), strength=None,
+    )
+    panel_predicted = {
+        strength: denoise(
+            panel_memory_tensor, panel_positive, panel_negative, panel_noise, panel_sigmas,
+            panel_seeds, text_cfg=float(panel_sampling.get("text_cfg", 4.0)), strength=strength,
+        )
+        for strength in strengths
+    }
+    panel_base_images = decode(panel_base)
+    panel_predicted_images = {strength: decode(values) for strength, values in panel_predicted.items()}
+    panel_output = output / "panel"
+    panel_output.mkdir(parents=True, exist_ok=True)
+    panel_sheets: list[str] = []
+    for index, ((split, loader, _, _), batch) in enumerate(zip(requests, batches, strict=True)):
+        for strength in strengths:
+            sheet = _make_sample_sheet(
+                panel_predicted_images[strength][index], loader, {"episodes": [batch["episodes"][0]]},
+                base_generated=panel_base_images[index],
+                generated_label=f"Direct reference delta {strength:g}x (heldout) — {batch['episodes'][0].style_id}",
+            )
+            path = panel_output / f"{split}-{index % 4}-strength-{strength:g}x-sheet.png"
+            sheet.save(path)
+            panel_sheets.append(str(path))
+    overview_images: dict[str, list[Image.Image]] = {
+        "Target": [
+            Image.open(loader.style_by_id[int(batch["episodes"][0].target_id)]["local_path"]).convert("RGB")
+            for (_, loader, _, _), batch in zip(requests, batches, strict=True)
+        ],
+        "Reference 1": [
+            Image.open(loader.style_by_id[int(batch["episodes"][0].reference_ids[0])]["local_path"]).convert("RGB")
+            for (_, loader, _, _), batch in zip(requests, batches, strict=True)
+        ],
+        "Frozen Anima": panel_base_images,
+        **{f"Predicted {strength:g}x": images for strength, images in panel_predicted_images.items()},
+    }
+    panel_overview = _save_panel(
+        panel_output,
+        [f"{split}-{index % 4}: {batch['episodes'][0].style_id}" for index, ((split, _, _, _), batch) in enumerate(zip(requests, batches, strict=True))],
+        overview_images, list(overview_images),
+        tile_width=int(sample_cfg.get("panel_tile_width", 384)),
+    )
+    activation_injector.close()
+    torch.cuda.empty_cache()
     summary = {
+        "sampling_contract": "fixed_test_sample_1_7_and_episodic_4_plus_4_v1",
         "checkpoint": str(checkpoint_path),
-        "panel": str(panel),
-        "heldout_artist_indices": selected,
-        "heldout_artist_ids": selected_ids,
-        "reference_ids": [list(ids) for ids in loaded["ids"]],
+        "fixed_reference_panel": str(fixed_panel),
+        "panel_overview": str(panel_overview),
+        "panel_sheets": panel_sheets,
+        "panel_episode_indices": [episode for _, _, episode, _ in requests],
+        "panel_style_ids": [batch["episodes"][0].style_id for batch in batches],
         "strengths": strengths,
         "prompt": str(generation["prompt"]),
-        "seed": seed,
+        "seed": fixed_seed,
     }
     write_json(output / "summary.json", summary)
     return summary
@@ -2279,6 +2331,23 @@ def train_scheduled_direct_reference_kv_delta_320(
             "diagnostics/kv-reference-direct-delta-r16-320",
         )
     )
+    sampling_contract = "fixed_test_sample_1_7_and_episodic_4_plus_4_v1"
+    for target in range(sample_every, completed + 1, sample_every):
+        checkpoint = checkpoints / f"step-{target:07d}.pt"
+        summary_path = destination / f"{sample_root}-step{target}" / "summary.json"
+        current_contract = None
+        if summary_path.exists():
+            import json
+            current_contract = json.loads(summary_path.read_text(encoding="utf-8")).get("sampling_contract")
+        if checkpoint.exists() and current_contract != sampling_contract:
+            sample_config = copy.deepcopy(config)
+            sample_cfg = sample_config["kv_reference_direct_delta_320_sample"]
+            sample_cfg["checkpoint"] = str(checkpoint.relative_to(destination))
+            sample_cfg["output_directory"] = f"{sample_root}-step{target}"
+            samples.append(sample_direct_reference_kv_delta_320(sample_config, destination))
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
     for target in targets:
         segments.append(
             train_direct_reference_kv_delta_320(
