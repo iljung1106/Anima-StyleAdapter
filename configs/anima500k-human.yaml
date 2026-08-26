@@ -946,8 +946,8 @@ kv_reference_direct_delta_320:
     wandb:
       enabled: true
       project: anima-style-adapter
-      name: kv-reference-direct-delta-r16-320-joint-flow-v1
-      id: kv-reference-direct-delta-r16-320-joint-flow-v1
+      name: kv-reference-direct-delta-r16-320-joint-flow-common-v1
+      id: kv-reference-direct-delta-r16-320-joint-flow-common-v1
 
 kv_reference_direct_delta_320_sample:
   checkpoint: kv_reference_direct_delta_r16_320_joint_flow_v1/checkpoints/step-0100000.pt
