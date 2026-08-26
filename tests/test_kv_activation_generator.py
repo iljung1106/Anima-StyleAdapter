@@ -390,6 +390,7 @@ class _FakeCrossAttention(nn.Module):
         super().__init__()
         self.n_heads = 2
         self.head_dim = 4
+        self.q_proj = nn.Linear(8, 8, bias=False)
         self.k_proj = nn.Linear(6, 8, bias=False)
         self.v_proj = nn.Linear(6, 8, bias=False)
         self.q_norm = _ScaleNorm()
@@ -412,6 +413,24 @@ class _ConstantDelta(nn.Module):
     ) -> torch.Tensor:
         assert block == 0
         return context.new_ones(len(context), 2, context.shape[1], 8)
+
+
+class _ConstantKVOQDelta(_ConstantDelta):
+    enable_qo = True
+    stream_dim = 8
+
+    def prepare_stream_codes(self, style: torch.Tensor) -> torch.Tensor:
+        return style.new_zeros(len(style), 1, 2, 1)
+
+    def stream_delta(
+        self,
+        values: torch.Tensor,
+        codes: torch.Tensor,
+        block: int,
+        kind: int,
+    ) -> torch.Tensor:
+        assert codes.shape == (len(values), 1, 2, 1)
+        return torch.full_like(values, float(kind + 1))
 
 
 def test_native_activation_injector_uses_styled_memory_without_base_input() -> None:
@@ -439,6 +458,50 @@ def test_native_activation_injector_can_drop_one_masked_block_for_a_group() -> N
         anima.blocks[0].cross_attn.k_proj(context), baseline
     )
     injector.close()
+
+
+def test_native_activation_injector_adds_reference_conditioned_q_and_o() -> None:
+    anima = _FakeAnima()
+    injector = NativeKVActivationInjector(anima, _ConstantKVOQDelta())
+    values = torch.randn(4, 5, 8)
+    baseline_q = anima.blocks[0].cross_attn.q_proj(values)
+    baseline_o = anima.blocks[0].cross_attn.output_proj(values)
+    injector.set_style(torch.randn(2, 3, 7))
+
+    torch.testing.assert_close(
+        anima.blocks[0].cross_attn.q_proj(values) - baseline_q,
+        torch.ones_like(baseline_q),
+    )
+    torch.testing.assert_close(
+        anima.blocks[0].cross_attn.output_proj(values) - baseline_o,
+        torch.full_like(baseline_o, 2.0),
+    )
+    injector.close()
+
+
+def test_direct_generator_qo_path_is_style_conditioned_and_differentiable() -> None:
+    model = ReferenceConditionedKVActivationGenerator(
+        style_dim=12,
+        context_dim=10,
+        output_dim=8,
+        blocks=2,
+        hidden_dim=8,
+        heads=2,
+        ff_dim=16,
+        enable_qo=True,
+        stream_dim=8,
+        stream_rank=3,
+        output_init_scale=0.01,
+    )
+    style = torch.randn(2, 4, 12)
+    values = torch.randn(2, 5, 8)
+    codes = model.prepare_stream_codes(style)
+    delta = model.stream_delta(values, codes, 1, 0)
+
+    assert codes.shape == (2, 2, 2, 8)
+    assert delta.shape == values.shape
+    delta.square().mean().backward()
+    assert model.stream_up[1][0].weight.grad is not None
 
 
 def test_native_probe_does_not_renormalize_cached_real_queries() -> None:

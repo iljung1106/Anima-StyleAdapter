@@ -66,6 +66,9 @@ class ReferenceConditionedKVActivationGenerator(nn.Module):
         normalize_style: bool = True,
         normalize_attended: bool = True,
         use_block_embedding: bool = True,
+        enable_qo: bool = False,
+        stream_dim: int = 2048,
+        stream_rank: int = 32,
     ) -> None:
         super().__init__()
         if hidden_dim % heads:
@@ -79,6 +82,11 @@ class ReferenceConditionedKVActivationGenerator(nn.Module):
         self.hidden_dim = int(hidden_dim)
         self.heads = int(heads)
         self.head_dim = hidden_dim // heads
+        self.enable_qo = bool(enable_qo)
+        self.stream_dim = int(stream_dim)
+        self.stream_rank = int(stream_rank)
+        if self.enable_qo and self.stream_rank <= 0:
+            raise ValueError("stream_rank must be positive when Q/O is enabled")
         self.style_norm = (
             nn.LayerNorm(style_dim) if bool(normalize_style) else nn.Identity()
         )
@@ -103,6 +111,36 @@ class ReferenceConditionedKVActivationGenerator(nn.Module):
             for _ in range(blocks)
         )
         self.log_gain = nn.Parameter(torch.zeros(blocks, 2))
+        if self.enable_qo:
+            # Two learned queries per block read the full visual style memory:
+            # one conditions Q and the other conditions O. The resulting code
+            # gates a block-local low-rank projection of the native projection
+            # input, preserving token dependence without training the base DiT.
+            self.stream_style_queries = nn.Parameter(
+                torch.empty(blocks, 2, hidden_dim)
+            )
+            self.stream_code_norm = nn.LayerNorm(hidden_dim)
+            self.stream_gates = nn.ModuleList(
+                nn.ModuleList(
+                    nn.Linear(hidden_dim, stream_rank, bias=True)
+                    for _ in range(2)
+                )
+                for _ in range(blocks)
+            )
+            self.stream_down = nn.ModuleList(
+                nn.ModuleList(
+                    nn.Linear(stream_dim, stream_rank, bias=False)
+                    for _ in range(2)
+                )
+                for _ in range(blocks)
+            )
+            self.stream_up = nn.ModuleList(
+                nn.ModuleList(
+                    nn.Linear(stream_rank, stream_dim, bias=False)
+                    for _ in range(2)
+                )
+                for _ in range(blocks)
+            )
         self.reset_parameters(float(output_init_scale))
 
     def reset_parameters(self, output_init_scale: float) -> None:
@@ -111,6 +149,17 @@ class ReferenceConditionedKVActivationGenerator(nn.Module):
                 nn.init.xavier_uniform_(module.weight)
         if self.block_embedding is not None:
             nn.init.normal_(self.block_embedding.weight, std=self.hidden_dim**-0.5)
+        if self.enable_qo:
+            nn.init.normal_(
+                self.stream_style_queries, std=self.hidden_dim**-0.5
+            )
+            for block_gates in self.stream_gates:
+                for gate in block_gates:
+                    nn.init.zeros_(gate.bias)
+            for block_heads in self.stream_up:
+                for head in block_heads:
+                    with torch.no_grad():
+                        head.weight.mul_(output_init_scale)
         for head in self.output_head:
             with torch.no_grad():
                 head.weight.mul_(output_init_scale)
@@ -159,6 +208,52 @@ class ReferenceConditionedKVActivationGenerator(nn.Module):
         ).transpose(1, 2)
         gain = self.log_gain[block].float().clamp(-4.0, 4.0).exp().to(output.dtype)
         return output * gain[None, :, None, None]
+
+    def prepare_stream_codes(self, style_memory: torch.Tensor) -> torch.Tensor:
+        """Read reference memory once for all block-local Q/O adapters."""
+        if not self.enable_qo:
+            raise RuntimeError("Q/O stream modulation is disabled")
+        style = self.style_norm(style_memory)
+        key = self.style_key(style)
+        value = self.style_value(style)
+        batch = int(style.shape[0])
+        queries = self.stream_style_queries.reshape(
+            self.blocks * 2, self.hidden_dim
+        )[None].expand(batch, -1, -1)
+        queries = queries.reshape(
+            batch, self.blocks * 2, self.heads, self.head_dim
+        ).transpose(1, 2)
+        key = key.reshape(
+            batch, style.shape[1], self.heads, self.head_dim
+        ).transpose(1, 2)
+        value = value.reshape(
+            batch, style.shape[1], self.heads, self.head_dim
+        ).transpose(1, 2)
+        codes = F.scaled_dot_product_attention(queries, key, value)
+        codes = codes.transpose(1, 2).reshape(
+            batch, self.blocks, 2, self.hidden_dim
+        )
+        return self.stream_code_norm(codes)
+
+    def stream_delta(
+        self,
+        stream_input: torch.Tensor,
+        stream_codes: torch.Tensor,
+        block_index: int,
+        kind: int,
+    ) -> torch.Tensor:
+        """Apply a reference-gated low-rank delta to Q (0) or O (1)."""
+        if not self.enable_qo:
+            raise RuntimeError("Q/O stream modulation is disabled")
+        if stream_input.shape[-1] != self.stream_dim:
+            raise ValueError(
+                f"Expected stream width {self.stream_dim}, "
+                f"got {stream_input.shape[-1]}"
+            )
+        code = stream_codes[:, block_index, kind]
+        gate = torch.tanh(self.stream_gates[block_index][kind](code))
+        hidden = self.stream_down[block_index][kind](stream_input)
+        return self.stream_up[block_index][kind](hidden * gate[:, None, :])
 
 
 class _OperatorCrossBlock(nn.Module):

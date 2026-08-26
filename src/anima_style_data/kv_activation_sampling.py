@@ -147,6 +147,7 @@ class NativeKVActivationInjector:
     def __init__(self, anima: torch.nn.Module, model: torch.nn.Module) -> None:
         self.model = model
         self.style_memory: torch.Tensor | None = None
+        self.stream_codes: torch.Tensor | None = None
         self.strength = 1.0
         self.enabled = False
         self.block_mask: torch.Tensor | None = None
@@ -172,6 +173,33 @@ class NativeKVActivationInjector:
                 )
             else:
                 raise TypeError("Anima cross-attention exposes no text K/V projection")
+            if bool(getattr(model, "enable_qo", False)):
+                if not hasattr(cross, "q_proj") or not hasattr(cross, "output_proj"):
+                    raise TypeError(
+                        "Q/O activation generation requires q_proj and output_proj"
+                    )
+                stream_dim = int(model.stream_dim)
+                dimensions = (
+                    int(cross.q_proj.in_features),
+                    int(cross.q_proj.out_features),
+                    int(cross.output_proj.in_features),
+                    int(cross.output_proj.out_features),
+                )
+                if dimensions != (stream_dim,) * 4:
+                    raise ValueError(
+                        f"Q/O projection widths {dimensions} do not match "
+                        f"configured stream_dim={stream_dim}"
+                    )
+                self.handles.append(
+                    cross.q_proj.register_forward_hook(
+                        self._stream_hook(block_index, 0)
+                    )
+                )
+                self.handles.append(
+                    cross.output_proj.register_forward_hook(
+                        self._stream_hook(block_index, 1)
+                    )
+                )
 
     def set_style(
         self,
@@ -183,6 +211,11 @@ class NativeKVActivationInjector:
         if style_memory.ndim != 3:
             raise ValueError("style_memory must be [style,slots,dim]")
         self.style_memory = style_memory
+        self.stream_codes = (
+            self.model.prepare_stream_codes(style_memory)
+            if bool(getattr(self.model, "enable_qo", False))
+            else None
+        )
         self.strength = float(strength)
         if block_mask is not None and block_mask.ndim != 1:
             raise ValueError("block_mask must be one-dimensional")
@@ -192,6 +225,7 @@ class NativeKVActivationInjector:
     def disable(self) -> None:
         self.enabled = False
         self.block_mask = None
+        self.stream_codes = None
 
     def _block_enabled(self, block_index: int) -> bool:
         return self.block_mask is None or bool(self.block_mask[block_index].item())
@@ -211,6 +245,26 @@ class NativeKVActivationInjector:
             device=context.device, dtype=context.dtype
         )
         return self.model(style, context, block_index) * self.strength
+
+    def _stream_delta(
+        self, values: torch.Tensor, block_index: int, kind: int
+    ) -> torch.Tensor:
+        if self.stream_codes is None:
+            raise RuntimeError("No active Q/O stream codes")
+        codes = _repeat_factor_rows(self.stream_codes, int(values.shape[0]))
+        return self.model.stream_delta(
+            values, codes, block_index, kind
+        ) * self.strength
+
+    def _stream_hook(self, block_index: int, kind: int):
+        def hook(module, inputs, output):
+            if not self.enabled or not self._block_enabled(block_index):
+                return output
+            return output + self._stream_delta(
+                inputs[0], block_index, kind
+            ).to(output.dtype)
+
+        return hook
 
     def _fused_hook(self, block_index: int):
         def hook(module, inputs, output):
