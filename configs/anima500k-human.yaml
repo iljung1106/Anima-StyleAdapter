@@ -943,7 +943,12 @@ kv_reference_direct_delta_320:
       huber_beta: 0.10
       direction_weight: 1.0
       constraint_weight: 1.0
-      relative_common_weight: 0.5
+      # Common collapse was still rising at 2k while these terms contributed
+      # only about five percent of the whole loss. Keep the already-effective
+      # RMS band unchanged and strengthen only the two common penalties.
+      common_cap_weight: 4.0
+      relative_common_weight: 2.0
+      rms_band_weight: 1.0
       # Fixed for the entire run and never estimated from a training batch.
       # Convex mixtures legitimately share more direction than single/signed
       # teachers, so each category uses its teacher-calibrated ceiling.
@@ -1015,8 +1020,8 @@ kv_reference_direct_delta_320:
     wandb:
       enabled: true
       project: anima-style-adapter
-      name: kv-reference-direct-delta-r16-320-whole-functional-10k-v1
-      id: kv-reference-direct-delta-r16-320-whole-functional-10k-v1
+      name: kv-reference-direct-delta-r16-320-whole-functional-10k-v1-common4x-from2k
+      id: kv-reference-direct-delta-r16-320-whole-functional-10k-v1-common4x-from2k
 
 kv_reference_direct_delta_320_sample:
   checkpoint: kv_reference_direct_delta_r16_320_joint_flow_v1/checkpoints/step-0100000.pt

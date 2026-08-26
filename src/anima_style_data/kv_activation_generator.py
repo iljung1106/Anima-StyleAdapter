@@ -483,6 +483,8 @@ def _final_effect_constraints(
     common_cap: float,
     rms_lower: float,
     rms_upper: float,
+    common_cap_weight: float = 1.0,
+    rms_band_weight: float = 1.0,
     rms_floor: float = 1e-4,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """Absolute common-direction cap and an output-RMS hinge band.
@@ -525,11 +527,15 @@ def _final_effect_constraints(
     upper_violation = F.relu(ratio - float(rms_upper))
     upper_loss = upper_violation.square().mean()
     band_loss = lower_loss + upper_loss
-    return common_cap_loss + band_loss, {
+    weighted_common_cap = float(common_cap_weight) * common_cap_loss
+    weighted_rms_band = float(rms_band_weight) * band_loss
+    return weighted_common_cap + weighted_rms_band, {
         "common_cap_loss": common_cap_loss.detach(),
+        "common_cap_weighted_loss": weighted_common_cap.detach(),
         "relative_common_loss": relative_common.detach(),
         "positive_pairwise_cosine": positive_pairwise.detach(),
         "rms_band_loss": band_loss.detach(),
+        "rms_band_weighted_loss": weighted_rms_band.detach(),
         "rms_ratio": ratio.mean().detach(),
         "rms_lower_violation_rate": lower_rate.detach(),
         "rms_upper_violation_rate": (upper_violation > 0).float().mean().detach(),
@@ -2343,24 +2349,35 @@ def train_direct_reference_kv_delta_320(
                         ),
                         rms_lower=curriculum["rms_lower"],
                         rms_upper=curriculum["rms_upper"],
+                        common_cap_weight=float(
+                            whole_model.get("common_cap_weight", 1.0)
+                        ),
+                        rms_band_weight=float(
+                            whole_model.get("rms_band_weight", 1.0)
+                        ),
                         rms_floor=float(whole_model.get("rms_floor", 1e-4)),
                     )
                     relative_common = _excess_common_direction_loss(
                         final_student, final_teacher
                     )
+                    relative_common_weighted = float(
+                        whole_model.get("relative_common_weight", 0.5)
+                    ) * relative_common
                     whole_loss = (
                         final_huber
                         + float(whole_model.get("direction_weight", 1.0))
                         * (1.0 - final_cosine)
                         + float(whole_model.get("constraint_weight", 1.0))
                         * constraint_loss
-                        + float(whole_model.get("relative_common_weight", 0.5))
-                        * relative_common
+                        + relative_common_weighted
                     )
                     whole_metrics = {
                         "whole/loss": whole_loss.detach(),
                         "whole/normalized_huber": final_huber.detach(),
                         "whole/cosine": final_cosine.detach(),
+                        "whole/relative_common_weighted_loss": (
+                            relative_common_weighted.detach()
+                        ),
                         **{f"whole/{key}": value for key, value in constraint_metrics.items()},
                     }
                 block_losses = []
