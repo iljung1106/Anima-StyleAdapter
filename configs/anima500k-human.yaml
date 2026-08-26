@@ -898,10 +898,10 @@ kv_reference_direct_delta_320:
     betas: [0.9, 0.95]
     adam_eps: 0.00000001
     weight_decay: 0.01
-    # Second smoke unclipped p99: generator 1064, Reader 71.2.  Keep ordinary
-    # updates untouched and clip only values above the observed tail.
-    max_grad_norm: 1100.0
-    reader_max_grad_norm: 75.0
+    # Final smoke unclipped p99/max: generator 4481/4544, Reader 3.06/3.20.
+    # Keep ordinary updates untouched and clip only values beyond that tail.
+    max_grad_norm: 5000.0
+    reader_max_grad_norm: 5.0
     fused_adamw: true
     log_every: 10
     validation_every: 250
