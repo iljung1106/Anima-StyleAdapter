@@ -22,7 +22,7 @@ def main() -> None:
     sample = config["kv_reference_direct_delta_320_sample"]
     sample["checkpoint"] = args.checkpoint
     sample["output_directory"] = args.output_directory
-    result = sample_direct_reference_kv_delta_320(config, args.destination)
+    result = sample_direct_reference_kv_delta_320(config, args.destination.resolve())
     print(json.dumps(result, indent=2))
 
 
