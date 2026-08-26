@@ -1730,6 +1730,38 @@ def train_direct_reference_kv_delta_320(
         if str(row["kind"]) in {"pair", "triple", "amplified", "signed"}
         and (whole_requested or bool(row.get("enabled", True)))
     ]
+    if whole_requested:
+        reference_manifest = (
+            destination / str(cfg["mixture_reference_cache"]) / "manifest.parquet"
+        )
+        available_reference_styles = {
+            str(row["style_id"])
+            for row in read_records(reference_manifest)
+            if str(row.get("split", "train")) == "train"
+        }
+        missing_reference_rows = [
+            row for row in raw_mixture_rows
+            if str(row["mixture_style_id"]) not in available_reference_styles
+        ]
+        if missing_reference_rows and bool(
+            dict(training.get("whole_model_functional", {})).get(
+                "require_all_mixture_references", True
+            )
+        ):
+            missing_by_kind = {
+                kind: sum(str(row["kind"]) == kind for row in missing_reference_rows)
+                for kind in ("pair", "triple", "amplified", "signed")
+            }
+            raise RuntimeError(
+                "Whole-model functional training requires visual tokens for every "
+                f"mixture; missing={len(missing_reference_rows)} "
+                f"by_kind={missing_by_kind} first_ids="
+                f"{[row['mixture_style_id'] for row in missing_reference_rows[:8]]}"
+            )
+        raw_mixture_rows = [
+            row for row in raw_mixture_rows
+            if str(row["mixture_style_id"]) in available_reference_styles
+        ]
     train_artists, validation_artists, mixture_rows = _direct_delta_artist_split(
         artist_ids,
         raw_mixture_rows,

@@ -47,6 +47,9 @@ final-velocity cache:
 
 Mixture는 새로 무작위 생성하지 않고 기존 materialized mixture reference와
 동일한 style ID와 signed/amplified weight를 사용한다.
+학습 시작 전 256개 mixture 모두에 train-split visual reference token이 있는지
+검증하며 하나라도 빠지면 즉시 중단한다. final velocity만 있고 대응 reference가
+없는 teacher effect는 styled-reference student의 학습 샘플로 사용할 수 없다.
 
 320 single teacher는 모두 optimization에 사용한다. 과거의 64-artist holdout은
 동일한 fixed 진단 cohort로 유지하지만 이 run에서는 teacher holdout이 아니다;

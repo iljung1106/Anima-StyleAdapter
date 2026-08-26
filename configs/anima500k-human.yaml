@@ -932,6 +932,7 @@ kv_reference_direct_delta_320:
     attention_ramp_steps: 500
     whole_model_functional:
       enabled: true
+      require_all_mixture_references: true
       effect_slice_lru_entries: 16
       huber_beta: 0.10
       direction_weight: 1.0
