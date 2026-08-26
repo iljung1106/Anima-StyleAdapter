@@ -2309,6 +2309,38 @@ def train_direct_reference_kv_delta_320(
                 running["generator_grad_clip_threshold"].append(generator_clip_used)
                 running["reader_grad_clip_threshold"].append(reader_clip_used)
                 running["update/human_flow"].append(1.0)
+                if accumulation_last and step % log_every == 0:
+                    row = {
+                        key: sum(values) / len(values)
+                        for key, values in running.items()
+                    }
+                    row["generator_lr"] = optimizer.param_groups[0]["lr"]
+                    row["reader_lr"] = optimizer.param_groups[1]["lr"]
+                    print(
+                        f"Direct reference flow-only step={step}/{steps} {row}",
+                        flush=True,
+                    )
+                    if wandb_run is not None:
+                        wandb_run.log(
+                            {f"train/{key}": value for key, value in row.items()},
+                            step=step,
+                        )
+                    running.clear()
+                if accumulation_last and (
+                    step % checkpoint_every == 0 or step == steps
+                ):
+                    for path in (
+                        state_path,
+                        checkpoints / f"step-{step:07d}.pt",
+                    ):
+                        _save_training_state(
+                            path,
+                            step=step,
+                            model=model,
+                            reader=reader,
+                            optimizer=optimizer,
+                            cfg=cfg,
+                        )
                 continue
 
             rng = random.Random(seed + micro_step * 1_000_003)

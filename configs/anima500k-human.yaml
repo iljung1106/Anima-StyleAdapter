@@ -883,7 +883,7 @@ kv_reference_activation_generator:
 # existing 64-teacher materialized mixtures remain compositional examples;
 # their component artists are forced into the 256-artist training split.
 kv_reference_direct_delta_320:
-  output_directory: kv_reference_direct_delta_r16_320_flow_only_5k_v1
+  output_directory: kv_reference_direct_delta_r16_320_flow_only_5k_v2
   # Fresh generator and optimizer. Reader alone is initialized from bootstrap.
   seed: 20260826
   blocks: 28
@@ -1025,15 +1025,15 @@ kv_reference_direct_delta_320:
     checkpoint_every: 500
     sample_every: 0
     sample_steps: [500, 1000, 2000, 5000]
-    sample_output_root: diagnostics/kv-reference-direct-delta-r16-320-flow-only-5k-v1
+    sample_output_root: diagnostics/kv-reference-direct-delta-r16-320-flow-only-5k-v2
     # The output directory is new, so the first segment is fresh. Subsequent
     # 500 -> 1k -> 2k -> 5k sampling segments resume only this same run.
     resume: true
     wandb:
       enabled: true
       project: anima-style-adapter
-      name: kv-reference-direct-delta-r16-320-flow-only-5k-v1
-      id: kv-reference-direct-delta-r16-320-flow-only-5k-v1
+      name: kv-reference-direct-delta-r16-320-flow-only-5k-v2
+      id: kv-reference-direct-delta-r16-320-flow-only-5k-v2
 
 kv_reference_direct_delta_320_sample:
   checkpoint: kv_reference_direct_delta_r16_320_joint_flow_v1/checkpoints/step-0100000.pt
