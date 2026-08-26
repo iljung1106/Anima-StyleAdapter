@@ -2238,6 +2238,14 @@ def train_direct_reference_kv_delta_320(
         base_values: list[torch.Tensor] = []
         adapted_values: list[torch.Tensor] = []
         timestep_values: list[torch.Tensor] = []
+        validation_rows = sum(
+            len(batch["latents"]) for batch in flow_validation_batches
+        )
+        validation_quantile_order = torch.randperm(
+            validation_rows,
+            generator=torch.Generator().manual_seed(seed ^ 0x5155414E),
+        )
+        validation_offset = 0
         try:
             for index, validation_batch in enumerate(flow_validation_batches):
                 latents = validation_batch["latents"].to(
@@ -2258,9 +2266,34 @@ def train_direct_reference_kv_delta_320(
                     dtype=latents.dtype,
                     generator=validation_rng,
                 )
-                timesteps = _sample_flow_timesteps(
-                    len(latents), device, human_flow, validation_rng
-                )
+                if (
+                    bool(human_flow.get("timestep_stratified_quantiles", False))
+                    and str(human_flow.get("timestep_sampling")) in {
+                        "sigmoid", "shift"
+                    }
+                ):
+                    positions = validation_quantile_order[
+                        validation_offset : validation_offset + len(latents)
+                    ].to(device=device, dtype=torch.float32)
+                    quantiles = (positions + 0.5) / validation_rows
+                    logits = math.sqrt(2.0) * torch.erfinv(
+                        2.0 * quantiles - 1.0
+                    )
+                    logits = (
+                        logits * float(human_flow.get("sigmoid_scale", 1.0))
+                        + float(human_flow.get("sigmoid_bias", 0.0))
+                    )
+                    timesteps = logits.sigmoid()
+                    if str(human_flow.get("timestep_sampling")) == "shift":
+                        shift = float(human_flow.get("discrete_flow_shift", 1.0))
+                        timesteps = (timesteps * shift) / (
+                            1 + (shift - 1) * timesteps
+                        )
+                else:
+                    timesteps = _sample_flow_timesteps(
+                        len(latents), device, human_flow, validation_rng
+                    )
+                validation_offset += len(latents)
                 sigma = timesteps[:, None, None, None].to(latents.dtype)
                 noisy = (1 - sigma) * latents + sigma * noise
                 target = (noise - latents).float()
