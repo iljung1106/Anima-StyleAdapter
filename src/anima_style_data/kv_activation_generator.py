@@ -486,6 +486,7 @@ def _final_effect_constraints(
     common_cap_weight: float = 1.0,
     rms_band_weight: float = 1.0,
     rms_floor: float = 1e-4,
+    pair_mask: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """Absolute common-direction cap and an output-RMS hinge band.
 
@@ -503,12 +504,17 @@ def _final_effect_constraints(
         student_unit = F.normalize(student_f.flatten(1), dim=-1)
         teacher_unit = F.normalize(teacher_f.flatten(1), dim=-1)
         off_diagonal = ~torch.eye(batch, device=student.device, dtype=torch.bool)
+        if pair_mask is not None:
+            if pair_mask.shape != (batch, batch):
+                raise ValueError("pair_mask must have shape [batch, batch]")
+            off_diagonal &= pair_mask.to(device=student.device, dtype=torch.bool)
         student_cosine = (student_unit @ student_unit.T)[off_diagonal]
         teacher_cosine = (teacher_unit @ teacher_unit.T)[off_diagonal]
-        positive_pairwise = F.relu(student_cosine).mean()
-        relative_common = F.relu(
-            student_cosine - teacher_cosine.detach()
-        ).mean()
+        if student_cosine.numel() > 0:
+            positive_pairwise = F.relu(student_cosine).mean()
+            relative_common = F.relu(
+                student_cosine - teacher_cosine.detach()
+            ).mean()
     common_cap_loss = F.relu(positive_pairwise - float(common_cap)).square()
 
     dimensions = tuple(range(1, student_f.ndim))
@@ -1713,6 +1719,7 @@ def train_direct_reference_kv_delta_320(
 
     cfg = copy.deepcopy(config["kv_reference_direct_delta_320"])
     training = dict(cfg["training"])
+    flow_only = bool(training.get("flow_only", False))
     steps = int(steps_override or training.get("steps", 4000))
     device = str(training.get("device", "cuda"))
     seed = int(cfg.get("seed", 20260826))
@@ -1786,8 +1793,9 @@ def train_direct_reference_kv_delta_320(
     }
     if any(not rows for rows in rows_by_kind.values()):
         raise RuntimeError("Every direct-delta mixture category needs rows")
-    teacher_down = teacher_down.to(device=device, dtype=torch.bfloat16)
-    teacher_up = teacher_up.to(device=device, dtype=torch.bfloat16)
+    if not flow_only:
+        teacher_down = teacher_down.to(device=device, dtype=torch.bfloat16)
+        teacher_up = teacher_up.to(device=device, dtype=torch.bfloat16)
 
     output = destination / str(cfg["output_directory"])
     output.mkdir(parents=True, exist_ok=True)
@@ -1796,53 +1804,59 @@ def train_direct_reference_kv_delta_320(
     chunk = int(training.get("materialization_style_chunk", 16))
     token_lru = int(training.get("token_lru_shards", 8))
     single_images = int(training.get("single_reference_images", 8))
-    single_loader = CachedTeacherReferenceLoader(
-        destination / str(cfg["synthetic_reference_cache"]),
-        split="train", style_ids=artist_ids, batch_size=chunk,
-        references=single_images, seed=seed ^ 0x53594E54,
-        token_lru_shards=token_lru, strict_style_ids=True,
-    )
-    single_bank = _materialize_reference_token_bank(
-        single_loader, artist_ids, references=single_images,
-        seed=seed ^ 0x53594E54, chunk_size=chunk, device=device,
-    )
     mixture_images = int(training.get("mixture_reference_images", 4))
+    single_bank = None
     mixture_banks: dict[str, torch.Tensor] = {}
-    for kind, rows in rows_by_kind.items():
-        style_ids = [str(row["mixture_style_id"]) for row in rows]
-        loader = CachedTeacherReferenceLoader(
-            destination / str(cfg["mixture_reference_cache"]),
-            split="train", style_ids=style_ids, batch_size=chunk,
-            references=mixture_images,
-            seed=seed ^ (sum(map(ord, kind)) * 1_000_003),
+    contexts = None
+    train_context_count = 0
+    query_bank = None
+    train_query_count = 0
+    probes = []
+    if not flow_only:
+        single_loader = CachedTeacherReferenceLoader(
+            destination / str(cfg["synthetic_reference_cache"]),
+            split="train", style_ids=artist_ids, batch_size=chunk,
+            references=single_images, seed=seed ^ 0x53594E54,
             token_lru_shards=token_lru, strict_style_ids=True,
         )
-        mixture_banks[kind] = _materialize_reference_token_bank(
-            loader, style_ids, references=mixture_images,
-            seed=seed ^ (sum(map(ord, kind)) * 1_000_003),
-            chunk_size=chunk, device=device,
+        single_bank = _materialize_reference_token_bank(
+            single_loader, artist_ids, references=single_images,
+            seed=seed ^ 0x53594E54, chunk_size=chunk, device=device,
         )
-
-    contexts = load_file(
-        destination / str(cfg["text_context_cache"]) / "base.safetensors",
-        device="cpu",
-    )["base_context"].to(device=device, dtype=torch.bfloat16)
-    heldout_contexts = int(training.get("heldout_contexts", 32))
-    train_context_count = len(contexts) - heldout_contexts
-    if train_context_count <= 0:
-        raise ValueError("heldout_contexts leaves no direct-delta training context")
-    query_cfg = dict(config["kv_real_query_bank"])
-    query_bank = _RealQueryBank(
-        destination / str(cfg["query_cache"]),
-        destination / str(query_cfg["source_cache"]),
-        device=device,
-        gpu_resident=bool(training.get("gpu_resident_queries", True)),
-    )
-    query_heldout = int(training.get("heldout_query_contents", 8))
-    train_query_count = len(query_bank.rows) - query_heldout
-    if train_query_count <= 0:
-        raise ValueError("heldout_query_contents leaves no real-Q training rows")
-    probes = _load_native_attention_probes(config, destination, device)
+        for kind, rows in rows_by_kind.items():
+            style_ids = [str(row["mixture_style_id"]) for row in rows]
+            loader = CachedTeacherReferenceLoader(
+                destination / str(cfg["mixture_reference_cache"]),
+                split="train", style_ids=style_ids, batch_size=chunk,
+                references=mixture_images,
+                seed=seed ^ (sum(map(ord, kind)) * 1_000_003),
+                token_lru_shards=token_lru, strict_style_ids=True,
+            )
+            mixture_banks[kind] = _materialize_reference_token_bank(
+                loader, style_ids, references=mixture_images,
+                seed=seed ^ (sum(map(ord, kind)) * 1_000_003),
+                chunk_size=chunk, device=device,
+            )
+        contexts = load_file(
+            destination / str(cfg["text_context_cache"]) / "base.safetensors",
+            device="cpu",
+        )["base_context"].to(device=device, dtype=torch.bfloat16)
+        heldout_contexts = int(training.get("heldout_contexts", 32))
+        train_context_count = len(contexts) - heldout_contexts
+        if train_context_count <= 0:
+            raise ValueError("heldout_contexts leaves no direct-delta training context")
+        query_cfg = dict(config["kv_real_query_bank"])
+        query_bank = _RealQueryBank(
+            destination / str(cfg["query_cache"]),
+            destination / str(query_cfg["source_cache"]),
+            device=device,
+            gpu_resident=bool(training.get("gpu_resident_queries", True)),
+        )
+        query_heldout = int(training.get("heldout_query_contents", 8))
+        train_query_count = len(query_bank.rows) - query_heldout
+        if train_query_count <= 0:
+            raise ValueError("heldout_query_contents leaves no real-Q training rows")
+        probes = _load_native_attention_probes(config, destination, device)
 
     whole_model = dict(training.get("whole_model_functional", {}))
     whole_enabled = bool(whole_model.get("enabled", False))
@@ -1889,6 +1903,8 @@ def train_direct_reference_kv_delta_320(
         blocks=int(teacher_down.shape[1]),
         **model_cfg,
     ).to(device=device, dtype=torch.bfloat16)
+    if flow_only:
+        del teacher_down, teacher_up
     generator_lr = float(training.get("generator_learning_rate", 2e-4))
     reader_lr = float(training.get("reader_learning_rate", generator_lr * 0.2))
     optimizer = torch.optim.AdamW(
@@ -1930,6 +1946,19 @@ def train_direct_reference_kv_delta_320(
 
     human_flow = dict(training.get("human_flow", {}))
     flow_enabled = bool(human_flow.get("enabled", False))
+    if flow_only:
+        if whole_enabled or not flow_enabled:
+            raise ValueError(
+                "flow_only requires human_flow.enabled=true and "
+                "whole_model_functional.enabled=false"
+            )
+        if any(
+            not _direct_delta_flow_due(step, human_flow)
+            for step in range(1, steps - int(cfg.get("initial_step", 0)) + 1)
+        ):
+            raise ValueError(
+                "flow_only requires the human-flow schedule to cover every step"
+            )
     flow_injector = None
     flow_prefetched = None
     flow_update_index = 0
@@ -2119,12 +2148,60 @@ def train_direct_reference_kv_delta_320(
                     residual_cosine = F.cosine_similarity(
                         student_effect.flatten(1), desired_effect.flatten(1), dim=-1
                     ).mean()
+                    constraint_progress = min(
+                        1.0,
+                        relative_step
+                        / max(1, int(human_flow.get("constraint_ramp_steps", 1000))),
+                    )
+                    common_cap_start = float(
+                        human_flow.get("common_cap_start", 0.65)
+                    )
+                    common_cap_end = float(
+                        human_flow.get("common_cap_end", 0.30)
+                    )
+                    flow_common_cap = common_cap_start + constraint_progress * (
+                        common_cap_end - common_cap_start
+                    )
+                    rms_lower_start = float(
+                        human_flow.get("rms_lower_start", 0.40)
+                    )
+                    rms_upper_start = float(
+                        human_flow.get("rms_upper_start", 1.80)
+                    )
+                    flow_rms_lower = rms_lower_start + constraint_progress * (
+                        float(human_flow.get("rms_lower", 0.75))
+                        - rms_lower_start
+                    )
+                    flow_rms_upper = rms_upper_start + constraint_progress * (
+                        float(human_flow.get("rms_upper", 1.25))
+                        - rms_upper_start
+                    )
+                    flow_style_ids = [
+                        str(item.style_id) for item in flow_batch["episodes"]
+                    ]
+                    cross_style_mask = torch.tensor(
+                        [
+                            left != right
+                            for left in flow_style_ids
+                            for right in flow_style_ids
+                        ],
+                        device=device,
+                        dtype=torch.bool,
+                    ).reshape(len(flow_style_ids), len(flow_style_ids))
                     residual_band, residual_band_metrics = _final_effect_constraints(
                         student_effect, desired_effect,
-                        common_cap=1.0,
-                        rms_lower=float(human_flow.get("rms_lower", 0.5)),
-                        rms_upper=float(human_flow.get("rms_upper", 1.5)),
+                        common_cap=flow_common_cap,
+                        rms_lower=flow_rms_lower,
+                        rms_upper=flow_rms_upper,
+                        common_cap_weight=(
+                            constraint_progress
+                            * float(human_flow.get("common_cap_weight", 1.0))
+                        ),
+                        rms_band_weight=float(
+                            human_flow.get("rms_band_weight", 1.0)
+                        ),
                         rms_floor=float(human_flow.get("rms_floor", 1e-4)),
+                        pair_mask=cross_style_mask,
                     )
                     flow_loss = (
                         residual_huber
@@ -2211,8 +2288,16 @@ def train_direct_reference_kv_delta_320(
                     float(residual_cosine.detach())
                 )
                 for key, value in residual_band_metrics.items():
-                    if key.startswith("rms_"):
+                    if key.startswith("rms_") or key in {
+                        "common_cap_loss",
+                        "common_cap_weighted_loss",
+                        "positive_pairwise_cosine",
+                    }:
                         running[f"human_flow/{key}"].append(float(value))
+                running["human_flow/common_cap"].append(flow_common_cap)
+                running["human_flow/constraint_progress"].append(
+                    constraint_progress
+                )
                 running["human_flow/timestep"].append(float(timesteps.mean()))
                 running["human_flow/reference_count"].append(
                     float(flow_mask.sum(dim=1).float().mean())
@@ -2752,9 +2837,10 @@ def train_direct_reference_kv_delta_320(
         "training_artists": len(train_artists),
         "validation_artists": len(validation_artists),
         "mixtures": len(mixture_rows),
-        "contexts": len(contexts),
+        "contexts": 0 if contexts is None else len(contexts),
         "reference_input": "styled_only",
-        "teacher_decomposition": "full",
+        "teacher_decomposition": "none" if flow_only else "full",
+        "primary_objective": "image_flow_only" if flow_only else "hybrid_distillation",
         "common_branch": False,
         "reader_end_to_end": True,
         "human_flow_enabled": flow_enabled,
