@@ -1980,6 +1980,12 @@ def train_direct_reference_kv_delta_320(
         )
         flow_loader_cfg.update({
             "batch_size": int(human_flow.get("batch_size", 4)),
+            "same_style_target_min": int(
+                human_flow.get("same_style_target_min", 1)
+            ),
+            "same_style_target_max": int(
+                human_flow.get("same_style_target_max", 1)
+            ),
             "min_references": int(human_flow.get("min_references", 1)),
             "max_references": int(human_flow.get("max_references", 4)),
             "self_reference_target_images_per_style": 0,
@@ -1987,6 +1993,18 @@ def train_direct_reference_kv_delta_320(
             "reference_curriculum": {},
             "pilot_reference_schedule": [],
         })
+        if int(human_flow.get("same_style_target_min", 1)) > 1:
+            flow_loader_cfg["prompt_modes"] = dict(
+                human_flow.get(
+                    "prompt_modes",
+                    {
+                        "full": 0.25,
+                        "tag_dropout": 0.45,
+                        "short": 0.30,
+                        "empty": 0.0,
+                    },
+                )
+            )
         flow_loader = MultiPromptDualQueryCachedStyleLoader(
             destination, flow_loader_cfg
         )
@@ -2028,6 +2046,32 @@ def train_direct_reference_kv_delta_320(
     warmup = int(training.get("warmup_steps", 100))
     generator_clip = float(training.get("max_grad_norm", 10.0))
     reader_clip = float(training.get("reader_max_grad_norm", 5.0))
+    reader_lr_schedule = dict(training.get("reader_lr_schedule", {}))
+
+    def flow_reader_lr(relative_step: int) -> float:
+        if not reader_lr_schedule:
+            return reader_lr * min(1.0, relative_step / max(1, warmup))
+        peak = float(reader_lr_schedule.get("peak_lr", reader_lr))
+        final = float(reader_lr_schedule.get("final_lr", reader_lr))
+        reader_warmup = int(reader_lr_schedule.get("warmup_steps", warmup))
+        decay_start = int(
+            reader_lr_schedule.get("decay_start_step", reader_warmup)
+        )
+        decay_end = int(
+            reader_lr_schedule.get("decay_end_step", decay_start + 1)
+        )
+        if peak <= 0 or final <= 0 or decay_end <= decay_start:
+            raise ValueError("Reader LR schedule is invalid")
+        if relative_step <= reader_warmup:
+            return peak * relative_step / max(1, reader_warmup)
+        if relative_step <= decay_start:
+            return peak
+        if relative_step >= decay_end:
+            return final
+        progress = (relative_step - decay_start) / max(
+            1, decay_end - decay_start
+        )
+        return peak * (final / peak) ** progress
     adaptive_clip = dict(training.get("adaptive_clip", {}))
     generator_adaptive_clip = dict(adaptive_clip.get("generator", {}))
     reader_adaptive_clip = dict(adaptive_clip.get("reader", {}))
@@ -2289,7 +2333,9 @@ def train_direct_reference_kv_delta_320(
                     reader_grad_history.append(float(reader_grad))
                     lr_scale = min(1.0, relative_step / max(1, warmup))
                     optimizer.param_groups[0]["lr"] = generator_lr * lr_scale
-                    optimizer.param_groups[1]["lr"] = reader_lr * lr_scale
+                    optimizer.param_groups[1]["lr"] = flow_reader_lr(
+                        relative_step
+                    )
                     optimizer.step()
                 else:
                     generator_grad = loss.new_zeros(())
@@ -2336,6 +2382,12 @@ def train_direct_reference_kv_delta_320(
                 running["human_flow/timestep"].append(float(timesteps.mean()))
                 running["human_flow/reference_count"].append(
                     float(flow_mask.sum(dim=1).float().mean())
+                )
+                running["human_flow/style_group_size"].append(
+                    float(len(flow_style_ids))
+                )
+                running["human_flow/unique_styles"].append(
+                    float(len(set(flow_style_ids)))
                 )
                 running["generator_grad_norm_unclipped"].append(
                     float(generator_grad)
@@ -3246,6 +3298,33 @@ def train_scheduled_direct_reference_kv_delta_320(
             "diagnostics/kv-reference-direct-delta-r16-320",
         )
     )
+    wandb_cfg = dict(training.get("wandb", {}))
+
+    def upload_sample(summary: dict[str, Any], target: int) -> None:
+        if not bool(wandb_cfg.get("enabled", True)):
+            return
+        import wandb
+
+        run = wandb.init(
+            project=str(wandb_cfg.get("project", "anima-style-adapter")),
+            name=str(wandb_cfg.get("name", "kv-reference-direct-delta-320")),
+            id=str(wandb_cfg.get("id", "kv-reference-direct-delta-320")),
+            resume="allow",
+        )
+        run.log(
+            {
+                "sample_step": target,
+                "samples/fixed_reference": wandb.Image(
+                    summary["fixed_reference_panel"],
+                    caption=f"fixed reference step {target}",
+                ),
+                "samples/panel": wandb.Image(
+                    summary["panel_overview"],
+                    caption=f"legacy panel step {target}",
+                ),
+            },
+        )
+        run.finish()
     sampling_contract = "fixed_test_sample_1_7_and_episodic_4_plus_4_v1"
     previous_targets = (
         [target for target in configured_targets if target <= completed]
@@ -3263,7 +3342,11 @@ def train_scheduled_direct_reference_kv_delta_320(
             sample_cfg = sample_config["kv_reference_direct_delta_320_sample"]
             sample_cfg["checkpoint"] = str(checkpoint.relative_to(destination))
             sample_cfg["output_directory"] = f"{sample_root}-step{target}"
-            samples.append(sample_direct_reference_kv_delta_320(sample_config, destination))
+            sample_summary = sample_direct_reference_kv_delta_320(
+                sample_config, destination
+            )
+            samples.append(sample_summary)
+            upload_sample(sample_summary, target)
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
@@ -3283,9 +3366,11 @@ def train_scheduled_direct_reference_kv_delta_320(
                 f"{cfg['output_directory']}/checkpoints/step-{target:07d}.pt"
             )
             sample_cfg["output_directory"] = f"{sample_root}-step{target}"
-            samples.append(
-                sample_direct_reference_kv_delta_320(sample_config, destination)
+            sample_summary = sample_direct_reference_kv_delta_320(
+                sample_config, destination
             )
+            samples.append(sample_summary)
+            upload_sample(sample_summary, target)
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()

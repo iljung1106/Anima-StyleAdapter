@@ -115,6 +115,14 @@ class ProductionStyleLoader:
         self.cfg = cfg
         self.seed = int(cfg.get("seed", 20260811))
         self.batch_size = int(cfg.get("batch_size", 1))
+        self.same_style_target_min = int(
+            cfg.get("same_style_target_min", 1)
+        )
+        self.same_style_target_max = int(
+            cfg.get("same_style_target_max", self.same_style_target_min)
+        )
+        if not 1 <= self.same_style_target_min <= self.same_style_target_max:
+            raise ValueError("same-style target bounds are invalid")
         self.min_references = int(cfg.get("min_references", 1))
         self.max_references = int(cfg.get("max_references", 8))
         self.split = str(cfg.get("split", "train"))
@@ -218,6 +226,38 @@ class ProductionStyleLoader:
             ]
         else:
             self.bucket_weights = [len(self.buckets[key]) for key in self.bucket_keys]
+        self.same_style_targets_by_bucket: dict[
+            tuple[int, int], dict[str, list[int]]
+        ] = {}
+        if self.same_style_target_min > 1:
+            for shape, image_ids in self.buckets.items():
+                grouped: dict[str, list[int]] = defaultdict(list)
+                for image_id in image_ids:
+                    row = self.style_by_id[image_id]
+                    style_id = str(row.get("style_id", row["artist"]))
+                    grouped[style_id].append(image_id)
+                eligible = {
+                    style_id: values
+                    for style_id, values in grouped.items()
+                    if min(
+                        len(values),
+                        len(self.by_style[style_id]) - self.min_references,
+                    )
+                    >= self.same_style_target_min
+                }
+                if eligible:
+                    self.same_style_targets_by_bucket[shape] = eligible
+            if not self.same_style_targets_by_bucket:
+                raise RuntimeError(
+                    "No latent bucket can form a same-style multi-target batch"
+                )
+            self.same_style_bucket_keys = sorted(
+                self.same_style_targets_by_bucket
+            )
+            self.same_style_bucket_weights = [
+                len(self.same_style_targets_by_bucket[shape])
+                for shape in self.same_style_bucket_keys
+            ]
         self.self_reference_buckets: dict[tuple[int, int], list[int]] = {}
         self.self_reference_target_ids: set[int] = set()
         if self.reference_curriculum and self.self_reference_target_images_per_style > 0:
@@ -311,6 +351,50 @@ class ProductionStyleLoader:
             bucket_keys = self.bucket_keys
             bucket_weights = self.bucket_weights
             target_buckets = self.buckets
+        if self.same_style_target_min > 1 and not use_self_reference_pool:
+            shape = rng.choices(
+                self.same_style_bucket_keys,
+                weights=self.same_style_bucket_weights,
+                k=1,
+            )[0]
+            grouped = self.same_style_targets_by_bucket[shape]
+            style_id = rng.choice(sorted(grouped))
+            target_pool = grouped[style_id]
+            target_upper = min(
+                self.same_style_target_max,
+                len(target_pool),
+                len(self.by_style[style_id]) - min_references,
+            )
+            target_count = rng.randint(
+                self.same_style_target_min, target_upper
+            )
+            chosen = rng.sample(target_pool, target_count)
+            reference_pool = [
+                image_id
+                for image_id in self.by_style[style_id]
+                if image_id not in chosen
+            ]
+            upper = min(max_references, len(reference_pool))
+            lower = min(min_references, upper)
+            counts, probabilities = _reference_count_distribution(
+                lower, upper, reference_count_weights
+            )
+            reference_count = rng.choices(
+                counts, weights=probabilities, k=1
+            )[0]
+            references = tuple(rng.sample(reference_pool, reference_count))
+            return [
+                StyleEpisode(
+                    target_id,
+                    references,
+                    style_id,
+                    shape,
+                    self.text_variants[target_id][
+                        step % len(self.text_variants[target_id])
+                    ],
+                )
+                for target_id in chosen
+            ]
         shape = rng.choices(bucket_keys, weights=bucket_weights, k=1)[0]
         candidates = target_buckets[shape]
         chosen: list[int] = []
