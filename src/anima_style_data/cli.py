@@ -796,7 +796,7 @@ def main() -> None:
             sample_direct_reference_kv_delta_320,
             train_reference_conditioned_bilinear_kv_operator,
             train_reference_conditioned_kv_activation_generator,
-            train_direct_reference_kv_delta_320,
+            train_scheduled_direct_reference_kv_delta_320,
         )
         from .kv_activation_sampling import (
             evaluate_kv_activation_reference_generalization,
@@ -842,7 +842,7 @@ def main() -> None:
             "kv-reference-activation-smoke": smoke_test_reference_conditioned_kv_activation_generator,
             "kv-reference-activation-train": train_reference_conditioned_kv_activation_generator,
             "kv-reference-direct-320-smoke": smoke_test_direct_reference_kv_delta_320,
-            "kv-reference-direct-320-train": train_direct_reference_kv_delta_320,
+            "kv-reference-direct-320-train": train_scheduled_direct_reference_kv_delta_320,
             "kv-reference-direct-320-sample": sample_direct_reference_kv_delta_320,
             "kv-reference-bilinear-smoke": smoke_test_reference_conditioned_bilinear_kv_operator,
             "kv-reference-bilinear-train": train_reference_conditioned_bilinear_kv_operator,

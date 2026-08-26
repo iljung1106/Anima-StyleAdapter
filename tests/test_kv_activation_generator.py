@@ -13,6 +13,7 @@ from anima_style_data.kv_activation_generator import (
     _functional_centered_attention_loss,
     _mean_teacher_operator,
     _mixture_target,
+    _prediction_population_metrics,
 )
 from anima_style_data.kv_activation_modulation import apply_kv_factors
 from anima_style_data.kv_activation_sampling import NativeKVActivationInjector
@@ -60,6 +61,24 @@ def test_direct_delta_generator_can_preserve_reference_strength() -> None:
     )
     assert isinstance(model.style_norm, nn.Identity)
     assert isinstance(model.output_norm, nn.Identity)
+
+
+def test_prediction_population_metrics_detect_common_direction_collapse() -> None:
+    common = torch.ones(4, 2, 3, 5)
+    diverse = torch.stack(
+        [
+            torch.ones(2, 3, 5),
+            -torch.ones(2, 3, 5),
+            torch.cat([torch.ones(1, 3, 5), -torch.ones(1, 3, 5)]),
+            torch.cat([-torch.ones(1, 3, 5), torch.ones(1, 3, 5)]),
+        ]
+    )
+    collapsed = _prediction_population_metrics(common)
+    separated = _prediction_population_metrics(diverse)
+    assert collapsed["common_direction_occupancy"] > 0.99
+    assert collapsed["artist_variance_fraction"] < 0.01
+    assert separated["common_direction_occupancy"] < 0.01
+    assert separated["artist_variance_fraction"] > 0.99
 
 
 def test_direct_delta_split_keeps_every_mixture_teacher_in_train() -> None:

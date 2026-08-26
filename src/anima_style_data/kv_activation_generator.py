@@ -420,6 +420,32 @@ def _normalized_activation_loss(
     }
 
 
+def _prediction_population_metrics(
+    prediction: torch.Tensor,
+) -> dict[str, torch.Tensor]:
+    """Measure whether artist predictions occupy distinct directions."""
+
+    flat = prediction.float().flatten(1)
+    population_mean = flat.mean(dim=0, keepdim=True)
+    total_energy = flat.square().mean().clamp_min(1e-12)
+    common_energy = population_mean.square().mean()
+    centered_energy = (flat - population_mean).square().mean()
+    normalized = F.normalize(flat, dim=-1)
+    similarities = normalized @ normalized.T
+    artists = len(flat)
+    if artists > 1:
+        pairwise = (similarities.sum() - similarities.diagonal().sum()) / (
+            artists * (artists - 1)
+        )
+    else:
+        pairwise = similarities.new_ones(())
+    return {
+        "artist_variance_fraction": centered_energy / total_energy,
+        "common_direction_occupancy": common_energy / total_energy,
+        "artist_pairwise_cosine": pairwise,
+    }
+
+
 def _mixture_target(
     context: torch.Tensor,
     teacher_down: torch.Tensor,
@@ -1890,6 +1916,7 @@ def train_direct_reference_kv_delta_320(
                                 teacher.roll(1, dims=0).float().flatten(2), dim=-1,
                             ).mean()
                             values["correct_minus_wrong_cosine"] = correct - wrong
+                            values.update(_prediction_population_metrics(student))
                             for key, value in values.items():
                                 validation_rows[f"single_r{reference_count}/{key}"].append(
                                     float(value)
@@ -2215,6 +2242,73 @@ def sample_direct_reference_kv_delta_320(
     }
     write_json(output / "summary.json", summary)
     return summary
+
+
+def train_scheduled_direct_reference_kv_delta_320(
+    config: dict[str, Any], destination: Path
+) -> dict[str, Any]:
+    """Train in checkpoint-sized segments and render each scheduled checkpoint."""
+
+    cfg = dict(config["kv_reference_direct_delta_320"])
+    training = dict(cfg["training"])
+    steps = int(training.get("steps", 100_000))
+    sample_every = int(training.get("sample_every", 0))
+    if sample_every <= 0:
+        return train_direct_reference_kv_delta_320(config, destination)
+
+    output = destination / str(cfg["output_directory"])
+    checkpoints = output / "checkpoints"
+    completed = max(
+        (
+            int(path.stem.removeprefix("step-"))
+            for path in checkpoints.glob("step-*.pt")
+        ),
+        default=0,
+    )
+    targets = list(
+        range(((completed // sample_every) + 1) * sample_every, steps + 1, sample_every)
+    )
+    if completed < steps and (not targets or targets[-1] != steps):
+        targets.append(steps)
+
+    segments = []
+    samples = []
+    sample_root = str(
+        training.get(
+            "sample_output_root",
+            "diagnostics/kv-reference-direct-delta-r16-320",
+        )
+    )
+    for target in targets:
+        segments.append(
+            train_direct_reference_kv_delta_320(
+                config, destination, steps_override=target
+            )
+        )
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        if target % sample_every == 0:
+            sample_config = copy.deepcopy(config)
+            sample_cfg = sample_config["kv_reference_direct_delta_320_sample"]
+            sample_cfg["checkpoint"] = (
+                f"{cfg['output_directory']}/checkpoints/step-{target:07d}.pt"
+            )
+            sample_cfg["output_directory"] = f"{sample_root}-step{target}"
+            samples.append(
+                sample_direct_reference_kv_delta_320(sample_config, destination)
+            )
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+    return {
+        "steps": steps,
+        "initial_step": completed,
+        "segment_targets": targets,
+        "segments": segments,
+        "samples": samples,
+    }
 
 
 def train_functional_reference_kv_operator(
