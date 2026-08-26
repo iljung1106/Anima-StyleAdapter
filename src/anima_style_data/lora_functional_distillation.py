@@ -2180,9 +2180,16 @@ class FunctionalLoRATeacherBank:
         timestep_index: int,
     ) -> torch.Tensor:
         if self.effects is not None:
-            return self._full_effect_rows(indices)[
-                :, content_index, timestep_index
-            ]
+            # Select the small functional slice before gathering mixture rows.
+            # Gathering first copies every cached content/timestep for the
+            # requested rows even though the caller consumes only one slice.
+            positions = torch.tensor(
+                [self.effect_position_by_index[index] for index in indices],
+                dtype=torch.long,
+            )
+            return self.effects[:, content_index, timestep_index].index_select(
+                0, positions
+            )
         rows = []
         for index in indices:
             path, position = self._effect_locations[index]

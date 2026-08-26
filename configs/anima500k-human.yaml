@@ -936,7 +936,10 @@ kv_reference_direct_delta_320:
     whole_model_functional:
       enabled: true
       require_all_mixture_references: true
-      effect_slice_lru_entries: 16
+      # The complete 14 GB bank is cheap relative to host RAM. Keeping only
+      # sixteen random (shard, content, timestep) slices caused synchronous
+      # safetensors reads between every DiT pass and left the GPU idle.
+      effect_slice_lru_entries: 0
       huber_beta: 0.10
       direction_weight: 1.0
       constraint_weight: 1.0
