@@ -259,14 +259,16 @@ class ReferenceConditionedKVActivationGenerator(nn.Module):
 class _OperatorCrossBlock(nn.Module):
     """Let operator queries read the complete typed reference memory."""
 
-    def __init__(self, dim: int, heads: int, ff_dim: int) -> None:
+    def __init__(
+        self, dim: int, heads: int, ff_dim: int, *, normalize_memory: bool = True
+    ) -> None:
         super().__init__()
         if dim % heads:
             raise ValueError("operator hidden dimension must divide heads")
         self.heads = int(heads)
         self.head_dim = int(dim // heads)
         self.query_norm = nn.LayerNorm(dim)
-        self.memory_norm = nn.LayerNorm(dim)
+        self.memory_norm = nn.LayerNorm(dim) if normalize_memory else nn.Identity()
         self.query = nn.Linear(dim, dim, bias=False)
         self.key = nn.Linear(dim, dim, bias=False)
         self.value = nn.Linear(dim, dim, bias=False)
@@ -320,6 +322,12 @@ class ReferenceConditionedLowRankKVOperator(nn.Module):
         initial_sigma: float = 0.01,
         minimum_sigma: float = 1e-6,
         maximum_sigma: float = 1.0,
+        normalize_style: bool = True,
+        normalize_memory: bool = True,
+        enable_qo: bool = False,
+        stream_dim: int = 2048,
+        stream_rank: int = 32,
+        stream_init_scale: float = 1e-6,
     ) -> None:
         super().__init__()
         if hidden_dim % heads:
@@ -333,10 +341,22 @@ class ReferenceConditionedLowRankKVOperator(nn.Module):
         self.output_dim = int(output_dim)
         self.blocks = int(blocks)
         self.hidden_dim = int(hidden_dim)
+        self.heads = int(heads)
+        self.head_dim = int(hidden_dim // heads)
         self.operator_rank = int(operator_rank)
         self.minimum_sigma = float(minimum_sigma)
         self.maximum_sigma = float(maximum_sigma)
-        self.style_norm = nn.LayerNorm(style_dim)
+        self.enable_qo = bool(enable_qo)
+        self.stream_dim = int(stream_dim)
+        self.stream_rank = int(stream_rank)
+        if self.enable_qo and self.stream_rank <= 0:
+            raise ValueError("stream_rank must be positive when Q/O is enabled")
+        if stream_init_scale < 0:
+            raise ValueError("stream_init_scale must be non-negative")
+        self.stream_init_scale = float(stream_init_scale)
+        self.style_norm = (
+            nn.LayerNorm(style_dim) if bool(normalize_style) else nn.Identity()
+        )
         self.style_input = nn.Linear(style_dim, hidden_dim, bias=False)
         # [block, K/V, down/up, rank, hidden].  The identities are explicit;
         # no mean pooling or shared rank token is used.
@@ -344,7 +364,9 @@ class ReferenceConditionedLowRankKVOperator(nn.Module):
             torch.empty(blocks, 2, 2, operator_rank, hidden_dim)
         )
         self.reader = nn.ModuleList(
-            _OperatorCrossBlock(hidden_dim, heads, ff_dim)
+            _OperatorCrossBlock(
+                hidden_dim, heads, ff_dim, normalize_memory=normalize_memory
+            )
             for _ in range(operator_layers)
         )
         # Dense output directions are block-local.  Sharing only the reader
@@ -367,6 +389,34 @@ class ReferenceConditionedLowRankKVOperator(nn.Module):
             )
             for _ in range(blocks)
         )
+        if self.enable_qo:
+            self.stream_style_queries = nn.Parameter(
+                torch.empty(blocks, 2, hidden_dim)
+            )
+            self.stream_key = nn.Linear(style_dim, hidden_dim, bias=False)
+            self.stream_value = nn.Linear(style_dim, hidden_dim, bias=False)
+            self.stream_code_norm = nn.LayerNorm(hidden_dim)
+            self.stream_gates = nn.ModuleList(
+                nn.ModuleList(
+                    nn.Linear(hidden_dim, stream_rank, bias=True)
+                    for _ in range(2)
+                )
+                for _ in range(blocks)
+            )
+            self.stream_down = nn.ModuleList(
+                nn.ModuleList(
+                    nn.Linear(stream_dim, stream_rank, bias=False)
+                    for _ in range(2)
+                )
+                for _ in range(blocks)
+            )
+            self.stream_up = nn.ModuleList(
+                nn.ModuleList(
+                    nn.Linear(stream_rank, stream_dim, bias=False)
+                    for _ in range(2)
+                )
+                for _ in range(blocks)
+            )
         self.reset_parameters(float(initial_sigma))
 
     def reset_parameters(self, initial_sigma: float) -> None:
@@ -376,6 +426,17 @@ class ReferenceConditionedLowRankKVOperator(nn.Module):
                 if module.bias is not None:
                     nn.init.zeros_(module.bias)
         nn.init.normal_(self.operator_queries, std=self.hidden_dim**-0.5)
+        if self.enable_qo:
+            nn.init.normal_(
+                self.stream_style_queries, std=self.hidden_dim**-0.5
+            )
+            for block_gates in self.stream_gates:
+                for gate in block_gates:
+                    nn.init.zeros_(gate.bias)
+            for block_heads in self.stream_up:
+                for head in block_heads:
+                    with torch.no_grad():
+                        head.weight.mul_(self.stream_init_scale)
         for block_heads in self.log_sigma:
             for head in block_heads:
                 nn.init.normal_(head.weight, std=0.01)
@@ -423,6 +484,68 @@ class ReferenceConditionedLowRankKVOperator(nn.Module):
             torch.stack(sigma_values, dim=1),
         )
 
+    def prepare_kv_factors(
+        self, style_memory: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Generate every block's K/V LoRA once for reuse across text tokens."""
+        down_rows = []
+        up_rows = []
+        for block in range(self.blocks):
+            down, up, sigma = self._operator(style_memory, block)
+            down_rows.append(down)
+            up_rows.append(up.transpose(-1, -2) * sigma[:, :, None, :])
+        return torch.stack(down_rows, dim=1), torch.stack(up_rows, dim=1)
+
+    def apply_prepared_kv(
+        self,
+        text_context: torch.Tensor,
+        down: torch.Tensor,
+        up: torch.Tensor,
+        block_index: int,
+    ) -> torch.Tensor:
+        return apply_kv_factors(
+            text_context, down[:, block_index], up[:, block_index]
+        )
+
+    def prepare_stream_codes(self, style_memory: torch.Tensor) -> torch.Tensor:
+        if not self.enable_qo:
+            raise RuntimeError("Q/O stream modulation is disabled")
+        style = self.style_norm(style_memory)
+        key = self.stream_key(style)
+        value = self.stream_value(style)
+        batch = int(style.shape[0])
+        queries = self.stream_style_queries.reshape(
+            self.blocks * 2, self.hidden_dim
+        )[None].expand(batch, -1, -1)
+        queries = queries.reshape(
+            batch, self.blocks * 2, self.heads, self.head_dim
+        ).transpose(1, 2)
+        key = key.reshape(
+            batch, style.shape[1], self.heads, self.head_dim
+        ).transpose(1, 2)
+        value = value.reshape(
+            batch, style.shape[1], self.heads, self.head_dim
+        ).transpose(1, 2)
+        codes = F.scaled_dot_product_attention(queries, key, value)
+        codes = codes.transpose(1, 2).reshape(
+            batch, self.blocks, 2, self.hidden_dim
+        )
+        return self.stream_code_norm(codes)
+
+    def stream_delta(
+        self,
+        stream_input: torch.Tensor,
+        stream_codes: torch.Tensor,
+        block_index: int,
+        kind: int,
+    ) -> torch.Tensor:
+        if not self.enable_qo:
+            raise RuntimeError("Q/O stream modulation is disabled")
+        code = stream_codes[:, block_index, kind]
+        gate = torch.tanh(self.stream_gates[block_index][kind](code))
+        hidden = self.stream_down[block_index][kind](stream_input)
+        return self.stream_up[block_index][kind](hidden * gate[:, None, :])
+
     def forward(
         self,
         style_memory: torch.Tensor,
@@ -442,6 +565,63 @@ class ReferenceConditionedLowRankKVOperator(nn.Module):
         hidden = torch.einsum("bnc,bkrc->bknr", text_context, down)
         hidden = hidden * sigma[:, :, None]
         return torch.einsum("bknr,bkro->bkno", hidden, up)
+
+
+def _build_direct_delta_generator(
+    model_cfg: dict[str, Any],
+    *,
+    style_dim: int,
+    context_dim: int,
+    output_dim: int,
+    blocks: int,
+) -> nn.Module:
+    effective = dict(model_cfg)
+    architecture = str(
+        effective.pop("architecture", "direct_cross_attention")
+    )
+    model_type: type[nn.Module]
+    if architecture == "direct_cross_attention":
+        model_type = ReferenceConditionedKVActivationGenerator
+    elif architecture == "low_rank_kvoq_operator":
+        model_type = ReferenceConditionedLowRankKVOperator
+    else:
+        raise ValueError(
+            f"Unsupported direct-delta architecture: {architecture}"
+        )
+    return model_type(
+        style_dim=style_dim,
+        context_dim=context_dim,
+        output_dim=output_dim,
+        blocks=blocks,
+        **effective,
+    )
+
+
+def _resolved_experiment_config(
+    config: dict[str, Any], config_key: str
+) -> dict[str, Any]:
+    """Resolve a small experiment override without duplicating its data contract."""
+    override = copy.deepcopy(config[config_key])
+    base_key = override.pop("extends_config_key", None)
+    if base_key is None:
+        return override
+    base = _resolved_experiment_config(config, str(base_key))
+    replace_sections = [
+        str(value) for value in override.pop("replace_sections", [])
+    ]
+    for section in replace_sections:
+        if section in override:
+            base[section] = override.pop(section)
+
+    def merge(target: dict[str, Any], values: dict[str, Any]) -> None:
+        for key, value in values.items():
+            if isinstance(value, dict) and isinstance(target.get(key), dict):
+                merge(target[key], value)
+            else:
+                target[key] = value
+
+    merge(base, override)
+    return base
 
 
 class _NativeAttentionProbe(nn.Module):
@@ -1270,7 +1450,7 @@ def train_reference_conditioned_kv_activation_generator(
     steps_override: int | None = None,
     config_key: str = "kv_reference_activation_generator",
 ) -> dict[str, Any]:
-    cfg = copy.deepcopy(config[config_key])
+    cfg = _resolved_experiment_config(config, config_key)
     training = dict(cfg["training"])
     steps = int(steps_override or training.get("steps", 3000))
     device = str(training.get("device", "cuda"))
@@ -1873,6 +2053,7 @@ def train_direct_reference_kv_delta_320(
     destination: Path,
     *,
     steps_override: int | None = None,
+    config_key: str = "kv_reference_direct_delta_320",
 ) -> dict[str, Any]:
     """Train styled-reference-only, text-conditioned full native K/V deltas."""
 
@@ -1888,7 +2069,7 @@ def train_direct_reference_kv_delta_320(
         _sample_flow_timesteps,
     )
 
-    cfg = copy.deepcopy(config["kv_reference_direct_delta_320"])
+    cfg = _resolved_experiment_config(config, config_key)
     training = dict(cfg["training"])
     flow_only = bool(training.get("flow_only", False))
     steps = int(steps_override or training.get("steps", 4000))
@@ -2064,15 +2245,12 @@ def train_direct_reference_kv_delta_320(
         }
 
     model_cfg = dict(cfg["model"])
-    architecture = str(model_cfg.pop("architecture", "direct_cross_attention"))
-    if architecture != "direct_cross_attention":
-        raise ValueError("320 direct-delta training requires direct_cross_attention")
-    model = ReferenceConditionedKVActivationGenerator(
+    model = _build_direct_delta_generator(
+        model_cfg,
         style_dim=int(reader.dim),
         context_dim=int(teacher_down.shape[-1]),
         output_dim=int(teacher_up.shape[-2]),
         blocks=int(teacher_down.shape[1]),
-        **model_cfg,
     ).to(device=device, dtype=torch.bfloat16)
     if flow_only:
         del teacher_down, teacher_up
@@ -2365,7 +2543,7 @@ def train_direct_reference_kv_delta_320(
             name=str(wandb_cfg.get("name", "kv-reference-direct-delta-320")),
             id=str(wandb_cfg.get("id", "kv-reference-direct-delta-320")),
             resume="allow" if resumed else "never",
-            config={"kv_reference_direct_delta_320": cfg},
+            config={config_key: cfg},
         )
 
     @torch.no_grad()
@@ -3558,7 +3736,8 @@ def smoke_test_direct_reference_kv_delta_320(
 
 @torch.no_grad()
 def sample_direct_reference_kv_delta_320(
-    config: dict[str, Any], destination: Path
+    config: dict[str, Any], destination: Path, *,
+    sample_config_key: str = "kv_reference_direct_delta_320_sample",
 ) -> dict[str, Any]:
     """Render the historical fixed references and deterministic 4+4 panel."""
 
@@ -3579,7 +3758,7 @@ def sample_direct_reference_kv_delta_320(
     from .synthetic_teacher import _sample_anima_batch
     from .dual_query_external_samples import load_dual_query_external_sample
 
-    sample_cfg = dict(config["kv_reference_direct_delta_320_sample"])
+    sample_cfg = dict(config[sample_config_key])
     device = str(sample_cfg.get("device", "cuda"))
     checkpoint_path = destination / str(sample_cfg["checkpoint"])
     checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
@@ -3596,20 +3775,28 @@ def sample_direct_reference_kv_delta_320(
     reader.load_state_dict(reader_state, strict=True)
     reader.requires_grad_(False).eval()
     model_cfg = dict(cfg["model"])
-    architecture = str(model_cfg.pop("architecture", "direct_cross_attention"))
-    if architecture != "direct_cross_attention":
-        raise RuntimeError("Direct-delta sample received a different architecture")
     model_state = (
         checkpoint["ema_model"]
         if use_ema and "ema_model" in checkpoint
         else checkpoint["model"]
     )
-    model = ReferenceConditionedKVActivationGenerator(
-        style_dim=int(model_state["style_key.weight"].shape[1]),
-        context_dim=int(model_state["context_query.0.weight"].shape[1]),
-        output_dim=int(model_state["output_head.0.weight"].shape[0] // 2),
+    architecture = str(model_cfg.get("architecture", "direct_cross_attention"))
+    if architecture == "direct_cross_attention":
+        context_dim = int(model_state["context_query.0.weight"].shape[1])
+        output_dim = int(model_state["output_head.0.weight"].shape[0] // 2)
+    elif architecture == "low_rank_kvoq_operator":
+        context_dim = int(model_state["down_output.0.0.weight"].shape[0])
+        output_dim = int(model_state["up_output.0.0.weight"].shape[0])
+    else:
+        raise RuntimeError(
+            f"Direct-delta sample received architecture {architecture!r}"
+        )
+    model = _build_direct_delta_generator(
+        model_cfg,
+        style_dim=int(reader.dim),
+        context_dim=context_dim,
+        output_dim=output_dim,
         blocks=int(cfg.get("blocks", 28)),
-        **model_cfg,
     ).to(device=device, dtype=torch.bfloat16)
     model.load_state_dict(model_state, strict=True)
     model.requires_grad_(False).eval()
@@ -3830,11 +4017,13 @@ def sample_direct_reference_kv_delta_320(
 
 
 def train_scheduled_direct_reference_kv_delta_320(
-    config: dict[str, Any], destination: Path
+    config: dict[str, Any], destination: Path, *,
+    config_key: str = "kv_reference_direct_delta_320",
+    sample_config_key: str = "kv_reference_direct_delta_320_sample",
 ) -> dict[str, Any]:
     """Train in checkpoint-sized segments and render each scheduled checkpoint."""
 
-    cfg = dict(config["kv_reference_direct_delta_320"])
+    cfg = _resolved_experiment_config(config, config_key)
     training = dict(cfg["training"])
     steps = int(training.get("steps", 100_000))
     sample_every = int(training.get("sample_every", 0))
@@ -3912,11 +4101,11 @@ def train_scheduled_direct_reference_kv_delta_320(
             current_contract = json.loads(summary_path.read_text(encoding="utf-8")).get("sampling_contract")
         if checkpoint.exists() and current_contract != sampling_contract:
             sample_config = copy.deepcopy(config)
-            sample_cfg = sample_config["kv_reference_direct_delta_320_sample"]
+            sample_cfg = sample_config[sample_config_key]
             sample_cfg["checkpoint"] = str(checkpoint.relative_to(destination))
             sample_cfg["output_directory"] = f"{sample_root}-step{target}"
             sample_summary = sample_direct_reference_kv_delta_320(
-                sample_config, destination
+                sample_config, destination, sample_config_key=sample_config_key
             )
             samples.append(sample_summary)
             upload_sample(sample_summary, target)
@@ -3926,7 +4115,7 @@ def train_scheduled_direct_reference_kv_delta_320(
     for target in targets:
         segments.append(
             train_direct_reference_kv_delta_320(
-                config, destination, steps_override=target
+                config, destination, steps_override=target, config_key=config_key
             )
         )
         gc.collect()
@@ -3934,13 +4123,13 @@ def train_scheduled_direct_reference_kv_delta_320(
             torch.cuda.empty_cache()
         if configured_targets or target % sample_every == 0:
             sample_config = copy.deepcopy(config)
-            sample_cfg = sample_config["kv_reference_direct_delta_320_sample"]
+            sample_cfg = sample_config[sample_config_key]
             sample_cfg["checkpoint"] = (
                 f"{cfg['output_directory']}/checkpoints/step-{target:07d}.pt"
             )
             sample_cfg["output_directory"] = f"{sample_root}-step{target}"
             sample_summary = sample_direct_reference_kv_delta_320(
-                sample_config, destination
+                sample_config, destination, sample_config_key=sample_config_key
             )
             samples.append(sample_summary)
             upload_sample(sample_summary, target)
@@ -3955,6 +4144,27 @@ def train_scheduled_direct_reference_kv_delta_320(
         "segments": segments,
         "samples": samples,
     }
+
+
+def train_scheduled_low_rank_kvoq_flow_50k(
+    config: dict[str, Any], destination: Path
+) -> dict[str, Any]:
+    return train_scheduled_direct_reference_kv_delta_320(
+        config,
+        destination,
+        config_key="kv_reference_low_rank_kvoq_flow_50k",
+        sample_config_key="kv_reference_low_rank_kvoq_flow_50k_sample",
+    )
+
+
+def sample_low_rank_kvoq_flow_50k(
+    config: dict[str, Any], destination: Path
+) -> dict[str, Any]:
+    return sample_direct_reference_kv_delta_320(
+        config,
+        destination,
+        sample_config_key="kv_reference_low_rank_kvoq_flow_50k_sample",
+    )
 
 
 def train_functional_reference_kv_operator(

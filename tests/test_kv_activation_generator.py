@@ -395,6 +395,42 @@ def test_operator_factor_export_matches_direct_activation() -> None:
     assert torch.allclose(actual, expected, atol=2e-5, rtol=2e-4)
 
 
+def test_low_rank_operator_reuses_kv_factors_and_modulates_qo() -> None:
+    torch.manual_seed(43)
+    model = ReferenceConditionedLowRankKVOperator(
+        style_dim=20,
+        context_dim=12,
+        output_dim=16,
+        blocks=2,
+        hidden_dim=16,
+        heads=4,
+        ff_dim=32,
+        operator_layers=2,
+        operator_rank=3,
+        normalize_style=False,
+        normalize_memory=False,
+        enable_qo=True,
+        stream_dim=16,
+        stream_rank=4,
+    )
+    style = torch.randn(2, 7, 20)
+    context = torch.randn(2, 5, 12)
+    down, up = model.prepare_kv_factors(style)
+    cached = model.apply_prepared_kv(context, down, up, 1)
+    direct = model(style, context, 1)
+    codes = model.prepare_stream_codes(style)
+    q_delta = model.stream_delta(torch.randn(2, 6, 16), codes, 1, 0)
+
+    assert down.shape == (2, 2, 2, 3, 12)
+    assert up.shape == (2, 2, 2, 16, 3)
+    assert torch.allclose(cached, direct, atol=2e-5, rtol=2e-4)
+    assert codes.shape == (2, 2, 2, 16)
+    assert q_delta.shape == (2, 6, 16)
+    (cached.square().mean() + q_delta.square().mean()).backward()
+    assert model.operator_queries.grad is not None
+    assert model.stream_style_queries.grad is not None
+
+
 class _ScaleNorm(nn.Module):
     def forward(self, value: torch.Tensor) -> torch.Tensor:
         return value * 2

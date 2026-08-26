@@ -1094,6 +1094,72 @@ kv_reference_direct_delta_320_sample:
   batch_size: 4
   panel_tile_width: 384
 
+# Long capacity experiment: preserve the current grouped image-flow training,
+# Reader and Q/O adapters, but replace dense token-wise K/V generation with a
+# reference-generated rank-32 LoRA operator.  The wider/deeper operator removes
+# the 256-wide K/V bottleneck while retaining the same frozen Anima injection
+# points and training data.
+kv_reference_low_rank_kvoq_flow_50k:
+  extends_config_key: kv_reference_direct_delta_320
+  replace_sections: [model]
+  output_directory: kv_reference_low_rank_kvoq_r32_w512_l3_flow_50k_v1
+  seed: 20260827
+  model:
+    architecture: low_rank_kvoq_operator
+    hidden_dim: 512
+    heads: 16
+    ff_dim: 2048
+    operator_layers: 3
+    operator_rank: 32
+    initial_sigma: 0.01
+    minimum_sigma: 0.000001
+    maximum_sigma: 1.0
+    normalize_style: false
+    normalize_memory: false
+    enable_qo: true
+    stream_dim: 2048
+    stream_rank: 32
+    stream_init_scale: 0.000001
+  training:
+    steps: 50000
+    # The larger generator needs a longer warmup and useful-LR plateau. Reader
+    # adaptation remains front-loaded, then settles to a very small LR.
+    generator_learning_rate: 0.000003
+    reader_learning_rate: 0.000003
+    generator_lr_schedule:
+      peak_lr: 0.000003
+      warmup_steps: 500
+      decay_start_step: 10000
+      decay_end_step: 50000
+      final_lr: 0.0000003
+    reader_lr_schedule:
+      peak_lr: 0.000003
+      warmup_steps: 250
+      decay_start_step: 1000
+      decay_end_step: 7500
+      final_lr: 0.00000006
+    checkpoint_every: 2500
+    sample_every: 2500
+    sample_steps: []
+    sample_output_root: diagnostics/kv-reference-low-rank-kvoq-r32-w512-l3-flow-50k-v1
+    resume: true
+    wandb:
+      enabled: true
+      project: anima-style-adapter
+      name: kv-reference-low-rank-kvoq-r32-w512-l3-flow-50k-v1
+      id: kv-reference-low-rank-kvoq-r32-w512-l3-flow-50k-v1
+
+kv_reference_low_rank_kvoq_flow_50k_sample:
+  checkpoint: kv_reference_low_rank_kvoq_r32_w512_l3_flow_50k_v1/checkpoints/step-0050000.pt
+  output_directory: diagnostics/kv-reference-low-rank-kvoq-r32-w512-l3-flow-50k-v1-step50000
+  device: cuda
+  artists: 8
+  references: 4
+  reference_seed: 20260827
+  strengths: [1.0, 2.0]
+  batch_size: 4
+  panel_tile_width: 384
+
 # Reference-conditioned low-rank operator pilot. Unlike the direct activation
 # head above, the reference generates a fresh block-local linear operator and
 # applies it to every native text token.  Teacher factors remain offline

@@ -147,6 +147,7 @@ class NativeKVActivationInjector:
     def __init__(self, anima: torch.nn.Module, model: torch.nn.Module) -> None:
         self.model = model
         self.style_memory: torch.Tensor | None = None
+        self.kv_factors: tuple[torch.Tensor, torch.Tensor] | None = None
         self.stream_codes: torch.Tensor | None = None
         self.strength = 1.0
         self.enabled = False
@@ -211,6 +212,11 @@ class NativeKVActivationInjector:
         if style_memory.ndim != 3:
             raise ValueError("style_memory must be [style,slots,dim]")
         self.style_memory = style_memory
+        self.kv_factors = (
+            self.model.prepare_kv_factors(style_memory)
+            if hasattr(self.model, "prepare_kv_factors")
+            else None
+        )
         self.stream_codes = (
             self.model.prepare_stream_codes(style_memory)
             if bool(getattr(self.model, "enable_qo", False))
@@ -225,6 +231,7 @@ class NativeKVActivationInjector:
     def disable(self) -> None:
         self.enabled = False
         self.block_mask = None
+        self.kv_factors = None
         self.stream_codes = None
 
     def _block_enabled(self, block_index: int) -> bool:
@@ -241,6 +248,17 @@ class NativeKVActivationInjector:
         return _repeat_factor_rows(self.style_memory, batch)
 
     def _delta(self, context: torch.Tensor, block_index: int) -> torch.Tensor:
+        if self.kv_factors is not None:
+            down, up = self.kv_factors
+            down = _repeat_factor_rows(down, int(context.shape[0])).to(
+                device=context.device, dtype=context.dtype
+            )
+            up = _repeat_factor_rows(up, int(context.shape[0])).to(
+                device=context.device, dtype=context.dtype
+            )
+            return self.model.apply_prepared_kv(
+                context, down, up, block_index
+            ) * self.strength
         style = self._style_rows(int(context.shape[0])).to(
             device=context.device, dtype=context.dtype
         )
