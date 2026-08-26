@@ -883,7 +883,7 @@ kv_reference_activation_generator:
 # existing 64-teacher materialized mixtures remain compositional examples;
 # their component artists are forced into the 256-artist training split.
 kv_reference_direct_delta_320:
-  output_directory: kv_reference_direct_delta_r16_320_kvoq_grouped_flow_5k_v1
+  output_directory: kv_reference_direct_delta_r16_320_kvoq_diverse_rms_flow_5k_v2
   # Fresh generator and optimizer. Reader alone is initialized from bootstrap.
   seed: 20260826
   blocks: 28
@@ -984,18 +984,28 @@ kv_reference_direct_delta_320:
       flow_mse_weight: 1.0
       residual_huber_weight: 0.0
       direction_weight: 0.0
-      # This run tests grouped flow matching without auxiliary constraints.
-      output_band_weight: 0.0
+      # Keep the final residual large enough to remain effective. This is a
+      # one-sided hinge below the lower bound, not a fixed target magnitude.
+      output_band_weight: 0.25
       constraint_ramp_steps: 1000
       common_cap_start: 0.30
       common_cap_end: 0.30
       common_cap_weight: 0.0
-      rms_lower_start: 0.0
-      rms_upper_start: 0.50
-      rms_lower: 0.0
-      rms_upper: 0.50
-      rms_band_weight: 0.0
+      rms_lower_start: 0.15
+      rms_upper_start: 0.75
+      rms_lower: 0.25
+      rms_upper: 0.75
+      rms_band_weight: 1.0
       rms_floor: 0.0001
+      # Grouped batches contain one artist, so compare each adapter's K/V/Q/O
+      # response on one fixed probe with a detached recent-artist population.
+      # Only cosine above the cap is penalized; same-artist rows are not repelled.
+      cross_style_diversity_weight: 0.03
+      diversity_cosine_cap: 0.35
+      diversity_queue_min_styles: 16
+      diversity_queue_size: 128
+      diversity_probe_blocks: [0, 7, 14, 21, 27]
+      diversity_signature_width: 64
       # Ranking is neither standard flow matching nor needed for the first
       # capacity test; disabling it also removes a full DiT backward pass.
       wrong_reference_weight: 0.0
@@ -1026,9 +1036,9 @@ kv_reference_direct_delta_320:
     generator_lr_schedule:
       peak_lr: 0.000001
       warmup_steps: 100
-      decay_start_step: 500
-      decay_end_step: 2000
-      final_lr: 0.00000005
+      decay_start_step: 1500
+      decay_end_step: 5000
+      final_lr: 0.0000001
     reader_lr_schedule:
       peak_lr: 0.000001
       warmup_steps: 100
@@ -1063,15 +1073,15 @@ kv_reference_direct_delta_320:
     checkpoint_every: 500
     sample_every: 0
     sample_steps: [500, 1000, 1500, 2000, 3000, 4000, 5000]
-    sample_output_root: diagnostics/kv-reference-direct-delta-r16-320-kvoq-grouped-flow-5k-v1
+    sample_output_root: diagnostics/kv-reference-direct-delta-r16-320-kvoq-diverse-rms-flow-5k-v2
     # The output directory is new, so the first segment is fresh. Subsequent
     # 250 -> 500 -> 1k -> 2k -> 5k segments resume only this same run.
     resume: true
     wandb:
       enabled: true
       project: anima-style-adapter
-      name: kv-reference-direct-delta-r16-320-kvoq-grouped-flow-5k-v1
-      id: kv-reference-direct-delta-r16-320-kvoq-grouped-flow-5k-v1
+      name: kv-reference-direct-delta-r16-320-kvoq-diverse-rms-flow-5k-v2
+      id: kv-reference-direct-delta-r16-320-kvoq-diverse-rms-flow-5k-v2
 
 kv_reference_direct_delta_320_sample:
   checkpoint: kv_reference_direct_delta_r16_320_joint_flow_v1/checkpoints/step-0100000.pt

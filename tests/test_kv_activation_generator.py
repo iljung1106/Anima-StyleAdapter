@@ -9,6 +9,7 @@ from anima_style_data.kv_activation_generator import (
     _NativeAttentionProbe,
     _apply_dense_kv_operator,
     _centered_residual_loss,
+    _cross_style_queue_diversity,
     _direct_delta_artist_split,
     _direct_delta_flow_due,
     _direct_delta_flow_updates_through,
@@ -106,6 +107,20 @@ def test_final_effect_constraints_only_penalize_rms_outside_band() -> None:
     assert small_metrics["rms_lower_violation_rate"] == 1
     assert large_metrics["rms_upper_violation_rate"] == 1
     assert small > 0 and large > 0
+
+
+def test_cross_style_queue_diversity_only_penalizes_cosine_above_cap() -> None:
+    signature = torch.tensor([1.0, 0.0])
+    collapsed, collapsed_cosine = _cross_style_queue_diversity(
+        signature, [torch.tensor([1.0, 0.0])], cosine_cap=0.35
+    )
+    distinct, distinct_cosine = _cross_style_queue_diversity(
+        signature, [torch.tensor([0.0, 1.0])], cosine_cap=0.35
+    )
+    assert collapsed > 0.4
+    assert collapsed_cosine == 1
+    assert distinct == 0
+    assert distinct_cosine == 0
 
 
 def test_whole_model_curriculum_turns_block_loss_off_at_2000() -> None:

@@ -644,6 +644,50 @@ def _final_effect_constraints(
     }
 
 
+def _adapter_probe_signature(
+    generator: ReferenceConditionedKVActivationGenerator,
+    style_memory: torch.Tensor,
+    text_context: torch.Tensor,
+    stream_input: torch.Tensor,
+    blocks: list[int],
+    signature_width: int = 64,
+) -> torch.Tensor:
+    """Evaluate each artist adapter on the same compact K/V/Q/O probe."""
+
+    def compact(values: torch.Tensor) -> torch.Tensor:
+        return F.adaptive_avg_pool1d(
+            values.float().flatten(1), int(signature_width)
+        ).squeeze(0)
+
+    style = style_memory[:1]
+    parts = [compact(generator(style, text_context, block)) for block in blocks]
+    if generator.enable_qo:
+        stream_codes = generator.prepare_stream_codes(style)
+        for block in blocks:
+            parts.extend(
+                compact(generator.stream_delta(stream_input, stream_codes, block, kind))
+                for kind in range(2)
+            )
+    return F.normalize(torch.cat(parts), dim=0)
+
+
+def _cross_style_queue_diversity(
+    signature: torch.Tensor,
+    references: list[torch.Tensor],
+    *,
+    cosine_cap: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Cap similarity to detached signatures belonging to other artists."""
+
+    if not references:
+        zero = signature.new_zeros(())
+        return zero, zero
+    similarities = torch.stack(references) @ signature
+    positive_cosine = F.relu(similarities).mean()
+    loss = F.relu(similarities - float(cosine_cap)).square().mean()
+    return loss, positive_cosine
+
+
 def _whole_model_curriculum(relative_step: int) -> dict[str, float]:
     """Weights and RMS bounds for the fixed 10k functional curriculum."""
 
@@ -2449,6 +2493,12 @@ def train_direct_reference_kv_delta_320(
     running: dict[str, list[float]] = defaultdict(list)
     generator_grad_history: list[float] = []
     reader_grad_history: list[float] = []
+    # A small detached population memory makes the diversity constraint valid
+    # for grouped batches, which intentionally contain only one artist. It is
+    # never used to center or alter the predicted residual.
+    cross_style_queue: dict[str, torch.Tensor] = {}
+    diversity_probe_context: torch.Tensor | None = None
+    diversity_probe_stream: torch.Tensor | None = None
     started = time.perf_counter()
     model.train()
     reader.train()
@@ -2474,6 +2524,13 @@ def train_direct_reference_kv_delta_320(
                 flow_context = flow_batch["conditioning"].to(
                     device=device, dtype=torch.bfloat16, non_blocking=True
                 )
+                if diversity_probe_context is None:
+                    diversity_probe_context = flow_context[:1, :16].detach().clone()
+                    probe_values = 16 * int(model.stream_dim)
+                    diversity_probe_stream = torch.linspace(
+                        -1.0, 1.0, probe_values,
+                        device=device, dtype=torch.bfloat16,
+                    ).reshape(1, 16, int(model.stream_dim))
                 flow_references, flow_mask = _sampling_reference_inputs(
                     flow_batch, device, "heldout"
                 )
@@ -2619,6 +2676,54 @@ def train_direct_reference_kv_delta_320(
                         rms_floor=float(human_flow.get("rms_floor", 1e-4)),
                         pair_mask=cross_style_mask,
                     )
+                    diversity_weight = float(
+                        human_flow.get("cross_style_diversity_weight", 0.0)
+                    )
+                    assert diversity_probe_context is not None
+                    assert diversity_probe_stream is not None
+                    diversity_signature = _adapter_probe_signature(
+                        model,
+                        flow_style,
+                        diversity_probe_context,
+                        diversity_probe_stream,
+                        [
+                            int(block)
+                            for block in human_flow.get(
+                                "diversity_probe_blocks", [0, 7, 14, 21, 27]
+                            )
+                        ],
+                        int(human_flow.get("diversity_signature_width", 64)),
+                    )
+                    unique_flow_styles = set(flow_style_ids)
+                    if diversity_weight and len(unique_flow_styles) != 1:
+                        raise ValueError(
+                            "cross-style diversity requires a single-style grouped batch"
+                        )
+                    flow_style_id = flow_style_ids[0]
+                    diversity_references = [
+                        value
+                        for style_id, value in cross_style_queue.items()
+                        if style_id != flow_style_id
+                    ]
+                    diversity_min_styles = int(
+                        human_flow.get("diversity_queue_min_styles", 16)
+                    )
+                    if len(diversity_references) >= diversity_min_styles:
+                        diversity_loss, diversity_positive_cosine = (
+                            _cross_style_queue_diversity(
+                                diversity_signature,
+                                diversity_references,
+                                cosine_cap=float(
+                                    human_flow.get("diversity_cosine_cap", 0.35)
+                                ),
+                            )
+                        )
+                    else:
+                        diversity_loss = student_effect.new_zeros(())
+                        diversity_positive_cosine = student_effect.new_zeros(())
+                    diversity_effective_weight = (
+                        diversity_weight * constraint_progress
+                    )
                     flow_mse_weight = float(
                         human_flow.get(
                             "flow_mse_weight",
@@ -2651,6 +2756,10 @@ def train_direct_reference_kv_delta_320(
                         )
                     if output_band_weight:
                         flow_loss = flow_loss + output_band_weight * residual_band
+                    if diversity_effective_weight:
+                        flow_loss = flow_loss + (
+                            diversity_effective_weight * diversity_loss
+                        )
                     if prior_preservation_weight:
                         flow_loss = flow_loss + (
                             prior_preservation_weight * prior_preservation
@@ -2664,6 +2773,16 @@ def train_direct_reference_kv_delta_320(
                         * flow_loss
                     )
                 (weighted_flow / accumulation_steps).backward()
+                if diversity_weight:
+                    # Updating an existing artist also refreshes its insertion
+                    # order, so the bounded queue tracks the recent population.
+                    cross_style_queue.pop(flow_style_id, None)
+                    cross_style_queue[flow_style_id] = diversity_signature.detach()
+                    diversity_queue_size = int(
+                        human_flow.get("diversity_queue_size", 128)
+                    )
+                    while len(cross_style_queue) > diversity_queue_size:
+                        cross_style_queue.pop(next(iter(cross_style_queue)))
                 del prediction, flow_style
                 denominator = base_rows.detach().clamp_min(1e-6)
                 correct_gain = (base_rows - correct_rows) / denominator
@@ -2760,6 +2879,20 @@ def train_direct_reference_kv_delta_320(
                     float(
                         (prior_preservation_weight * prior_preservation).detach()
                     )
+                )
+                running["human_flow/cross_style_diversity_loss"].append(
+                    float(diversity_loss.detach())
+                )
+                running["human_flow/cross_style_diversity_weighted"].append(
+                    float(
+                        (diversity_effective_weight * diversity_loss).detach()
+                    )
+                )
+                running["human_flow/cross_style_positive_cosine"].append(
+                    float(diversity_positive_cosine.detach())
+                )
+                running["human_flow/diversity_queue_styles"].append(
+                    float(len(cross_style_queue))
                 )
                 running["human_flow/block_keep_rate"].append(
                     float(block_mask.float().mean())
