@@ -1160,7 +1160,10 @@ def generate_lora_mixture_references(
                 "kinds", ["pair", "triple", "amplified", "signed"]
             )
         )
-        and bool(row.get("enabled", True))
+        and (
+            bool(cfg.get("include_disabled", False))
+            or bool(row.get("enabled", True))
+        )
     ]
     if not mixture_rows:
         raise RuntimeError("No materialized mixture specifications were selected")

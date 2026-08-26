@@ -789,6 +789,9 @@ kv_activation_mixture_teacher:
 kv_activation_mixture_references:
   output_directory: kv_activation_mixture_references_rank16_256x4_v1
   functional_config_key: kv_activation_mixture_teacher
+  # The final-velocity cache retained every stable full-DiT effect. Materialize
+  # the 21 rows rejected only by the older block-activation gate as well.
+  include_disabled: true
   content_context_cache: kv_lora_functional_teacher_bank_rank16_64_v2_broad256x4
   negative_conditioning_file: synthetic_teacher_500x16/text/negative.safetensors
   random_content_per_mixture: true
