@@ -9,11 +9,13 @@ from anima_style_data.kv_activation_generator import (
     _NativeAttentionProbe,
     _apply_dense_kv_operator,
     _centered_residual_loss,
+    _direct_delta_artist_split,
     _functional_centered_attention_loss,
     _mean_teacher_operator,
     _mixture_target,
 )
 from anima_style_data.kv_activation_modulation import apply_kv_factors
+from anima_style_data.kv_activation_sampling import NativeKVActivationInjector
 from anima_style_data.kv_real_query_distillation import (
     _operator_factors,
     _selected_content_indices,
@@ -42,6 +44,38 @@ def test_activation_generator_is_reference_conditioned_and_backpropagates() -> N
     second.square().mean().backward()
     assert model.output_head[1].weight.grad is not None
     assert model.output_head[0].weight.grad is None
+
+
+def test_direct_delta_generator_can_preserve_reference_strength() -> None:
+    model = ReferenceConditionedKVActivationGenerator(
+        style_dim=16,
+        context_dim=12,
+        output_dim=20,
+        blocks=2,
+        hidden_dim=16,
+        heads=4,
+        ff_dim=32,
+        normalize_style=False,
+        normalize_attended=False,
+    )
+    assert isinstance(model.style_norm, nn.Identity)
+    assert isinstance(model.output_norm, nn.Identity)
+
+
+def test_direct_delta_split_keeps_every_mixture_teacher_in_train() -> None:
+    artists = [f"artist-{index}" for index in range(10)]
+    rows = [{
+        "kind": "signed",
+        "style_ids": ["artist-7", "artist-1"],
+        "weights": [1.2, -0.2],
+    }]
+    train, validation, remapped = _direct_delta_artist_split(
+        artists, rows, training_artists=6
+    )
+    assert len(train) == 6
+    assert len(validation) == 4
+    assert {1, 7}.issubset(train)
+    assert remapped[0]["teacher_components"] == [7, 1]
 
 
 def test_mixture_target_matches_exact_weighted_factor_effect() -> None:
@@ -247,6 +281,34 @@ class _FakeCrossAttention(nn.Module):
         self.k_norm = nn.Identity()
         self.v_norm = nn.Identity()
         self.output_proj = nn.Linear(8, 8, bias=False)
+
+
+class _FakeAnima(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        block = nn.Module()
+        block.cross_attn = _FakeCrossAttention()
+        self.blocks = nn.ModuleList([block])
+
+
+class _ConstantDelta(nn.Module):
+    def forward(
+        self, style: torch.Tensor, context: torch.Tensor, block: int
+    ) -> torch.Tensor:
+        assert block == 0
+        return context.new_ones(len(context), 2, context.shape[1], 8)
+
+
+def test_native_activation_injector_uses_styled_memory_without_base_input() -> None:
+    torch.manual_seed(42)
+    anima = _FakeAnima()
+    injector = NativeKVActivationInjector(anima, _ConstantDelta())
+    context = torch.randn(4, 5, 6)
+    baseline = anima.blocks[0].cross_attn.k_proj(context)
+    injector.set_style(torch.randn(2, 3, 7), strength=1.5)
+    styled = anima.blocks[0].cross_attn.k_proj(context)
+    torch.testing.assert_close(styled - baseline, torch.full_like(styled, 1.5))
+    injector.close()
 
 
 def test_native_probe_does_not_renormalize_cached_real_queries() -> None:

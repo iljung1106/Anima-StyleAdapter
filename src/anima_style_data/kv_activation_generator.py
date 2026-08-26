@@ -62,6 +62,8 @@ class ReferenceConditionedKVActivationGenerator(nn.Module):
         heads: int = 8,
         ff_dim: int = 1024,
         output_init_scale: float = 0.02,
+        normalize_style: bool = True,
+        normalize_attended: bool = True,
     ) -> None:
         super().__init__()
         if hidden_dim % heads:
@@ -75,7 +77,9 @@ class ReferenceConditionedKVActivationGenerator(nn.Module):
         self.hidden_dim = int(hidden_dim)
         self.heads = int(heads)
         self.head_dim = hidden_dim // heads
-        self.style_norm = nn.LayerNorm(style_dim)
+        self.style_norm = (
+            nn.LayerNorm(style_dim) if bool(normalize_style) else nn.Identity()
+        )
         self.context_norm = nn.LayerNorm(context_dim)
         self.style_key = nn.Linear(style_dim, hidden_dim, bias=False)
         self.style_value = nn.Linear(style_dim, hidden_dim, bias=False)
@@ -83,7 +87,9 @@ class ReferenceConditionedKVActivationGenerator(nn.Module):
         self.context_query = nn.ModuleList(
             nn.Linear(context_dim, hidden_dim, bias=False) for _ in range(blocks)
         )
-        self.output_norm = nn.LayerNorm(hidden_dim)
+        self.output_norm = (
+            nn.LayerNorm(hidden_dim) if bool(normalize_attended) else nn.Identity()
+        )
         self.ff_norm = nn.LayerNorm(hidden_dim)
         self.ff = _SwiGLU(hidden_dim, ff_dim)
         self.output_head = nn.ModuleList(
@@ -1420,6 +1426,790 @@ def _select_reference_tokens(
         rows.append(values)
         mask[row, :count] = True
     return torch.stack(rows), mask
+
+
+def _direct_delta_artist_split(
+    artist_ids: list[str],
+    mixture_rows: list[dict[str, Any]],
+    *,
+    training_artists: int,
+) -> tuple[list[int], list[int], list[dict[str, Any]]]:
+    """Keep every mixture component in train and hold out whole artists."""
+
+    index_by_style = {style_id: index for index, style_id in enumerate(artist_ids)}
+    remapped = []
+    required: set[int] = set()
+    for row in mixture_rows:
+        style_ids = [str(value) for value in row.get("style_ids", [])]
+        if not style_ids:
+            raise RuntimeError("Mixture rows must retain component style_ids")
+        missing = [style_id for style_id in style_ids if style_id not in index_by_style]
+        if missing:
+            raise RuntimeError(f"Mixture styles are absent from the 320 bank: {missing[:4]}")
+        components = [index_by_style[style_id] for style_id in style_ids]
+        if len(components) != len(row["weights"]):
+            raise RuntimeError("Mixture component styles and weights disagree")
+        required.update(components)
+        remapped.append({**row, "teacher_components": components})
+    if len(required) > int(training_artists):
+        raise ValueError("training_artists cannot contain every mixture component")
+    remaining = [index for index in range(len(artist_ids)) if index not in required]
+    train = sorted(required) + remaining[: int(training_artists) - len(required)]
+    train_set = set(train)
+    validation = [index for index in range(len(artist_ids)) if index not in train_set]
+    return train, validation, remapped
+
+
+def _open_direct_delta_reader(
+    reader: DetailPreservingTypedSlotReader,
+) -> list[nn.Parameter]:
+    """Fine-tune every Reader path used to produce style memory."""
+
+    parameters = []
+    for name, parameter in reader.named_parameters():
+        trainable = not name.startswith("reconstruction_")
+        parameter.requires_grad_(trainable)
+        if trainable:
+            parameters.append(parameter)
+    if not parameters:
+        raise RuntimeError("No direct-delta Reader parameters were selected")
+    reader.train()
+    return parameters
+
+
+def train_direct_reference_kv_delta_320(
+    config: dict[str, Any],
+    destination: Path,
+    *,
+    steps_override: int | None = None,
+) -> dict[str, Any]:
+    """Train styled-reference-only, text-conditioned full native K/V deltas."""
+
+    from .kv_real_query_distillation import _RealQueryBank
+
+    cfg = copy.deepcopy(config["kv_reference_direct_delta_320"])
+    training = dict(cfg["training"])
+    steps = int(steps_override or training.get("steps", 4000))
+    device = str(training.get("device", "cuda"))
+    seed = int(cfg.get("seed", 20260826))
+    random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.set_float32_matmul_precision("high")
+
+    artist_ids, teacher_down, teacher_up = load_kv_lora_factor_bank(
+        destination / str(cfg["lora_directory"]),
+        blocks=int(cfg.get("blocks", 28)),
+        dtype=torch.float16,
+    )
+    raw_mixture_rows = [
+        row
+        for row in read_records(destination / str(cfg["mixture_manifest"]))
+        if str(row["kind"]) in {"pair", "triple", "amplified", "signed"}
+        and bool(row.get("enabled", True))
+    ]
+    train_artists, validation_artists, mixture_rows = _direct_delta_artist_split(
+        artist_ids,
+        raw_mixture_rows,
+        training_artists=int(training.get("training_artists", 256)),
+    )
+    if not validation_artists:
+        raise RuntimeError("Direct-delta training requires held-out artists")
+    rows_by_kind = {
+        kind: [row for row in mixture_rows if str(row["kind"]) == kind]
+        for kind in ("pair", "triple", "amplified", "signed")
+    }
+    if any(not rows for rows in rows_by_kind.values()):
+        raise RuntimeError("Every direct-delta mixture category needs rows")
+    teacher_down = teacher_down.to(device=device, dtype=torch.bfloat16)
+    teacher_up = teacher_up.to(device=device, dtype=torch.bfloat16)
+
+    output = destination / str(cfg["output_directory"])
+    output.mkdir(parents=True, exist_ok=True)
+    reader = _load_reader(config, destination, cfg, device)
+    reader_parameters = _open_direct_delta_reader(reader)
+    chunk = int(training.get("materialization_style_chunk", 16))
+    token_lru = int(training.get("token_lru_shards", 8))
+    single_images = int(training.get("single_reference_images", 8))
+    single_loader = CachedTeacherReferenceLoader(
+        destination / str(cfg["synthetic_reference_cache"]),
+        split="train", style_ids=artist_ids, batch_size=chunk,
+        references=single_images, seed=seed ^ 0x53594E54,
+        token_lru_shards=token_lru, strict_style_ids=True,
+    )
+    single_bank = _materialize_reference_token_bank(
+        single_loader, artist_ids, references=single_images,
+        seed=seed ^ 0x53594E54, chunk_size=chunk, device=device,
+    )
+    mixture_images = int(training.get("mixture_reference_images", 4))
+    mixture_banks: dict[str, torch.Tensor] = {}
+    for kind, rows in rows_by_kind.items():
+        style_ids = [str(row["mixture_style_id"]) for row in rows]
+        loader = CachedTeacherReferenceLoader(
+            destination / str(cfg["mixture_reference_cache"]),
+            split="train", style_ids=style_ids, batch_size=chunk,
+            references=mixture_images,
+            seed=seed ^ (sum(map(ord, kind)) * 1_000_003),
+            token_lru_shards=token_lru, strict_style_ids=True,
+        )
+        mixture_banks[kind] = _materialize_reference_token_bank(
+            loader, style_ids, references=mixture_images,
+            seed=seed ^ (sum(map(ord, kind)) * 1_000_003),
+            chunk_size=chunk, device=device,
+        )
+
+    contexts = load_file(
+        destination / str(cfg["text_context_cache"]) / "base.safetensors",
+        device="cpu",
+    )["base_context"].to(device=device, dtype=torch.bfloat16)
+    heldout_contexts = int(training.get("heldout_contexts", 32))
+    train_context_count = len(contexts) - heldout_contexts
+    if train_context_count <= 0:
+        raise ValueError("heldout_contexts leaves no direct-delta training context")
+    query_cfg = dict(config["kv_real_query_bank"])
+    query_bank = _RealQueryBank(
+        destination / str(cfg["query_cache"]),
+        destination / str(query_cfg["source_cache"]),
+        device=device,
+        gpu_resident=bool(training.get("gpu_resident_queries", True)),
+    )
+    query_heldout = int(training.get("heldout_query_contents", 8))
+    train_query_count = len(query_bank.rows) - query_heldout
+    if train_query_count <= 0:
+        raise ValueError("heldout_query_contents leaves no real-Q training rows")
+    probes = _load_native_attention_probes(config, destination, device)
+
+    model_cfg = dict(cfg["model"])
+    architecture = str(model_cfg.pop("architecture", "direct_cross_attention"))
+    if architecture != "direct_cross_attention":
+        raise ValueError("320 direct-delta training requires direct_cross_attention")
+    model = ReferenceConditionedKVActivationGenerator(
+        style_dim=int(reader.dim),
+        context_dim=int(teacher_down.shape[-1]),
+        output_dim=int(teacher_up.shape[-2]),
+        blocks=int(teacher_down.shape[1]),
+        **model_cfg,
+    ).to(device=device, dtype=torch.bfloat16)
+    generator_lr = float(training.get("generator_learning_rate", 2e-4))
+    reader_lr = float(training.get("reader_learning_rate", generator_lr * 0.2))
+    optimizer = torch.optim.AdamW(
+        [
+            {"name": "generator", "params": list(model.parameters()), "lr": generator_lr},
+            {"name": "reader", "params": reader_parameters, "lr": reader_lr},
+        ],
+        betas=tuple(training.get("betas", [0.9, 0.95])),
+        eps=float(training.get("adam_eps", 1e-8)),
+        weight_decay=float(training.get("weight_decay", 0.01)),
+        fused=bool(training.get("fused_adamw", True)),
+    )
+    checkpoints = output / "checkpoints"
+    checkpoints.mkdir(parents=True, exist_ok=True)
+    state_path = output / "training_state.pt"
+    start_step = 0
+    if bool(training.get("resume", True)) and state_path.exists():
+        state = torch.load(state_path, map_location="cpu", weights_only=False)
+        model.load_state_dict(state["model"], strict=True)
+        reader.load_state_dict(state["reader"], strict=True)
+        optimizer.load_state_dict(state["optimizer"])
+        start_step = int(state["step"])
+        random.setstate(state["python_rng"])
+        torch.set_rng_state(state["torch_rng"])
+        torch.cuda.set_rng_state_all(state["cuda_rng"])
+
+    batch = int(training.get("batch_size", 8))
+    blocks_per_step = int(training.get("blocks_per_step", 4))
+    categories = ("single", "pair", "triple", "amplified", "signed")
+    category_weights = tuple(
+        float(value)
+        for value in training.get("category_weights", [0.5, 0.125, 0.125, 0.125, 0.125])
+    )
+    single_counts = [int(value) for value in training.get("single_reference_counts", [1, 2, 4, 8])]
+    single_count_weights = [float(value) for value in training.get("single_reference_count_weights", [0.30, 0.25, 0.25, 0.20])]
+    mixture_counts = [int(value) for value in training.get("mixture_reference_counts", [1, 2, 4])]
+    mixture_count_weights = [float(value) for value in training.get("mixture_reference_count_weights", [0.40, 0.35, 0.25])]
+    direction_weight = float(training.get("direction_weight", 0.3))
+    magnitude_weight = float(training.get("magnitude_weight", 0.15))
+    consistency_weight = float(training.get("reference_consistency_weight", 0.1))
+    attention_weight = float(training.get("attention_weight", 0.2))
+    attention_ramp = int(training.get("attention_ramp_steps", 500))
+    warmup = int(training.get("warmup_steps", 100))
+    generator_clip = float(training.get("max_grad_norm", 10.0))
+    reader_clip = float(training.get("reader_max_grad_norm", 5.0))
+    log_every = int(training.get("log_every", 10))
+    validation_every = int(training.get("validation_every", 250))
+    checkpoint_every = int(training.get("checkpoint_every", 500))
+    validation_tokens = int(training.get("validation_tokens", 64))
+    validation_blocks = [
+        int(value)
+        for value in training.get("validation_blocks", [0, 4, 8, 12, 16, 20, 24, 27])
+    ]
+
+    wandb_run = None
+    wandb_cfg = dict(training.get("wandb", {}))
+    if bool(wandb_cfg.get("enabled", True)):
+        import wandb
+
+        wandb_run = wandb.init(
+            project=str(wandb_cfg.get("project", "anima-style-adapter")),
+            name=str(wandb_cfg.get("name", "kv-reference-direct-delta-320")),
+            id=str(wandb_cfg.get("id", "kv-reference-direct-delta-320")),
+            resume="allow" if start_step else "never",
+            config={"kv_reference_direct_delta_320": cfg},
+        )
+
+    running: dict[str, list[float]] = defaultdict(list)
+    generator_grad_history: list[float] = []
+    reader_grad_history: list[float] = []
+    started = time.perf_counter()
+    model.train()
+    reader.train()
+    try:
+        for step in range(start_step + 1, steps + 1):
+            rng = random.Random(seed + step * 1_000_003)
+            category = rng.choices(categories, weights=category_weights, k=1)[0]
+            alternative_references = None
+            alternative_mask = None
+            if category == "single":
+                artists = rng.sample(train_artists, batch)
+                counts = rng.choices(single_counts, weights=single_count_weights, k=batch)
+                references, reference_mask = _select_reference_tokens(
+                    single_bank, artists, reference_counts=counts,
+                    reference_start=0, reference_stop=single_images, rng=rng,
+                )
+                alternative_references, alternative_mask = _select_reference_tokens(
+                    single_bank, artists, reference_counts=counts,
+                    reference_start=0, reference_stop=single_images,
+                    rng=random.Random(seed ^ (step * 97_409)),
+                )
+                components = torch.tensor(artists, device=device, dtype=torch.long)[:, None]
+                weights = torch.ones(batch, 1, device=device)
+            else:
+                source_rows = rows_by_kind[category]
+                selected_rows = rng.sample(range(len(source_rows)), batch)
+                counts = rng.choices(mixture_counts, weights=mixture_count_weights, k=batch)
+                references, reference_mask = _select_reference_tokens(
+                    mixture_banks[category], selected_rows,
+                    reference_counts=counts, reference_start=0,
+                    reference_stop=mixture_images, rng=rng,
+                )
+                selected = [source_rows[index] for index in selected_rows]
+                maximum = max(len(row["teacher_components"]) for row in selected)
+                components = torch.full(
+                    (batch, maximum), -1, device=device, dtype=torch.long
+                )
+                weights = torch.zeros(batch, maximum, device=device)
+                for row_index, row in enumerate(selected):
+                    count = len(row["teacher_components"])
+                    components[row_index, :count] = torch.tensor(
+                        row["teacher_components"], device=device
+                    )
+                    weights[row_index, :count] = torch.tensor(
+                        row["weights"], device=device
+                    )
+            context_indices = torch.tensor(
+                [rng.randrange(train_context_count) for _ in range(batch)],
+                device=device, dtype=torch.long,
+            )
+            context = contexts[context_indices]
+            query_content = rng.randrange(train_query_count)
+            query_timestep = rng.randrange(len(query_bank.timesteps))
+            functional_context = query_bank.context(query_content)[None].expand(
+                batch, -1, -1
+            )
+            first_block = ((step - 1) * blocks_per_step) % model.blocks
+            selected_blocks = [
+                (first_block + offset) % model.blocks for offset in range(blocks_per_step)
+            ]
+            active_attention = attention_weight * min(
+                1.0, step / max(1, attention_ramp)
+            )
+            optimizer.zero_grad(set_to_none=True)
+            with torch.autocast("cuda", dtype=torch.bfloat16):
+                style = reader(references, reference_mask).tokens
+                alternative_style = (
+                    reader(alternative_references, alternative_mask).tokens
+                    if alternative_references is not None and alternative_mask is not None
+                    else None
+                )
+                block_losses = []
+                block_metrics = []
+                first_student = None
+                first_teacher = None
+                for block in selected_blocks:
+                    student = model(style, context, block)
+                    teacher = _mixture_target(
+                        context, teacher_down, teacher_up,
+                        components, weights, block,
+                    )
+                    raw_loss, metrics = _normalized_activation_loss(
+                        student, teacher,
+                        direction_weight=direction_weight,
+                        magnitude_weight=magnitude_weight,
+                    )
+                    if first_student is None:
+                        first_student, first_teacher = student, teacher
+                    if active_attention > 0:
+                        functional_student = model(style, functional_context, block)
+                        functional_teacher = _mixture_target(
+                            functional_context, teacher_down, teacher_up,
+                            components, weights, block,
+                        )
+                        probe = probes[block]
+                        queries = query_bank.query(
+                            query_content, query_timestep, block
+                        )[None].expand(batch, -1, -1, -1)
+                        zero = torch.zeros_like(functional_student)
+                        base_key, base_value = probe.project_context(
+                            functional_context, zero
+                        )
+                        student_key, student_value = probe.project_context(
+                            functional_context, functional_student
+                        )
+                        teacher_key, teacher_value = probe.project_context(
+                            functional_context, functional_teacher
+                        )
+                        base_output = probe.attend(
+                            queries, base_key, base_value, queries_normalized=True
+                        )
+                        student_effect = probe.attend(
+                            queries, student_key, student_value,
+                            queries_normalized=True,
+                        ) - base_output
+                        teacher_effect = probe.attend(
+                            queries, teacher_key, teacher_value,
+                            queries_normalized=True,
+                        ) - base_output
+                        attention_loss, attention_metrics = _normalized_activation_loss(
+                            student_effect[:, None], teacher_effect[:, None],
+                            direction_weight=direction_weight,
+                            magnitude_weight=magnitude_weight,
+                        )
+                        raw_loss = raw_loss + active_attention * attention_loss
+                        metrics.update({
+                            f"attention_{key}": value
+                            for key, value in attention_metrics.items()
+                        })
+                    block_losses.append(raw_loss)
+                    block_metrics.append(metrics)
+                loss = torch.stack(block_losses).mean()
+                consistency = loss.new_zeros(())
+                if alternative_style is not None:
+                    assert first_student is not None and first_teacher is not None
+                    alternate = model(alternative_style, context, selected_blocks[0])
+                    scale = first_teacher.float().square().mean(
+                        dim=(2, 3), keepdim=True
+                    ).sqrt().clamp_min(1e-5)
+                    consistency = F.smooth_l1_loss(
+                        alternate.float() / scale,
+                        first_student.float() / scale,
+                        beta=0.1,
+                    )
+                    loss = loss + consistency_weight * consistency
+            loss.backward()
+            generator_grad = torch.nn.utils.clip_grad_norm_(
+                model.parameters(), generator_clip, foreach=True
+            )
+            reader_grad = torch.nn.utils.clip_grad_norm_(
+                reader_parameters, reader_clip, foreach=True
+            )
+            generator_grad_history.append(float(generator_grad))
+            reader_grad_history.append(float(reader_grad))
+            lr_scale = min(1.0, step / max(1, warmup))
+            optimizer.param_groups[0]["lr"] = generator_lr * lr_scale
+            optimizer.param_groups[1]["lr"] = reader_lr * lr_scale
+            optimizer.step()
+
+            running["loss"].append(float(loss.detach()))
+            running["generator_grad_norm_unclipped"].append(float(generator_grad))
+            running["reader_grad_norm_unclipped"].append(float(reader_grad))
+            running["reference_count"].append(sum(counts) / len(counts))
+            running["reference_consistency"].append(float(consistency.detach()))
+            running["attention_weight"].append(active_attention)
+            running[f"category/{category}"].append(1.0)
+            for key in block_metrics[0]:
+                running[key].append(
+                    sum(float(values[key]) for values in block_metrics)
+                    / len(block_metrics)
+                )
+            if step % log_every == 0:
+                row = {key: sum(values) / len(values) for key, values in running.items()}
+                row["generator_lr"] = optimizer.param_groups[0]["lr"]
+                row["reader_lr"] = optimizer.param_groups[1]["lr"]
+                row["context_unique_fraction"] = len(set(context_indices.tolist())) / batch
+                print(f"Direct reference K/V delta step={step}/{steps} {row}", flush=True)
+                if wandb_run is not None:
+                    wandb_run.log(
+                        {f"train/{key}": value for key, value in row.items()},
+                        step=step,
+                    )
+                running.clear()
+
+            if validation_every > 0 and step % validation_every == 0:
+                model.eval()
+                reader.eval()
+                validation_rows: dict[str, list[float]] = defaultdict(list)
+                val_artists = validation_artists[: min(8, len(validation_artists))]
+                token_ids = torch.linspace(
+                    0, contexts.shape[1] - 1,
+                    min(validation_tokens, contexts.shape[1]), device=device,
+                ).round().long().unique()
+                val_context = contexts[train_context_count, token_ids][None].expand(
+                    len(val_artists), -1, -1
+                )
+                with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
+                    for reference_count in single_counts:
+                        val_refs, val_mask = _select_reference_tokens(
+                            single_bank, val_artists,
+                            reference_counts=[reference_count] * len(val_artists),
+                            reference_start=0, reference_stop=single_images,
+                            rng=random.Random(seed ^ step ^ reference_count),
+                        )
+                        val_style = reader(val_refs, val_mask).tokens
+                        artist_tensor = torch.tensor(
+                            val_artists, device=device, dtype=torch.long
+                        )
+                        for block in validation_blocks:
+                            student = model(val_style, val_context, block)
+                            teacher = _mixture_target(
+                                val_context, teacher_down, teacher_up,
+                                artist_tensor[:, None],
+                                torch.ones(len(val_artists), 1, device=device), block,
+                            )
+                            _, values = _normalized_activation_loss(
+                                student, teacher,
+                                direction_weight=direction_weight,
+                                magnitude_weight=magnitude_weight,
+                            )
+                            correct = F.cosine_similarity(
+                                student.float().flatten(2),
+                                teacher.float().flatten(2), dim=-1,
+                            ).mean()
+                            wrong = F.cosine_similarity(
+                                student.float().flatten(2),
+                                teacher.roll(1, dims=0).float().flatten(2), dim=-1,
+                            ).mean()
+                            values["correct_minus_wrong_cosine"] = correct - wrong
+                            for key, value in values.items():
+                                validation_rows[f"single_r{reference_count}/{key}"].append(
+                                    float(value)
+                                )
+                    for kind, source_rows in rows_by_kind.items():
+                        selected_rows = list(range(min(4, len(source_rows))))
+                        mix_refs, mix_mask = _select_reference_tokens(
+                            mixture_banks[kind], selected_rows,
+                            reference_counts=[mixture_images] * len(selected_rows),
+                            reference_start=0, reference_stop=mixture_images,
+                            rng=random.Random(seed ^ step ^ sum(map(ord, kind))),
+                        )
+                        mix_style = reader(mix_refs, mix_mask).tokens
+                        selected = [source_rows[index] for index in selected_rows]
+                        maximum = max(len(row["teacher_components"]) for row in selected)
+                        mix_components = torch.full(
+                            (len(selected), maximum), -1,
+                            device=device, dtype=torch.long,
+                        )
+                        mix_weights = torch.zeros(
+                            len(selected), maximum, device=device
+                        )
+                        for row_index, source in enumerate(selected):
+                            count = len(source["teacher_components"])
+                            mix_components[row_index, :count] = torch.tensor(
+                                source["teacher_components"], device=device
+                            )
+                            mix_weights[row_index, :count] = torch.tensor(
+                                source["weights"], device=device
+                            )
+                        mix_context = val_context[:1].expand(len(selected), -1, -1)
+                        for block in validation_blocks:
+                            student = model(mix_style, mix_context, block)
+                            teacher = _mixture_target(
+                                mix_context, teacher_down, teacher_up,
+                                mix_components, mix_weights, block,
+                            )
+                            _, values = _normalized_activation_loss(
+                                student, teacher,
+                                direction_weight=direction_weight,
+                                magnitude_weight=magnitude_weight,
+                            )
+                            for key, value in values.items():
+                                validation_rows[f"mixture_{kind}/{key}"].append(
+                                    float(value)
+                                )
+                validation = {
+                    key: sum(values) / len(values)
+                    for key, values in validation_rows.items()
+                }
+                print(f"Direct reference K/V delta validation step={step} {validation}", flush=True)
+                if wandb_run is not None:
+                    wandb_run.log(
+                        {f"val/{key}": value for key, value in validation.items()},
+                        step=step,
+                    )
+                model.train()
+                reader.train()
+
+            if step % checkpoint_every == 0 or step == steps:
+                for path in (state_path, checkpoints / f"step-{step:07d}.pt"):
+                    _save_training_state(
+                        path, step=step, model=model, reader=reader,
+                        optimizer=optimizer, cfg=cfg,
+                    )
+    finally:
+        if wandb_run is not None:
+            wandb_run.finish()
+
+    def grad_summary(values: list[float]) -> dict[str, float]:
+        if not values:
+            return {"median": 0.0, "p95": 0.0, "p99": 0.0, "maximum": 0.0}
+        tensor = torch.tensor(values, dtype=torch.float32)
+        return {
+            "median": float(tensor.median()),
+            "p95": float(tensor.quantile(0.95)),
+            "p99": float(tensor.quantile(0.99)),
+            "maximum": float(tensor.max()),
+        }
+
+    summary = {
+        "steps": steps,
+        "start_step": start_step,
+        "artists": len(artist_ids),
+        "training_artists": len(train_artists),
+        "validation_artists": len(validation_artists),
+        "mixtures": len(mixture_rows),
+        "contexts": len(contexts),
+        "reference_input": "styled_only",
+        "teacher_decomposition": "full",
+        "common_branch": False,
+        "reader_end_to_end": True,
+        "generator_grad_norm": grad_summary(generator_grad_history),
+        "reader_grad_norm": grad_summary(reader_grad_history),
+        "elapsed_seconds": time.perf_counter() - started,
+    }
+    write_json(output / "summary.json", summary)
+    return summary
+
+
+def smoke_test_direct_reference_kv_delta_320(
+    config: dict[str, Any], destination: Path
+) -> dict[str, Any]:
+    effective = copy.deepcopy(config)
+    cfg = effective["kv_reference_direct_delta_320"]
+    cfg["output_directory"] = "kv_reference_direct_delta_320_smoke"
+    cfg["training"]["resume"] = False
+    cfg["training"]["wandb"]["enabled"] = False
+    cfg["training"]["validation_every"] = 50
+    cfg["training"]["checkpoint_every"] = 100
+    return train_direct_reference_kv_delta_320(
+        effective, destination, steps_override=100
+    )
+
+
+@torch.no_grad()
+def sample_direct_reference_kv_delta_320(
+    config: dict[str, Any], destination: Path
+) -> dict[str, Any]:
+    """Render held-out teachers against direct activation predictions."""
+
+    from PIL import Image
+
+    from .kv_activation_sampling import (
+        NativeKVActivationInjector,
+        NativeKVFactorInjector,
+        _save_panel,
+    )
+    from .lora_functional_distillation import _preview_pixels
+    from .style_transfer import (
+        _load_sampling_vae,
+        _optimize_frozen_anima,
+        _resolve_anima_model,
+    )
+    from .synthetic_teacher import _sample_anima_batch
+    from .dual_query_external_samples import load_dual_query_external_sample
+
+    sample_cfg = dict(config["kv_reference_direct_delta_320_sample"])
+    device = str(sample_cfg.get("device", "cuda"))
+    checkpoint_path = destination / str(sample_cfg["checkpoint"])
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    cfg = dict(checkpoint["config"])
+    training = dict(cfg["training"])
+    artist_ids, teacher_down, teacher_up = load_kv_lora_factor_bank(
+        destination / str(cfg["lora_directory"]),
+        blocks=int(cfg.get("blocks", 28)), dtype=torch.float16,
+    )
+    mixture_rows = [
+        row
+        for row in read_records(destination / str(cfg["mixture_manifest"]))
+        if str(row["kind"]) in {"pair", "triple", "amplified", "signed"}
+        and bool(row.get("enabled", True))
+    ]
+    _, validation_artists, _ = _direct_delta_artist_split(
+        artist_ids, mixture_rows,
+        training_artists=int(training.get("training_artists", 256)),
+    )
+    artist_count = min(int(sample_cfg.get("artists", 8)), len(validation_artists))
+    selected = validation_artists[:artist_count]
+    selected_ids = [artist_ids[index] for index in selected]
+
+    reader = _load_reader(config, destination, cfg, device)
+    reader.load_state_dict(checkpoint["reader"], strict=True)
+    reader.requires_grad_(False).eval()
+    model_cfg = dict(cfg["model"])
+    architecture = str(model_cfg.pop("architecture", "direct_cross_attention"))
+    if architecture != "direct_cross_attention":
+        raise RuntimeError("Direct-delta sample received a different architecture")
+    model = ReferenceConditionedKVActivationGenerator(
+        style_dim=int(reader.dim),
+        context_dim=int(teacher_down.shape[-1]),
+        output_dim=int(teacher_up.shape[-2]),
+        blocks=int(teacher_down.shape[1]),
+        **model_cfg,
+    ).to(device=device, dtype=torch.bfloat16)
+    model.load_state_dict(checkpoint["model"], strict=True)
+    model.requires_grad_(False).eval()
+    references = int(sample_cfg.get("references", 4))
+    loader = CachedTeacherReferenceLoader(
+        destination / str(cfg["synthetic_reference_cache"]),
+        split="train", style_ids=selected_ids, batch_size=artist_count,
+        references=int(training.get("single_reference_images", 8)),
+        seed=int(sample_cfg.get("seed", 20260826)),
+        token_lru_shards=int(training.get("token_lru_shards", 8)),
+        strict_style_ids=True,
+    )
+    loaded = loader.load_styles(
+        selected_ids,
+        references_per_style=references,
+        seed=int(sample_cfg.get("reference_seed", 20260826)),
+    )
+    reference_tokens = loaded["tokens"].to(
+        device=device, dtype=torch.bfloat16, non_blocking=True
+    )
+    reference_mask = torch.ones(
+        reference_tokens.shape[:2], device=device, dtype=torch.bool
+    )
+    with torch.autocast("cuda", dtype=torch.bfloat16):
+        style_memory = reader(reference_tokens, reference_mask).tokens
+
+    prepared = load_dual_query_external_sample(config, destination)
+    generation = dict(prepared["cfg"])
+    positive = prepared["positive"].to(device=device, dtype=torch.bfloat16)
+    negative = prepared["negative"].to(device=device, dtype=torch.bfloat16)
+    if positive.ndim == 2:
+        positive = positive[None]
+    if negative.ndim == 2:
+        negative = negative[None]
+    anima = _resolve_anima_model(config, destination, device).requires_grad_(False).eval()
+    _optimize_frozen_anima(
+        anima, low_precision_rmsnorm=True, fuse_attention_projections=True
+    )
+    factor_injector = NativeKVFactorInjector(anima)
+    activation_injector = NativeKVActivationInjector(anima, model)
+    width, height = int(generation["width"]), int(generation["height"])
+    seed = int(generation["seed"])
+    steps = int(generation["steps"])
+    shift = float(generation.get("flow_shift", 3.0))
+    text_cfg = float(generation["cfg"])
+    sigmas = torch.linspace(1.0, 0.0, steps + 1, device=device, dtype=torch.float32)
+    sigmas = sigmas * shift / (1 + (shift - 1) * sigmas)
+    noise = torch.randn(
+        1, 16, 1, height // 8, width // 8,
+        generator=torch.Generator(device="cpu").manual_seed(seed),
+        dtype=torch.float32,
+    ).to(device=device, dtype=torch.bfloat16)
+    batch_size = int(sample_cfg.get("batch_size", 4))
+
+    def denoise(mode: str, strength: float = 1.0) -> torch.Tensor:
+        values = []
+        for start in range(0, artist_count, batch_size):
+            stop = min(artist_count, start + batch_size)
+            rows = stop - start
+            if mode == "base":
+                factor_injector.disable()
+                activation_injector.disable()
+            elif mode == "teacher":
+                activation_injector.disable()
+                factor_injector.set_factors(
+                    teacher_down[selected[start:stop]].to(
+                        device=device, dtype=torch.bfloat16
+                    ),
+                    teacher_up[selected[start:stop]].to(
+                        device=device, dtype=torch.bfloat16
+                    ),
+                    strength=strength,
+                )
+            elif mode == "predicted":
+                factor_injector.disable()
+                activation_injector.set_style(
+                    style_memory[start:stop], strength=strength
+                )
+            else:
+                raise ValueError(f"Unknown direct-delta sample mode: {mode}")
+            with torch.autocast("cuda", dtype=torch.bfloat16):
+                values.append(_sample_anima_batch(
+                    anima,
+                    noise.repeat(rows, 1, 1, 1, 1),
+                    positive.expand(rows, -1, -1),
+                    negative.expand(rows, -1, -1),
+                    sigmas,
+                    text_cfg=text_cfg,
+                    speed=None,
+                    generation_seeds=[seed] * rows,
+                ).cpu())
+        return torch.cat(values)
+
+    baseline = denoise("base")
+    teacher = denoise("teacher")
+    strengths = [float(value) for value in sample_cfg.get("strengths", [1.0, 2.0])]
+    predicted = {strength: denoise("predicted", strength) for strength in strengths}
+    factor_injector.close()
+    activation_injector.close()
+    torch.cuda.empty_cache()
+
+    vae = _load_sampling_vae(config, destination).to(
+        device=device, dtype=torch.bfloat16
+    ).requires_grad_(False).eval()
+    latent_groups = {
+        "Frozen Anima": baseline,
+        "Teacher K/V-LoRA 1x": teacher,
+        **{f"Predicted {strength:g}x": value for strength, value in predicted.items()},
+    }
+    images: dict[str, list[Image.Image]] = {}
+    manifest = {
+        int(row["id"]): row
+        for row in read_records(
+            destination / str(cfg["synthetic_reference_cache"]) / "manifest.parquet"
+        )
+    }
+    images["Styled references"] = [
+        Image.open(manifest[int(ids[0])]["local_path"]).convert("RGB")
+        for ids in loaded["ids"]
+    ]
+    for label, latents in latent_groups.items():
+        decoded = []
+        for start in range(0, artist_count, batch_size):
+            with torch.autocast("cuda", dtype=torch.bfloat16):
+                decoded.extend(_preview_pixels(
+                    vae.decode_to_pixels(latents[start : start + batch_size].to(device))
+                ))
+        images[label] = decoded
+    output = destination / str(sample_cfg["output_directory"])
+    output.mkdir(parents=True, exist_ok=True)
+    panel = _save_panel(
+        output, selected_ids, images, list(images),
+        tile_width=int(sample_cfg.get("panel_tile_width", 384)),
+    )
+    summary = {
+        "checkpoint": str(checkpoint_path),
+        "panel": str(panel),
+        "heldout_artist_indices": selected,
+        "heldout_artist_ids": selected_ids,
+        "reference_ids": [list(ids) for ids in loaded["ids"]],
+        "strengths": strengths,
+        "prompt": str(generation["prompt"]),
+        "seed": seed,
+    }
+    write_json(output / "summary.json", summary)
+    return summary
 
 
 def train_functional_reference_kv_operator(

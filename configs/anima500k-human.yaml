@@ -841,6 +841,86 @@ kv_reference_activation_generator:
       name: kv-reference-activation-generator-r16-64-v1
       id: kv-reference-activation-generator-r16-64-v1
 
+# Styled-reference-only direct native text K/V residual training.  All 320
+# K/V-only LoRA teachers supervise full pre-k_norm/pre-v_norm deltas.  The
+# existing 64-teacher materialized mixtures remain compositional examples;
+# their component artists are forced into the 256-artist training split.
+kv_reference_direct_delta_320:
+  output_directory: kv_reference_direct_delta_r16_320_v1
+  seed: 20260826
+  blocks: 28
+  lora_directory: artist_kv_lora_teachers_rank16_320_b2_v3
+  reader_checkpoint: kv_lora_oracle_bootstrap_v3_64_broad256x4/checkpoints/step-0001750.pt
+  synthetic_reference_cache: kv_lora_teacher_references_rank16_320x8_realq_v2/dual_query_reference_tokens_v8_step10000
+  mixture_reference_cache: kv_activation_mixture_references_rank16_256x4_v1/dual_query_reference_tokens_v8_step10000
+  mixture_manifest: kv_activation_mixture_specs_rank16_64_v1/mixtures.parquet
+  text_context_cache: kv_lora_functional_teacher_bank_rank16_64_v2_broad256x4
+  query_cache: kv_real_query_bank_broad64x4_q64_v1
+  model:
+    architecture: direct_cross_attention
+    hidden_dim: 256
+    heads: 8
+    ff_dim: 1024
+    output_init_scale: 0.02
+    normalize_style: false
+    normalize_attended: false
+  training:
+    device: cuda
+    steps: 4000
+    batch_size: 8
+    blocks_per_step: 4
+    training_artists: 256
+    single_reference_images: 8
+    mixture_reference_images: 4
+    materialization_style_chunk: 16
+    token_lru_shards: 8
+    category_weights: [0.50, 0.125, 0.125, 0.125, 0.125]
+    single_reference_counts: [1, 2, 4, 8]
+    single_reference_count_weights: [0.30, 0.25, 0.25, 0.20]
+    mixture_reference_counts: [1, 2, 4]
+    mixture_reference_count_weights: [0.40, 0.35, 0.25]
+    heldout_contexts: 32
+    heldout_query_contents: 8
+    gpu_resident_queries: true
+    direction_weight: 0.30
+    magnitude_weight: 0.15
+    reference_consistency_weight: 0.10
+    attention_weight: 0.20
+    attention_ramp_steps: 500
+    generator_learning_rate: 0.0001
+    reader_learning_rate: 0.00002
+    warmup_steps: 100
+    betas: [0.9, 0.95]
+    adam_eps: 0.00000001
+    weight_decay: 0.01
+    # Initial permissive limits.  The 100-step smoke reports p95/p99
+    # unclipped norms; the final run should clip only genuine outliers.
+    max_grad_norm: 10.0
+    reader_max_grad_norm: 5.0
+    fused_adamw: true
+    log_every: 10
+    validation_every: 250
+    validation_tokens: 64
+    validation_blocks: [0, 4, 8, 12, 16, 20, 24, 27]
+    checkpoint_every: 500
+    resume: true
+    wandb:
+      enabled: true
+      project: anima-style-adapter
+      name: kv-reference-direct-delta-r16-320-v1
+      id: kv-reference-direct-delta-r16-320-v1
+
+kv_reference_direct_delta_320_sample:
+  checkpoint: kv_reference_direct_delta_r16_320_v1/checkpoints/step-0000500.pt
+  output_directory: diagnostics/kv-reference-direct-delta-r16-320-step500
+  device: cuda
+  artists: 8
+  references: 4
+  reference_seed: 20260826
+  strengths: [1.0, 2.0]
+  batch_size: 4
+  panel_tile_width: 384
+
 # Reference-conditioned low-rank operator pilot. Unlike the direct activation
 # head above, the reference generates a fresh block-local linear operator and
 # applies it to every native text token.  Teacher factors remain offline

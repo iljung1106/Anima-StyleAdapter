@@ -141,6 +141,87 @@ class NativeKVFactorInjector:
         return hook
 
 
+class NativeKVActivationInjector:
+    """Generate and add dense text K/V residuals inside native projections."""
+
+    def __init__(self, anima: torch.nn.Module, model: torch.nn.Module) -> None:
+        self.model = model
+        self.style_memory: torch.Tensor | None = None
+        self.strength = 1.0
+        self.enabled = False
+        self.handles: list[Any] = []
+        for block_index, block in enumerate(anima.blocks):
+            cross = block.cross_attn
+            if hasattr(cross, "kv_proj"):
+                self.handles.append(
+                    cross.kv_proj.register_forward_hook(
+                        self._fused_hook(block_index)
+                    )
+                )
+            elif hasattr(cross, "k_proj") and hasattr(cross, "v_proj"):
+                self.handles.append(
+                    cross.k_proj.register_forward_hook(
+                        self._split_hook(block_index, 0)
+                    )
+                )
+                self.handles.append(
+                    cross.v_proj.register_forward_hook(
+                        self._split_hook(block_index, 1)
+                    )
+                )
+            else:
+                raise TypeError("Anima cross-attention exposes no text K/V projection")
+
+    def set_style(
+        self, style_memory: torch.Tensor, *, strength: float = 1.0
+    ) -> None:
+        if style_memory.ndim != 3:
+            raise ValueError("style_memory must be [style,slots,dim]")
+        self.style_memory = style_memory
+        self.strength = float(strength)
+        self.enabled = True
+
+    def disable(self) -> None:
+        self.enabled = False
+
+    def close(self) -> None:
+        for handle in self.handles:
+            handle.remove()
+        self.handles.clear()
+
+    def _style_rows(self, batch: int) -> torch.Tensor:
+        if self.style_memory is None:
+            raise RuntimeError("No active direct K/V style memory")
+        return _repeat_factor_rows(self.style_memory, batch)
+
+    def _delta(self, context: torch.Tensor, block_index: int) -> torch.Tensor:
+        style = self._style_rows(int(context.shape[0])).to(
+            device=context.device, dtype=context.dtype
+        )
+        return self.model(style, context, block_index) * self.strength
+
+    def _fused_hook(self, block_index: int):
+        def hook(module, inputs, output):
+            if not self.enabled:
+                return output
+            delta = self._delta(inputs[0], block_index)
+            return output + torch.cat((delta[:, 0], delta[:, 1]), dim=-1).to(
+                output.dtype
+            )
+
+        return hook
+
+    def _split_hook(self, block_index: int, kind: int):
+        def hook(module, inputs, output):
+            if not self.enabled:
+                return output
+            return output + self._delta(inputs[0], block_index)[:, kind].to(
+                output.dtype
+            )
+
+        return hook
+
+
 class NativeKVCommonResidualInjector(NativeKVFactorInjector):
     """Inject a frozen dense common operator plus strength-scaled factors."""
 
