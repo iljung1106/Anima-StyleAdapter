@@ -2880,6 +2880,9 @@ def train_direct_reference_kv_delta_320(
                         (prior_preservation_weight * prior_preservation).detach()
                     )
                 )
+                running["human_flow/rms_band_outer_weighted"].append(
+                    float((output_band_weight * residual_band).detach())
+                )
                 running["human_flow/cross_style_diversity_loss"].append(
                     float(diversity_loss.detach())
                 )
