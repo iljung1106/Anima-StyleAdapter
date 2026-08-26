@@ -1721,11 +1721,14 @@ def train_direct_reference_kv_delta_320(
         blocks=int(cfg.get("blocks", 28)),
         dtype=torch.float16,
     )
+    whole_requested = bool(
+        dict(training.get("whole_model_functional", {})).get("enabled", False)
+    )
     raw_mixture_rows = [
         row
         for row in read_records(destination / str(cfg["mixture_manifest"]))
         if str(row["kind"]) in {"pair", "triple", "amplified", "signed"}
-        and bool(row.get("enabled", True))
+        and (whole_requested or bool(row.get("enabled", True)))
     ]
     train_artists, validation_artists, mixture_rows = _direct_delta_artist_split(
         artist_ids,
@@ -1734,9 +1737,6 @@ def train_direct_reference_kv_delta_320(
     )
     if not validation_artists:
         raise RuntimeError("Direct-delta training requires held-out artists")
-    whole_requested = bool(
-        dict(training.get("whole_model_functional", {})).get("enabled", False)
-    )
     if whole_requested:
         # The functional bank was deliberately built from all 320 teachers.
         # Keep the former held-out set as a fixed diagnostic cohort, but do
