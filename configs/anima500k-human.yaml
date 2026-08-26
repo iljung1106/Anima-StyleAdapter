@@ -883,7 +883,7 @@ kv_reference_activation_generator:
 # existing 64-teacher materialized mixtures remain compositional examples;
 # their component artists are forced into the 256-artist training split.
 kv_reference_direct_delta_320:
-  output_directory: kv_reference_direct_delta_r16_320_flow_matching_5k_v1
+  output_directory: kv_reference_direct_delta_r16_320_flow_matching_5k_v2
   # Fresh generator and optimizer. Reader alone is initialized from bootstrap.
   seed: 20260826
   blocks: 28
@@ -901,9 +901,9 @@ kv_reference_direct_delta_320:
     heads: 8
     ff_dim: 1024
     # Removing sample-wise normalization preserves the Reader's native scale.
-    # Start as the exact frozen base model; standard flow matching then learns
-    # only corrections that lower the real velocity error.
-    output_init_scale: 0.0
+    # Near-zero preserves the frozen base while avoiding singular zero-vector
+    # gradients in diagnostic cosine/common calculations.
+    output_init_scale: 0.000001
     normalize_style: false
     normalize_attended: false
     use_block_embedding: false
@@ -1029,15 +1029,15 @@ kv_reference_direct_delta_320:
     checkpoint_every: 250
     sample_every: 0
     sample_steps: [250, 500, 1000, 2000, 5000]
-    sample_output_root: diagnostics/kv-reference-direct-delta-r16-320-flow-matching-5k-v1
+    sample_output_root: diagnostics/kv-reference-direct-delta-r16-320-flow-matching-5k-v2
     # The output directory is new, so the first segment is fresh. Subsequent
     # 250 -> 500 -> 1k -> 2k -> 5k segments resume only this same run.
     resume: true
     wandb:
       enabled: true
       project: anima-style-adapter
-      name: kv-reference-direct-delta-r16-320-flow-matching-5k-v1
-      id: kv-reference-direct-delta-r16-320-flow-matching-5k-v1
+      name: kv-reference-direct-delta-r16-320-flow-matching-5k-v2
+      id: kv-reference-direct-delta-r16-320-flow-matching-5k-v2
 
 kv_reference_direct_delta_320_sample:
   checkpoint: kv_reference_direct_delta_r16_320_joint_flow_v1/checkpoints/step-0100000.pt

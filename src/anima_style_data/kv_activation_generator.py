@@ -2204,21 +2204,36 @@ def train_direct_reference_kv_delta_320(
                         rms_floor=float(human_flow.get("rms_floor", 1e-4)),
                         pair_mask=cross_style_mask,
                     )
-                    flow_loss = (
-                        float(
-                            human_flow.get(
-                                "flow_mse_weight",
-                                human_flow.get("absolute_mse_weight", 0.1),
-                            )
+                    flow_mse_weight = float(
+                        human_flow.get(
+                            "flow_mse_weight",
+                            human_flow.get("absolute_mse_weight", 0.1),
                         )
-                        * flow_mse
-                        + float(human_flow.get("residual_huber_weight", 1.0))
-                        * residual_huber
-                        + float(human_flow.get("direction_weight", 1.0))
-                        * (1.0 - residual_cosine)
-                        + float(human_flow.get("output_band_weight", 1.0))
-                        * residual_band
                     )
+                    residual_huber_weight = float(
+                        human_flow.get("residual_huber_weight", 1.0)
+                    )
+                    residual_direction_weight = float(
+                        human_flow.get("direction_weight", 1.0)
+                    )
+                    output_band_weight = float(
+                        human_flow.get("output_band_weight", 1.0)
+                    )
+                    flow_loss = flow_mse_weight * flow_mse
+                    if residual_huber_weight:
+                        flow_loss = (
+                            flow_loss + residual_huber_weight * residual_huber
+                        )
+                    if residual_direction_weight:
+                        flow_loss = flow_loss + residual_direction_weight * (
+                            1.0 - residual_cosine
+                        )
+                    if output_band_weight:
+                        flow_loss = flow_loss + output_band_weight * residual_band
+                    if not bool(torch.isfinite(flow_loss)):
+                        raise RuntimeError(
+                            f"Non-finite human-flow loss at step {step}"
+                        )
                     weighted_flow = (
                         float(human_flow.get("flow_loss_weight", 1.0))
                         * flow_loss
