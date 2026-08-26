@@ -916,8 +916,8 @@ kv_reference_direct_delta_320:
       id: kv-reference-direct-delta-r16-320-v1
 
 kv_reference_direct_delta_320_sample:
-  checkpoint: kv_reference_direct_delta_r16_320_v1/checkpoints/step-0000500.pt
-  output_directory: diagnostics/kv-reference-direct-delta-r16-320-step500
+  checkpoint: kv_reference_direct_delta_r16_320_v1/checkpoints/step-0004000.pt
+  output_directory: diagnostics/kv-reference-direct-delta-r16-320-step4000
   device: cuda
   artists: 8
   references: 4
