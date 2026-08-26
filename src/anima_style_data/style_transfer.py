@@ -2080,9 +2080,21 @@ def _sample_flow_timesteps(
         return torch.rand(batch_size, device=device, dtype=torch.float32, generator=generator)
     if mode not in {"sigmoid", "shift"}:
         raise ValueError(f"Unsupported timestep_sampling: {mode}")
-    logits = torch.randn(
-        batch_size, device=device, dtype=torch.float32, generator=generator
-    )
+    if bool(config.get("timestep_stratified_quantiles", False)):
+        # One jittered draw from every equal-probability interval preserves the
+        # shifted-logistic marginal while preventing a same-style group from
+        # accidentally concentrating at one end of the flow trajectory.
+        jitter = torch.rand(
+            batch_size, device=device, dtype=torch.float32, generator=generator
+        )
+        quantiles = (torch.arange(batch_size, device=device) + jitter) / batch_size
+        permutation = torch.randperm(batch_size, device=device, generator=generator)
+        quantiles = quantiles[permutation].clamp_(1e-6, 1.0 - 1e-6)
+        logits = math.sqrt(2.0) * torch.erfinv(2.0 * quantiles - 1.0)
+    else:
+        logits = torch.randn(
+            batch_size, device=device, dtype=torch.float32, generator=generator
+        )
     logits = (
         logits * float(config.get("sigmoid_scale", 1.0))
         + float(config.get("sigmoid_bias", 0.0))

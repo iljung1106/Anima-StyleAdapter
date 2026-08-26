@@ -426,6 +426,21 @@ def test_native_activation_injector_uses_styled_memory_without_base_input() -> N
     injector.close()
 
 
+def test_native_activation_injector_can_drop_one_masked_block_for_a_group() -> None:
+    anima = _FakeAnima()
+    injector = NativeKVActivationInjector(anima, _ConstantDelta())
+    context = torch.randn(3, 5, 6)
+    baseline = anima.blocks[0].cross_attn.k_proj(context)
+    injector.set_style(
+        torch.randn(1, 3, 7), block_mask=torch.tensor([False])
+    )
+
+    torch.testing.assert_close(
+        anima.blocks[0].cross_attn.k_proj(context), baseline
+    )
+    injector.close()
+
+
 def test_native_probe_does_not_renormalize_cached_real_queries() -> None:
     torch.manual_seed(43)
     probe = _NativeAttentionProbe(_FakeCrossAttention())

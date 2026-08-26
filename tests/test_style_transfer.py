@@ -245,6 +245,25 @@ def test_shifted_timestep_sampling_matches_flow_transform():
     assert 0.65 < float(actual.mean()) < 0.75
 
 
+def test_timestep_stratification_draws_one_jittered_quantile_per_group_row():
+    batch = 4
+    actual = _sample_flow_timesteps(
+        batch,
+        "cpu",
+        {
+            "timestep_sampling": "sigmoid",
+            "timestep_stratified_quantiles": True,
+        },
+        torch.Generator().manual_seed(124),
+    )
+    normal = torch.distributions.Normal(0.0, 1.0)
+    recovered_quantiles = normal.cdf(torch.logit(actual))
+
+    assert sorted((recovered_quantiles * batch).floor().int().tolist()) == list(
+        range(batch)
+    )
+
+
 def test_uniform_timestep_sampling_ignores_shift_options():
     generator = torch.Generator().manual_seed(321)
     actual = _sample_flow_timesteps(

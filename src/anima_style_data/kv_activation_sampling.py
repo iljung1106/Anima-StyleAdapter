@@ -149,6 +149,7 @@ class NativeKVActivationInjector:
         self.style_memory: torch.Tensor | None = None
         self.strength = 1.0
         self.enabled = False
+        self.block_mask: torch.Tensor | None = None
         self.handles: list[Any] = []
         for block_index, block in enumerate(anima.blocks):
             cross = block.cross_attn
@@ -173,16 +174,27 @@ class NativeKVActivationInjector:
                 raise TypeError("Anima cross-attention exposes no text K/V projection")
 
     def set_style(
-        self, style_memory: torch.Tensor, *, strength: float = 1.0
+        self,
+        style_memory: torch.Tensor,
+        *,
+        strength: float = 1.0,
+        block_mask: torch.Tensor | None = None,
     ) -> None:
         if style_memory.ndim != 3:
             raise ValueError("style_memory must be [style,slots,dim]")
         self.style_memory = style_memory
         self.strength = float(strength)
+        if block_mask is not None and block_mask.ndim != 1:
+            raise ValueError("block_mask must be one-dimensional")
+        self.block_mask = block_mask
         self.enabled = True
 
     def disable(self) -> None:
         self.enabled = False
+        self.block_mask = None
+
+    def _block_enabled(self, block_index: int) -> bool:
+        return self.block_mask is None or bool(self.block_mask[block_index].item())
 
     def close(self) -> None:
         for handle in self.handles:
@@ -202,7 +214,7 @@ class NativeKVActivationInjector:
 
     def _fused_hook(self, block_index: int):
         def hook(module, inputs, output):
-            if not self.enabled:
+            if not self.enabled or not self._block_enabled(block_index):
                 return output
             delta = self._delta(inputs[0], block_index)
             return output + torch.cat((delta[:, 0], delta[:, 1]), dim=-1).to(
@@ -213,7 +225,7 @@ class NativeKVActivationInjector:
 
     def _split_hook(self, block_index: int, kind: int):
         def hook(module, inputs, output):
-            if not self.enabled:
+            if not self.enabled or not self._block_enabled(block_index):
                 return output
             return output + self._delta(inputs[0], block_index)[:, kind].to(
                 output.dtype

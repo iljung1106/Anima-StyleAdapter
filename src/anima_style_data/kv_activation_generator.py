@@ -1054,6 +1054,8 @@ def _save_training_state(
     optimizer: torch.optim.Optimizer,
     cfg: dict[str, Any],
     reader: nn.Module | None = None,
+    ema_model: dict[str, torch.Tensor] | None = None,
+    ema_reader: dict[str, torch.Tensor] | None = None,
 ) -> None:
     temporary = path.with_suffix(path.suffix + ".tmp")
     state = {
@@ -1069,8 +1071,37 @@ def _save_training_state(
         state["reader"] = {
             key: value.detach().cpu() for key, value in reader.state_dict().items()
         }
+    if ema_model is not None:
+        state["ema_model"] = {
+            key: value.detach().cpu() for key, value in ema_model.items()
+        }
+    if ema_reader is not None:
+        state["ema_reader"] = {
+            key: value.detach().cpu() for key, value in ema_reader.items()
+        }
     torch.save(state, temporary)
     temporary.replace(path)
+
+
+@torch.no_grad()
+def _update_parameter_ema(
+    shadow: dict[str, torch.Tensor], module: nn.Module, decay: float
+) -> None:
+    for name, parameter in module.named_parameters():
+        if name not in shadow:
+            continue
+        value = parameter.detach()
+        if value.dtype != shadow[name].dtype:
+            value = value.to(dtype=shadow[name].dtype)
+        shadow[name].mul_(decay).add_(value, alpha=1.0 - decay)
+
+
+def _ema_checkpoint_state(
+    module: nn.Module, shadow: dict[str, torch.Tensor]
+) -> dict[str, torch.Tensor]:
+    state = dict(module.state_dict())
+    state.update(shadow)
+    return state
 
 
 def _load_native_attention_probes(
@@ -1922,6 +1953,7 @@ def train_direct_reference_kv_delta_320(
     state_path = output / "training_state.pt"
     start_step = 0
     resumed = False
+    state: dict[str, Any] | None = None
     if bool(training.get("resume", True)) and state_path.exists():
         state = torch.load(state_path, map_location="cpu", weights_only=False)
         model.load_state_dict(state["model"], strict=True)
@@ -1944,6 +1976,35 @@ def train_direct_reference_kv_delta_320(
         if start_step != int(initial.get("step", start_step)):
             raise ValueError("initial_step must match the warm-start checkpoint")
 
+    ema_cfg = dict(training.get("ema", {}))
+    ema_enabled = bool(ema_cfg.get("enabled", False))
+    ema_decay = float(ema_cfg.get("decay", 0.999))
+    if ema_enabled and not 0.0 < ema_decay < 1.0:
+        raise ValueError("EMA decay must be between zero and one")
+    ema_model: dict[str, torch.Tensor] | None = None
+    ema_reader: dict[str, torch.Tensor] | None = None
+    if ema_enabled:
+        saved_model_ema = state.get("ema_model") if state is not None else None
+        saved_reader_ema = state.get("ema_reader") if state is not None else None
+        ema_model = {
+            name: (
+                saved_model_ema[name].to(device=device, dtype=torch.float32)
+                if saved_model_ema is not None
+                else parameter.detach().float().clone()
+            )
+            for name, parameter in model.named_parameters()
+            if parameter.requires_grad
+        }
+        ema_reader = {
+            name: (
+                saved_reader_ema[name].to(device=device, dtype=torch.float32)
+                if saved_reader_ema is not None
+                else parameter.detach().float().clone()
+            )
+            for name, parameter in reader.named_parameters()
+            if parameter.requires_grad
+        }
+
     human_flow = dict(training.get("human_flow", {}))
     flow_enabled = bool(human_flow.get("enabled", False))
     if flow_only:
@@ -1961,6 +2022,7 @@ def train_direct_reference_kv_delta_320(
             )
     flow_injector = None
     flow_prefetched = None
+    flow_validation_batches: list[dict[str, Any]] = []
     flow_update_index = 0
     anima = None
     if flow_enabled or whole_enabled:
@@ -2008,6 +2070,45 @@ def train_direct_reference_kv_delta_320(
         flow_loader = MultiPromptDualQueryCachedStyleLoader(
             destination, flow_loader_cfg
         )
+        flow_validation_every = int(
+            human_flow.get("fixed_validation_every", 0)
+        )
+        if flow_validation_every > 0:
+            validation_cfg = dict(flow_loader_cfg)
+            validation_cfg.update({
+                "split": str(detail_cfg.get("validation_split", "validation")),
+                "prompt_modes": {
+                    "full": 1.0,
+                    "tag_dropout": 0.0,
+                    "short": 0.0,
+                    "empty": 0.0,
+                },
+                "quality_probability": 0.0,
+            })
+            validation_loader = MultiPromptDualQueryCachedStyleLoader(
+                destination, validation_cfg
+            )
+            overlapping_artists = set(flow_loader.by_style) & set(
+                validation_loader.by_style
+            )
+            if overlapping_artists:
+                raise RuntimeError(
+                    "Fixed flow validation is not artist-disjoint; overlap: "
+                    + ", ".join(sorted(overlapping_artists)[:8])
+                )
+            flow_validation_batches = [
+                validation_loader.load_step(index)
+                for index in range(
+                    int(human_flow.get("fixed_validation_batches", 4))
+                )
+            ]
+            print(
+                "Prepared fixed artist-disjoint flow validation: "
+                f"train_artists={len(flow_loader.by_style)} "
+                f"validation_artists={len(validation_loader.by_style)} "
+                f"batches={len(flow_validation_batches)}",
+                flush=True,
+            )
         completed_relative = max(0, start_step - int(cfg.get("initial_step", 0)))
         accumulation = int(training.get("gradient_accumulation_steps", 1))
         flow_update_index = accumulation * _direct_delta_flow_updates_through(
@@ -2046,7 +2147,34 @@ def train_direct_reference_kv_delta_320(
     warmup = int(training.get("warmup_steps", 100))
     generator_clip = float(training.get("max_grad_norm", 10.0))
     reader_clip = float(training.get("reader_max_grad_norm", 5.0))
+    generator_lr_schedule = dict(training.get("generator_lr_schedule", {}))
     reader_lr_schedule = dict(training.get("reader_lr_schedule", {}))
+
+    def flow_generator_lr(relative_step: int) -> float:
+        if not generator_lr_schedule:
+            return generator_lr * min(1.0, relative_step / max(1, warmup))
+        peak = float(generator_lr_schedule.get("peak_lr", generator_lr))
+        final = float(generator_lr_schedule.get("final_lr", generator_lr))
+        generator_warmup = int(
+            generator_lr_schedule.get("warmup_steps", warmup)
+        )
+        decay_start = int(
+            generator_lr_schedule.get("decay_start_step", generator_warmup)
+        )
+        decay_end = int(
+            generator_lr_schedule.get("decay_end_step", decay_start + 1)
+        )
+        if peak <= 0 or final < 0 or decay_end <= decay_start:
+            raise ValueError("Generator LR schedule is invalid")
+        if relative_step <= generator_warmup:
+            return peak * relative_step / max(1, generator_warmup)
+        if relative_step <= decay_start:
+            return peak
+        if relative_step >= decay_end:
+            return final
+        progress = (relative_step - decay_start) / (decay_end - decay_start)
+        cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+        return final + (peak - final) * cosine
 
     def flow_reader_lr(relative_step: int) -> float:
         if not reader_lr_schedule:
@@ -2099,6 +2227,95 @@ def train_direct_reference_kv_delta_320(
             resume="allow" if resumed else "never",
             config={"kv_reference_direct_delta_320": cfg},
         )
+
+    @torch.no_grad()
+    def fixed_flow_validation() -> dict[str, float]:
+        if not flow_validation_batches:
+            return {}
+        assert anima is not None and flow_injector is not None
+        model.eval()
+        reader.eval()
+        base_values: list[torch.Tensor] = []
+        adapted_values: list[torch.Tensor] = []
+        timestep_values: list[torch.Tensor] = []
+        try:
+            for index, validation_batch in enumerate(flow_validation_batches):
+                latents = validation_batch["latents"].to(
+                    device=device, dtype=torch.bfloat16, non_blocking=True
+                )
+                context = validation_batch["conditioning"].to(
+                    device=device, dtype=torch.bfloat16, non_blocking=True
+                )
+                references, reference_mask = _sampling_reference_inputs(
+                    validation_batch, device, "heldout"
+                )
+                validation_rng = torch.Generator(device=device).manual_seed(
+                    seed ^ 0x56414C46 ^ (index * 1_000_003)
+                )
+                noise = torch.randn(
+                    latents.shape,
+                    device=device,
+                    dtype=latents.dtype,
+                    generator=validation_rng,
+                )
+                timesteps = _sample_flow_timesteps(
+                    len(latents), device, human_flow, validation_rng
+                )
+                sigma = timesteps[:, None, None, None].to(latents.dtype)
+                noisy = (1 - sigma) * latents + sigma * noise
+                target = (noise - latents).float()
+                padding = torch.zeros(
+                    len(latents), 1, latents.shape[-2], latents.shape[-1],
+                    device=device, dtype=latents.dtype,
+                )
+                with torch.autocast("cuda", dtype=torch.bfloat16):
+                    flow_injector.disable()
+                    base = anima(
+                        noisy.unsqueeze(2), timesteps.to(latents.dtype),
+                        context=context, padding_mask=padding,
+                        target_input_ids=None,
+                    ).squeeze(2).float()
+                    style = reader(references, reference_mask).tokens
+                    flow_injector.set_style(style)
+                    adapted = anima(
+                        noisy.unsqueeze(2), timesteps.to(latents.dtype),
+                        context=context, padding_mask=padding,
+                        target_input_ids=None,
+                    ).squeeze(2).float()
+                    flow_injector.disable()
+                dimensions = tuple(range(1, adapted.ndim))
+                base_values.append((base - target).square().mean(dim=dimensions))
+                adapted_values.append(
+                    (adapted - target).square().mean(dim=dimensions)
+                )
+                timestep_values.append(timesteps)
+        finally:
+            flow_injector.disable()
+            model.train()
+            reader.train()
+        base_rows = torch.cat(base_values)
+        adapted_rows = torch.cat(adapted_values)
+        timesteps = torch.cat(timestep_values)
+        metrics = {
+            "flow_mse": float(adapted_rows.mean()),
+            "base_mse": float(base_rows.mean()),
+            "correct_gain": float(
+                ((base_rows - adapted_rows) / base_rows.clamp_min(1e-6)).mean()
+            ),
+        }
+        for name, mask in {
+            "low": timesteps < 0.4,
+            "mid": (timesteps >= 0.4) & (timesteps < 0.75),
+            "high": timesteps >= 0.75,
+        }.items():
+            if bool(mask.any()):
+                metrics[f"correct_gain_{name}"] = float(
+                    (
+                        (base_rows[mask] - adapted_rows[mask])
+                        / base_rows[mask].clamp_min(1e-6)
+                    ).mean()
+                )
+        return metrics
 
     running: dict[str, list[float]] = defaultdict(list)
     generator_grad_history: list[float] = []
@@ -2165,9 +2382,34 @@ def train_direct_reference_kv_delta_320(
                 # Leave inference mode before using the frozen baseline as a
                 # constant in differentiable residual losses.
                 base_prediction = base_prediction.clone()
+                block_dropout = float(
+                    human_flow.get("group_shared_block_dropout", 0.0)
+                )
+                if not 0.0 <= block_dropout < 1.0:
+                    raise ValueError("group-shared block dropout must be in [0,1)")
+                block_mask = None
+                block_strength = 1.0
+                if block_dropout:
+                    block_rng = random.Random(
+                        seed ^ 0x424C4F43 ^ (micro_step * 1_000_003)
+                    )
+                    block_mask = torch.tensor(
+                        [
+                            block_rng.random() >= block_dropout
+                            for _ in range(model.blocks)
+                        ],
+                        dtype=torch.bool,
+                    )
+                    if not bool(block_mask.any()):
+                        block_mask[block_rng.randrange(model.blocks)] = True
+                    block_strength = 1.0 / (1.0 - block_dropout)
                 with torch.autocast("cuda", dtype=torch.bfloat16):
                     flow_style = reader(flow_references, flow_mask).tokens
-                    flow_injector.set_style(flow_style)
+                    flow_injector.set_style(
+                        flow_style,
+                        strength=block_strength,
+                        block_mask=block_mask,
+                    )
                     prediction = anima(
                         noisy.unsqueeze(2),
                         timesteps.to(latents.dtype),
@@ -2263,6 +2505,12 @@ def train_direct_reference_kv_delta_320(
                     output_band_weight = float(
                         human_flow.get("output_band_weight", 1.0)
                     )
+                    prior_preservation = (
+                        (student_effect / effect_scale).square().mean()
+                    )
+                    prior_preservation_weight = float(
+                        human_flow.get("prior_preservation_weight", 0.0)
+                    )
                     flow_loss = flow_mse_weight * flow_mse
                     if residual_huber_weight:
                         flow_loss = (
@@ -2274,6 +2522,10 @@ def train_direct_reference_kv_delta_320(
                         )
                     if output_band_weight:
                         flow_loss = flow_loss + output_band_weight * residual_band
+                    if prior_preservation_weight:
+                        flow_loss = flow_loss + (
+                            prior_preservation_weight * prior_preservation
+                        )
                     if not bool(torch.isfinite(flow_loss)):
                         raise RuntimeError(
                             f"Non-finite human-flow loss at step {step}"
@@ -2331,12 +2583,16 @@ def train_direct_reference_kv_delta_320(
                     )
                     generator_grad_history.append(float(generator_grad))
                     reader_grad_history.append(float(reader_grad))
-                    lr_scale = min(1.0, relative_step / max(1, warmup))
-                    optimizer.param_groups[0]["lr"] = generator_lr * lr_scale
+                    optimizer.param_groups[0]["lr"] = flow_generator_lr(
+                        relative_step
+                    )
                     optimizer.param_groups[1]["lr"] = flow_reader_lr(
                         relative_step
                     )
                     optimizer.step()
+                    if ema_model is not None and ema_reader is not None:
+                        _update_parameter_ema(ema_model, model, ema_decay)
+                        _update_parameter_ema(ema_reader, reader, ema_decay)
                 else:
                     generator_grad = loss.new_zeros(())
                     reader_grad = loss.new_zeros(())
@@ -2367,6 +2623,18 @@ def train_direct_reference_kv_delta_320(
                     )
                 running["human_flow/residual_cosine"].append(
                     float(residual_cosine.detach())
+                )
+                running["human_flow/prior_preservation"].append(
+                    float(prior_preservation.detach())
+                )
+                running["human_flow/prior_preservation_weighted"].append(
+                    float(
+                        (prior_preservation_weight * prior_preservation).detach()
+                    )
+                )
+                running["human_flow/block_keep_rate"].append(
+                    float(block_mask.float().mean())
+                    if block_mask is not None else 1.0
                 )
                 for key, value in residual_band_metrics.items():
                     if key.startswith("rms_") or key in {
@@ -2413,6 +2681,25 @@ def train_direct_reference_kv_delta_320(
                             step=step,
                         )
                     running.clear()
+                if (
+                    accumulation_last
+                    and flow_validation_batches
+                    and step % flow_validation_every == 0
+                ):
+                    validation_metrics = fixed_flow_validation()
+                    print(
+                        f"Fixed artist-disjoint flow validation step={step}: "
+                        f"{validation_metrics}",
+                        flush=True,
+                    )
+                    if wandb_run is not None:
+                        wandb_run.log(
+                            {
+                                f"validation_flow/{key}": value
+                                for key, value in validation_metrics.items()
+                            },
+                            step=step,
+                        )
                 if accumulation_last and (
                     step % checkpoint_every == 0 or step == steps
                 ):
@@ -2427,6 +2714,14 @@ def train_direct_reference_kv_delta_320(
                             reader=reader,
                             optimizer=optimizer,
                             cfg=cfg,
+                            ema_model=(
+                                _ema_checkpoint_state(model, ema_model)
+                                if ema_model is not None else None
+                            ),
+                            ema_reader=(
+                                _ema_checkpoint_state(reader, ema_reader)
+                                if ema_reader is not None else None
+                            ),
                         )
                 continue
 
@@ -3024,14 +3319,26 @@ def sample_direct_reference_kv_delta_320(
     checkpoint_path = destination / str(sample_cfg["checkpoint"])
     checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     cfg = dict(checkpoint["config"])
+    use_ema = bool(
+        dict(cfg.get("training", {})).get("ema", {}).get("sample", True)
+    )
     reader = _load_reader(config, destination, cfg, device)
-    reader.load_state_dict(checkpoint["reader"], strict=True)
+    reader_state = (
+        checkpoint["ema_reader"]
+        if use_ema and "ema_reader" in checkpoint
+        else checkpoint["reader"]
+    )
+    reader.load_state_dict(reader_state, strict=True)
     reader.requires_grad_(False).eval()
     model_cfg = dict(cfg["model"])
     architecture = str(model_cfg.pop("architecture", "direct_cross_attention"))
     if architecture != "direct_cross_attention":
         raise RuntimeError("Direct-delta sample received a different architecture")
-    model_state = checkpoint["model"]
+    model_state = (
+        checkpoint["ema_model"]
+        if use_ema and "ema_model" in checkpoint
+        else checkpoint["model"]
+    )
     model = ReferenceConditionedKVActivationGenerator(
         style_dim=int(model_state["style_key.weight"].shape[1]),
         context_dim=int(model_state["context_query.0.weight"].shape[1]),
@@ -3243,6 +3550,7 @@ def sample_direct_reference_kv_delta_320(
     summary = {
         "sampling_contract": "fixed_test_sample_1_7_and_episodic_4_plus_4_v1",
         "checkpoint": str(checkpoint_path),
+        "weights": "ema" if use_ema and "ema_model" in checkpoint else "raw",
         "fixed_reference_panel": str(fixed_panel),
         "panel_overview": str(panel_overview),
         "panel_sheets": panel_sheets,
