@@ -1503,6 +1503,32 @@ def _open_direct_delta_reader(
     return parameters
 
 
+def _direct_delta_flow_due(relative_step: int, config: dict[str, Any]) -> bool:
+    """Select rare image-flow updates without landing on checkpoint boundaries."""
+
+    if relative_step <= 0 or not bool(config.get("enabled", False)):
+        return False
+    warmup_updates = int(config.get("warmup_updates", 0))
+    interval = int(
+        config.get("warmup_every", 10)
+        if relative_step <= warmup_updates
+        else config.get("every", 20)
+    )
+    if interval <= 0:
+        raise ValueError("human_flow update intervals must be positive")
+    offset = int(config.get("offset", 1)) % interval
+    return relative_step % interval == offset
+
+
+def _direct_delta_flow_updates_through(
+    relative_step: int, config: dict[str, Any]
+) -> int:
+    return sum(
+        _direct_delta_flow_due(step, config)
+        for step in range(1, max(0, int(relative_step)) + 1)
+    )
+
+
 def train_direct_reference_kv_delta_320(
     config: dict[str, Any],
     destination: Path,
@@ -1511,7 +1537,16 @@ def train_direct_reference_kv_delta_320(
 ) -> dict[str, Any]:
     """Train styled-reference-only, text-conditioned full native K/V deltas."""
 
+    from .detail_style_training import _loader_config
+    from .global_query_style_tokenizer import MultiPromptDualQueryCachedStyleLoader
+    from .kv_activation_sampling import NativeKVActivationInjector
     from .kv_real_query_distillation import _RealQueryBank
+    from .query_style_tokenizer import _sampling_reference_inputs
+    from .style_transfer import (
+        _optimize_frozen_anima,
+        _resolve_anima_model,
+        _sample_flow_timesteps,
+    )
 
     cfg = copy.deepcopy(config["kv_reference_direct_delta_320"])
     training = dict(cfg["training"])
@@ -1633,6 +1668,7 @@ def train_direct_reference_kv_delta_320(
     checkpoints.mkdir(parents=True, exist_ok=True)
     state_path = output / "training_state.pt"
     start_step = 0
+    resumed = False
     if bool(training.get("resume", True)) and state_path.exists():
         state = torch.load(state_path, map_location="cpu", weights_only=False)
         model.load_state_dict(state["model"], strict=True)
@@ -1642,6 +1678,66 @@ def train_direct_reference_kv_delta_320(
         random.setstate(state["python_rng"])
         torch.set_rng_state(state["torch_rng"])
         torch.cuda.set_rng_state_all(state["cuda_rng"])
+        resumed = True
+    elif cfg.get("initial_checkpoint"):
+        initial = torch.load(
+            destination / str(cfg["initial_checkpoint"]),
+            map_location="cpu",
+            weights_only=False,
+        )
+        model.load_state_dict(initial["model"], strict=True)
+        reader.load_state_dict(initial["reader"], strict=True)
+        start_step = int(cfg.get("initial_step", initial.get("step", 0)))
+        if start_step != int(initial.get("step", start_step)):
+            raise ValueError("initial_step must match the warm-start checkpoint")
+
+    human_flow = dict(training.get("human_flow", {}))
+    flow_enabled = bool(human_flow.get("enabled", False))
+    flow_injector = None
+    flow_prefetched = None
+    flow_update_index = 0
+    if flow_enabled:
+        detail_cfg = dict(config["detail_preserving_style_cross_attention"])
+        flow_loader_cfg = _loader_config(
+            config,
+            detail_cfg,
+            split=str(detail_cfg.get("train_split", "train")),
+        )
+        flow_loader_cfg.update({
+            "batch_size": int(human_flow.get("batch_size", 4)),
+            "min_references": int(human_flow.get("min_references", 1)),
+            "max_references": int(human_flow.get("max_references", 4)),
+            "self_reference_target_images_per_style": 0,
+            "ram_resident_tokens": False,
+            "reference_curriculum": {},
+            "pilot_reference_schedule": [],
+        })
+        flow_loader = MultiPromptDualQueryCachedStyleLoader(
+            destination, flow_loader_cfg
+        )
+        anima = _resolve_anima_model(
+            config, destination, device
+        ).requires_grad_(False).eval()
+        _optimize_frozen_anima(
+            anima, low_precision_rmsnorm=True, fuse_attention_projections=True
+        )
+        flow_injector = NativeKVActivationInjector(anima, model)
+        completed_relative = max(0, start_step - int(cfg.get("initial_step", 0)))
+        flow_update_index = _direct_delta_flow_updates_through(
+            completed_relative, human_flow
+        )
+        remaining_flow_updates = (
+            _direct_delta_flow_updates_through(
+                max(0, steps - int(cfg.get("initial_step", 0))), human_flow
+            )
+            - flow_update_index
+        )
+        flow_prefetched = flow_loader.prefetch(
+            flow_update_index,
+            remaining_flow_updates,
+            workers=int(human_flow.get("prefetch_workers", 2)),
+            depth=int(human_flow.get("prefetch_batches", 4)),
+        )
 
     batch = int(training.get("batch_size", 8))
     blocks_per_step = int(training.get("blocks_per_step", 4))
@@ -1680,7 +1776,7 @@ def train_direct_reference_kv_delta_320(
             project=str(wandb_cfg.get("project", "anima-style-adapter")),
             name=str(wandb_cfg.get("name", "kv-reference-direct-delta-320")),
             id=str(wandb_cfg.get("id", "kv-reference-direct-delta-320")),
-            resume="allow" if start_step else "never",
+            resume="allow" if resumed else "never",
             config={"kv_reference_direct_delta_320": cfg},
         )
 
@@ -1692,6 +1788,120 @@ def train_direct_reference_kv_delta_320(
     reader.train()
     try:
         for step in range(start_step + 1, steps + 1):
+            relative_step = step - int(cfg.get("initial_step", 0))
+            if _direct_delta_flow_due(relative_step, human_flow):
+                assert flow_prefetched is not None
+                assert flow_injector is not None
+                flow_batch = next(flow_prefetched)
+                flow_rng = torch.Generator(device=device).manual_seed(
+                    seed ^ 0x464C4F57 ^ (step * 100_003)
+                )
+                latents = flow_batch["latents"].to(
+                    device=device, dtype=torch.bfloat16, non_blocking=True
+                )
+                flow_context = flow_batch["conditioning"].to(
+                    device=device, dtype=torch.bfloat16, non_blocking=True
+                )
+                flow_references, flow_mask = _sampling_reference_inputs(
+                    flow_batch, device, "heldout"
+                )
+                noise = torch.randn(
+                    latents.shape,
+                    device=device,
+                    dtype=latents.dtype,
+                    generator=flow_rng,
+                )
+                timesteps = _sample_flow_timesteps(
+                    len(latents), device, human_flow, flow_rng
+                )
+                sigma = timesteps[:, None, None, None].to(latents.dtype)
+                noisy = (1 - sigma) * latents + sigma * noise
+                target = (noise - latents).float()
+                padding = torch.zeros(
+                    len(latents), 1, latents.shape[-2], latents.shape[-1],
+                    device=device, dtype=latents.dtype,
+                )
+                optimizer.zero_grad(set_to_none=True)
+                with torch.autocast("cuda", dtype=torch.bfloat16):
+                    flow_style = reader(flow_references, flow_mask).tokens
+                    flow_injector.set_style(flow_style)
+                    prediction = anima(
+                        noisy.unsqueeze(2),
+                        timesteps.to(latents.dtype),
+                        context=flow_context,
+                        padding_mask=padding,
+                        target_input_ids=None,
+                    ).squeeze(2).float()
+                    flow_injector.disable()
+                    dimensions = tuple(range(1, prediction.ndim))
+                    correct_rows = (prediction - target).square().mean(dim=dimensions)
+                    flow_loss = correct_rows.mean()
+                    weighted_flow = (
+                        float(human_flow.get("flow_loss_weight", 1.0))
+                        * flow_loss
+                    )
+                weighted_flow.backward()
+                del prediction, flow_style
+                with torch.autocast("cuda", dtype=torch.bfloat16):
+                    wrong_style = reader(
+                        flow_references.roll(1, dims=0),
+                        flow_mask.roll(1, dims=0),
+                    ).tokens
+                    flow_injector.set_style(wrong_style)
+                    wrong_prediction = anima(
+                        noisy.unsqueeze(2),
+                        timesteps.to(latents.dtype),
+                        context=flow_context,
+                        padding_mask=padding,
+                        target_input_ids=None,
+                    ).squeeze(2).float()
+                    flow_injector.disable()
+                    wrong_rows = (
+                        wrong_prediction - target
+                    ).square().mean(dim=dimensions)
+                    ranking = F.relu(
+                        float(human_flow.get("wrong_reference_margin", 0.02))
+                        + correct_rows.detach()
+                        - wrong_rows
+                    ).mean()
+                    weighted_ranking = (
+                        float(human_flow.get("wrong_reference_weight", 0.1))
+                        * ranking
+                    )
+                weighted_ranking.backward()
+                loss = weighted_flow.detach() + weighted_ranking.detach()
+                generator_grad = torch.nn.utils.clip_grad_norm_(
+                    model.parameters(), generator_clip, foreach=True
+                )
+                reader_grad = torch.nn.utils.clip_grad_norm_(
+                    reader_parameters, reader_clip, foreach=True
+                )
+                generator_grad_history.append(float(generator_grad))
+                reader_grad_history.append(float(reader_grad))
+                lr_scale = min(1.0, relative_step / max(1, warmup))
+                optimizer.param_groups[0]["lr"] = generator_lr * lr_scale
+                optimizer.param_groups[1]["lr"] = reader_lr * lr_scale
+                optimizer.step()
+                flow_update_index += 1
+                running["loss"].append(float(loss.detach()))
+                running["human_flow/loss"].append(float(flow_loss.detach()))
+                running["human_flow/wrong_reference_ranking"].append(
+                    float(ranking.detach())
+                )
+                running["human_flow/correct_minus_wrong_mse"].append(
+                    float((correct_rows - wrong_rows).mean().detach())
+                )
+                running["human_flow/timestep"].append(float(timesteps.mean()))
+                running["human_flow/reference_count"].append(
+                    float(flow_mask.sum(dim=1).float().mean())
+                )
+                running["generator_grad_norm_unclipped"].append(
+                    float(generator_grad)
+                )
+                running["reader_grad_norm_unclipped"].append(float(reader_grad))
+                running["update/human_flow"].append(1.0)
+                continue
+
             rng = random.Random(seed + step * 1_000_003)
             category = rng.choices(categories, weights=category_weights, k=1)[0]
             alternative_references = None
@@ -1748,7 +1958,7 @@ def train_direct_reference_kv_delta_320(
                 (first_block + offset) % model.blocks for offset in range(blocks_per_step)
             ]
             active_attention = attention_weight * min(
-                1.0, step / max(1, attention_ramp)
+                1.0, relative_step / max(1, attention_ramp)
             )
             optimizer.zero_grad(set_to_none=True)
             with torch.autocast("cuda", dtype=torch.bfloat16):
@@ -1841,9 +2051,12 @@ def train_direct_reference_kv_delta_320(
             )
             generator_grad_history.append(float(generator_grad))
             reader_grad_history.append(float(reader_grad))
-            lr_scale = min(1.0, step / max(1, warmup))
-            optimizer.param_groups[0]["lr"] = generator_lr * lr_scale
-            optimizer.param_groups[1]["lr"] = reader_lr * lr_scale
+            lr_scale = min(1.0, relative_step / max(1, warmup))
+            distill_lr = float(
+                human_flow.get("distillation_lr_multiplier", 1.0)
+            )
+            optimizer.param_groups[0]["lr"] = generator_lr * lr_scale * distill_lr
+            optimizer.param_groups[1]["lr"] = reader_lr * lr_scale * distill_lr
             optimizer.step()
 
             running["loss"].append(float(loss.detach()))
@@ -1852,6 +2065,7 @@ def train_direct_reference_kv_delta_320(
             running["reference_count"].append(sum(counts) / len(counts))
             running["reference_consistency"].append(float(consistency.detach()))
             running["attention_weight"].append(active_attention)
+            running["update/distillation"].append(1.0)
             running[f"category/{category}"].append(1.0)
             for key in block_metrics[0]:
                 running[key].append(
@@ -1983,6 +2197,8 @@ def train_direct_reference_kv_delta_320(
                         optimizer=optimizer, cfg=cfg,
                     )
     finally:
+        if flow_injector is not None:
+            flow_injector.close()
         if wandb_run is not None:
             wandb_run.finish()
 
@@ -2009,6 +2225,11 @@ def train_direct_reference_kv_delta_320(
         "teacher_decomposition": "full",
         "common_branch": False,
         "reader_end_to_end": True,
+        "human_flow_enabled": flow_enabled,
+        "human_flow_updates": flow_update_index,
+        "distillation_lr_multiplier": float(
+            human_flow.get("distillation_lr_multiplier", 1.0)
+        ),
         "generator_grad_norm": grad_summary(generator_grad_history),
         "reader_grad_norm": grad_summary(reader_grad_history),
         "elapsed_seconds": time.perf_counter() - started,
@@ -2032,7 +2253,9 @@ def smoke_test_direct_reference_kv_delta_320(
     cfg["training"]["max_grad_norm"] = 1.0e9
     cfg["training"]["reader_max_grad_norm"] = 1.0e9
     return train_direct_reference_kv_delta_320(
-        effective, destination, steps_override=100
+        effective,
+        destination,
+        steps_override=int(cfg.get("initial_step", 0)) + 100,
     )
 
 
@@ -2315,7 +2538,7 @@ def train_scheduled_direct_reference_kv_delta_320(
             int(path.stem.removeprefix("step-"))
             for path in checkpoints.glob("step-*.pt")
         ),
-        default=0,
+        default=int(cfg.get("initial_step", 0)),
     )
     targets = list(
         range(((completed // sample_every) + 1) * sample_every, steps + 1, sample_every)

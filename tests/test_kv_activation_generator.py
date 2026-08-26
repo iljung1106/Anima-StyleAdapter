@@ -10,6 +10,8 @@ from anima_style_data.kv_activation_generator import (
     _apply_dense_kv_operator,
     _centered_residual_loss,
     _direct_delta_artist_split,
+    _direct_delta_flow_due,
+    _direct_delta_flow_updates_through,
     _functional_centered_attention_loss,
     _mean_teacher_operator,
     _mixture_target,
@@ -95,6 +97,24 @@ def test_direct_delta_split_keeps_every_mixture_teacher_in_train() -> None:
     assert len(validation) == 4
     assert {1, 7}.issubset(train)
     assert remapped[0]["teacher_components"] == [7, 1]
+
+
+def test_direct_delta_flow_schedule_is_dense_then_every_twenty() -> None:
+    config = {
+        "enabled": True,
+        "warmup_updates": 1000,
+        "warmup_every": 10,
+        "every": 20,
+        "offset": 1,
+    }
+    assert _direct_delta_flow_due(1, config)
+    assert _direct_delta_flow_due(991, config)
+    assert not _direct_delta_flow_due(1000, config)
+    assert _direct_delta_flow_due(1001, config)
+    assert _direct_delta_flow_due(1021, config)
+    assert not _direct_delta_flow_due(1020, config)
+    assert _direct_delta_flow_updates_through(1000, config) == 100
+    assert _direct_delta_flow_updates_through(1020, config) == 101
 
 
 def test_mixture_target_matches_exact_weighted_factor_effect() -> None:

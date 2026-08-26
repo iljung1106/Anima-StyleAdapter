@@ -846,7 +846,11 @@ kv_reference_activation_generator:
 # existing 64-teacher materialized mixtures remain compositional examples;
 # their component artists are forced into the 256-artist training split.
 kv_reference_direct_delta_320:
-  output_directory: kv_reference_direct_delta_r16_320_100k_v2
+  output_directory: kv_reference_direct_delta_r16_320_joint_flow_v1
+  # Preserve the learned Reader/direct-head geometry but deliberately discard
+  # the 20k optimizer moments that reinforced the common visual direction.
+  initial_checkpoint: kv_reference_direct_delta_r16_320_100k_v2/checkpoints/step-0020000.pt
+  initial_step: 20000
   seed: 20260826
   blocks: 28
   lora_directory: artist_kv_lora_teachers_rank16_320_b2_v3
@@ -890,6 +894,28 @@ kv_reference_direct_delta_320:
     reference_consistency_weight: 0.10
     attention_weight: 0.20
     attention_ramp_steps: 500
+    human_flow:
+      enabled: true
+      batch_size: 4
+      # During the first 1k continuation updates, repair the image objective
+      # more quickly; afterwards one strong flow update replaces every 20th
+      # cheap teacher-distillation update.
+      warmup_updates: 1000
+      warmup_every: 10
+      every: 20
+      offset: 1
+      distillation_lr_multiplier: 0.03
+      flow_loss_weight: 1.0
+      wrong_reference_weight: 0.10
+      wrong_reference_margin: 0.02
+      min_references: 1
+      max_references: 4
+      timestep_sampling: shift
+      sigmoid_scale: 1.0
+      sigmoid_bias: 0.0
+      discrete_flow_shift: 3.0
+      prefetch_workers: 2
+      prefetch_batches: 4
     # The unnormalized direct head starts at 5e-4 weight scale; Adam updates
     # at the old 1e-4 LR overwhelmed that initializer within twenty steps.
     generator_learning_rate: 0.000002
@@ -909,17 +935,17 @@ kv_reference_direct_delta_320:
     validation_blocks: [0, 4, 8, 12, 16, 20, 24, 27]
     checkpoint_every: 10000
     sample_every: 10000
-    sample_output_root: diagnostics/kv-reference-direct-delta-r16-320-100k-v2
+    sample_output_root: diagnostics/kv-reference-direct-delta-r16-320-joint-flow-v1
     resume: true
     wandb:
       enabled: true
       project: anima-style-adapter
-      name: kv-reference-direct-delta-r16-320-100k-v2
-      id: kv-reference-direct-delta-r16-320-100k-v2
+      name: kv-reference-direct-delta-r16-320-joint-flow-v1
+      id: kv-reference-direct-delta-r16-320-joint-flow-v1
 
 kv_reference_direct_delta_320_sample:
-  checkpoint: kv_reference_direct_delta_r16_320_100k_v2/checkpoints/step-0100000.pt
-  output_directory: diagnostics/kv-reference-direct-delta-r16-320-100k-v2-step100000
+  checkpoint: kv_reference_direct_delta_r16_320_joint_flow_v1/checkpoints/step-0100000.pt
+  output_directory: diagnostics/kv-reference-direct-delta-r16-320-joint-flow-v1-step100000
   device: cuda
   artists: 8
   references: 4
