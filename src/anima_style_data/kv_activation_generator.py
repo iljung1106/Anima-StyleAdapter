@@ -446,6 +446,28 @@ def _prediction_population_metrics(
     }
 
 
+def _excess_common_direction_loss(
+    student: torch.Tensor,
+    teacher: torch.Tensor,
+) -> torch.Tensor:
+    """Penalize pairwise collapse beyond the teacher's shared geometry."""
+
+    student_flat = F.normalize(student.float().flatten(1), dim=-1)
+    teacher_flat = F.normalize(teacher.float().flatten(1), dim=-1)
+    artists = len(student_flat)
+    if artists < 2:
+        return student_flat.new_zeros(())
+    student_similarity = student_flat @ student_flat.T
+    teacher_similarity = teacher_flat @ teacher_flat.T
+    off_diagonal = ~torch.eye(
+        artists, device=student.device, dtype=torch.bool
+    )
+    return F.relu(
+        student_similarity[off_diagonal]
+        - teacher_similarity[off_diagonal].detach()
+    ).mean()
+
+
 def _mixture_target(
     context: torch.Tensor,
     teacher_down: torch.Tensor,
@@ -1753,6 +1775,7 @@ def train_direct_reference_kv_delta_320(
     direction_weight = float(training.get("direction_weight", 0.3))
     magnitude_weight = float(training.get("magnitude_weight", 0.15))
     consistency_weight = float(training.get("reference_consistency_weight", 0.1))
+    common_direction_weight = float(training.get("common_direction_weight", 0.0))
     attention_weight = float(training.get("attention_weight", 0.2))
     attention_ramp = int(training.get("attention_ramp_steps", 500))
     warmup = int(training.get("warmup_steps", 100))
@@ -1970,6 +1993,7 @@ def train_direct_reference_kv_delta_320(
                 )
                 block_losses = []
                 block_metrics = []
+                common_direction_losses = []
                 first_student = None
                 first_teacher = None
                 for block in selected_blocks:
@@ -1977,6 +2001,9 @@ def train_direct_reference_kv_delta_320(
                     teacher = _mixture_target(
                         context, teacher_down, teacher_up,
                         components, weights, block,
+                    )
+                    common_direction_losses.append(
+                        _excess_common_direction_loss(student, teacher)
                     )
                     raw_loss, metrics = _normalized_activation_loss(
                         student, teacher,
@@ -2029,6 +2056,8 @@ def train_direct_reference_kv_delta_320(
                     block_losses.append(raw_loss)
                     block_metrics.append(metrics)
                 loss = torch.stack(block_losses).mean()
+                common_direction = torch.stack(common_direction_losses).mean()
+                loss = loss + common_direction_weight * common_direction
                 consistency = loss.new_zeros(())
                 if alternative_style is not None:
                     assert first_student is not None and first_teacher is not None
@@ -2064,6 +2093,9 @@ def train_direct_reference_kv_delta_320(
             running["reader_grad_norm_unclipped"].append(float(reader_grad))
             running["reference_count"].append(sum(counts) / len(counts))
             running["reference_consistency"].append(float(consistency.detach()))
+            running["common_direction_loss"].append(
+                float(common_direction.detach())
+            )
             running["attention_weight"].append(active_attention)
             running["update/distillation"].append(1.0)
             running[f"category/{category}"].append(1.0)

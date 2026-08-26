@@ -923,6 +923,9 @@ kv_reference_direct_delta_320:
     # at the old 1e-4 LR overwhelmed that initializer within twenty steps.
     generator_learning_rate: 0.000002
     reader_learning_rate: 0.0000004
+    # Penalize student pairwise cosine only when it exceeds the corresponding
+    # teacher geometry. Inference has no Common branch or mean subtraction.
+    common_direction_weight: 1.0
     warmup_steps: 100
     betas: [0.9, 0.95]
     adam_eps: 0.00000001

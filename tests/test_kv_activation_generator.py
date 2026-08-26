@@ -83,6 +83,21 @@ def test_prediction_population_metrics_detect_common_direction_collapse() -> Non
     assert separated["artist_variance_fraction"] > 0.99
 
 
+def test_common_direction_loss_penalizes_collapse_beyond_teacher() -> None:
+    from anima_style_data.kv_activation_generator import (
+        _excess_common_direction_loss,
+    )
+
+    collapsed = torch.ones(4, 2, 3, 5)
+    separated = torch.zeros(4, 2, 3, 5)
+    for index in range(4):
+        separated[index].flatten()[index] = 1
+
+    assert _excess_common_direction_loss(collapsed, separated) > 0.99
+    assert _excess_common_direction_loss(separated, separated) < 1e-6
+    assert _excess_common_direction_loss(collapsed, collapsed) < 1e-6
+
+
 def test_direct_delta_split_keeps_every_mixture_teacher_in_train() -> None:
     artists = [f"artist-{index}" for index in range(10)]
     rows = [{
