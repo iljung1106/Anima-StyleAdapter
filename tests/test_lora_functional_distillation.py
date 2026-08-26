@@ -89,6 +89,11 @@ def test_teacher_bank_filters_effect_kinds_and_reuses_population_mean(tmp_path):
     )
     assert len(lazy._effect_shards) == 1
 
+    no_mean = FunctionalLoRATeacherBank(
+        tmp_path, load_kinds={"single"}, load_population_mean=False
+    )
+    assert no_mean.single_population_mean is None
+
 
 def test_artist_only_population_objective_anchors_common_offset_and_spread():
     teacher = torch.eye(4).reshape(4, 1, 4) + 0.3

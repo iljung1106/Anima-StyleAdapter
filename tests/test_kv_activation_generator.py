@@ -13,9 +13,11 @@ from anima_style_data.kv_activation_generator import (
     _direct_delta_flow_due,
     _direct_delta_flow_updates_through,
     _functional_centered_attention_loss,
+    _final_effect_constraints,
     _mean_teacher_operator,
     _mixture_target,
     _prediction_population_metrics,
+    _whole_model_curriculum,
 )
 from anima_style_data.kv_activation_modulation import apply_kv_factors
 from anima_style_data.kv_activation_sampling import NativeKVActivationInjector
@@ -63,6 +65,54 @@ def test_direct_delta_generator_can_preserve_reference_strength() -> None:
     )
     assert isinstance(model.style_norm, nn.Identity)
     assert isinstance(model.output_norm, nn.Identity)
+
+
+def test_direct_delta_generator_can_remove_softmax_invariant_block_key() -> None:
+    model = ReferenceConditionedKVActivationGenerator(
+        style_dim=16, context_dim=12, output_dim=20, blocks=2,
+        hidden_dim=16, heads=4, ff_dim=32, use_block_embedding=False,
+    )
+    assert model.block_embedding is None
+
+
+def test_final_effect_constraints_use_absolute_pairwise_cap_without_centering() -> None:
+    teacher = torch.zeros(4, 1, 2, 4)
+    for index in range(4):
+        teacher[index].flatten()[index] = 1
+    collapsed = torch.ones_like(teacher)
+    loss, metrics = _final_effect_constraints(
+        collapsed, teacher, common_cap=0.25, rms_lower=0.0, rms_upper=10.0
+    )
+    assert loss > 0.5
+    assert metrics["positive_pairwise_cosine"] > 0.99
+    assert metrics["common_cap_loss"] > 0.5
+
+
+def test_final_effect_constraints_only_penalize_rms_outside_band() -> None:
+    teacher = torch.ones(2, 1, 2, 4)
+    inside, inside_metrics = _final_effect_constraints(
+        teacher, teacher, common_cap=1.0, rms_lower=0.75, rms_upper=1.25
+    )
+    small, small_metrics = _final_effect_constraints(
+        teacher * 0.25, teacher, common_cap=1.0,
+        rms_lower=0.75, rms_upper=1.25,
+    )
+    large, large_metrics = _final_effect_constraints(
+        teacher * 2.0, teacher, common_cap=1.0,
+        rms_lower=0.75, rms_upper=1.25,
+    )
+    assert inside < 1e-7
+    assert inside_metrics["rms_band_loss"] < 1e-7
+    assert small_metrics["rms_lower_violation_rate"] == 1
+    assert large_metrics["rms_upper_violation_rate"] == 1
+    assert small > 0 and large > 0
+
+
+def test_whole_model_curriculum_turns_block_loss_off_at_2000() -> None:
+    assert _whole_model_curriculum(500)["block_weight"] == 1
+    assert 0 < _whole_model_curriculum(1000)["block_weight"] < 1
+    assert _whole_model_curriculum(2000)["block_weight"] == 0
+    assert _whole_model_curriculum(2000)["rms_lower"] == 0.75
 
 
 def test_prediction_population_metrics_detect_common_direction_collapse() -> None:
@@ -130,6 +180,17 @@ def test_direct_delta_flow_schedule_is_dense_then_every_twenty() -> None:
     assert not _direct_delta_flow_due(1020, config)
     assert _direct_delta_flow_updates_through(1000, config) == 100
     assert _direct_delta_flow_updates_through(1020, config) == 101
+
+
+def test_whole_model_flow_schedule_is_three_of_four_after_5000() -> None:
+    config = {
+        "enabled": True, "start_step": 5000,
+        "cycle": 4, "slots": [0, 1, 2],
+    }
+    assert not _direct_delta_flow_due(5000, config)
+    assert [_direct_delta_flow_due(step, config) for step in range(5001, 5005)] == [
+        True, True, True, False
+    ]
 
 
 def test_mixture_target_matches_exact_weighted_factor_effect() -> None:

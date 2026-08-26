@@ -880,11 +880,8 @@ kv_reference_activation_generator:
 # existing 64-teacher materialized mixtures remain compositional examples;
 # their component artists are forced into the 256-artist training split.
 kv_reference_direct_delta_320:
-  output_directory: kv_reference_direct_delta_r16_320_joint_flow_v1
-  # Preserve the learned Reader/direct-head geometry but deliberately discard
-  # the 20k optimizer moments that reinforced the common visual direction.
-  initial_checkpoint: kv_reference_direct_delta_r16_320_100k_v2/checkpoints/step-0020000.pt
-  initial_step: 20000
+  output_directory: kv_reference_direct_delta_r16_320_whole_functional_10k_v1
+  # Fresh generator and optimizer. Reader alone is initialized from bootstrap.
   seed: 20260826
   blocks: 28
   lora_directory: artist_kv_lora_teachers_rank16_320_b2_v3
@@ -892,6 +889,7 @@ kv_reference_direct_delta_320:
   synthetic_reference_cache: kv_lora_teacher_references_rank16_320x8_realq_v2/dual_query_reference_tokens_v8_step10000
   mixture_reference_cache: kv_activation_mixture_references_rank16_256x4_v1/dual_query_reference_tokens_v8_step10000
   mixture_manifest: kv_activation_mixture_specs_rank16_64_v1/mixtures.parquet
+  functional_teacher_cache: kv_lora_functional_teacher_bank_rank16_320_mixtures_compact16x4_v1
   text_context_cache: kv_lora_functional_teacher_bank_rank16_64_v2_broad256x4
   query_cache: kv_real_query_bank_broad64x4_q64_v1
   model:
@@ -905,11 +903,15 @@ kv_reference_direct_delta_320:
     output_init_scale: 0.0005
     normalize_style: false
     normalize_attended: false
+    use_block_embedding: false
   training:
     device: cuda
-    steps: 100000
-    batch_size: 8
+    steps: 10000
+    batch_size: 4
+    gradient_accumulation_steps: 2
     blocks_per_step: 4
+    # Defines the fixed 64-artist diagnostic cohort; whole-model mode still
+    # optimizes all 320 single teachers.
     training_artists: 256
     single_reference_images: 8
     mixture_reference_images: 4
@@ -928,21 +930,33 @@ kv_reference_direct_delta_320:
     reference_consistency_weight: 0.10
     attention_weight: 0.20
     attention_ramp_steps: 500
+    whole_model_functional:
+      enabled: true
+      effect_slice_lru_entries: 16
+      huber_beta: 0.10
+      direction_weight: 1.0
+      constraint_weight: 1.0
+      relative_common_weight: 0.5
+      # Fixed for the entire run; it is not estimated from a training batch.
+      common_cap: 0.35
+      rms_floor: 0.0001
     human_flow:
       enabled: true
       # Two rows leave safe headroom for the frozen DiT backward graph plus
       # resident teacher/reference banks. Thousands of flow events provide
       # the required sample count without a risky batch-four peak.
       batch_size: 2
-      # During the first 1k continuation updates, repair the image objective
-      # more quickly; afterwards one strong flow update replaces every 20th
-      # cheap teacher-distillation update.
-      warmup_updates: 1000
-      warmup_every: 10
-      every: 20
-      offset: 1
-      distillation_lr_multiplier: 0.03
+      # 5k 이후 네 update 중 세 update를 human flow로 사용한다.
+      start_step: 5000
+      cycle: 4
+      slots: [0, 1, 2]
       flow_loss_weight: 1.0
+      absolute_mse_weight: 0.1
+      direction_weight: 1.0
+      output_band_weight: 1.0
+      rms_lower: 0.5
+      rms_upper: 1.5
+      rms_floor: 0.0001
       wrong_reference_weight: 0.10
       wrong_reference_margin: 0.02
       min_references: 1
@@ -968,20 +982,26 @@ kv_reference_direct_delta_320:
     # generator and 10.63/19.0 for Reader. Clip only beyond the observed p99.
     max_grad_norm: 18000.0
     reader_max_grad_norm: 12.0
+    adaptive_clip:
+      generator: {minimum_history: 100, window: 1000, quantile: 0.99, multiplier: 1.25, floor: 1000.0}
+      reader: {minimum_history: 100, window: 1000, quantile: 0.99, multiplier: 1.25, floor: 1.0}
     fused_adamw: true
     log_every: 10
     validation_every: 250
     validation_tokens: 64
     validation_blocks: [0, 4, 8, 12, 16, 20, 24, 27]
     checkpoint_every: 10000
-    sample_every: 10000
-    sample_output_root: diagnostics/kv-reference-direct-delta-r16-320-joint-flow-v1
+    sample_every: 0
+    sample_steps: [2000, 5000, 10000]
+    sample_output_root: diagnostics/kv-reference-direct-delta-r16-320-whole-functional-10k-v1
+    # The output directory is new, so the first segment is fresh. Subsequent
+    # 2k -> 5k -> 10k sampling segments resume only this same run.
     resume: true
     wandb:
       enabled: true
       project: anima-style-adapter
-      name: kv-reference-direct-delta-r16-320-joint-flow-common-v1
-      id: kv-reference-direct-delta-r16-320-joint-flow-common-v1
+      name: kv-reference-direct-delta-r16-320-whole-functional-10k-v1
+      id: kv-reference-direct-delta-r16-320-whole-functional-10k-v1
 
 kv_reference_direct_delta_320_sample:
   checkpoint: kv_reference_direct_delta_r16_320_joint_flow_v1/checkpoints/step-0100000.pt

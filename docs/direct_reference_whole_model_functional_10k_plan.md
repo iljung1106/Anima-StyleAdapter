@@ -48,6 +48,10 @@ final-velocity cache:
 Mixture는 새로 무작위 생성하지 않고 기존 materialized mixture reference와
 동일한 style ID와 signed/amplified weight를 사용한다.
 
+320 single teacher는 모두 optimization에 사용한다. 과거의 64-artist holdout은
+동일한 fixed 진단 cohort로 유지하지만 이 run에서는 teacher holdout이 아니다;
+실제 미학적 일반화 판단은 별도 human validation reference/panel로 한다.
+
 ## 손실
 
 ### 초기 block bootstrap
@@ -73,14 +77,37 @@ student_effect = student_prediction - cached_base_prediction
 구성한다. 공통방향 억제는 mean을 빼지 않고 teacher geometry를 기준으로 한다.
 
 ```text
-L_common = mean ReLU(
+L_common_relative = mean ReLU(
   cosine(student_effect_i, student_effect_j)
   - cosine(teacher_effect_i, teacher_effect_j)
 )
+
+C_student = mean ReLU(cosine(student_effect_i, student_effect_j))
+L_common_cap = ReLU(C_student - C_max)^2
 ```
 
 따라서 teacher가 실제로 공유하는 방향은 허용하고 student가 그보다 더 한
-방향으로 붕괴하는 경우만 벌점으로 준다.
+방향으로 붕괴하는 경우만 벌점으로 준다. 동시에 `C_max`는 학습 batch의
+평균으로 정하지 않는 고정 상한이며, teacher population 진단으로 정한 뒤 한
+run 동안 변경하지 않는다. 두 항 모두 pairwise cosine을 직접 계산하며 batch
+mean subtraction은 손실 계산 어디에도 사용하지 않는다.
+
+출력 크기는 점추정으로 teacher RMS에 강제로 붙이지 않고 허용 구간 안에
+유지한다.
+
+```text
+r = RMS(student_effect) / max(RMS(teacher_effect), rms_floor)
+L_output_band = ReLU(r_min-r)^2 + ReLU(r-r_max)^2
+```
+
+- teacher effect가 `rms_floor`보다 작은 row에는 잘못된 non-zero 출력을
+  강제하지 않도록 하한 항을 적용하지 않는다.
+- 0-500: `[0.40, 1.60]`
+- 500-2,000: `[0.40, 1.60] -> [0.60, 1.40]` 선형 축소
+- 2,000-5,000: `[0.75, 1.25]`
+- human flow: `[0.50, 1.50]`
+- 이 항은 구간 밖에서만 gradient를 내므로 정상 크기의 스타일 차이를
+  평탄화하지 않는다.
 
 ### Human functional flow loss
 
@@ -136,7 +163,9 @@ batch에서 계산된다. 따라서 teacher 단계는 batch 4를 우선 검증�
 필수 지표:
 
 - teacher/student final-effect cosine, normalized error, RMS ratio
-- teacher-relative excess common-direction loss와 pairwise cosine
+- teacher-relative excess common-direction loss, absolute common cap 위반량,
+  positive pairwise cosine
+- output RMS band의 lower/upper 위반율과 loss
 - artist variance 및 common-direction occupancy(진단 전용)
 - base/correct/wrong MSE와 relative gain
 - correct-minus-wrong gain

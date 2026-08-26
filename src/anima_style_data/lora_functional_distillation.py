@@ -2022,6 +2022,7 @@ class FunctionalLoRATeacherBank:
         *,
         load_kinds: set[str] | None = None,
         effect_slice_lru_entries: int = 0,
+        load_population_mean: bool = True,
     ):
         self.root = root
         self.base = load_file(root / "base.safetensors", device="cpu")
@@ -2109,7 +2110,7 @@ class FunctionalLoRATeacherBank:
         }
         single_indices = self.by_kind.get("single", [])
         self.single_population_mean = None
-        if len(single_indices) >= 2:
+        if bool(load_population_mean) and len(single_indices) >= 2:
             cache_path = root / "single_population_mean.safetensors"
             if cache_path.exists():
                 population_mean = load_file(cache_path, device="cpu")[

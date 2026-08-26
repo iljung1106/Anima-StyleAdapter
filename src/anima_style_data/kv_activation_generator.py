@@ -64,6 +64,7 @@ class ReferenceConditionedKVActivationGenerator(nn.Module):
         output_init_scale: float = 0.02,
         normalize_style: bool = True,
         normalize_attended: bool = True,
+        use_block_embedding: bool = True,
     ) -> None:
         super().__init__()
         if hidden_dim % heads:
@@ -83,7 +84,11 @@ class ReferenceConditionedKVActivationGenerator(nn.Module):
         self.context_norm = nn.LayerNorm(context_dim)
         self.style_key = nn.Linear(style_dim, hidden_dim, bias=False)
         self.style_value = nn.Linear(style_dim, hidden_dim, bias=False)
-        self.block_embedding = nn.Embedding(blocks, hidden_dim)
+        # Adding one block vector to every key is exactly cancelled by the
+        # attention softmax.  Keep the option only for loading older models.
+        self.block_embedding = (
+            nn.Embedding(blocks, hidden_dim) if bool(use_block_embedding) else None
+        )
         self.context_query = nn.ModuleList(
             nn.Linear(context_dim, hidden_dim, bias=False) for _ in range(blocks)
         )
@@ -103,7 +108,8 @@ class ReferenceConditionedKVActivationGenerator(nn.Module):
         for module in self.modules():
             if isinstance(module, nn.Linear):
                 nn.init.xavier_uniform_(module.weight)
-        nn.init.normal_(self.block_embedding.weight, std=self.hidden_dim**-0.5)
+        if self.block_embedding is not None:
+            nn.init.normal_(self.block_embedding.weight, std=self.hidden_dim**-0.5)
         for head in self.output_head:
             with torch.no_grad():
                 head.weight.mul_(output_init_scale)
@@ -124,8 +130,10 @@ class ReferenceConditionedKVActivationGenerator(nn.Module):
         if not 0 <= block < self.blocks:
             raise ValueError("block_index is outside the model")
         style = self.style_norm(style_memory)
-        block_code = self.block_embedding.weight[block].to(style.dtype)
-        key = self.style_key(style) + block_code[None, None]
+        key = self.style_key(style)
+        if self.block_embedding is not None:
+            block_code = self.block_embedding.weight[block].to(style.dtype)
+            key = key + block_code[None, None]
         value = self.style_value(style)
         query = self.context_query[block](self.context_norm(text_context))
         batch, text_tokens, _ = query.shape
@@ -466,6 +474,123 @@ def _excess_common_direction_loss(
         student_similarity[off_diagonal]
         - teacher_similarity[off_diagonal].detach()
     ).mean()
+
+
+def _final_effect_constraints(
+    student: torch.Tensor,
+    teacher: torch.Tensor,
+    *,
+    common_cap: float,
+    rms_lower: float,
+    rms_upper: float,
+    rms_floor: float = 1e-4,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Absolute common-direction cap and an output-RMS hinge band.
+
+    This deliberately never centers either tensor.  In particular, no batch
+    mean participates in the loss or changes the direction being learned.
+    """
+
+    student_f = student.float()
+    teacher_f = teacher.detach().float()
+    batch = int(student_f.shape[0])
+    zero = student_f.new_zeros(())
+    positive_pairwise = zero
+    relative_common = zero
+    if batch > 1:
+        student_unit = F.normalize(student_f.flatten(1), dim=-1)
+        teacher_unit = F.normalize(teacher_f.flatten(1), dim=-1)
+        off_diagonal = ~torch.eye(batch, device=student.device, dtype=torch.bool)
+        student_cosine = (student_unit @ student_unit.T)[off_diagonal]
+        teacher_cosine = (teacher_unit @ teacher_unit.T)[off_diagonal]
+        positive_pairwise = F.relu(student_cosine).mean()
+        relative_common = F.relu(
+            student_cosine - teacher_cosine.detach()
+        ).mean()
+    common_cap_loss = F.relu(positive_pairwise - float(common_cap)).square()
+
+    dimensions = tuple(range(1, student_f.ndim))
+    student_rms = student_f.square().mean(dim=dimensions).sqrt()
+    teacher_rms = teacher_f.square().mean(dim=dimensions).sqrt()
+    denominator = teacher_rms.clamp_min(float(rms_floor))
+    ratio = student_rms / denominator
+    lower_rows = teacher_rms >= float(rms_floor)
+    lower_violation = F.relu(float(rms_lower) - ratio)
+    if bool(lower_rows.any()):
+        lower_loss = lower_violation[lower_rows].square().mean()
+        lower_rate = (lower_violation[lower_rows] > 0).float().mean()
+    else:
+        lower_loss = zero
+        lower_rate = zero
+    upper_violation = F.relu(ratio - float(rms_upper))
+    upper_loss = upper_violation.square().mean()
+    band_loss = lower_loss + upper_loss
+    return common_cap_loss + band_loss, {
+        "common_cap_loss": common_cap_loss.detach(),
+        "relative_common_loss": relative_common.detach(),
+        "positive_pairwise_cosine": positive_pairwise.detach(),
+        "rms_band_loss": band_loss.detach(),
+        "rms_ratio": ratio.mean().detach(),
+        "rms_lower_violation_rate": lower_rate.detach(),
+        "rms_upper_violation_rate": (upper_violation > 0).float().mean().detach(),
+    }
+
+
+def _whole_model_curriculum(relative_step: int) -> dict[str, float]:
+    """Weights and RMS bounds for the fixed 10k functional curriculum."""
+
+    step = max(0, int(relative_step))
+    if step <= 500:
+        block_weight = 1.0
+        whole_weight = 0.10
+        rms_lower, rms_upper = 0.40, 1.60
+    elif step < 2000:
+        progress = (step - 500) / 1500
+        block_weight = 1.0 - progress
+        whole_weight = 0.10 + 0.90 * progress
+        rms_lower = 0.40 + 0.20 * progress
+        rms_upper = 1.60 - 0.20 * progress
+    elif step < 5000:
+        block_weight = 0.0
+        whole_weight = 1.0
+        rms_lower, rms_upper = 0.75, 1.25
+    else:
+        block_weight = 0.0
+        whole_weight = 1.0
+        rms_lower, rms_upper = 0.75, 1.25
+    return {
+        "block_weight": block_weight,
+        "whole_weight": whole_weight,
+        "rms_lower": rms_lower,
+        "rms_upper": rms_upper,
+    }
+
+
+def _clip_outlier_grad_norm(
+    parameters: list[nn.Parameter] | Any,
+    history: list[float],
+    *,
+    fallback: float,
+    config: dict[str, Any],
+) -> tuple[torch.Tensor, float]:
+    """Clip only above a trailing historical high quantile."""
+
+    values = list(parameters)
+    minimum_history = int(config.get("minimum_history", 100))
+    threshold = float(fallback)
+    if len(history) >= minimum_history:
+        window = int(config.get("window", 1000))
+        quantile = float(config.get("quantile", 0.99))
+        multiplier = float(config.get("multiplier", 1.25))
+        floor = float(config.get("floor", 0.0))
+        observed = torch.tensor(history[-window:], dtype=torch.float32)
+        threshold = max(
+            floor, float(observed.quantile(quantile)) * multiplier
+        )
+    norm = torch.nn.utils.clip_grad_norm_(
+        values, threshold, foreach=True
+    )
+    return norm, threshold
 
 
 def _mixture_target(
@@ -1530,6 +1655,15 @@ def _direct_delta_flow_due(relative_step: int, config: dict[str, Any]) -> bool:
 
     if relative_step <= 0 or not bool(config.get("enabled", False)):
         return False
+    if "start_step" in config:
+        start = int(config["start_step"])
+        if relative_step <= start:
+            return False
+        cycle = int(config.get("cycle", 4))
+        if cycle <= 0:
+            raise ValueError("human_flow cycle must be positive")
+        slots = {int(value) % cycle for value in config.get("slots", [0, 1, 2])}
+        return (relative_step - start - 1) % cycle in slots
     warmup_updates = int(config.get("warmup_updates", 0))
     interval = int(
         config.get("warmup_every", 10)
@@ -1562,6 +1696,7 @@ def train_direct_reference_kv_delta_320(
     from .detail_style_training import _loader_config
     from .global_query_style_tokenizer import MultiPromptDualQueryCachedStyleLoader
     from .kv_activation_sampling import NativeKVActivationInjector
+    from .lora_functional_distillation import FunctionalLoRATeacherBank
     from .kv_real_query_distillation import _RealQueryBank
     from .query_style_tokenizer import _sampling_reference_inputs
     from .style_transfer import (
@@ -1599,6 +1734,14 @@ def train_direct_reference_kv_delta_320(
     )
     if not validation_artists:
         raise RuntimeError("Direct-delta training requires held-out artists")
+    whole_requested = bool(
+        dict(training.get("whole_model_functional", {})).get("enabled", False)
+    )
+    if whole_requested:
+        # The functional bank was deliberately built from all 320 teachers.
+        # Keep the former held-out set as a fixed diagnostic cohort, but do
+        # not omit those valid teachers from optimization.
+        train_artists = list(range(len(artist_ids)))
     rows_by_kind = {
         kind: [row for row in mixture_rows if str(row["kind"]) == kind]
         for kind in ("pair", "triple", "amplified", "signed")
@@ -1663,6 +1806,29 @@ def train_direct_reference_kv_delta_320(
         raise ValueError("heldout_query_contents leaves no real-Q training rows")
     probes = _load_native_attention_probes(config, destination, device)
 
+    whole_model = dict(training.get("whole_model_functional", {}))
+    whole_enabled = bool(whole_model.get("enabled", False))
+    functional_bank = None
+    functional_index_by_style: dict[str, int] = {}
+    if whole_enabled:
+        functional_bank = FunctionalLoRATeacherBank(
+            destination / str(cfg["functional_teacher_cache"]),
+            effect_slice_lru_entries=int(
+                whole_model.get("effect_slice_lru_entries", 16)
+            ),
+            load_population_mean=False,
+        )
+        if len(functional_bank.effect_indices) != len(functional_bank.mixtures):
+            raise RuntimeError(
+                "Functional teacher cache is incomplete: "
+                f"{len(functional_bank.effect_indices)}/"
+                f"{len(functional_bank.mixtures)} effects"
+            )
+        functional_index_by_style = {
+            str(row["mixture_style_id"]): int(row["index"])
+            for row in functional_bank.mixtures
+        }
+
     model_cfg = dict(cfg["model"])
     architecture = str(model_cfg.pop("architecture", "direct_cross_attention"))
     if architecture != "direct_cross_attention":
@@ -1718,6 +1884,15 @@ def train_direct_reference_kv_delta_320(
     flow_injector = None
     flow_prefetched = None
     flow_update_index = 0
+    anima = None
+    if flow_enabled or whole_enabled:
+        anima = _resolve_anima_model(
+            config, destination, device
+        ).requires_grad_(False).eval()
+        _optimize_frozen_anima(
+            anima, low_precision_rmsnorm=True, fuse_attention_projections=True
+        )
+        flow_injector = NativeKVActivationInjector(anima, model)
     if flow_enabled:
         detail_cfg = dict(config["detail_preserving_style_cross_attention"])
         flow_loader_cfg = _loader_config(
@@ -1737,19 +1912,13 @@ def train_direct_reference_kv_delta_320(
         flow_loader = MultiPromptDualQueryCachedStyleLoader(
             destination, flow_loader_cfg
         )
-        anima = _resolve_anima_model(
-            config, destination, device
-        ).requires_grad_(False).eval()
-        _optimize_frozen_anima(
-            anima, low_precision_rmsnorm=True, fuse_attention_projections=True
-        )
-        flow_injector = NativeKVActivationInjector(anima, model)
         completed_relative = max(0, start_step - int(cfg.get("initial_step", 0)))
-        flow_update_index = _direct_delta_flow_updates_through(
+        accumulation = int(training.get("gradient_accumulation_steps", 1))
+        flow_update_index = accumulation * _direct_delta_flow_updates_through(
             completed_relative, human_flow
         )
         remaining_flow_updates = (
-            _direct_delta_flow_updates_through(
+            accumulation * _direct_delta_flow_updates_through(
                 max(0, steps - int(cfg.get("initial_step", 0))), human_flow
             )
             - flow_update_index
@@ -1781,9 +1950,15 @@ def train_direct_reference_kv_delta_320(
     warmup = int(training.get("warmup_steps", 100))
     generator_clip = float(training.get("max_grad_norm", 10.0))
     reader_clip = float(training.get("reader_max_grad_norm", 5.0))
+    adaptive_clip = dict(training.get("adaptive_clip", {}))
+    generator_adaptive_clip = dict(adaptive_clip.get("generator", {}))
+    reader_adaptive_clip = dict(adaptive_clip.get("reader", {}))
     log_every = int(training.get("log_every", 10))
     validation_every = int(training.get("validation_every", 250))
     checkpoint_every = int(training.get("checkpoint_every", 500))
+    accumulation_steps = int(training.get("gradient_accumulation_steps", 1))
+    if accumulation_steps <= 0:
+        raise ValueError("gradient_accumulation_steps must be positive")
     validation_tokens = int(training.get("validation_tokens", 64))
     validation_blocks = [
         int(value)
@@ -1810,14 +1985,20 @@ def train_direct_reference_kv_delta_320(
     model.train()
     reader.train()
     try:
-        for step in range(start_step + 1, steps + 1):
+        for micro_step in range(
+            start_step * accumulation_steps + 1,
+            steps * accumulation_steps + 1,
+        ):
+            step = (micro_step - 1) // accumulation_steps + 1
+            accumulation_index = (micro_step - 1) % accumulation_steps
+            accumulation_last = accumulation_index == accumulation_steps - 1
             relative_step = step - int(cfg.get("initial_step", 0))
             if _direct_delta_flow_due(relative_step, human_flow):
                 assert flow_prefetched is not None
                 assert flow_injector is not None
                 flow_batch = next(flow_prefetched)
                 flow_rng = torch.Generator(device=device).manual_seed(
-                    seed ^ 0x464C4F57 ^ (step * 100_003)
+                    seed ^ 0x464C4F57 ^ (micro_step * 100_003)
                 )
                 latents = flow_batch["latents"].to(
                     device=device, dtype=torch.bfloat16, non_blocking=True
@@ -1844,7 +2025,24 @@ def train_direct_reference_kv_delta_320(
                     len(latents), 1, latents.shape[-2], latents.shape[-1],
                     device=device, dtype=latents.dtype,
                 )
-                optimizer.zero_grad(set_to_none=True)
+                if accumulation_index == 0:
+                    optimizer.zero_grad(set_to_none=True)
+                assert anima is not None
+                assert flow_injector is not None
+                flow_injector.disable()
+                with torch.inference_mode(), torch.autocast(
+                    "cuda", dtype=torch.bfloat16
+                ):
+                    base_prediction = anima(
+                        noisy.unsqueeze(2),
+                        timesteps.to(latents.dtype),
+                        context=flow_context,
+                        padding_mask=padding,
+                        target_input_ids=None,
+                    ).squeeze(2).float()
+                # Leave inference mode before using the frozen baseline as a
+                # constant in differentiable residual losses.
+                base_prediction = base_prediction.clone()
                 with torch.autocast("cuda", dtype=torch.bfloat16):
                     flow_style = reader(flow_references, flow_mask).tokens
                     flow_injector.set_style(flow_style)
@@ -1857,13 +2055,42 @@ def train_direct_reference_kv_delta_320(
                     ).squeeze(2).float()
                     flow_injector.disable()
                     dimensions = tuple(range(1, prediction.ndim))
+                    base_rows = (base_prediction - target).square().mean(dim=dimensions)
                     correct_rows = (prediction - target).square().mean(dim=dimensions)
-                    flow_loss = correct_rows.mean()
+                    desired_effect = target - base_prediction
+                    student_effect = prediction - base_prediction
+                    effect_scale = desired_effect.square().mean(
+                        dim=dimensions, keepdim=True
+                    ).sqrt().clamp_min(float(human_flow.get("rms_floor", 1e-4)))
+                    residual_huber = F.smooth_l1_loss(
+                        student_effect / effect_scale,
+                        desired_effect / effect_scale,
+                        beta=float(human_flow.get("huber_beta", 0.1)),
+                    )
+                    residual_cosine = F.cosine_similarity(
+                        student_effect.flatten(1), desired_effect.flatten(1), dim=-1
+                    ).mean()
+                    residual_band, residual_band_metrics = _final_effect_constraints(
+                        student_effect, desired_effect,
+                        common_cap=1.0,
+                        rms_lower=float(human_flow.get("rms_lower", 0.5)),
+                        rms_upper=float(human_flow.get("rms_upper", 1.5)),
+                        rms_floor=float(human_flow.get("rms_floor", 1e-4)),
+                    )
+                    flow_loss = (
+                        residual_huber
+                        + float(human_flow.get("direction_weight", 1.0))
+                        * (1.0 - residual_cosine)
+                        + float(human_flow.get("output_band_weight", 1.0))
+                        * residual_band
+                        + float(human_flow.get("absolute_mse_weight", 0.1))
+                        * correct_rows.mean()
+                    )
                     weighted_flow = (
                         float(human_flow.get("flow_loss_weight", 1.0))
                         * flow_loss
                     )
-                weighted_flow.backward()
+                (weighted_flow / accumulation_steps).backward()
                 del prediction, flow_style
                 with torch.autocast("cuda", dtype=torch.bfloat16):
                     wrong_style = reader(
@@ -1882,29 +2109,40 @@ def train_direct_reference_kv_delta_320(
                     wrong_rows = (
                         wrong_prediction - target
                     ).square().mean(dim=dimensions)
+                    denominator = base_rows.detach().clamp_min(1e-6)
+                    correct_gain = (base_rows - correct_rows) / denominator
+                    wrong_gain = (base_rows - wrong_rows) / denominator
                     ranking = F.relu(
                         float(human_flow.get("wrong_reference_margin", 0.02))
-                        + correct_rows.detach()
-                        - wrong_rows
+                        + wrong_gain
+                        - correct_gain.detach()
                     ).mean()
                     weighted_ranking = (
                         float(human_flow.get("wrong_reference_weight", 0.1))
                         * ranking
                     )
-                weighted_ranking.backward()
+                (weighted_ranking / accumulation_steps).backward()
                 loss = weighted_flow.detach() + weighted_ranking.detach()
-                generator_grad = torch.nn.utils.clip_grad_norm_(
-                    model.parameters(), generator_clip, foreach=True
-                )
-                reader_grad = torch.nn.utils.clip_grad_norm_(
-                    reader_parameters, reader_clip, foreach=True
-                )
-                generator_grad_history.append(float(generator_grad))
-                reader_grad_history.append(float(reader_grad))
-                lr_scale = min(1.0, relative_step / max(1, warmup))
-                optimizer.param_groups[0]["lr"] = generator_lr * lr_scale
-                optimizer.param_groups[1]["lr"] = reader_lr * lr_scale
-                optimizer.step()
+                if accumulation_last:
+                    generator_grad, generator_clip_used = _clip_outlier_grad_norm(
+                        model.parameters(), generator_grad_history,
+                        fallback=generator_clip, config=generator_adaptive_clip,
+                    )
+                    reader_grad, reader_clip_used = _clip_outlier_grad_norm(
+                        reader_parameters, reader_grad_history,
+                        fallback=reader_clip, config=reader_adaptive_clip,
+                    )
+                    generator_grad_history.append(float(generator_grad))
+                    reader_grad_history.append(float(reader_grad))
+                    lr_scale = min(1.0, relative_step / max(1, warmup))
+                    optimizer.param_groups[0]["lr"] = generator_lr * lr_scale
+                    optimizer.param_groups[1]["lr"] = reader_lr * lr_scale
+                    optimizer.step()
+                else:
+                    generator_grad = loss.new_zeros(())
+                    reader_grad = loss.new_zeros(())
+                    generator_clip_used = generator_clip
+                    reader_clip_used = reader_clip
                 flow_update_index += 1
                 running["loss"].append(float(loss.detach()))
                 running["human_flow/loss"].append(float(flow_loss.detach()))
@@ -1914,6 +2152,18 @@ def train_direct_reference_kv_delta_320(
                 running["human_flow/correct_minus_wrong_mse"].append(
                     float((correct_rows - wrong_rows).mean().detach())
                 )
+                running["human_flow/correct_gain"].append(
+                    float(correct_gain.mean().detach())
+                )
+                running["human_flow/wrong_gain"].append(
+                    float(wrong_gain.mean().detach())
+                )
+                running["human_flow/residual_cosine"].append(
+                    float(residual_cosine.detach())
+                )
+                for key, value in residual_band_metrics.items():
+                    if key.startswith("rms_"):
+                        running[f"human_flow/{key}"].append(float(value))
                 running["human_flow/timestep"].append(float(timesteps.mean()))
                 running["human_flow/reference_count"].append(
                     float(flow_mask.sum(dim=1).float().mean())
@@ -1922,15 +2172,18 @@ def train_direct_reference_kv_delta_320(
                     float(generator_grad)
                 )
                 running["reader_grad_norm_unclipped"].append(float(reader_grad))
+                running["generator_grad_clip_threshold"].append(generator_clip_used)
+                running["reader_grad_clip_threshold"].append(reader_clip_used)
                 running["update/human_flow"].append(1.0)
                 continue
 
-            rng = random.Random(seed + step * 1_000_003)
+            rng = random.Random(seed + micro_step * 1_000_003)
             category = rng.choices(categories, weights=category_weights, k=1)[0]
             alternative_references = None
             alternative_mask = None
             if category == "single":
                 artists = rng.sample(train_artists, batch)
+                functional_effect_indices = list(artists)
                 counts = rng.choices(single_counts, weights=single_count_weights, k=batch)
                 references, reference_mask = _select_reference_tokens(
                     single_bank, artists, reference_counts=counts,
@@ -1953,6 +2206,10 @@ def train_direct_reference_kv_delta_320(
                     reference_stop=mixture_images, rng=rng,
                 )
                 selected = [source_rows[index] for index in selected_rows]
+                functional_effect_indices = [
+                    functional_index_by_style[str(row["mixture_style_id"])]
+                    for row in selected
+                ] if whole_enabled else []
                 maximum = max(len(row["teacher_components"]) for row in selected)
                 components = torch.full(
                     (batch, maximum), -1, device=device, dtype=torch.long
@@ -1976,14 +2233,17 @@ def train_direct_reference_kv_delta_320(
             functional_context = query_bank.context(query_content)[None].expand(
                 batch, -1, -1
             )
+            curriculum = _whole_model_curriculum(relative_step)
             first_block = ((step - 1) * blocks_per_step) % model.blocks
             selected_blocks = [
                 (first_block + offset) % model.blocks for offset in range(blocks_per_step)
-            ]
-            active_attention = attention_weight * min(
-                1.0, relative_step / max(1, attention_ramp)
+            ] if not whole_enabled or curriculum["block_weight"] > 0 else []
+            active_attention = (
+                attention_weight * min(1.0, relative_step / max(1, attention_ramp))
+                * (curriculum["block_weight"] if whole_enabled else 1.0)
             )
-            optimizer.zero_grad(set_to_none=True)
+            if accumulation_index == 0:
+                optimizer.zero_grad(set_to_none=True)
             with torch.autocast("cuda", dtype=torch.bfloat16):
                 style = reader(references, reference_mask).tokens
                 alternative_style = (
@@ -1991,6 +2251,83 @@ def train_direct_reference_kv_delta_320(
                     if alternative_references is not None and alternative_mask is not None
                     else None
                 )
+                whole_loss = style.new_zeros((), dtype=torch.float32)
+                whole_metrics: dict[str, torch.Tensor] = {}
+                if whole_enabled:
+                    assert functional_bank is not None
+                    assert flow_injector is not None
+                    assert anima is not None
+                    functional_content = rng.randrange(
+                        int(functional_bank.base["noisy_inputs"].shape[0])
+                    )
+                    functional_timestep = rng.randrange(
+                        int(functional_bank.base["noisy_inputs"].shape[1])
+                    )
+                    final_context = functional_bank.base["base_context"][
+                        functional_content : functional_content + 1
+                    ].to(device=device, dtype=torch.bfloat16).expand(batch, -1, -1)
+                    final_noisy = functional_bank.base["noisy_inputs"][
+                        functional_content, functional_timestep
+                    ].to(device=device, dtype=torch.bfloat16)[None].expand(batch, -1, -1, -1)
+                    final_base = functional_bank.base["base_predictions"][
+                        functional_content, functional_timestep
+                    ].to(device=device, dtype=torch.float32)[None].expand(batch, -1, -1, -1)
+                    final_teacher = functional_bank.effect_rows(
+                        functional_effect_indices,
+                        functional_content,
+                        functional_timestep,
+                    ).to(device=device, dtype=torch.float32)
+                    final_t = functional_bank.base["timesteps"][
+                        functional_timestep
+                    ].to(device=device, dtype=torch.bfloat16).expand(batch)
+                    final_padding = torch.zeros(
+                        batch, 1, final_noisy.shape[-2], final_noisy.shape[-1],
+                        device=device, dtype=torch.bfloat16,
+                    )
+                    flow_injector.set_style(style)
+                    final_prediction = anima(
+                        final_noisy.unsqueeze(2), final_t,
+                        context=final_context, padding_mask=final_padding,
+                        target_input_ids=None,
+                    ).squeeze(2).float()
+                    flow_injector.disable()
+                    final_student = final_prediction - final_base
+                    final_scale = final_teacher.square().mean(
+                        dim=tuple(range(1, final_teacher.ndim)), keepdim=True
+                    ).sqrt().clamp_min(float(whole_model.get("rms_floor", 1e-4)))
+                    final_huber = F.smooth_l1_loss(
+                        final_student / final_scale,
+                        final_teacher / final_scale,
+                        beta=float(whole_model.get("huber_beta", 0.1)),
+                    )
+                    final_cosine = F.cosine_similarity(
+                        final_student.flatten(1), final_teacher.flatten(1), dim=-1
+                    ).mean()
+                    constraint_loss, constraint_metrics = _final_effect_constraints(
+                        final_student, final_teacher,
+                        common_cap=float(whole_model.get("common_cap", 0.35)),
+                        rms_lower=curriculum["rms_lower"],
+                        rms_upper=curriculum["rms_upper"],
+                        rms_floor=float(whole_model.get("rms_floor", 1e-4)),
+                    )
+                    relative_common = _excess_common_direction_loss(
+                        final_student, final_teacher
+                    )
+                    whole_loss = (
+                        final_huber
+                        + float(whole_model.get("direction_weight", 1.0))
+                        * (1.0 - final_cosine)
+                        + float(whole_model.get("constraint_weight", 1.0))
+                        * constraint_loss
+                        + float(whole_model.get("relative_common_weight", 0.5))
+                        * relative_common
+                    )
+                    whole_metrics = {
+                        "whole/loss": whole_loss.detach(),
+                        "whole/normalized_huber": final_huber.detach(),
+                        "whole/cosine": final_cosine.detach(),
+                        **{f"whole/{key}": value for key, value in constraint_metrics.items()},
+                    }
                 block_losses = []
                 block_metrics = []
                 common_direction_losses = []
@@ -2055,11 +2392,22 @@ def train_direct_reference_kv_delta_320(
                         })
                     block_losses.append(raw_loss)
                     block_metrics.append(metrics)
-                loss = torch.stack(block_losses).mean()
-                common_direction = torch.stack(common_direction_losses).mean()
-                loss = loss + common_direction_weight * common_direction
+                if block_losses:
+                    block_loss = torch.stack(block_losses).mean()
+                    common_direction = torch.stack(common_direction_losses).mean()
+                else:
+                    block_loss = whole_loss.new_zeros(())
+                    common_direction = whole_loss.new_zeros(())
+                if whole_enabled:
+                    loss = (
+                        curriculum["whole_weight"] * whole_loss
+                        + curriculum["block_weight"]
+                        * (block_loss + common_direction_weight * common_direction)
+                    )
+                else:
+                    loss = block_loss + common_direction_weight * common_direction
                 consistency = loss.new_zeros(())
-                if alternative_style is not None:
+                if alternative_style is not None and selected_blocks:
                     assert first_student is not None and first_teacher is not None
                     alternate = model(alternative_style, context, selected_blocks[0])
                     scale = first_teacher.float().square().mean(
@@ -2071,40 +2419,55 @@ def train_direct_reference_kv_delta_320(
                         beta=0.1,
                     )
                     loss = loss + consistency_weight * consistency
-            loss.backward()
-            generator_grad = torch.nn.utils.clip_grad_norm_(
-                model.parameters(), generator_clip, foreach=True
-            )
-            reader_grad = torch.nn.utils.clip_grad_norm_(
-                reader_parameters, reader_clip, foreach=True
-            )
-            generator_grad_history.append(float(generator_grad))
-            reader_grad_history.append(float(reader_grad))
-            lr_scale = min(1.0, relative_step / max(1, warmup))
-            distill_lr = float(
-                human_flow.get("distillation_lr_multiplier", 1.0)
-            )
-            optimizer.param_groups[0]["lr"] = generator_lr * lr_scale * distill_lr
-            optimizer.param_groups[1]["lr"] = reader_lr * lr_scale * distill_lr
-            optimizer.step()
+            (loss / accumulation_steps).backward()
+            if accumulation_last:
+                generator_grad, generator_clip_used = _clip_outlier_grad_norm(
+                    model.parameters(), generator_grad_history,
+                    fallback=generator_clip, config=generator_adaptive_clip,
+                )
+                reader_grad, reader_clip_used = _clip_outlier_grad_norm(
+                    reader_parameters, reader_grad_history,
+                    fallback=reader_clip, config=reader_adaptive_clip,
+                )
+                generator_grad_history.append(float(generator_grad))
+                reader_grad_history.append(float(reader_grad))
+                lr_scale = min(1.0, relative_step / max(1, warmup))
+                distill_lr = float(
+                    human_flow.get("distillation_lr_multiplier", 1.0)
+                )
+                optimizer.param_groups[0]["lr"] = generator_lr * lr_scale * distill_lr
+                optimizer.param_groups[1]["lr"] = reader_lr * lr_scale * distill_lr
+                optimizer.step()
+            else:
+                generator_grad = loss.new_zeros(())
+                reader_grad = loss.new_zeros(())
+                generator_clip_used = generator_clip
+                reader_clip_used = reader_clip
 
             running["loss"].append(float(loss.detach()))
             running["generator_grad_norm_unclipped"].append(float(generator_grad))
             running["reader_grad_norm_unclipped"].append(float(reader_grad))
+            running["generator_grad_clip_threshold"].append(generator_clip_used)
+            running["reader_grad_clip_threshold"].append(reader_clip_used)
             running["reference_count"].append(sum(counts) / len(counts))
             running["reference_consistency"].append(float(consistency.detach()))
             running["common_direction_loss"].append(
                 float(common_direction.detach())
             )
             running["attention_weight"].append(active_attention)
+            running["curriculum/block_weight"].append(curriculum["block_weight"])
+            running["curriculum/whole_weight"].append(curriculum["whole_weight"])
             running["update/distillation"].append(1.0)
             running[f"category/{category}"].append(1.0)
-            for key in block_metrics[0]:
-                running[key].append(
-                    sum(float(values[key]) for values in block_metrics)
-                    / len(block_metrics)
-                )
-            if step % log_every == 0:
+            if block_metrics:
+                for key in block_metrics[0]:
+                    running[key].append(
+                        sum(float(values[key]) for values in block_metrics)
+                        / len(block_metrics)
+                    )
+            for key, value in whole_metrics.items():
+                running[key].append(float(value))
+            if accumulation_last and step % log_every == 0:
                 row = {key: sum(values) / len(values) for key, values in running.items()}
                 row["generator_lr"] = optimizer.param_groups[0]["lr"]
                 row["reader_lr"] = optimizer.param_groups[1]["lr"]
@@ -2117,7 +2480,7 @@ def train_direct_reference_kv_delta_320(
                     )
                 running.clear()
 
-            if validation_every > 0 and step % validation_every == 0:
+            if accumulation_last and validation_every > 0 and step % validation_every == 0:
                 model.eval()
                 reader.eval()
                 validation_rows: dict[str, list[float]] = defaultdict(list)
@@ -2167,6 +2530,73 @@ def train_direct_reference_kv_delta_320(
                                 validation_rows[f"single_r{reference_count}/{key}"].append(
                                     float(value)
                                 )
+                    if whole_enabled:
+                        assert functional_bank is not None
+                        assert flow_injector is not None
+                        assert anima is not None
+                        final_content = int(
+                            functional_bank.base["noisy_inputs"].shape[0]
+                        ) - 1
+                        final_timestep = int(
+                            functional_bank.base["noisy_inputs"].shape[1]
+                        ) // 2
+                        final_count = min(4, single_images)
+                        final_refs, final_mask = _select_reference_tokens(
+                            single_bank, val_artists,
+                            reference_counts=[final_count] * len(val_artists),
+                            reference_start=0, reference_stop=single_images,
+                            rng=random.Random(seed ^ 0x56414C),
+                        )
+                        final_style = reader(final_refs, final_mask).tokens
+                        final_context = functional_bank.base["base_context"][
+                            final_content : final_content + 1
+                        ].to(device=device, dtype=torch.bfloat16).expand(
+                            len(val_artists), -1, -1
+                        )
+                        final_noisy = functional_bank.base["noisy_inputs"][
+                            final_content, final_timestep
+                        ].to(device=device, dtype=torch.bfloat16)[None].expand(
+                            len(val_artists), -1, -1, -1
+                        )
+                        final_base = functional_bank.base["base_predictions"][
+                            final_content, final_timestep
+                        ].to(device=device, dtype=torch.float32)[None].expand(
+                            len(val_artists), -1, -1, -1
+                        )
+                        final_teacher = functional_bank.effect_rows(
+                            val_artists, final_content, final_timestep
+                        ).to(device=device, dtype=torch.float32)
+                        final_times = functional_bank.base["timesteps"][
+                            final_timestep
+                        ].to(device=device, dtype=torch.bfloat16).expand(
+                            len(val_artists)
+                        )
+                        final_padding = torch.zeros(
+                            len(val_artists), 1, final_noisy.shape[-2],
+                            final_noisy.shape[-1], device=device,
+                            dtype=torch.bfloat16,
+                        )
+                        flow_injector.set_style(final_style)
+                        final_prediction = anima(
+                            final_noisy.unsqueeze(2), final_times,
+                            context=final_context, padding_mask=final_padding,
+                            target_input_ids=None,
+                        ).squeeze(2).float()
+                        flow_injector.disable()
+                        final_student = final_prediction - final_base
+                        final_cosine = F.cosine_similarity(
+                            final_student.flatten(1), final_teacher.flatten(1), dim=-1
+                        ).mean()
+                        _, final_values = _final_effect_constraints(
+                            final_student, final_teacher,
+                            common_cap=float(whole_model.get("common_cap", 0.35)),
+                            rms_lower=curriculum["rms_lower"],
+                            rms_upper=curriculum["rms_upper"],
+                            rms_floor=float(whole_model.get("rms_floor", 1e-4)),
+                        )
+                        validation_rows["whole/cosine"].append(float(final_cosine))
+                        for key, value in final_values.items():
+                            validation_rows[f"whole/{key}"].append(float(value))
                     for kind, source_rows in rows_by_kind.items():
                         selected_rows = list(range(min(4, len(source_rows))))
                         mix_refs, mix_mask = _select_reference_tokens(
@@ -2222,7 +2652,7 @@ def train_direct_reference_kv_delta_320(
                 model.train()
                 reader.train()
 
-            if step % checkpoint_every == 0 or step == steps:
+            if accumulation_last and (step % checkpoint_every == 0 or step == steps):
                 for path in (state_path, checkpoints / f"step-{step:07d}.pt"):
                     _save_training_state(
                         path, step=step, model=model, reader=reader,
@@ -2560,7 +2990,11 @@ def train_scheduled_direct_reference_kv_delta_320(
     training = dict(cfg["training"])
     steps = int(training.get("steps", 100_000))
     sample_every = int(training.get("sample_every", 0))
-    if sample_every <= 0:
+    configured_targets = sorted({
+        int(value) for value in training.get("sample_steps", [])
+        if 0 < int(value) <= steps
+    })
+    if sample_every <= 0 and not configured_targets:
         return train_direct_reference_kv_delta_320(config, destination)
 
     output = destination / str(cfg["output_directory"])
@@ -2572,9 +3006,12 @@ def train_scheduled_direct_reference_kv_delta_320(
         ),
         default=int(cfg.get("initial_step", 0)),
     )
-    targets = list(
-        range(((completed // sample_every) + 1) * sample_every, steps + 1, sample_every)
-    )
+    if configured_targets:
+        targets = [target for target in configured_targets if target > completed]
+    else:
+        targets = list(
+            range(((completed // sample_every) + 1) * sample_every, steps + 1, sample_every)
+        )
     if completed < steps and (not targets or targets[-1] != steps):
         targets.append(steps)
 
@@ -2587,7 +3024,11 @@ def train_scheduled_direct_reference_kv_delta_320(
         )
     )
     sampling_contract = "fixed_test_sample_1_7_and_episodic_4_plus_4_v1"
-    for target in range(sample_every, completed + 1, sample_every):
+    previous_targets = (
+        [target for target in configured_targets if target <= completed]
+        if configured_targets else range(sample_every, completed + 1, sample_every)
+    )
+    for target in previous_targets:
         checkpoint = checkpoints / f"step-{target:07d}.pt"
         summary_path = destination / f"{sample_root}-step{target}" / "summary.json"
         current_contract = None
@@ -2612,7 +3053,7 @@ def train_scheduled_direct_reference_kv_delta_320(
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-        if target % sample_every == 0:
+        if configured_targets or target % sample_every == 0:
             sample_config = copy.deepcopy(config)
             sample_cfg = sample_config["kv_reference_direct_delta_320_sample"]
             sample_cfg["checkpoint"] = (
