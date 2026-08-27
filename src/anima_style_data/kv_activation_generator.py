@@ -5064,7 +5064,10 @@ def sample_direct_reference_kv_delta_320(
     checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     cfg = dict(checkpoint["config"])
     use_ema = bool(
-        dict(cfg.get("training", {})).get("ema", {}).get("sample", True)
+        sample_cfg.get(
+            "use_ema",
+            dict(cfg.get("training", {})).get("ema", {}).get("sample", True),
+        )
     )
     reader = _load_reader(config, destination, cfg, device)
     reader_state = (
