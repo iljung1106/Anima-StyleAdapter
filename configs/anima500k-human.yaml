@@ -2108,6 +2108,36 @@ kv_reference_expert_kv_teacher_flow_hybrid_1k_sample:
   batch_size: 4
   panel_tile_width: 384
 
+# v8 reached step 90 correctly but a large-resolution four-target human-flow
+# batch exhausted the last 256 MiB of an 80 GiB GPU.  Keep teacher batches at
+# four and reduce only the expensive flow group to three support/query rows.
+kv_reference_expert_kv_teacher_flow_hybrid_b3_1k:
+  extends_config_key: kv_reference_expert_kv_teacher_flow_hybrid_1k
+  output_directory: kv_reference_expert_kv64x16_teacher_flow_hybrid_b3_w768_l3_1k_v9
+  seed: 20260904
+  training:
+    human_flow:
+      batch_size: 3
+      same_style_target_min: 2
+      same_style_target_max: 3
+    sample_output_root: diagnostics/kv-reference-expert-kv64x16-teacher-flow-hybrid-b3-w768-l3-1k-v9
+    wandb:
+      enabled: true
+      project: anima-style-adapter
+      name: kv-reference-expert-kv64x16-teacher-flow-hybrid-b3-w768-l3-1k-v9
+      id: kv-reference-expert-kv64x16-teacher-flow-hybrid-b3-w768-l3-1k-v9
+
+kv_reference_expert_kv_teacher_flow_hybrid_b3_1k_sample:
+  checkpoint: kv_reference_expert_kv64x16_teacher_flow_hybrid_b3_w768_l3_1k_v9/checkpoints/step-0001000.pt
+  output_directory: diagnostics/kv-reference-expert-kv64x16-teacher-flow-hybrid-b3-w768-l3-1k-v9-step1000
+  device: cuda
+  artists: 8
+  references: 4
+  reference_seed: 20260904
+  strengths: [1.0, 2.0]
+  batch_size: 4
+  panel_tile_width: 384
+
 # Reference-conditioned low-rank operator pilot. Unlike the direct activation
 # head above, the reference generates a fresh block-local linear operator and
 # applies it to every native text token.  Teacher factors remain offline
