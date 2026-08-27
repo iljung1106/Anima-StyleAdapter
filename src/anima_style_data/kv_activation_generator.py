@@ -1516,6 +1516,59 @@ def _excess_common_direction_loss(
     ).mean()
 
 
+def _final_effect_retrieval_loss(
+    student: torch.Tensor,
+    teacher: torch.Tensor,
+    *,
+    temperature: float = 0.07,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Make each predicted final effect identify its matching teacher effect.
+
+    Every row is evaluated under the same content, noise, and timestep. The
+    off-diagonal rows are therefore genuine wrong-style negatives rather than
+    content negatives. Neither tensor is centered and no batch mean is used.
+    """
+
+    batch = int(student.shape[0])
+    zero = student.float().new_zeros(())
+    if batch < 2:
+        return zero, {
+            "retrieval_loss": zero.detach(),
+            "retrieval_accuracy": zero.detach(),
+            "correct_cosine": zero.detach(),
+            "hardest_wrong_cosine": zero.detach(),
+            "correct_minus_hardest_wrong_cosine": zero.detach(),
+        }
+    if temperature <= 0:
+        raise ValueError("temperature must be positive")
+
+    student_unit = F.normalize(student.float().flatten(1), dim=-1)
+    teacher_unit = F.normalize(teacher.detach().float().flatten(1), dim=-1)
+    cosine = student_unit @ teacher_unit.T
+    labels = torch.arange(batch, device=student.device)
+    logits = cosine / float(temperature)
+    loss = 0.5 * (
+        F.cross_entropy(logits, labels)
+        + F.cross_entropy(logits.T, labels)
+    )
+    correct = cosine.diagonal()
+    wrong = cosine.masked_fill(
+        torch.eye(batch, device=student.device, dtype=torch.bool),
+        -torch.inf,
+    )
+    hardest_wrong = wrong.max(dim=1).values
+    accuracy = (cosine.argmax(dim=1) == labels).float().mean()
+    return loss, {
+        "retrieval_loss": loss.detach(),
+        "retrieval_accuracy": accuracy.detach(),
+        "correct_cosine": correct.mean().detach(),
+        "hardest_wrong_cosine": hardest_wrong.mean().detach(),
+        "correct_minus_hardest_wrong_cosine": (
+            correct - hardest_wrong
+        ).mean().detach(),
+    }
+
+
 def _final_effect_constraints(
     student: torch.Tensor,
     teacher: torch.Tensor,
@@ -4497,6 +4550,18 @@ def train_direct_reference_kv_delta_320(
                     relative_common_weighted = float(
                         whole_model.get("relative_common_weight", 0.5)
                     ) * relative_common
+                    retrieval_loss, retrieval_metrics = (
+                        _final_effect_retrieval_loss(
+                            final_student,
+                            final_teacher,
+                            temperature=float(
+                                whole_model.get("retrieval_temperature", 0.07)
+                            ),
+                        )
+                    )
+                    retrieval_weighted = float(
+                        whole_model.get("retrieval_weight", 0.0)
+                    ) * retrieval_loss
                     whole_loss = (
                         final_huber
                         + float(whole_model.get("direction_weight", 1.0))
@@ -4504,14 +4569,22 @@ def train_direct_reference_kv_delta_320(
                         + float(whole_model.get("constraint_weight", 1.0))
                         * constraint_loss
                         + relative_common_weighted
+                        + retrieval_weighted
                     )
                     whole_metrics = {
                         "whole/loss": whole_loss.detach(),
                         "whole/normalized_huber": final_huber.detach(),
                         "whole/cosine": final_cosine.detach(),
+                        "whole/retrieval_weighted_loss": (
+                            retrieval_weighted.detach()
+                        ),
                         "whole/relative_common_weighted_loss": (
                             relative_common_weighted.detach()
                         ),
+                        **{
+                            f"whole/{key}": value
+                            for key, value in retrieval_metrics.items()
+                        },
                         **{f"whole/{key}": value for key, value in constraint_metrics.items()},
                     }
                 block_losses = []
@@ -4805,6 +4878,13 @@ def train_direct_reference_kv_delta_320(
                         final_cosine = F.cosine_similarity(
                             final_student.flatten(1), final_teacher.flatten(1), dim=-1
                         ).mean()
+                        _, final_retrieval_values = _final_effect_retrieval_loss(
+                            final_student,
+                            final_teacher,
+                            temperature=float(
+                                whole_model.get("retrieval_temperature", 0.07)
+                            ),
+                        )
                         _, final_values = _final_effect_constraints(
                             final_student, final_teacher,
                             common_cap=float(
@@ -4817,6 +4897,8 @@ def train_direct_reference_kv_delta_320(
                             rms_floor=float(whole_model.get("rms_floor", 1e-4)),
                         )
                         validation_rows["whole/cosine"].append(float(final_cosine))
+                        for key, value in final_retrieval_values.items():
+                            validation_rows[f"whole/{key}"].append(float(value))
                         for key, value in final_values.items():
                             validation_rows[f"whole/{key}"].append(float(value))
                     for kind, source_rows in rows_by_kind.items():
@@ -5614,6 +5696,27 @@ def sample_expert_kv_teacher_functional_2k(
         config,
         destination,
         sample_config_key="kv_reference_expert_kv_teacher_functional_2k_sample",
+    )
+
+
+def train_scheduled_expert_kv_teacher_retrieval_1k(
+    config: dict[str, Any], destination: Path
+) -> dict[str, Any]:
+    return train_scheduled_direct_reference_kv_delta_320(
+        config,
+        destination,
+        config_key="kv_reference_expert_kv_teacher_retrieval_1k",
+        sample_config_key="kv_reference_expert_kv_teacher_retrieval_1k_sample",
+    )
+
+
+def sample_expert_kv_teacher_retrieval_1k(
+    config: dict[str, Any], destination: Path
+) -> dict[str, Any]:
+    return sample_direct_reference_kv_delta_320(
+        config,
+        destination,
+        sample_config_key="kv_reference_expert_kv_teacher_retrieval_1k_sample",
     )
 
 

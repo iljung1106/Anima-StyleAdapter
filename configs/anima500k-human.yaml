@@ -1834,6 +1834,30 @@ kv_reference_expert_kv_teacher_functional_2k_sample:
   batch_size: 4
   panel_tile_width: 384
 
+kv_reference_expert_kv_teacher_retrieval_1k:
+  extends_config_key: kv_reference_expert_kv_teacher_functional_2k
+  output_directory: kv_reference_expert_kv64x16_lossfree_teacher_retrieval_w768_l3_1k_v3
+  seed: 20260829
+  training:
+    steps: 1000
+    validation_every: 125
+    checkpoint_every: 250
+    sample_steps: [250, 500, 1000]
+    sample_output_root: diagnostics/kv-reference-expert-kv64x16-lossfree-teacher-retrieval-w768-l3-1k-v3
+    whole_model_functional:
+      retrieval_weight: 0.5
+      retrieval_temperature: 0.07
+    wandb:
+      enabled: true
+      project: anima-style-adapter
+      name: kv-reference-expert-kv64x16-lossfree-teacher-retrieval-w768-l3-1k-v3
+      id: kv-reference-expert-kv64x16-lossfree-teacher-retrieval-w768-l3-1k-v3
+
+kv_reference_expert_kv_teacher_retrieval_1k_sample:
+  extends_config_key: kv_reference_expert_kv_teacher_functional_2k_sample
+  checkpoint: kv_reference_expert_kv64x16_lossfree_teacher_retrieval_w768_l3_1k_v3/checkpoints/step-0001000.pt
+  output_directory: diagnostics/kv-reference-expert-kv64x16-lossfree-teacher-retrieval-w768-l3-1k-v3-step1000
+
 # Reference-conditioned low-rank operator pilot. Unlike the direct activation
 # head above, the reference generates a fresh block-local linear operator and
 # applies it to every native text token.  Teacher factors remain offline

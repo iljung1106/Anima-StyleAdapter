@@ -15,6 +15,7 @@ from anima_style_data.kv_activation_generator import (
     _direct_delta_flow_updates_through,
     _functional_centered_attention_loss,
     _final_effect_constraints,
+    _final_effect_retrieval_loss,
     _mean_teacher_operator,
     _mixture_target,
     _population_common_occupancy,
@@ -29,6 +30,21 @@ from anima_style_data.kv_real_query_distillation import (
     _operator_factors,
     _selected_content_indices,
 )
+
+
+def test_final_effect_retrieval_loss_rewards_correct_style_matching() -> None:
+    teacher = torch.eye(4).reshape(4, 1, 2, 2)
+    matched_loss, matched = _final_effect_retrieval_loss(
+        teacher.clone(), teacher, temperature=0.1
+    )
+    mismatched_loss, mismatched = _final_effect_retrieval_loss(
+        teacher.roll(1, dims=0), teacher, temperature=0.1
+    )
+
+    assert matched_loss < mismatched_loss
+    assert matched["retrieval_accuracy"] == 1
+    assert matched["correct_minus_hardest_wrong_cosine"] > 0
+    assert mismatched["retrieval_accuracy"] == 0
 
 
 def test_activation_generator_is_reference_conditioned_and_backpropagates() -> None:

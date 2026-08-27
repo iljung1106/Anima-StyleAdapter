@@ -151,6 +151,8 @@ def build_parser() -> argparse.ArgumentParser:
         ("kv-reference-expert-kvo-flow-aligned-1k-no-o-sample", "Render step-1000 flow-aligned model without O residuals"),
         ("kv-reference-expert-kv-teacher-functional-2k-train", "Train K/V experts on cached final teacher velocity"),
         ("kv-reference-expert-kv-teacher-functional-2k-sample", "Render final-velocity-trained K/V experts"),
+        ("kv-reference-expert-kv-teacher-retrieval-1k-train", "Train K/V experts with artist-discriminative final velocity"),
+        ("kv-reference-expert-kv-teacher-retrieval-1k-sample", "Render artist-discriminative final-velocity K/V experts"),
         ("kv-reference-bilinear-smoke", "Smoke-test reference-conditioned bilinear K/V operators"),
         ("kv-reference-bilinear-train", "Train reference-conditioned bilinear K/V operators"),
         ("kv-reference-bilinear-sample", "Render reference-conditioned bilinear K/V operators"),
@@ -870,6 +872,8 @@ def main() -> None:
             sample_expert_kvo_flow_aligned_1k_no_o,
             train_scheduled_expert_kv_teacher_functional_2k,
             sample_expert_kv_teacher_functional_2k,
+            train_scheduled_expert_kv_teacher_retrieval_1k,
+            sample_expert_kv_teacher_retrieval_1k,
         )
         from .kv_activation_sampling import (
             evaluate_kv_activation_reference_generalization,
@@ -940,6 +944,8 @@ def main() -> None:
             "kv-reference-expert-kvo-flow-aligned-1k-no-o-sample": sample_expert_kvo_flow_aligned_1k_no_o,
             "kv-reference-expert-kv-teacher-functional-2k-train": train_scheduled_expert_kv_teacher_functional_2k,
             "kv-reference-expert-kv-teacher-functional-2k-sample": sample_expert_kv_teacher_functional_2k,
+            "kv-reference-expert-kv-teacher-retrieval-1k-train": train_scheduled_expert_kv_teacher_retrieval_1k,
+            "kv-reference-expert-kv-teacher-retrieval-1k-sample": sample_expert_kv_teacher_retrieval_1k,
             "kv-reference-bilinear-smoke": smoke_test_reference_conditioned_bilinear_kv_operator,
             "kv-reference-bilinear-train": train_reference_conditioned_bilinear_kv_operator,
             "kv-reference-bilinear-sample": sample_reference_conditioned_bilinear_kv_operator,
