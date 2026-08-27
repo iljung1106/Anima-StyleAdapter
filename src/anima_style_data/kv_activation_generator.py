@@ -4594,6 +4594,8 @@ def train_direct_reference_kv_delta_320(
                 functional_consistency_metrics: dict[str, torch.Tensor] = {}
                 functional_contrastive = style.new_zeros((), dtype=torch.float32)
                 functional_contrastive_metrics: dict[str, torch.Tensor] = {}
+                teacher_signature_retrieval = style.new_zeros((), dtype=torch.float32)
+                teacher_signature_metrics: dict[str, torch.Tensor] = {}
                 if (
                     consistency_left is not None
                     and consistency_left_mask is not None
@@ -4728,6 +4730,70 @@ def train_direct_reference_kv_delta_320(
                                 f"functional_{key}": value
                                 for key, value in retrieval_values.items()
                             }
+                teacher_signature_weight = float(
+                    whole_model.get("teacher_signature_weight", 0.0)
+                )
+                if teacher_signature_weight > 0:
+                    assert contexts is not None
+                    probe_context = contexts[:1, :16]
+                    probe_context_batch = probe_context.expand(batch, -1, -1)
+                    probe_stream = torch.linspace(
+                        -1.0,
+                        1.0,
+                        16 * int(model.stream_dim),
+                        device=device,
+                        dtype=torch.bfloat16,
+                    ).reshape(1, 16, int(model.stream_dim))
+                    probe_blocks = [
+                        int(block)
+                        for block in whole_model.get(
+                            "teacher_signature_blocks", [0, 7, 14, 21, 27]
+                        )
+                    ]
+                    signature_width = int(
+                        whole_model.get("teacher_signature_width", 64)
+                    )
+                    student_signature = _adapter_probe_signatures(
+                        model,
+                        style,
+                        probe_context,
+                        probe_stream,
+                        probe_blocks,
+                        signature_width,
+                        normalize=False,
+                    )
+                    with torch.no_grad():
+                        teacher_signature = torch.cat(
+                            [
+                                F.adaptive_avg_pool1d(
+                                    _mixture_target(
+                                        probe_context_batch,
+                                        teacher_down,
+                                        teacher_up,
+                                        components,
+                                        weights,
+                                        block,
+                                    ).float().flatten(1),
+                                    signature_width,
+                                )
+                                for block in probe_blocks
+                            ],
+                            dim=1,
+                        )
+                    (
+                        teacher_signature_retrieval,
+                        retrieval_values,
+                    ) = _final_effect_retrieval_loss(
+                        student_signature,
+                        teacher_signature,
+                        temperature=float(
+                            whole_model.get("teacher_signature_temperature", 0.10)
+                        ),
+                    )
+                    teacher_signature_metrics = {
+                        f"teacher_signature_{key}": value
+                        for key, value in retrieval_values.items()
+                    }
                 whole_loss = style.new_zeros((), dtype=torch.float32)
                 whole_metrics: dict[str, torch.Tensor] = {}
                 if whole_enabled:
@@ -4837,6 +4903,7 @@ def train_direct_reference_kv_delta_320(
                             whole_model.get("functional_contrastive_weight", 0.0)
                         )
                         * functional_contrastive
+                        + teacher_signature_weight * teacher_signature_retrieval
                     )
                     whole_metrics = {
                         "whole/loss": whole_loss.detach(),
@@ -4863,6 +4930,10 @@ def train_direct_reference_kv_delta_320(
                         **{
                             f"whole/{key}": value
                             for key, value in functional_contrastive_metrics.items()
+                        },
+                        **{
+                            f"whole/{key}": value
+                            for key, value in teacher_signature_metrics.items()
                         },
                         **{f"whole/{key}": value for key, value in constraint_metrics.items()},
                     }
@@ -5262,6 +5333,75 @@ def train_direct_reference_kv_delta_320(
                             for key, value in functional_values.items():
                                 validation_rows[
                                     f"whole/functional_{key}"
+                                ].append(float(value))
+                        if float(
+                            whole_model.get("teacher_signature_weight", 0.0)
+                        ) > 0:
+                            signature_blocks = [
+                                int(block)
+                                for block in whole_model.get(
+                                    "teacher_signature_blocks",
+                                    [0, 7, 14, 21, 27],
+                                )
+                            ]
+                            signature_width = int(
+                                whole_model.get("teacher_signature_width", 64)
+                            )
+                            probe_context = contexts[:1, :16]
+                            probe_batch = probe_context.expand(
+                                len(val_artists), -1, -1
+                            )
+                            probe_stream = torch.linspace(
+                                -1.0,
+                                1.0,
+                                16 * int(model.stream_dim),
+                                device=device,
+                                dtype=torch.bfloat16,
+                            ).reshape(1, 16, int(model.stream_dim))
+                            student_signature = _adapter_probe_signatures(
+                                model,
+                                final_style,
+                                probe_context,
+                                probe_stream,
+                                signature_blocks,
+                                signature_width,
+                                normalize=False,
+                            )
+                            teacher_signature = torch.cat(
+                                [
+                                    F.adaptive_avg_pool1d(
+                                        _mixture_target(
+                                            probe_batch,
+                                            teacher_down,
+                                            teacher_up,
+                                            artist_tensor[:, None],
+                                            torch.ones(
+                                                len(val_artists),
+                                                1,
+                                                device=device,
+                                            ),
+                                            block,
+                                        ).float().flatten(1),
+                                        signature_width,
+                                    )
+                                    for block in signature_blocks
+                                ],
+                                dim=1,
+                            )
+                            _, teacher_signature_values = (
+                                _final_effect_retrieval_loss(
+                                    student_signature,
+                                    teacher_signature,
+                                    temperature=float(
+                                        whole_model.get(
+                                            "teacher_signature_temperature", 0.10
+                                        )
+                                    ),
+                                )
+                            )
+                            for key, value in teacher_signature_values.items():
+                                validation_rows[
+                                    f"whole/teacher_signature_{key}"
                                 ].append(float(value))
                     for kind, source_rows in rows_by_kind.items():
                         selected_rows = list(range(min(4, len(source_rows))))
@@ -6163,6 +6303,27 @@ def sample_expert_kv_teacher_functional_infonce_250(
         sample_config_key=(
             "kv_reference_expert_kv_teacher_functional_infonce_250_sample"
         ),
+    )
+
+
+def train_scheduled_expert_kv_teacher_signature_250(
+    config: dict[str, Any], destination: Path
+) -> dict[str, Any]:
+    return train_scheduled_direct_reference_kv_delta_320(
+        config,
+        destination,
+        config_key="kv_reference_expert_kv_teacher_signature_250",
+        sample_config_key="kv_reference_expert_kv_teacher_signature_250_sample",
+    )
+
+
+def sample_expert_kv_teacher_signature_250(
+    config: dict[str, Any], destination: Path
+) -> dict[str, Any]:
+    return sample_direct_reference_kv_delta_320(
+        config,
+        destination,
+        sample_config_key="kv_reference_expert_kv_teacher_signature_250_sample",
     )
 
 

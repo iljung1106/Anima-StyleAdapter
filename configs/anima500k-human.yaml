@@ -1992,6 +1992,43 @@ kv_reference_expert_kv_teacher_functional_infonce_250_sample:
   batch_size: 4
   panel_tile_width: 384
 
+# v6 separated training artists but did not generalize. Here the compact
+# multi-block student function must retrieve the actual LoRA teacher function,
+# so an arbitrary per-artist code is no longer a valid solution. This remains
+# a direction-level contrastive target, not exact per-block activation MSE.
+kv_reference_expert_kv_teacher_signature_250:
+  extends_config_key: kv_reference_expert_kv_teacher_functional_infonce_250
+  output_directory: kv_reference_expert_kv64x16_teacher_signature_w768_l3_250_v7
+  seed: 20260902
+  training:
+    steps: 250
+    validation_every: 125
+    checkpoint_every: 250
+    sample_steps: [250]
+    sample_output_root: diagnostics/kv-reference-expert-kv64x16-teacher-signature-w768-l3-250-v7
+    whole_model_functional:
+      functional_contrastive_weight: 0.0
+      teacher_signature_weight: 0.25
+      teacher_signature_temperature: 0.10
+      teacher_signature_blocks: [0, 7, 14, 21, 27]
+      teacher_signature_width: 64
+    wandb:
+      enabled: true
+      project: anima-style-adapter
+      name: kv-reference-expert-kv64x16-teacher-signature-w768-l3-250-v7
+      id: kv-reference-expert-kv64x16-teacher-signature-w768-l3-250-v7
+
+kv_reference_expert_kv_teacher_signature_250_sample:
+  checkpoint: kv_reference_expert_kv64x16_teacher_signature_w768_l3_250_v7/checkpoints/step-0000250.pt
+  output_directory: diagnostics/kv-reference-expert-kv64x16-teacher-signature-w768-l3-250-v7-step250
+  device: cuda
+  artists: 8
+  references: 4
+  reference_seed: 20260902
+  strengths: [1.0, 2.0]
+  batch_size: 4
+  panel_tile_width: 384
+
 # Reference-conditioned low-rank operator pilot. Unlike the direct activation
 # head above, the reference generates a fresh block-local linear operator and
 # applies it to every native text token.  Teacher factors remain offline
