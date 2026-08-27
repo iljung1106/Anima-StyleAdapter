@@ -1768,7 +1768,7 @@ kv_reference_expert_kvo_flow_aligned_1k_no_o_sample:
 # remains the primary load controller; its differentiable guard is overload-only.
 kv_reference_expert_kv_teacher_functional_2k:
   extends_config_key: kv_reference_expert_kvo_lossfree_flow_5k
-  output_directory: kv_reference_expert_kv64x16_lossfree_teacher_functional_w768_l3_2k_v1
+  output_directory: kv_reference_expert_kv64x16_lossfree_teacher_functional_w768_l3_2k_v2
   seed: 20260828
   model:
     enable_qo: false
@@ -1811,7 +1811,7 @@ kv_reference_expert_kv_teacher_functional_2k:
     checkpoint_every: 500
     sample_every: 0
     sample_steps: [500, 1000, 1500, 2000]
-    sample_output_root: diagnostics/kv-reference-expert-kv64x16-lossfree-teacher-functional-w768-l3-2k-v1
+    sample_output_root: diagnostics/kv-reference-expert-kv64x16-lossfree-teacher-functional-w768-l3-2k-v2
     resume: true
     ema:
       enabled: true
@@ -1820,12 +1820,12 @@ kv_reference_expert_kv_teacher_functional_2k:
     wandb:
       enabled: true
       project: anima-style-adapter
-      name: kv-reference-expert-kv64x16-lossfree-teacher-functional-w768-l3-2k-v1
-      id: kv-reference-expert-kv64x16-lossfree-teacher-functional-w768-l3-2k-v1
+      name: kv-reference-expert-kv64x16-lossfree-teacher-functional-w768-l3-2k-v2
+      id: kv-reference-expert-kv64x16-lossfree-teacher-functional-w768-l3-2k-v2
 
 kv_reference_expert_kv_teacher_functional_2k_sample:
-  checkpoint: kv_reference_expert_kv64x16_lossfree_teacher_functional_w768_l3_2k_v1/checkpoints/step-0002000.pt
-  output_directory: diagnostics/kv-reference-expert-kv64x16-lossfree-teacher-functional-w768-l3-2k-v1-step2000
+  checkpoint: kv_reference_expert_kv64x16_lossfree_teacher_functional_w768_l3_2k_v2/checkpoints/step-0002000.pt
+  output_directory: diagnostics/kv-reference-expert-kv64x16-lossfree-teacher-functional-w768-l3-2k-v2-step2000
   device: cuda
   artists: 8
   references: 4
