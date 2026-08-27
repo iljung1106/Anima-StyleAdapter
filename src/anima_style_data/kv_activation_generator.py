@@ -1672,6 +1672,69 @@ def _adapter_probe_signature(
     return F.normalize(signature, dim=0) if normalize else signature
 
 
+def _adapter_probe_signatures(
+    generator: ReferenceConditionedKVActivationGenerator,
+    style_memory: torch.Tensor,
+    text_context: torch.Tensor,
+    stream_input: torch.Tensor,
+    blocks: list[int],
+    signature_width: int = 64,
+    *,
+    normalize: bool = True,
+) -> torch.Tensor:
+    """Vectorized adapter signatures for a batch of artist memories."""
+
+    batch = int(style_memory.shape[0])
+    if text_context.shape[0] == 1:
+        text_context = text_context.expand(batch, -1, -1)
+    if stream_input.shape[0] == 1:
+        stream_input = stream_input.expand(batch, -1, -1)
+
+    def compact(values: torch.Tensor) -> torch.Tensor:
+        return F.adaptive_avg_pool1d(
+            values.float().flatten(1), int(signature_width)
+        )
+
+    parts = [compact(generator(style_memory, text_context, block)) for block in blocks]
+    if generator.enable_qo:
+        stream_codes = generator.prepare_stream_codes(style_memory)
+        for block in blocks:
+            parts.extend(
+                compact(generator.stream_delta(stream_input, stream_codes, block, kind))
+                for kind in range(2)
+                if generator.stream_kind_enabled(kind)
+            )
+    signatures = torch.cat(parts, dim=1)
+    return F.normalize(signatures, dim=1) if normalize else signatures
+
+
+def _same_artist_signature_consistency_batch(
+    student: torch.Tensor,
+    target: torch.Tensor,
+    *,
+    cosine_floor: float,
+    rms_ratio_tolerance: float,
+    magnitude_weight: float,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Match adapter behavior row-wise for disjoint views of each artist."""
+
+    student_f = student.float().flatten(1)
+    target_f = target.detach().float().flatten(1)
+    cosine = F.cosine_similarity(student_f, target_f, dim=1)
+    direction = F.relu(float(cosine_floor) - cosine).square().mean()
+    student_rms = student_f.square().mean(dim=1).sqrt().clamp_min(1e-8)
+    target_rms = target_f.square().mean(dim=1).sqrt().clamp_min(1e-8)
+    log_ratio = (student_rms.log() - target_rms.log()).abs()
+    tolerance = math.log(float(rms_ratio_tolerance))
+    magnitude = F.relu(log_ratio - tolerance).square().mean()
+    loss = direction + float(magnitude_weight) * magnitude
+    return loss, {
+        "functional_consistency_loss": loss.detach(),
+        "functional_consistency_cosine": cosine.mean().detach(),
+        "functional_consistency_log_rms_error": log_ratio.mean().detach(),
+    }
+
+
 def _same_artist_signature_consistency(
     student: torch.Tensor,
     target: torch.Tensor,
@@ -4439,7 +4502,12 @@ def train_direct_reference_kv_delta_320(
                     reference_start=0, reference_stop=single_images,
                     rng=random.Random(seed ^ (step * 97_409)),
                 )
-                if float(whole_model.get("reader_consistency_weight", 0.0)) > 0:
+                if (
+                    float(whole_model.get("reader_consistency_weight", 0.0)) > 0
+                    or float(
+                        whole_model.get("functional_consistency_weight", 0.0)
+                    ) > 0
+                ):
                     split = max(1, single_images // 2)
                     consistency_counts = [min(count, split) for count in counts]
                     consistency_left, consistency_left_mask = _select_reference_tokens(
@@ -4519,6 +4587,8 @@ def train_direct_reference_kv_delta_320(
                 )
                 reader_consistency = style.new_zeros((), dtype=torch.float32)
                 reader_consistency_metrics: dict[str, torch.Tensor] = {}
+                functional_consistency = style.new_zeros((), dtype=torch.float32)
+                functional_consistency_metrics: dict[str, torch.Tensor] = {}
                 if (
                     consistency_left is not None
                     and consistency_left_mask is not None
@@ -4560,6 +4630,75 @@ def train_direct_reference_kv_delta_320(
                             ),
                         )
                     )
+                    functional_consistency_weight = float(
+                        whole_model.get("functional_consistency_weight", 0.0)
+                    )
+                    if functional_consistency_weight > 0:
+                        assert contexts is not None
+                        probe_context = contexts[:1, :16]
+                        probe_stream = torch.linspace(
+                            -1.0,
+                            1.0,
+                            16 * int(model.stream_dim),
+                            device=device,
+                            dtype=torch.bfloat16,
+                        ).reshape(1, 16, int(model.stream_dim))
+                        probe_blocks = [
+                            int(block)
+                            for block in whole_model.get(
+                                "functional_consistency_blocks",
+                                [0, 7, 14, 21, 27],
+                            )
+                        ]
+                        left_signature = _adapter_probe_signatures(
+                            model,
+                            left_memory,
+                            probe_context,
+                            probe_stream,
+                            probe_blocks,
+                            int(
+                                whole_model.get(
+                                    "functional_consistency_signature_width", 64
+                                )
+                            ),
+                            normalize=False,
+                        )
+                        with torch.no_grad():
+                            right_signature = _adapter_probe_signatures(
+                                model,
+                                right_memory,
+                                probe_context,
+                                probe_stream,
+                                probe_blocks,
+                                int(
+                                    whole_model.get(
+                                        "functional_consistency_signature_width", 64
+                                    )
+                                ),
+                                normalize=False,
+                            )
+                        (
+                            functional_consistency,
+                            functional_consistency_metrics,
+                        ) = _same_artist_signature_consistency_batch(
+                            left_signature,
+                            right_signature,
+                            cosine_floor=float(
+                                whole_model.get(
+                                    "functional_consistency_cosine_floor", 0.75
+                                )
+                            ),
+                            rms_ratio_tolerance=float(
+                                whole_model.get(
+                                    "functional_consistency_rms_tolerance", 1.5
+                                )
+                            ),
+                            magnitude_weight=float(
+                                whole_model.get(
+                                    "functional_consistency_magnitude_weight", 0.25
+                                )
+                            ),
+                        )
                 whole_loss = style.new_zeros((), dtype=torch.float32)
                 whole_metrics: dict[str, torch.Tensor] = {}
                 if whole_enabled:
@@ -4661,6 +4800,10 @@ def train_direct_reference_kv_delta_320(
                         + retrieval_weighted
                         + float(whole_model.get("reader_consistency_weight", 0.0))
                         * reader_consistency
+                        + float(
+                            whole_model.get("functional_consistency_weight", 0.0)
+                        )
+                        * functional_consistency
                     )
                     whole_metrics = {
                         "whole/loss": whole_loss.detach(),
@@ -4679,6 +4822,10 @@ def train_direct_reference_kv_delta_320(
                         **{
                             f"whole/{key}": value
                             for key, value in reader_consistency_metrics.items()
+                        },
+                        **{
+                            f"whole/{key}": value
+                            for key, value in functional_consistency_metrics.items()
                         },
                         **{f"whole/{key}": value for key, value in constraint_metrics.items()},
                     }
@@ -5850,6 +5997,31 @@ def sample_expert_kv_teacher_single_consistent_500(
         config,
         destination,
         sample_config_key="kv_reference_expert_kv_teacher_single_consistent_500_sample",
+    )
+
+
+def train_scheduled_expert_kv_teacher_functional_consistent_500(
+    config: dict[str, Any], destination: Path
+) -> dict[str, Any]:
+    return train_scheduled_direct_reference_kv_delta_320(
+        config,
+        destination,
+        config_key="kv_reference_expert_kv_teacher_functional_consistent_500",
+        sample_config_key=(
+            "kv_reference_expert_kv_teacher_functional_consistent_500_sample"
+        ),
+    )
+
+
+def sample_expert_kv_teacher_functional_consistent_500(
+    config: dict[str, Any], destination: Path
+) -> dict[str, Any]:
+    return sample_direct_reference_kv_delta_320(
+        config,
+        destination,
+        sample_config_key=(
+            "kv_reference_expert_kv_teacher_functional_consistent_500_sample"
+        ),
     )
 
 

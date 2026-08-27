@@ -1919,6 +1919,45 @@ kv_reference_expert_kv_teacher_single_consistent_500_sample:
   batch_size: 4
   panel_tile_width: 384
 
+# Disjoint subsets of one artist are aligned only through the K/V adapter they
+# produce on fixed text probes. Reader token slots themselves may differ. This
+# keeps the retrieval/final-effect supervision and the loss-free persistent
+# population routing controller from v3, with only an overload auxiliary guard.
+kv_reference_expert_kv_teacher_functional_consistent_500:
+  extends_config_key: kv_reference_expert_kv_teacher_single_consistent_500
+  output_directory: kv_reference_expert_kv64x16_teacher_functional_consistent_w768_l3_500_v5
+  seed: 20260831
+  training:
+    steps: 500
+    validation_every: 125
+    checkpoint_every: 250
+    sample_steps: [250, 500]
+    sample_output_root: diagnostics/kv-reference-expert-kv64x16-teacher-functional-consistent-w768-l3-500-v5
+    whole_model_functional:
+      reader_consistency_weight: 0.0
+      functional_consistency_weight: 0.25
+      functional_consistency_cosine_floor: 0.80
+      functional_consistency_rms_tolerance: 1.5
+      functional_consistency_magnitude_weight: 0.25
+      functional_consistency_blocks: [0, 7, 14, 21, 27]
+      functional_consistency_signature_width: 64
+    wandb:
+      enabled: true
+      project: anima-style-adapter
+      name: kv-reference-expert-kv64x16-teacher-functional-consistent-w768-l3-500-v5
+      id: kv-reference-expert-kv64x16-teacher-functional-consistent-w768-l3-500-v5
+
+kv_reference_expert_kv_teacher_functional_consistent_500_sample:
+  checkpoint: kv_reference_expert_kv64x16_teacher_functional_consistent_w768_l3_500_v5/checkpoints/step-0000500.pt
+  output_directory: diagnostics/kv-reference-expert-kv64x16-teacher-functional-consistent-w768-l3-500-v5-step500
+  device: cuda
+  artists: 8
+  references: 4
+  reference_seed: 20260831
+  strengths: [1.0, 2.0]
+  batch_size: 4
+  panel_tile_width: 384
+
 # Reference-conditioned low-rank operator pilot. Unlike the direct activation
 # head above, the reference generates a fresh block-local linear operator and
 # applies it to every native text token.  Teacher factors remain offline

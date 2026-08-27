@@ -885,6 +885,8 @@ def main() -> None:
             sample_expert_kv_teacher_retrieval_250_raw,
             train_scheduled_expert_kv_teacher_single_consistent_500,
             sample_expert_kv_teacher_single_consistent_500,
+            train_scheduled_expert_kv_teacher_functional_consistent_500,
+            sample_expert_kv_teacher_functional_consistent_500,
         )
         from .kv_activation_sampling import (
             evaluate_kv_activation_reference_generalization,
@@ -960,6 +962,8 @@ def main() -> None:
             "kv-reference-expert-kv-teacher-retrieval-250-raw-sample": sample_expert_kv_teacher_retrieval_250_raw,
             "kv-reference-expert-kv-teacher-single-consistent-500-train": train_scheduled_expert_kv_teacher_single_consistent_500,
             "kv-reference-expert-kv-teacher-single-consistent-500-sample": sample_expert_kv_teacher_single_consistent_500,
+            "kv-reference-expert-kv-teacher-functional-consistent-500-train": train_scheduled_expert_kv_teacher_functional_consistent_500,
+            "kv-reference-expert-kv-teacher-functional-consistent-500-sample": sample_expert_kv_teacher_functional_consistent_500,
             "kv-reference-bilinear-smoke": smoke_test_reference_conditioned_bilinear_kv_operator,
             "kv-reference-bilinear-train": train_reference_conditioned_bilinear_kv_operator,
             "kv-reference-bilinear-sample": sample_reference_conditioned_bilinear_kv_operator,
