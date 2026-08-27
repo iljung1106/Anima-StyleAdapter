@@ -244,6 +244,64 @@ def test_selection_bias_changes_topk_but_not_selected_mixture_weights() -> None:
     assert torch.allclose(weights, expected)
 
 
+def test_population_loss_free_bias_updates_once_from_recorded_artists() -> None:
+    model = ReferenceConditionedKVActivationGenerator(
+        style_dim=16,
+        context_dim=12,
+        output_dim=20,
+        blocks=1,
+        hidden_dim=16,
+        heads=4,
+        ff_dim=32,
+        output_rank=2,
+        output_experts=4,
+        output_top_k=2,
+        output_init_scale=1e-3,
+        expert_usage_decay=0.0,
+        expert_bias_update_rate=0.1,
+        expert_bias_max=1.0,
+        expert_bias_population_update=True,
+    )
+    logits = torch.tensor([[[3.0, 2.0, 1.0, 0.0]]])
+    _, _, sparse, dense, selected = model._sparse_router(logits, 2)
+    model.set_routing_recording(False)
+    model._record_routing(
+        "kv",
+        model.output_expert_usage,
+        model.output_expert_load,
+        model.output_expert_selection_bias,
+        0,
+        sparse,
+        dense,
+        selected,
+        2,
+        logits,
+    )
+    model.apply_routing_population_update()
+    assert torch.count_nonzero(model.output_expert_selection_bias) == 0
+
+    model.set_routing_recording(True)
+    for _ in range(2):
+        model._record_routing(
+            "kv",
+            model.output_expert_usage,
+            model.output_expert_load,
+            model.output_expert_selection_bias,
+            0,
+            sparse,
+            dense,
+            selected,
+            2,
+            logits,
+        )
+    metrics = model.apply_routing_population_update()
+    bias = model.output_expert_selection_bias[0, 0]
+    assert torch.all(bias[:2] < 0)
+    assert torch.all(bias[2:] > 0)
+    assert metrics["kv_population_groups"] == 2
+    assert metrics["kv_max_violation"] == 1
+
+
 def test_router_core_margin_has_gradient_at_uniform_logits() -> None:
     model = ReferenceConditionedKVActivationGenerator(
         style_dim=16,

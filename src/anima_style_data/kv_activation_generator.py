@@ -107,6 +107,8 @@ class ReferenceConditionedKVActivationGenerator(nn.Module):
         expert_bias_max: float = 0.5,
         expert_bias_update_steps: int = 0,
         expert_bias_decay_end_step: int = 0,
+        expert_bias_population_update: bool = False,
+        expert_bias_deadband: float = 0.0,
         output_entropy_target: float = -1.0,
         stream_entropy_target: float = -1.0,
         expert_specialization_steps: int = 0,
@@ -162,6 +164,8 @@ class ReferenceConditionedKVActivationGenerator(nn.Module):
         self.expert_bias_max = float(expert_bias_max)
         self.expert_bias_update_steps = int(expert_bias_update_steps)
         self.expert_bias_decay_end_step = int(expert_bias_decay_end_step)
+        self.expert_bias_population_update = bool(expert_bias_population_update)
+        self.expert_bias_deadband = float(expert_bias_deadband)
         self.output_entropy_target = float(output_entropy_target)
         self.stream_entropy_target = float(stream_entropy_target)
         self.expert_specialization_steps = int(expert_specialization_steps)
@@ -184,6 +188,7 @@ class ReferenceConditionedKVActivationGenerator(nn.Module):
             or self.expert_bias_max < 0
             or self.expert_bias_update_steps < 0
             or self.expert_bias_decay_end_step < 0
+            or not 0.0 <= self.expert_bias_deadband < 1.0
             or self.expert_specialization_steps < 0
             or self.output_core_margin < 0
             or self.stream_core_margin < 0
@@ -221,6 +226,10 @@ class ReferenceConditionedKVActivationGenerator(nn.Module):
         self._routing_margins: dict[str, list[torch.Tensor]] = {
             "kv": [], "qo": [],
         }
+        self._routing_record_enabled = True
+        self._routing_population_records: list[
+            tuple[str, int, int | None, torch.Tensor, torch.Tensor]
+        ] = []
         if self.enable_qo and self.stream_rank <= 0:
             raise ValueError("stream_rank must be positive when Q/O is enabled")
         self.style_norm = (
@@ -660,16 +669,16 @@ class ReferenceConditionedKVActivationGenerator(nn.Module):
             weights = weights[:, 0]
             self._record_routing(
                 "qo",
-                self.stream_expert_usage[:, kind : kind + 1],
-                self.stream_expert_load[:, kind : kind + 1],
-                self.stream_expert_selection_bias[:, kind : kind + 1],
+                self.stream_expert_usage,
+                self.stream_expert_load,
+                self.stream_expert_selection_bias,
                 block_index,
                 sparse,
                 dense,
                 selected,
                 self.stream_top_k,
                 logits[:, None],
-                usage_kind=0,
+                usage_kind=kind,
             )
             channels = torch.tanh(
                 self.stream_channel_gates[block_index][kind](code).reshape(
@@ -732,6 +741,11 @@ class ReferenceConditionedKVActivationGenerator(nn.Module):
 
     def set_routing_step(self, step: int) -> None:
         self._routing_step = max(0, int(step))
+
+    def set_routing_recording(self, enabled: bool) -> None:
+        """Include only genuine routed training examples in population stats."""
+
+        self._routing_record_enabled = bool(enabled)
 
     def _selection_bias_scale(self) -> float:
         if not self.expert_bias_decay_end_step:
@@ -797,7 +811,7 @@ class ReferenceConditionedKVActivationGenerator(nn.Module):
         *,
         usage_kind: int | None = None,
     ) -> None:
-        if not self.training:
+        if not self.training or not self._routing_record_enabled:
             return
         current = probabilities.float().mean(dim=0)
         current_dense = dense_probabilities.float().mean(dim=0)
@@ -847,6 +861,17 @@ class ReferenceConditionedKVActivationGenerator(nn.Module):
             self._routing_specialization_terms.append(
                 F.relu(entropy - entropy_cap).square()
             )
+        if self.expert_bias_population_update:
+            self._routing_population_records.append(
+                (
+                    name,
+                    int(block),
+                    usage_kind,
+                    current.detach(),
+                    current_load.detach(),
+                )
+            )
+            return
         with torch.no_grad():
             usage_rows.mul_(self.expert_usage_decay).add_(
                 current, alpha=1.0 - self.expert_usage_decay
@@ -867,6 +892,82 @@ class ReferenceConditionedKVActivationGenerator(nn.Module):
                 )
                 bias_rows.sub_(bias_rows.mean(dim=-1, keepdim=True))
                 bias_rows.clamp_(-self.expert_bias_max, self.expert_bias_max)
+
+    @torch.no_grad()
+    def apply_routing_population_update(self) -> dict[str, torch.Tensor]:
+        """Update selection-only biases once from an optimizer's artist set."""
+
+        zero = next(self.parameters()).new_zeros((), dtype=torch.float32)
+        if not self.expert_bias_population_update:
+            return {}
+        grouped: dict[
+            tuple[str, int, int | None],
+            list[tuple[torch.Tensor, torch.Tensor]],
+        ] = defaultdict(list)
+        for name, block, kind, usage, load in self._routing_population_records:
+            grouped[(name, block, kind)].append((usage, load))
+        population_sizes: dict[str, list[int]] = defaultdict(list)
+        for (name, block, kind), values in grouped.items():
+            current_usage = torch.stack([value[0] for value in values]).mean(0)
+            current_load = torch.stack([value[1] for value in values]).mean(0)
+            if name == "kv":
+                usage_rows = self.output_expert_usage[block]
+                load_rows = self.output_expert_load[block]
+                bias_rows = self.output_expert_selection_bias[block]
+                top_k = self.output_top_k
+                experts = self.output_experts
+            else:
+                assert kind is not None
+                usage_rows = self.stream_expert_usage[block, kind : kind + 1]
+                load_rows = self.stream_expert_load[block, kind : kind + 1]
+                bias_rows = self.stream_expert_selection_bias[
+                    block, kind : kind + 1
+                ]
+                top_k = self.stream_top_k
+                experts = self.stream_experts
+            usage_rows.mul_(self.expert_usage_decay).add_(
+                current_usage, alpha=1.0 - self.expert_usage_decay
+            )
+            load_rows.mul_(self.expert_usage_decay).add_(
+                current_load, alpha=1.0 - self.expert_usage_decay
+            )
+            if self.expert_bias_update_rate:
+                target = float(top_k) / experts
+                error = target - load_rows.float()
+                direction = error.sign()
+                if self.expert_bias_deadband:
+                    direction = direction * (
+                        error.abs() > self.expert_bias_deadband * target
+                    )
+                bias_rows.add_(direction, alpha=self.expert_bias_update_rate)
+                bias_rows.sub_(bias_rows.mean(dim=-1, keepdim=True))
+                bias_rows.clamp_(-self.expert_bias_max, self.expert_bias_max)
+            population_sizes[name].append(len(values))
+        self._routing_population_records.clear()
+
+        metrics: dict[str, torch.Tensor] = {}
+        for name, load, top_k, experts in (
+            ("kv", getattr(self, "output_expert_load", None), self.output_top_k, self.output_experts),
+            ("qo", getattr(self, "stream_expert_load", None), self.stream_top_k, self.stream_experts),
+        ):
+            if load is None or not experts:
+                continue
+            if name == "qo" and self.enable_qo and not self.enable_q:
+                load = load[:, 1:2]
+            target = float(top_k) / experts
+            router_max = load.float().amax(dim=-1).flatten()
+            metrics[f"{name}_population_groups"] = zero.new_tensor(
+                sum(population_sizes[name]) / max(1, len(population_sizes[name]))
+            )
+            metrics[f"{name}_ema_max_load"] = router_max.max()
+            metrics[f"{name}_ema_p95_max_load"] = torch.quantile(
+                router_max, 0.95
+            )
+            metrics[f"{name}_max_violation"] = router_max.max() / target - 1.0
+            metrics[f"{name}_overload_router_fraction"] = (
+                router_max > self.expert_balance_cap * target
+            ).float().mean()
+        return metrics
 
     def routing_auxiliary(
         self,
@@ -3007,6 +3108,11 @@ def train_direct_reference_kv_delta_320(
         start_step = int(cfg.get("initial_step", initial.get("step", 0)))
         if start_step != int(initial.get("step", start_step)):
             raise ValueError("initial_step must match the warm-start checkpoint")
+    if (
+        hasattr(model, "set_routing_recording")
+        and bool(getattr(model, "expert_bias_population_update", False))
+    ):
+        model.set_routing_recording(False)
 
     ema_cfg = dict(training.get("ema", {}))
     ema_enabled = bool(ema_cfg.get("enabled", False))
@@ -3506,6 +3612,8 @@ def train_direct_reference_kv_delta_320(
                         strength=block_strength,
                         block_mask=block_mask,
                     )
+                    if hasattr(model, "set_routing_recording"):
+                        model.set_routing_recording(True)
                     prediction = anima(
                         noisy.unsqueeze(2),
                         timesteps.to(latents.dtype),
@@ -3513,6 +3621,8 @@ def train_direct_reference_kv_delta_320(
                         padding_mask=padding,
                         target_input_ids=None,
                     ).squeeze(2).float()
+                    if hasattr(model, "set_routing_recording"):
+                        model.set_routing_recording(False)
                     flow_injector.disable()
                     dimensions = tuple(range(1, prediction.ndim))
                     base_rows = (base_prediction - target).square().mean(dim=dimensions)
@@ -3912,6 +4022,10 @@ def train_direct_reference_kv_delta_320(
                     optimizer.param_groups[1]["lr"] = flow_reader_lr(
                         relative_step
                     )
+                    if hasattr(model, "apply_routing_population_update"):
+                        routing_metrics.update(
+                            model.apply_routing_population_update()
+                        )
                     optimizer.step()
                     if ema_model is not None and ema_reader is not None:
                         _update_parameter_ema(ema_model, model, ema_decay)
@@ -5235,6 +5349,27 @@ def sample_expert_kvo_margin_flow_5k(
         config,
         destination,
         sample_config_key="kv_reference_expert_kvo_margin_flow_5k_sample",
+    )
+
+
+def train_scheduled_expert_kvo_lossfree_flow_5k(
+    config: dict[str, Any], destination: Path
+) -> dict[str, Any]:
+    return train_scheduled_direct_reference_kv_delta_320(
+        config,
+        destination,
+        config_key="kv_reference_expert_kvo_lossfree_flow_5k",
+        sample_config_key="kv_reference_expert_kvo_lossfree_flow_5k_sample",
+    )
+
+
+def sample_expert_kvo_lossfree_flow_5k(
+    config: dict[str, Any], destination: Path
+) -> dict[str, Any]:
+    return sample_direct_reference_kv_delta_320(
+        config,
+        destination,
+        sample_config_key="kv_reference_expert_kvo_lossfree_flow_5k_sample",
     )
 
 
