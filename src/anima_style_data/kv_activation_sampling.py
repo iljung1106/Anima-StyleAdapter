@@ -211,6 +211,8 @@ class NativeKVActivationInjector:
     ) -> None:
         if style_memory.ndim != 3:
             raise ValueError("style_memory must be [style,slots,dim]")
+        if hasattr(self.model, "reset_routing_records"):
+            self.model.reset_routing_records()
         self.style_memory = style_memory
         self.kv_factors = (
             self.model.prepare_kv_factors(style_memory)

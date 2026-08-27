@@ -105,6 +105,48 @@ def test_direct_delta_rank32_head_keeps_token_conditioning_and_backpropagates() 
     assert model.output_head[0].up.grad is None
 
 
+def test_sparse_expert_generator_routes_kv_and_independent_qo_paths() -> None:
+    torch.manual_seed(23)
+    model = ReferenceConditionedKVActivationGenerator(
+        style_dim=32,
+        context_dim=24,
+        output_dim=40,
+        blocks=2,
+        hidden_dim=32,
+        heads=4,
+        ff_dim=64,
+        ff_layers=2,
+        output_rank=4,
+        output_experts=6,
+        output_top_k=2,
+        output_init_scale=1e-3,
+        enable_qo=True,
+        stream_dim=40,
+        stream_rank=3,
+        stream_experts=4,
+        stream_top_k=2,
+    )
+    style = torch.randn(2, 7, 32)
+    context = torch.randn(2, 9, 24)
+    stream = torch.randn(2, 11, 40)
+    model.reset_routing_records()
+    kv = model(style, context, 1)
+    codes = model.prepare_stream_codes(style)
+    q = model.stream_delta(stream, codes, 1, 0)
+    o = model.stream_delta(stream, codes, 1, 1)
+    balance, metrics = model.routing_auxiliary()
+    assert kv.shape == (2, 2, 9, 40)
+    assert q.shape == o.shape == stream.shape
+    assert not torch.allclose(q, o)
+    assert metrics["kv_router_entropy"] > 0
+    assert metrics["qo_router_entropy"] > 0
+    (kv.square().mean() + q.square().mean() + o.square().mean() + balance).backward()
+    assert model.output_expert_up.grad is not None
+    assert model.stream_expert_up.grad is not None
+    assert model.stream_style_key[0].weight.grad is not None
+    assert model.stream_style_key[1].weight.grad is not None
+
+
 def test_final_effect_constraints_use_absolute_pairwise_cap_without_centering() -> None:
     teacher = torch.zeros(4, 1, 2, 4)
     for index in range(4):

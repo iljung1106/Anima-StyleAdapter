@@ -84,6 +84,8 @@ class ReferenceConditionedKVActivationGenerator(nn.Module):
         ff_dim: int = 1024,
         ff_layers: int = 1,
         output_rank: int = 0,
+        output_experts: int = 0,
+        output_top_k: int = 0,
         output_init_scale: float = 0.02,
         normalize_style: bool = True,
         normalize_attended: bool = True,
@@ -91,12 +93,24 @@ class ReferenceConditionedKVActivationGenerator(nn.Module):
         enable_qo: bool = False,
         stream_dim: int = 2048,
         stream_rank: int = 32,
+        stream_experts: int = 0,
+        stream_top_k: int = 0,
+        expert_usage_decay: float = 0.99,
+        expert_balance_cap: float = 1.5,
     ) -> None:
         super().__init__()
         if hidden_dim % heads:
             raise ValueError("hidden_dim must be divisible by heads")
         if ff_layers <= 0 or output_rank < 0:
             raise ValueError("ff_layers must be positive and output_rank non-negative")
+        if output_experts < 0 or stream_experts < 0:
+            raise ValueError("expert counts must be non-negative")
+        if output_experts and not 0 < output_top_k <= output_experts:
+            raise ValueError("output_top_k must select existing experts")
+        if stream_experts and not 0 < stream_top_k <= stream_experts:
+            raise ValueError("stream_top_k must select existing experts")
+        if not 0.0 <= expert_usage_decay < 1.0 or expert_balance_cap < 1.0:
+            raise ValueError("expert usage controls are invalid")
         if output_init_scale < 0:
             raise ValueError("output_init_scale must be non-negative")
         self.style_dim = int(style_dim)
@@ -107,9 +121,19 @@ class ReferenceConditionedKVActivationGenerator(nn.Module):
         self.heads = int(heads)
         self.head_dim = hidden_dim // heads
         self.output_rank = int(output_rank)
+        self.output_experts = int(output_experts)
+        self.output_top_k = int(output_top_k)
         self.enable_qo = bool(enable_qo)
         self.stream_dim = int(stream_dim)
         self.stream_rank = int(stream_rank)
+        self.stream_experts = int(stream_experts)
+        self.stream_top_k = int(stream_top_k)
+        self.expert_usage_decay = float(expert_usage_decay)
+        self.expert_balance_cap = float(expert_balance_cap)
+        self._routing_balance_terms: list[torch.Tensor] = []
+        self._routing_entropies: dict[str, list[torch.Tensor]] = {
+            "kv": [], "qo": [],
+        }
         if self.enable_qo and self.stream_rank <= 0:
             raise ValueError("stream_rank must be positive when Q/O is enabled")
         self.style_norm = (
@@ -137,7 +161,35 @@ class ReferenceConditionedKVActivationGenerator(nn.Module):
         self.extra_ff = nn.ModuleList(
             _SwiGLU(hidden_dim, ff_dim) for _ in range(int(ff_layers) - 1)
         )
-        if self.output_rank:
+        if self.output_experts:
+            if not self.output_rank:
+                raise ValueError("output experts require a positive expert rank")
+            self.output_router_queries = nn.Parameter(
+                torch.empty(blocks, 2, hidden_dim)
+            )
+            self.output_router_norm = nn.LayerNorm(hidden_dim)
+            self.output_routers = nn.ModuleList(
+                nn.ModuleList(
+                    nn.Linear(hidden_dim, self.output_experts, bias=True)
+                    for _ in range(2)
+                )
+                for _ in range(blocks)
+            )
+            self.output_expert_down = nn.Parameter(torch.empty(
+                blocks, 2, self.output_experts, self.output_rank, hidden_dim
+            ))
+            self.output_expert_up = nn.Parameter(torch.empty(
+                blocks, 2, self.output_experts, self.output_rank, output_dim
+            ))
+            self.register_buffer(
+                "output_expert_usage",
+                torch.full(
+                    (blocks, 2, self.output_experts),
+                    1.0 / self.output_experts,
+                ),
+            )
+            self.output_head = nn.ModuleList()
+        elif self.output_rank:
             self.output_head = nn.ModuleList(
                 _LowRankKVResidualHead(
                     hidden_dim, output_dim, self.output_rank, output_init_scale
@@ -159,27 +211,72 @@ class ReferenceConditionedKVActivationGenerator(nn.Module):
                 torch.empty(blocks, 2, hidden_dim)
             )
             self.stream_code_norm = nn.LayerNorm(hidden_dim)
-            self.stream_gates = nn.ModuleList(
-                nn.ModuleList(
-                    nn.Linear(hidden_dim, stream_rank, bias=True)
-                    for _ in range(2)
+            if self.stream_experts:
+                self.stream_style_key = nn.ModuleList(
+                    nn.Linear(style_dim, hidden_dim, bias=False) for _ in range(2)
                 )
-                for _ in range(blocks)
-            )
-            self.stream_down = nn.ModuleList(
-                nn.ModuleList(
-                    nn.Linear(stream_dim, stream_rank, bias=False)
-                    for _ in range(2)
+                self.stream_style_value = nn.ModuleList(
+                    nn.Linear(style_dim, hidden_dim, bias=False) for _ in range(2)
                 )
-                for _ in range(blocks)
-            )
-            self.stream_up = nn.ModuleList(
-                nn.ModuleList(
-                    nn.Linear(stream_rank, stream_dim, bias=False)
-                    for _ in range(2)
+                self.stream_routers = nn.ModuleList(
+                    nn.ModuleList(
+                        nn.Linear(hidden_dim, self.stream_experts, bias=True)
+                        for _ in range(2)
+                    )
+                    for _ in range(blocks)
                 )
-                for _ in range(blocks)
-            )
+                self.stream_channel_gates = nn.ModuleList(
+                    nn.ModuleList(
+                        nn.Linear(
+                            hidden_dim,
+                            self.stream_experts * self.stream_rank,
+                            bias=True,
+                        )
+                        for _ in range(2)
+                    )
+                    for _ in range(blocks)
+                )
+                self.stream_gain = nn.ModuleList(
+                    nn.ModuleList(
+                        nn.Linear(hidden_dim, 1, bias=True) for _ in range(2)
+                    )
+                    for _ in range(blocks)
+                )
+                self.stream_expert_down = nn.Parameter(torch.empty(
+                    blocks, 2, self.stream_experts, self.stream_rank, stream_dim
+                ))
+                self.stream_expert_up = nn.Parameter(torch.empty(
+                    blocks, 2, self.stream_experts, self.stream_rank, stream_dim
+                ))
+                self.register_buffer(
+                    "stream_expert_usage",
+                    torch.full(
+                        (blocks, 2, self.stream_experts),
+                        1.0 / self.stream_experts,
+                    ),
+                )
+            else:
+                self.stream_gates = nn.ModuleList(
+                    nn.ModuleList(
+                        nn.Linear(hidden_dim, stream_rank, bias=True)
+                        for _ in range(2)
+                    )
+                    for _ in range(blocks)
+                )
+                self.stream_down = nn.ModuleList(
+                    nn.ModuleList(
+                        nn.Linear(stream_dim, stream_rank, bias=False)
+                        for _ in range(2)
+                    )
+                    for _ in range(blocks)
+                )
+                self.stream_up = nn.ModuleList(
+                    nn.ModuleList(
+                        nn.Linear(stream_rank, stream_dim, bias=False)
+                        for _ in range(2)
+                    )
+                    for _ in range(blocks)
+                )
         self.reset_parameters(float(output_init_scale))
 
     def reset_parameters(self, output_init_scale: float) -> None:
@@ -192,14 +289,45 @@ class ReferenceConditionedKVActivationGenerator(nn.Module):
             nn.init.normal_(
                 self.stream_style_queries, std=self.hidden_dim**-0.5
             )
-            for block_gates in self.stream_gates:
-                for gate in block_gates:
-                    nn.init.zeros_(gate.bias)
-            for block_heads in self.stream_up:
-                for head in block_heads:
-                    with torch.no_grad():
-                        head.weight.mul_(output_init_scale)
-        if not self.output_rank:
+            if self.stream_experts:
+                nn.init.normal_(
+                    self.stream_expert_down, std=self.stream_dim**-0.5
+                )
+                nn.init.normal_(
+                    self.stream_expert_up,
+                    std=self.stream_rank**-0.5 * output_init_scale,
+                )
+                q_bias = math.log(0.25 / (2.0 - 0.25))
+                for block in range(self.blocks):
+                    for kind in range(2):
+                        nn.init.zeros_(self.stream_routers[block][kind].bias)
+                        nn.init.zeros_(self.stream_channel_gates[block][kind].bias)
+                        nn.init.zeros_(self.stream_gain[block][kind].weight)
+                        nn.init.constant_(
+                            self.stream_gain[block][kind].bias,
+                            q_bias if kind == 0 else 0.0,
+                        )
+            else:
+                for block_gates in self.stream_gates:
+                    for gate in block_gates:
+                        nn.init.zeros_(gate.bias)
+                for block_heads in self.stream_up:
+                    for head in block_heads:
+                        with torch.no_grad():
+                            head.weight.mul_(output_init_scale)
+        if self.output_experts:
+            nn.init.normal_(self.output_router_queries, std=self.hidden_dim**-0.5)
+            nn.init.normal_(
+                self.output_expert_down, std=self.hidden_dim**-0.5
+            )
+            nn.init.normal_(
+                self.output_expert_up,
+                std=self.output_rank**-0.5 * output_init_scale,
+            )
+            for block_routers in self.output_routers:
+                for router in block_routers:
+                    nn.init.zeros_(router.bias)
+        elif not self.output_rank:
             for head in self.output_head:
                 with torch.no_grad():
                     head.weight.mul_(output_init_scale)
@@ -245,8 +373,40 @@ class ReferenceConditionedKVActivationGenerator(nn.Module):
         hidden = hidden + self.ff(self.ff_norm(hidden))
         for norm, ff in zip(self.extra_ff_norm, self.extra_ff, strict=True):
             hidden = hidden + ff(norm(hidden))
-        output = self.output_head[block](hidden)
-        if not self.output_rank:
+        if self.output_experts:
+            router_query = self.output_router_queries[block].to(style.dtype)
+            router_query = router_query[None].expand(batch, -1, -1)
+            router_query = router_query.reshape(
+                batch, 2, self.heads, self.head_dim
+            ).transpose(1, 2)
+            router_code = F.scaled_dot_product_attention(
+                router_query, key, value
+            ).transpose(1, 2).reshape(batch, 2, self.hidden_dim)
+            router_code = self.output_router_norm(router_code)
+            logits = torch.stack([
+                self.output_routers[block][kind](router_code[:, kind])
+                for kind in range(2)
+            ], dim=1)
+            indices, weights, sparse = self._sparse_router(
+                logits, self.output_top_k
+            )
+            self._record_routing(
+                "kv", self.output_expert_usage, block, sparse
+            )
+            down_bank = self.output_expert_down[block]
+            up_bank = self.output_expert_up[block]
+            kind_rows = torch.arange(2, device=hidden.device)[None, :, None]
+            selected_down = down_bank[kind_rows, indices]
+            selected_up = up_bank[kind_rows, indices]
+            low_rank = torch.einsum(
+                "bnh,bekrh->beknr", hidden, selected_down
+            )
+            output = torch.einsum(
+                "beknr,bekro,bek->bneo", low_rank, selected_up, weights
+            )
+        else:
+            output = self.output_head[block](hidden)
+        if not self.output_rank and not self.output_experts:
             output = output.reshape(batch, text_tokens, 2, self.output_dim)
         output = output.transpose(1, 2)
         gain = self.log_gain[block].float().clamp(-4.0, 4.0).exp().to(output.dtype)
@@ -257,25 +417,45 @@ class ReferenceConditionedKVActivationGenerator(nn.Module):
         if not self.enable_qo:
             raise RuntimeError("Q/O stream modulation is disabled")
         style = self.style_norm(style_memory)
-        key = self.style_key(style)
-        value = self.style_value(style)
         batch = int(style.shape[0])
-        queries = self.stream_style_queries.reshape(
-            self.blocks * 2, self.hidden_dim
-        )[None].expand(batch, -1, -1)
-        queries = queries.reshape(
-            batch, self.blocks * 2, self.heads, self.head_dim
-        ).transpose(1, 2)
-        key = key.reshape(
-            batch, style.shape[1], self.heads, self.head_dim
-        ).transpose(1, 2)
-        value = value.reshape(
-            batch, style.shape[1], self.heads, self.head_dim
-        ).transpose(1, 2)
-        codes = F.scaled_dot_product_attention(queries, key, value)
-        codes = codes.transpose(1, 2).reshape(
-            batch, self.blocks, 2, self.hidden_dim
-        )
+        if self.stream_experts:
+            rows = []
+            for kind in range(2):
+                queries = self.stream_style_queries[:, kind][None].expand(
+                    batch, -1, -1
+                ).reshape(
+                    batch, self.blocks, self.heads, self.head_dim
+                ).transpose(1, 2)
+                key = self.stream_style_key[kind](style).reshape(
+                    batch, style.shape[1], self.heads, self.head_dim
+                ).transpose(1, 2)
+                value = self.stream_style_value[kind](style).reshape(
+                    batch, style.shape[1], self.heads, self.head_dim
+                ).transpose(1, 2)
+                code = F.scaled_dot_product_attention(queries, key, value)
+                rows.append(code.transpose(1, 2))
+            codes = torch.stack(rows, dim=2).reshape(
+                batch, self.blocks, 2, self.hidden_dim
+            )
+        else:
+            key = self.style_key(style)
+            value = self.style_value(style)
+            queries = self.stream_style_queries.reshape(
+                self.blocks * 2, self.hidden_dim
+            )[None].expand(batch, -1, -1)
+            queries = queries.reshape(
+                batch, self.blocks * 2, self.heads, self.head_dim
+            ).transpose(1, 2)
+            key = key.reshape(
+                batch, style.shape[1], self.heads, self.head_dim
+            ).transpose(1, 2)
+            value = value.reshape(
+                batch, style.shape[1], self.heads, self.head_dim
+            ).transpose(1, 2)
+            codes = F.scaled_dot_product_attention(queries, key, value)
+            codes = codes.transpose(1, 2).reshape(
+                batch, self.blocks, 2, self.hidden_dim
+            )
         return self.stream_code_norm(codes)
 
     def stream_delta(
@@ -294,9 +474,106 @@ class ReferenceConditionedKVActivationGenerator(nn.Module):
                 f"got {stream_input.shape[-1]}"
             )
         code = stream_codes[:, block_index, kind]
+        if self.stream_experts:
+            logits = self.stream_routers[block_index][kind](code)
+            indices, weights, sparse = self._sparse_router(
+                logits[:, None], self.stream_top_k
+            )
+            indices = indices[:, 0]
+            weights = weights[:, 0]
+            self._record_routing(
+                "qo",
+                self.stream_expert_usage[:, kind : kind + 1],
+                block_index,
+                sparse,
+                usage_kind=0,
+            )
+            channels = torch.tanh(
+                self.stream_channel_gates[block_index][kind](code).reshape(
+                    len(code), self.stream_experts, self.stream_rank
+                )
+            )
+            batch_rows = torch.arange(len(code), device=code.device)[:, None]
+            selected_channels = channels[batch_rows, indices]
+            selected_down = self.stream_expert_down[
+                block_index, kind
+            ][indices]
+            selected_up = self.stream_expert_up[
+                block_index, kind
+            ][indices]
+            hidden = torch.einsum(
+                "bnc,bkrc->bknr", stream_input, selected_down
+            ) * selected_channels[:, :, None]
+            delta = torch.einsum(
+                "bknr,bkro,bk->bno", hidden, selected_up, weights
+            )
+            gain = 2.0 * torch.sigmoid(
+                self.stream_gain[block_index][kind](code).float()
+            ).to(delta.dtype)
+            return delta * gain[:, None]
         gate = torch.tanh(self.stream_gates[block_index][kind](code))
         hidden = self.stream_down[block_index][kind](stream_input)
         return self.stream_up[block_index][kind](hidden * gate[:, None, :])
+
+    @staticmethod
+    def _sparse_router(
+        logits: torch.Tensor, top_k: int
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        indices = logits.topk(int(top_k), dim=-1).indices
+        selected_logits = logits.gather(-1, indices)
+        weights = selected_logits.float().softmax(dim=-1).to(logits.dtype)
+        sparse = torch.zeros_like(logits).scatter(-1, indices, weights)
+        return indices, weights, sparse
+
+    def reset_routing_records(self) -> None:
+        self._routing_balance_terms.clear()
+        for values in self._routing_entropies.values():
+            values.clear()
+
+    def _record_routing(
+        self,
+        name: str,
+        usage: torch.Tensor,
+        block: int,
+        probabilities: torch.Tensor,
+        *,
+        usage_kind: int | None = None,
+    ) -> None:
+        if not self.training:
+            return
+        current = probabilities.float().mean(dim=0)
+        usage_rows = usage[block]
+        if usage_kind is not None:
+            usage_rows = usage_rows[usage_kind : usage_kind + 1]
+        threshold = self.expert_balance_cap / probabilities.shape[-1]
+        overload = F.relu(usage_rows.detach().float() - threshold)
+        self._routing_balance_terms.append((current * overload).sum(dim=-1).mean())
+        entropy = -(
+            probabilities.float().clamp_min(1e-8).log()
+            * probabilities.float()
+        ).sum(dim=-1).mean()
+        self._routing_entropies[name].append(entropy)
+        with torch.no_grad():
+            usage_rows.mul_(self.expert_usage_decay).add_(
+                current, alpha=1.0 - self.expert_usage_decay
+            )
+
+    def routing_auxiliary(self) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        zero = next(self.parameters()).new_zeros((), dtype=torch.float32)
+        balance = (
+            torch.stack(self._routing_balance_terms).mean()
+            if self._routing_balance_terms else zero
+        )
+        metrics = {"expert_balance_loss": balance.detach()}
+        for name, values in self._routing_entropies.items():
+            metrics[f"{name}_router_entropy"] = (
+                torch.stack(values).mean().detach() if values else zero
+            )
+        if self.output_experts:
+            metrics["kv_expert_max_usage"] = self.output_expert_usage.max().detach()
+        if self.stream_experts:
+            metrics["qo_expert_max_usage"] = self.stream_expert_usage.max().detach()
+        return balance, metrics
 
 
 class _OperatorCrossBlock(nn.Module):
@@ -2974,6 +3251,14 @@ def train_direct_reference_kv_delta_320(
                     prior_preservation_weight = float(
                         human_flow.get("prior_preservation_weight", 0.0)
                     )
+                    if hasattr(model, "routing_auxiliary"):
+                        routing_balance, routing_metrics = model.routing_auxiliary()
+                    else:
+                        routing_balance = flow_mse.new_zeros(())
+                        routing_metrics = {}
+                    routing_balance_weight = float(
+                        human_flow.get("expert_balance_weight", 0.0)
+                    )
                     flow_loss = flow_mse_weight * flow_mse
                     if residual_huber_weight:
                         flow_loss = (
@@ -2992,6 +3277,10 @@ def train_direct_reference_kv_delta_320(
                     if prior_preservation_weight:
                         flow_loss = flow_loss + (
                             prior_preservation_weight * prior_preservation
+                        )
+                    if routing_balance_weight:
+                        flow_loss = flow_loss + (
+                            routing_balance_weight * routing_balance
                         )
                     if not bool(torch.isfinite(flow_loss)):
                         raise RuntimeError(
@@ -3109,6 +3398,14 @@ def train_direct_reference_kv_delta_320(
                         (prior_preservation_weight * prior_preservation).detach()
                     )
                 )
+                running["human_flow/expert_balance_loss"].append(
+                    float(routing_balance.detach())
+                )
+                running["human_flow/expert_balance_weighted"].append(
+                    float((routing_balance_weight * routing_balance).detach())
+                )
+                for name, value in routing_metrics.items():
+                    running[f"human_flow/{name}"].append(float(value))
                 running["human_flow/rms_band_outer_weighted"].append(
                     float((output_band_weight * residual_band).detach())
                 )
@@ -3834,7 +4131,9 @@ def sample_direct_reference_kv_delta_320(
     architecture = str(model_cfg.get("architecture", "direct_cross_attention"))
     if architecture == "direct_cross_attention":
         context_dim = int(model_state["context_query.0.weight"].shape[1])
-        if int(model_cfg.get("output_rank", 0)):
+        if int(model_cfg.get("output_experts", 0)):
+            output_dim = int(model_state["output_expert_up"].shape[-1])
+        elif int(model_cfg.get("output_rank", 0)):
             output_dim = int(model_state["output_head.0.up"].shape[-1])
         else:
             output_dim = int(model_state["output_head.0.weight"].shape[0] // 2)
@@ -4239,6 +4538,27 @@ def sample_direct_rank32_kvoq_flow_50k(
         config,
         destination,
         sample_config_key="kv_reference_direct_rank32_kvoq_flow_50k_sample",
+    )
+
+
+def train_scheduled_expert_kvoq_flow_10k(
+    config: dict[str, Any], destination: Path
+) -> dict[str, Any]:
+    return train_scheduled_direct_reference_kv_delta_320(
+        config,
+        destination,
+        config_key="kv_reference_expert_kvoq_flow_10k",
+        sample_config_key="kv_reference_expert_kvoq_flow_10k_sample",
+    )
+
+
+def sample_expert_kvoq_flow_10k(
+    config: dict[str, Any], destination: Path
+) -> dict[str, Any]:
+    return sample_direct_reference_kv_delta_320(
+        config,
+        destination,
+        sample_config_key="kv_reference_expert_kvoq_flow_10k_sample",
     )
 
 
