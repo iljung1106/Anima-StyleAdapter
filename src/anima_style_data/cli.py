@@ -805,6 +805,8 @@ def main() -> None:
         "kv-reference-expert-kvo-flow-aligned-1k-no-o-sample",
         "kv-reference-expert-kv-teacher-functional-2k-train",
         "kv-reference-expert-kv-teacher-functional-2k-sample",
+        "kv-reference-expert-kv-teacher-retrieval-1k-train",
+        "kv-reference-expert-kv-teacher-retrieval-1k-sample",
         "kv-reference-bilinear-smoke",
         "kv-reference-bilinear-train",
         "kv-reference-bilinear-sample",
