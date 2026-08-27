@@ -3679,6 +3679,22 @@ def train_direct_reference_kv_delta_320(
                 )
         return metrics
 
+    def log_fixed_flow_validation(step: int) -> None:
+        validation_metrics = fixed_flow_validation()
+        print(
+            f"Fixed artist-disjoint flow validation step={step}: "
+            f"{validation_metrics}",
+            flush=True,
+        )
+        if wandb_run is not None:
+            wandb_run.log(
+                {
+                    f"validation_flow/{key}": value
+                    for key, value in validation_metrics.items()
+                },
+                step=step,
+            )
+
     running: dict[str, list[float]] = defaultdict(list)
     generator_grad_history: list[float] = []
     reader_grad_history: list[float] = []
@@ -4442,20 +4458,7 @@ def train_direct_reference_kv_delta_320(
                     and flow_validation_batches
                     and step % flow_validation_every == 0
                 ):
-                    validation_metrics = fixed_flow_validation()
-                    print(
-                        f"Fixed artist-disjoint flow validation step={step}: "
-                        f"{validation_metrics}",
-                        flush=True,
-                    )
-                    if wandb_run is not None:
-                        wandb_run.log(
-                            {
-                                f"validation_flow/{key}": value
-                                for key, value in validation_metrics.items()
-                            },
-                            step=step,
-                        )
+                    log_fixed_flow_validation(step)
                 if accumulation_last and (
                     step % checkpoint_every == 0 or step == steps
                 ):
@@ -5455,6 +5458,18 @@ def train_direct_reference_kv_delta_320(
                         {f"val/{key}": value for key, value in validation.items()},
                         step=step,
                     )
+                model.train()
+                reader.train()
+
+            # Sparse flow schedules need not coincide with validation steps.
+            # Run the fixed human-reference check after a distillation update
+            # as well, so configured validation intervals are never skipped.
+            if (
+                accumulation_last
+                and flow_validation_batches
+                and step % flow_validation_every == 0
+            ):
+                log_fixed_flow_validation(step)
                 model.train()
                 reader.train()
 
