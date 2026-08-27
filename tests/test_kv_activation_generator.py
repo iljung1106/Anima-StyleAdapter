@@ -76,6 +76,35 @@ def test_direct_delta_generator_can_remove_softmax_invariant_block_key() -> None
     assert model.block_embedding is None
 
 
+def test_direct_delta_rank32_head_keeps_token_conditioning_and_backpropagates() -> None:
+    torch.manual_seed(19)
+    model = ReferenceConditionedKVActivationGenerator(
+        style_dim=32,
+        context_dim=24,
+        output_dim=40,
+        blocks=2,
+        hidden_dim=32,
+        heads=4,
+        ff_dim=64,
+        ff_layers=3,
+        output_rank=4,
+        output_init_scale=1e-3,
+        normalize_style=False,
+        normalize_attended=False,
+    )
+    style = torch.randn(2, 6, 32)
+    context = torch.randn(2, 9, 24)
+    output = model(style, context, 1)
+    assert output.shape == (2, 2, 9, 40)
+    assert model.output_head[1].down.out_features == 8
+    assert model.output_head[1].up.shape == (2, 4, 40)
+    assert not torch.allclose(output[:, :, 0], output[:, :, 1])
+    output.square().mean().backward()
+    assert model.output_head[1].up.grad is not None
+    assert model.output_head[1].down.weight.grad is not None
+    assert model.output_head[0].up.grad is None
+
+
 def test_final_effect_constraints_use_absolute_pairwise_cap_without_centering() -> None:
     teacher = torch.zeros(4, 1, 2, 4)
     for index in range(4):

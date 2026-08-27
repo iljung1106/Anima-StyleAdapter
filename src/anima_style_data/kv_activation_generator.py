@@ -44,6 +44,26 @@ class _SwiGLU(nn.Module):
         return self.output(F.silu(gate) * content)
 
 
+class _LowRankKVResidualHead(nn.Module):
+    """LoRA-shaped K/V residual head over a conditioned token feature."""
+
+    def __init__(
+        self, hidden_dim: int, output_dim: int, rank: int, init_scale: float
+    ) -> None:
+        super().__init__()
+        self.rank = int(rank)
+        self.down = nn.Linear(hidden_dim, 2 * rank, bias=False)
+        self.up = nn.Parameter(torch.empty(2, rank, output_dim))
+        nn.init.xavier_uniform_(self.down.weight)
+        nn.init.xavier_uniform_(self.up)
+        with torch.no_grad():
+            self.up.mul_(float(init_scale))
+
+    def forward(self, hidden: torch.Tensor) -> torch.Tensor:
+        low_rank = self.down(hidden).reshape(*hidden.shape[:-1], 2, self.rank)
+        return torch.einsum("...kr,kro->...ko", low_rank, self.up)
+
+
 class ReferenceConditionedKVActivationGenerator(nn.Module):
     """Generate block-local raw delta-K/delta-V activations.
 
@@ -62,6 +82,8 @@ class ReferenceConditionedKVActivationGenerator(nn.Module):
         hidden_dim: int = 256,
         heads: int = 8,
         ff_dim: int = 1024,
+        ff_layers: int = 1,
+        output_rank: int = 0,
         output_init_scale: float = 0.02,
         normalize_style: bool = True,
         normalize_attended: bool = True,
@@ -73,6 +95,8 @@ class ReferenceConditionedKVActivationGenerator(nn.Module):
         super().__init__()
         if hidden_dim % heads:
             raise ValueError("hidden_dim must be divisible by heads")
+        if ff_layers <= 0 or output_rank < 0:
+            raise ValueError("ff_layers must be positive and output_rank non-negative")
         if output_init_scale < 0:
             raise ValueError("output_init_scale must be non-negative")
         self.style_dim = int(style_dim)
@@ -82,6 +106,7 @@ class ReferenceConditionedKVActivationGenerator(nn.Module):
         self.hidden_dim = int(hidden_dim)
         self.heads = int(heads)
         self.head_dim = hidden_dim // heads
+        self.output_rank = int(output_rank)
         self.enable_qo = bool(enable_qo)
         self.stream_dim = int(stream_dim)
         self.stream_rank = int(stream_rank)
@@ -106,10 +131,24 @@ class ReferenceConditionedKVActivationGenerator(nn.Module):
         )
         self.ff_norm = nn.LayerNorm(hidden_dim)
         self.ff = _SwiGLU(hidden_dim, ff_dim)
-        self.output_head = nn.ModuleList(
-            nn.Linear(hidden_dim, output_dim * 2, bias=False)
-            for _ in range(blocks)
+        self.extra_ff_norm = nn.ModuleList(
+            nn.LayerNorm(hidden_dim) for _ in range(int(ff_layers) - 1)
         )
+        self.extra_ff = nn.ModuleList(
+            _SwiGLU(hidden_dim, ff_dim) for _ in range(int(ff_layers) - 1)
+        )
+        if self.output_rank:
+            self.output_head = nn.ModuleList(
+                _LowRankKVResidualHead(
+                    hidden_dim, output_dim, self.output_rank, output_init_scale
+                )
+                for _ in range(blocks)
+            )
+        else:
+            self.output_head = nn.ModuleList(
+                nn.Linear(hidden_dim, output_dim * 2, bias=False)
+                for _ in range(blocks)
+            )
         self.log_gain = nn.Parameter(torch.zeros(blocks, 2))
         if self.enable_qo:
             # Two learned queries per block read the full visual style memory:
@@ -160,9 +199,10 @@ class ReferenceConditionedKVActivationGenerator(nn.Module):
                 for head in block_heads:
                     with torch.no_grad():
                         head.weight.mul_(output_init_scale)
-        for head in self.output_head:
-            with torch.no_grad():
-                head.weight.mul_(output_init_scale)
+        if not self.output_rank:
+            for head in self.output_head:
+                with torch.no_grad():
+                    head.weight.mul_(output_init_scale)
 
     def forward(
         self,
@@ -203,9 +243,12 @@ class ReferenceConditionedKVActivationGenerator(nn.Module):
         )
         hidden = self.output_norm(attended)
         hidden = hidden + self.ff(self.ff_norm(hidden))
-        output = self.output_head[block](hidden).reshape(
-            batch, text_tokens, 2, self.output_dim
-        ).transpose(1, 2)
+        for norm, ff in zip(self.extra_ff_norm, self.extra_ff, strict=True):
+            hidden = hidden + ff(norm(hidden))
+        output = self.output_head[block](hidden)
+        if not self.output_rank:
+            output = output.reshape(batch, text_tokens, 2, self.output_dim)
+        output = output.transpose(1, 2)
         gain = self.log_gain[block].float().clamp(-4.0, 4.0).exp().to(output.dtype)
         return output * gain[None, :, None, None]
 
@@ -2482,17 +2525,25 @@ def train_direct_reference_kv_delta_320(
         decay_end = int(
             generator_lr_schedule.get("decay_end_step", decay_start + 1)
         )
+        tail_final = float(generator_lr_schedule.get("tail_final_lr", final))
+        tail_end = int(generator_lr_schedule.get("tail_decay_end_step", decay_end))
         if peak <= 0 or final < 0 or decay_end <= decay_start:
             raise ValueError("Generator LR schedule is invalid")
+        if tail_final < 0 or tail_end < decay_end:
+            raise ValueError("Generator LR tail schedule is invalid")
         if relative_step <= generator_warmup:
             return peak * relative_step / max(1, generator_warmup)
         if relative_step <= decay_start:
             return peak
-        if relative_step >= decay_end:
-            return final
-        progress = (relative_step - decay_start) / (decay_end - decay_start)
+        if relative_step < decay_end:
+            progress = (relative_step - decay_start) / (decay_end - decay_start)
+            cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+            return final + (peak - final) * cosine
+        if relative_step >= tail_end or tail_end == decay_end:
+            return tail_final
+        progress = (relative_step - decay_end) / (tail_end - decay_end)
         cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
-        return final + (peak - final) * cosine
+        return tail_final + (final - tail_final) * cosine
 
     def flow_reader_lr(relative_step: int) -> float:
         if not reader_lr_schedule:
@@ -3783,7 +3834,10 @@ def sample_direct_reference_kv_delta_320(
     architecture = str(model_cfg.get("architecture", "direct_cross_attention"))
     if architecture == "direct_cross_attention":
         context_dim = int(model_state["context_query.0.weight"].shape[1])
-        output_dim = int(model_state["output_head.0.weight"].shape[0] // 2)
+        if int(model_cfg.get("output_rank", 0)):
+            output_dim = int(model_state["output_head.0.up"].shape[-1])
+        else:
+            output_dim = int(model_state["output_head.0.weight"].shape[0] // 2)
     elif architecture == "low_rank_kvoq_operator":
         context_dim = int(model_state["down_output.0.0.weight"].shape[0])
         output_dim = int(model_state["up_output.0.0.weight"].shape[0])
@@ -4164,6 +4218,27 @@ def sample_low_rank_kvoq_flow_50k(
         config,
         destination,
         sample_config_key="kv_reference_low_rank_kvoq_flow_50k_sample",
+    )
+
+
+def train_scheduled_direct_rank32_kvoq_flow_50k(
+    config: dict[str, Any], destination: Path
+) -> dict[str, Any]:
+    return train_scheduled_direct_reference_kv_delta_320(
+        config,
+        destination,
+        config_key="kv_reference_direct_rank32_kvoq_flow_50k",
+        sample_config_key="kv_reference_direct_rank32_kvoq_flow_50k_sample",
+    )
+
+
+def sample_direct_rank32_kvoq_flow_50k(
+    config: dict[str, Any], destination: Path
+) -> dict[str, Any]:
+    return sample_direct_reference_kv_delta_320(
+        config,
+        destination,
+        sample_config_key="kv_reference_direct_rank32_kvoq_flow_50k_sample",
     )
 
 

@@ -1160,6 +1160,71 @@ kv_reference_low_rank_kvoq_flow_50k_sample:
   batch_size: 4
   panel_tile_width: 384
 
+# Widen the trainable v4 token-conditioned path without changing its successful
+# conditioning contract.  Each text token still cross-attends to the reference;
+# only the final block-local K/V residual head is factorized as rank-32 LoRA.
+# This deliberately avoids generating one enormous fixed operator per reference.
+kv_reference_direct_rank32_kvoq_flow_50k:
+  extends_config_key: kv_reference_direct_delta_320
+  replace_sections: [model]
+  output_directory: kv_reference_direct_r32_w768_l3_kvoq_flow_50k_v1
+  seed: 20260827
+  model:
+    architecture: direct_cross_attention
+    hidden_dim: 768
+    heads: 16
+    ff_dim: 3072
+    ff_layers: 3
+    output_rank: 32
+    output_init_scale: 0.000001
+    normalize_style: false
+    normalize_attended: false
+    use_block_embedding: false
+    enable_qo: true
+    stream_dim: 2048
+    stream_rank: 32
+  training:
+    steps: 50000
+    generator_learning_rate: 0.000003
+    reader_learning_rate: 0.000003
+    # Reproduce v4's useful first 5k schedule, then anneal rather than holding
+    # its terminal LR for another 45k updates.
+    generator_lr_schedule:
+      peak_lr: 0.000003
+      warmup_steps: 100
+      decay_start_step: 1500
+      decay_end_step: 5000
+      final_lr: 0.0000003
+      tail_decay_end_step: 50000
+      tail_final_lr: 0.00000003
+    reader_lr_schedule:
+      peak_lr: 0.000003
+      warmup_steps: 100
+      decay_start_step: 250
+      decay_end_step: 750
+      final_lr: 0.00000006
+    checkpoint_every: 2500
+    sample_every: 2500
+    sample_steps: []
+    sample_output_root: diagnostics/kv-reference-direct-r32-w768-l3-kvoq-flow-50k-v1
+    resume: true
+    wandb:
+      enabled: true
+      project: anima-style-adapter
+      name: kv-reference-direct-r32-w768-l3-kvoq-flow-50k-v1
+      id: kv-reference-direct-r32-w768-l3-kvoq-flow-50k-v1
+
+kv_reference_direct_rank32_kvoq_flow_50k_sample:
+  checkpoint: kv_reference_direct_r32_w768_l3_kvoq_flow_50k_v1/checkpoints/step-0050000.pt
+  output_directory: diagnostics/kv-reference-direct-r32-w768-l3-kvoq-flow-50k-v1-step50000
+  device: cuda
+  artists: 8
+  references: 4
+  reference_seed: 20260827
+  strengths: [1.0, 2.0]
+  batch_size: 4
+  panel_tile_width: 384
+
 # Reference-conditioned low-rank operator pilot. Unlike the direct activation
 # head above, the reference generates a fresh block-local linear operator and
 # applies it to every native text token.  Teacher factors remain offline
