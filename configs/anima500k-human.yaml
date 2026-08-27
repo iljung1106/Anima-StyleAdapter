@@ -2138,6 +2138,56 @@ kv_reference_expert_kv_teacher_flow_hybrid_b3_1k_sample:
   batch_size: 4
   panel_tile_width: 384
 
+# Every K/V LoRA teacher artist has exactly thirty entries in the real human
+# reference-token cache. Use those inference-domain references to predict the
+# matching artist's cached final velocity and compact LoRA function directly.
+# This removes the synthetic LoRA-render reference domain gap without needing
+# a paired base image. Keep a small mixture share for compositional behavior;
+# noisy image-flow updates are disabled in this causal probe.
+kv_reference_expert_kv_human_teacher_500:
+  extends_config_key: kv_reference_expert_kv_teacher_flow_hybrid_b3_1k
+  output_directory: kv_reference_expert_kv64x16_human_teacher_w768_l3_500_v10
+  seed: 20260905
+  single_reference_cache: dual_query_reference_tokens_v8_step10000
+  single_reference_seed: 2026090501
+  training:
+    steps: 500
+    category_weights: [0.80, 0.05, 0.05, 0.05, 0.05]
+    human_flow:
+      enabled: false
+    validation_every: 125
+    checkpoint_every: 250
+    sample_steps: [250, 500]
+    sample_output_root: diagnostics/kv-reference-expert-kv64x16-human-teacher-w768-l3-500-v10
+    generator_lr_schedule:
+      peak_lr: 0.000003
+      warmup_steps: 100
+      decay_start_step: 250
+      decay_end_step: 500
+      final_lr: 0.0000005
+    reader_lr_schedule:
+      peak_lr: 0.0000015
+      warmup_steps: 100
+      decay_start_step: 250
+      decay_end_step: 500
+      final_lr: 0.0000001
+    wandb:
+      enabled: true
+      project: anima-style-adapter
+      name: kv-reference-expert-kv64x16-human-teacher-w768-l3-500-v10
+      id: kv-reference-expert-kv64x16-human-teacher-w768-l3-500-v10
+
+kv_reference_expert_kv_human_teacher_500_sample:
+  checkpoint: kv_reference_expert_kv64x16_human_teacher_w768_l3_500_v10/checkpoints/step-0000500.pt
+  output_directory: diagnostics/kv-reference-expert-kv64x16-human-teacher-w768-l3-500-v10-step500
+  device: cuda
+  artists: 8
+  references: 4
+  reference_seed: 20260905
+  strengths: [1.0, 2.0]
+  batch_size: 4
+  panel_tile_width: 384
+
 # Reference-conditioned low-rank operator pilot. Unlike the direct activation
 # head above, the reference generates a fresh block-local linear operator and
 # applies it to every native text token.  Teacher factors remain offline

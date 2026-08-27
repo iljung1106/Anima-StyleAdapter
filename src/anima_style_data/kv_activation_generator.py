@@ -3155,15 +3155,21 @@ def train_direct_reference_kv_delta_320(
     train_query_count = 0
     probes = []
     if not flow_only:
+        single_reference_cache = str(
+            cfg.get("single_reference_cache", cfg["synthetic_reference_cache"])
+        )
+        single_reference_seed = int(
+            cfg.get("single_reference_seed", seed ^ 0x53594E54)
+        )
         single_loader = CachedTeacherReferenceLoader(
-            destination / str(cfg["synthetic_reference_cache"]),
+            destination / single_reference_cache,
             split="train", style_ids=artist_ids, batch_size=chunk,
-            references=single_images, seed=seed ^ 0x53594E54,
+            references=single_images, seed=single_reference_seed,
             token_lru_shards=token_lru, strict_style_ids=True,
         )
         single_bank = _materialize_reference_token_bank(
             single_loader, artist_ids, references=single_images,
-            seed=seed ^ 0x53594E54, chunk_size=chunk, device=device,
+            seed=single_reference_seed, chunk_size=chunk, device=device,
         )
         for kind, rows in rows_by_kind.items():
             style_ids = [str(row["mixture_style_id"]) for row in rows]
@@ -6389,6 +6395,27 @@ def sample_expert_kv_teacher_flow_hybrid_b3_1k(
         sample_config_key=(
             "kv_reference_expert_kv_teacher_flow_hybrid_b3_1k_sample"
         ),
+    )
+
+
+def train_scheduled_expert_kv_human_teacher_500(
+    config: dict[str, Any], destination: Path
+) -> dict[str, Any]:
+    return train_scheduled_direct_reference_kv_delta_320(
+        config,
+        destination,
+        config_key="kv_reference_expert_kv_human_teacher_500",
+        sample_config_key="kv_reference_expert_kv_human_teacher_500_sample",
+    )
+
+
+def sample_expert_kv_human_teacher_500(
+    config: dict[str, Any], destination: Path
+) -> dict[str, Any]:
+    return sample_direct_reference_kv_delta_320(
+        config,
+        destination,
+        sample_config_key="kv_reference_expert_kv_human_teacher_500_sample",
     )
 
 
