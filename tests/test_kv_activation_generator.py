@@ -181,6 +181,29 @@ def test_sparse_expert_generator_can_disable_q_and_keep_o() -> None:
     assert torch.count_nonzero(o) > 0
 
 
+def test_kv_only_routing_ignores_configured_stream_expert_count() -> None:
+    model = ReferenceConditionedKVActivationGenerator(
+        style_dim=16,
+        context_dim=12,
+        output_dim=20,
+        blocks=1,
+        hidden_dim=16,
+        heads=4,
+        ff_dim=32,
+        output_rank=2,
+        output_experts=8,
+        output_top_k=2,
+        output_init_scale=1e-3,
+        enable_qo=False,
+        stream_experts=4,
+        stream_top_k=2,
+    )
+
+    _, _, metrics = model.routing_auxiliary()
+    assert "kv_expert_max_load" in metrics
+    assert "qo_expert_max_load" not in metrics
+
+
 def test_dense_overload_balance_reaches_unselected_router_logits() -> None:
     model = ReferenceConditionedKVActivationGenerator(
         style_dim=16,

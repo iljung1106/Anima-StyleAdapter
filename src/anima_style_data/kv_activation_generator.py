@@ -1009,7 +1009,7 @@ class ReferenceConditionedKVActivationGenerator(nn.Module):
                 self.output_expert_selection_bias.amax(dim=-1)
                 - self.output_expert_selection_bias.amin(dim=-1)
             ).max().detach() * self._selection_bias_scale()
-        if self.stream_experts:
+        if self.enable_qo and self.stream_experts:
             metrics["qo_expert_max_usage"] = self.stream_expert_usage.max().detach()
             metrics["qo_expert_max_load"] = self.stream_expert_load.max().detach()
             metrics["qo_expert_bias_span"] = (
