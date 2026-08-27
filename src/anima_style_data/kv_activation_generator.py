@@ -1699,6 +1699,33 @@ def _same_artist_signature_consistency(
     }
 
 
+def _same_artist_memory_consistency(
+    student: torch.Tensor,
+    target: torch.Tensor,
+    *,
+    cosine_floor: float,
+    rms_ratio_tolerance: float,
+    magnitude_weight: float,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Match Reader memories from disjoint images of each artist."""
+
+    student_f = student.float().flatten(1)
+    target_f = target.detach().float().flatten(1)
+    cosine = F.cosine_similarity(student_f, target_f, dim=1)
+    direction = F.relu(float(cosine_floor) - cosine).square().mean()
+    student_rms = student_f.square().mean(dim=1).sqrt().clamp_min(1e-8)
+    target_rms = target_f.square().mean(dim=1).sqrt().clamp_min(1e-8)
+    log_ratio = (student_rms.log() - target_rms.log()).abs()
+    tolerance = math.log(float(rms_ratio_tolerance))
+    magnitude = F.relu(log_ratio - tolerance).square().mean()
+    loss = direction + float(magnitude_weight) * magnitude
+    return loss, {
+        "reader_consistency_loss": loss.detach(),
+        "reader_consistency_cosine": cosine.mean().detach(),
+        "reader_consistency_log_rms_error": log_ratio.mean().detach(),
+    }
+
+
 def _same_artist_queue_infonce(
     anchor: torch.Tensor,
     positive: torch.Tensor,
@@ -4395,6 +4422,10 @@ def train_direct_reference_kv_delta_320(
             category = rng.choices(categories, weights=category_weights, k=1)[0]
             alternative_references = None
             alternative_mask = None
+            consistency_left = None
+            consistency_left_mask = None
+            consistency_right = None
+            consistency_right_mask = None
             if category == "single":
                 artists = rng.sample(train_artists, batch)
                 functional_effect_indices = list(artists)
@@ -4408,6 +4439,21 @@ def train_direct_reference_kv_delta_320(
                     reference_start=0, reference_stop=single_images,
                     rng=random.Random(seed ^ (step * 97_409)),
                 )
+                if float(whole_model.get("reader_consistency_weight", 0.0)) > 0:
+                    split = max(1, single_images // 2)
+                    consistency_counts = [min(count, split) for count in counts]
+                    consistency_left, consistency_left_mask = _select_reference_tokens(
+                        single_bank, artists,
+                        reference_counts=consistency_counts,
+                        reference_start=0, reference_stop=split,
+                        rng=random.Random(seed ^ (step * 193_939)),
+                    )
+                    consistency_right, consistency_right_mask = _select_reference_tokens(
+                        single_bank, artists,
+                        reference_counts=consistency_counts,
+                        reference_start=split, reference_stop=single_images,
+                        rng=random.Random(seed ^ (step * 389_357)),
+                    )
                 components = torch.tensor(artists, device=device, dtype=torch.long)[:, None]
                 weights = torch.ones(batch, 1, device=device)
             else:
@@ -4471,6 +4517,49 @@ def train_direct_reference_kv_delta_320(
                     if alternative_references is not None and alternative_mask is not None
                     else None
                 )
+                reader_consistency = style.new_zeros((), dtype=torch.float32)
+                reader_consistency_metrics: dict[str, torch.Tensor] = {}
+                if (
+                    consistency_left is not None
+                    and consistency_left_mask is not None
+                    and consistency_right is not None
+                    and consistency_right_mask is not None
+                ):
+                    if step % 2 == 0:
+                        consistency_left, consistency_right = (
+                            consistency_right, consistency_left
+                        )
+                        consistency_left_mask, consistency_right_mask = (
+                            consistency_right_mask, consistency_left_mask
+                        )
+                    left_memory = reader(
+                        consistency_left, consistency_left_mask
+                    ).tokens
+                    with torch.no_grad():
+                        right_memory = reader(
+                            consistency_right, consistency_right_mask
+                        ).tokens
+                    reader_consistency, reader_consistency_metrics = (
+                        _same_artist_memory_consistency(
+                            left_memory,
+                            right_memory,
+                            cosine_floor=float(
+                                whole_model.get(
+                                    "reader_consistency_cosine_floor", 0.85
+                                )
+                            ),
+                            rms_ratio_tolerance=float(
+                                whole_model.get(
+                                    "reader_consistency_rms_tolerance", 1.5
+                                )
+                            ),
+                            magnitude_weight=float(
+                                whole_model.get(
+                                    "reader_consistency_magnitude_weight", 0.25
+                                )
+                            ),
+                        )
+                    )
                 whole_loss = style.new_zeros((), dtype=torch.float32)
                 whole_metrics: dict[str, torch.Tensor] = {}
                 if whole_enabled:
@@ -4570,6 +4659,8 @@ def train_direct_reference_kv_delta_320(
                         * constraint_loss
                         + relative_common_weighted
                         + retrieval_weighted
+                        + float(whole_model.get("reader_consistency_weight", 0.0))
+                        * reader_consistency
                     )
                     whole_metrics = {
                         "whole/loss": whole_loss.detach(),
@@ -4584,6 +4675,10 @@ def train_direct_reference_kv_delta_320(
                         **{
                             f"whole/{key}": value
                             for key, value in retrieval_metrics.items()
+                        },
+                        **{
+                            f"whole/{key}": value
+                            for key, value in reader_consistency_metrics.items()
                         },
                         **{f"whole/{key}": value for key, value in constraint_metrics.items()},
                     }
@@ -4705,8 +4800,12 @@ def train_direct_reference_kv_delta_320(
                 distill_lr = float(
                     human_flow.get("distillation_lr_multiplier", 1.0)
                 )
-                optimizer.param_groups[0]["lr"] = generator_lr * lr_scale * distill_lr
-                optimizer.param_groups[1]["lr"] = reader_lr * lr_scale * distill_lr
+                optimizer.param_groups[0]["lr"] = (
+                    flow_generator_lr(relative_step) * distill_lr
+                )
+                optimizer.param_groups[1]["lr"] = (
+                    flow_reader_lr(relative_step) * distill_lr
+                )
                 if hasattr(model, "apply_routing_population_update"):
                     routing_metrics.update(
                         model.apply_routing_population_update()
@@ -5730,6 +5829,27 @@ def sample_expert_kv_teacher_retrieval_250_raw(
         config,
         destination,
         sample_config_key="kv_reference_expert_kv_teacher_retrieval_250_raw_sample",
+    )
+
+
+def train_scheduled_expert_kv_teacher_single_consistent_500(
+    config: dict[str, Any], destination: Path
+) -> dict[str, Any]:
+    return train_scheduled_direct_reference_kv_delta_320(
+        config,
+        destination,
+        config_key="kv_reference_expert_kv_teacher_single_consistent_500",
+        sample_config_key="kv_reference_expert_kv_teacher_single_consistent_500_sample",
+    )
+
+
+def sample_expert_kv_teacher_single_consistent_500(
+    config: dict[str, Any], destination: Path
+) -> dict[str, Any]:
+    return sample_direct_reference_kv_delta_320(
+        config,
+        destination,
+        sample_config_key="kv_reference_expert_kv_teacher_single_consistent_500_sample",
     )
 
 

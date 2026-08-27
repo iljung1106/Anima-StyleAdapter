@@ -21,6 +21,7 @@ from anima_style_data.kv_activation_generator import (
     _population_common_occupancy,
     _prediction_population_metrics,
     _same_artist_queue_infonce,
+    _same_artist_memory_consistency,
     _same_artist_signature_consistency,
     _whole_model_curriculum,
 )
@@ -45,6 +46,28 @@ def test_final_effect_retrieval_loss_rewards_correct_style_matching() -> None:
     assert matched["retrieval_accuracy"] == 1
     assert matched["correct_minus_hardest_wrong_cosine"] > 0
     assert mismatched["retrieval_accuracy"] == 0
+
+
+def test_same_artist_memory_consistency_is_rowwise() -> None:
+    memory = torch.randn(3, 4, 8)
+    matched, matched_metrics = _same_artist_memory_consistency(
+        memory,
+        memory.clone(),
+        cosine_floor=0.9,
+        rms_ratio_tolerance=1.5,
+        magnitude_weight=0.25,
+    )
+    mismatched, _ = _same_artist_memory_consistency(
+        memory,
+        memory.roll(1, dims=0),
+        cosine_floor=0.9,
+        rms_ratio_tolerance=1.5,
+        magnitude_weight=0.25,
+    )
+
+    assert matched == 0
+    assert matched_metrics["reader_consistency_cosine"] == 1
+    assert mismatched > matched
 
 
 def test_activation_generator_is_reference_conditioned_and_backpropagates() -> None:
