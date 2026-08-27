@@ -2029,6 +2029,85 @@ kv_reference_expert_kv_teacher_signature_250_sample:
   batch_size: 4
   panel_tile_width: 384
 
+# The teacher-only probes learn some corpus style but leave arbitrary external
+# references in a common-output basin.  Every tenth update therefore uses an
+# actual human support/query flow target; the other nine retain the lower-noise
+# cached final-effect and compact LoRA-function targets.  Human flow carries no
+# magnitude floor or positive-only consistency shortcut.  Persistent
+# population routing bias remains the primary load controller and the
+# differentiable balance term is only a weak overload guard.
+kv_reference_expert_kv_teacher_flow_hybrid_1k:
+  extends_config_key: kv_reference_expert_kv_teacher_signature_250
+  output_directory: kv_reference_expert_kv64x16_teacher_flow_hybrid_w768_l3_1k_v8
+  seed: 20260903
+  training:
+    steps: 1000
+    validation_every: 125
+    checkpoint_every: 250
+    sample_steps: [250, 500, 1000]
+    sample_output_root: diagnostics/kv-reference-expert-kv64x16-teacher-flow-hybrid-w768-l3-1k-v8
+    generator_lr_schedule:
+      peak_lr: 0.000003
+      warmup_steps: 100
+      decay_start_step: 500
+      decay_end_step: 1000
+      final_lr: 0.0000005
+    reader_lr_schedule:
+      peak_lr: 0.0000015
+      warmup_steps: 100
+      decay_start_step: 250
+      decay_end_step: 750
+      final_lr: 0.0000001
+    human_flow:
+      enabled: true
+      batch_size: 4
+      same_style_target_min: 2
+      same_style_target_max: 4
+      prompt_modes: {full: 0.25, tag_dropout: 0.45, short: 0.30, empty: 0.0}
+      start_step: 0
+      cycle: 10
+      slots: [0]
+      flow_mse_weight: 1.0
+      residual_huber_weight: 0.0
+      direction_weight: 0.0
+      output_band_weight: 0.0
+      prior_preservation_weight: 0.01
+      cross_style_diversity_weight: 0.0
+      population_common_weight: 0.05
+      population_common_cap: 0.30
+      population_common_min_styles: 16
+      same_artist_consistency_weight: 0.0
+      same_artist_contrastive_weight: 0.0
+      reference_subset_dropout: 0.25
+      timestep_stratified_quantiles: true
+      group_shared_block_dropout: 0.10
+      expert_balance_weight: 0.001
+      expert_specialization_weight: 0.0
+      fixed_validation_every: 250
+      fixed_validation_batches: 4
+      prefetch_workers: 4
+      prefetch_batches: 8
+    ema:
+      enabled: true
+      decay: 0.995
+      sample: true
+    wandb:
+      enabled: true
+      project: anima-style-adapter
+      name: kv-reference-expert-kv64x16-teacher-flow-hybrid-w768-l3-1k-v8
+      id: kv-reference-expert-kv64x16-teacher-flow-hybrid-w768-l3-1k-v8
+
+kv_reference_expert_kv_teacher_flow_hybrid_1k_sample:
+  checkpoint: kv_reference_expert_kv64x16_teacher_flow_hybrid_w768_l3_1k_v8/checkpoints/step-0001000.pt
+  output_directory: diagnostics/kv-reference-expert-kv64x16-teacher-flow-hybrid-w768-l3-1k-v8-step1000
+  device: cuda
+  artists: 8
+  references: 4
+  reference_seed: 20260903
+  strengths: [1.0, 2.0]
+  batch_size: 4
+  panel_tile_width: 384
+
 # Reference-conditioned low-rank operator pilot. Unlike the direct activation
 # head above, the reference generates a fresh block-local linear operator and
 # applies it to every native text token.  Teacher factors remain offline

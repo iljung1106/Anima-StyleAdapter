@@ -6327,6 +6327,31 @@ def sample_expert_kv_teacher_signature_250(
     )
 
 
+def train_scheduled_expert_kv_teacher_flow_hybrid_1k(
+    config: dict[str, Any], destination: Path
+) -> dict[str, Any]:
+    return train_scheduled_direct_reference_kv_delta_320(
+        config,
+        destination,
+        config_key="kv_reference_expert_kv_teacher_flow_hybrid_1k",
+        sample_config_key=(
+            "kv_reference_expert_kv_teacher_flow_hybrid_1k_sample"
+        ),
+    )
+
+
+def sample_expert_kv_teacher_flow_hybrid_1k(
+    config: dict[str, Any], destination: Path
+) -> dict[str, Any]:
+    return sample_direct_reference_kv_delta_320(
+        config,
+        destination,
+        sample_config_key=(
+            "kv_reference_expert_kv_teacher_flow_hybrid_1k_sample"
+        ),
+    )
+
+
 def train_functional_reference_kv_operator(
     config: dict[str, Any],
     destination: Path,
