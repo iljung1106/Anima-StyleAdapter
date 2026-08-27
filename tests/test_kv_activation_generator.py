@@ -17,6 +17,7 @@ from anima_style_data.kv_activation_generator import (
     _final_effect_constraints,
     _mean_teacher_operator,
     _mixture_target,
+    _population_common_occupancy,
     _prediction_population_metrics,
     _same_artist_signature_consistency,
     _whole_model_curriculum,
@@ -211,6 +212,7 @@ def test_dense_overload_balance_reaches_unselected_router_logits() -> None:
         dense,
         selected,
         2,
+        logits,
     )
     balance, _, _ = model.routing_auxiliary()
     balance.backward()
@@ -242,7 +244,7 @@ def test_selection_bias_changes_topk_but_not_selected_mixture_weights() -> None:
     assert torch.allclose(weights, expected)
 
 
-def test_router_specialization_penalizes_uniform_topk_after_ramp() -> None:
+def test_router_core_margin_has_gradient_at_uniform_logits() -> None:
     model = ReferenceConditionedKVActivationGenerator(
         style_dim=16,
         context_dim=12,
@@ -255,7 +257,8 @@ def test_router_specialization_penalizes_uniform_topk_after_ramp() -> None:
         output_experts=8,
         output_top_k=4,
         output_init_scale=1e-3,
-        output_entropy_target=torch.tensor(2.0).log().item(),
+        output_core_experts=2,
+        output_core_margin=0.8,
         expert_specialization_steps=100,
     )
     model.set_routing_step(100)
@@ -271,14 +274,16 @@ def test_router_specialization_penalizes_uniform_topk_after_ramp() -> None:
         dense,
         selected,
         4,
+        logits,
     )
     _, specialization, metrics = model.routing_auxiliary()
     assert specialization > 0
     assert torch.allclose(
         metrics["kv_effective_experts"], torch.tensor(4.0), atol=1e-5
     )
+    assert metrics["kv_core_margin_target"] == torch.tensor(0.8)
     specialization.backward()
-    assert logits.grad is not None
+    assert torch.count_nonzero(logits.grad) > 0
 
 
 def test_same_artist_consistency_uses_cosine_and_rms_bands() -> None:
@@ -347,6 +352,26 @@ def test_cross_style_queue_diversity_only_penalizes_cosine_above_cap() -> None:
     assert collapsed_cosine == 1
     assert distinct == 0
     assert distinct_cosine == 0
+
+
+def test_population_common_occupancy_caps_shared_direction_without_centering() -> None:
+    signature = torch.tensor([1.0, 0.0], requires_grad=True)
+    collapsed, occupancy = _population_common_occupancy(
+        signature,
+        [torch.tensor([1.0, 0.0]), torch.tensor([1.0, 0.0])],
+        occupancy_cap=0.30,
+    )
+    distinct, distinct_occupancy = _population_common_occupancy(
+        torch.tensor([-1.0, 0.0]),
+        [torch.tensor([1.0, 0.0])],
+        occupancy_cap=0.30,
+    )
+    assert occupancy == 1
+    assert collapsed > 0
+    collapsed.backward()
+    assert torch.count_nonzero(signature.grad) > 0
+    assert distinct == 0
+    assert distinct_occupancy == 0
 
 
 def test_whole_model_curriculum_turns_block_loss_off_at_2000() -> None:

@@ -110,6 +110,13 @@ class ReferenceConditionedKVActivationGenerator(nn.Module):
         output_entropy_target: float = -1.0,
         stream_entropy_target: float = -1.0,
         expert_specialization_steps: int = 0,
+        output_core_experts: int = 0,
+        stream_core_experts: int = 0,
+        output_core_margin: float = 0.0,
+        stream_core_margin: float = 0.0,
+        expert_specialization_start_step: int = 0,
+        router_temperature_end: float = 1.0,
+        router_temperature_steps: int = 0,
     ) -> None:
         super().__init__()
         if hidden_dim % heads:
@@ -158,6 +165,15 @@ class ReferenceConditionedKVActivationGenerator(nn.Module):
         self.output_entropy_target = float(output_entropy_target)
         self.stream_entropy_target = float(stream_entropy_target)
         self.expert_specialization_steps = int(expert_specialization_steps)
+        self.output_core_experts = int(output_core_experts)
+        self.stream_core_experts = int(stream_core_experts)
+        self.output_core_margin = float(output_core_margin)
+        self.stream_core_margin = float(stream_core_margin)
+        self.expert_specialization_start_step = int(
+            expert_specialization_start_step
+        )
+        self.router_temperature_end = float(router_temperature_end)
+        self.router_temperature_steps = int(router_temperature_steps)
         self._routing_step = 0
         if (
             self.router_init_scale < 0
@@ -169,6 +185,11 @@ class ReferenceConditionedKVActivationGenerator(nn.Module):
             or self.expert_bias_update_steps < 0
             or self.expert_bias_decay_end_step < 0
             or self.expert_specialization_steps < 0
+            or self.output_core_margin < 0
+            or self.stream_core_margin < 0
+            or self.expert_specialization_start_step < 0
+            or not 0 < self.router_temperature_end <= 1.0
+            or self.router_temperature_steps < 0
         ):
             raise ValueError("router exploration controls are invalid")
         if (
@@ -184,9 +205,20 @@ class ReferenceConditionedKVActivationGenerator(nn.Module):
             self.stream_top_k
         ):
             raise ValueError("stream entropy target exceeds top-k entropy")
+        if self.output_core_experts and not (
+            0 < self.output_core_experts < self.output_top_k
+        ):
+            raise ValueError("output core experts must be inside output top-k")
+        if self.stream_core_experts and not (
+            0 < self.stream_core_experts < self.stream_top_k
+        ):
+            raise ValueError("stream core experts must be inside stream top-k")
         self._routing_balance_terms: list[torch.Tensor] = []
         self._routing_specialization_terms: list[torch.Tensor] = []
         self._routing_entropies: dict[str, list[torch.Tensor]] = {
+            "kv": [], "qo": [],
+        }
+        self._routing_margins: dict[str, list[torch.Tensor]] = {
             "kv": [], "qo": [],
         }
         if self.enable_qo and self.stream_rank <= 0:
@@ -516,6 +548,7 @@ class ReferenceConditionedKVActivationGenerator(nn.Module):
                 dense,
                 selected,
                 self.output_top_k,
+                logits,
             )
             down_bank = self.output_expert_down[block]
             up_bank = self.output_expert_up[block]
@@ -635,6 +668,7 @@ class ReferenceConditionedKVActivationGenerator(nn.Module):
                 dense,
                 selected,
                 self.stream_top_k,
+                logits[:, None],
                 usage_kind=0,
             )
             channels = torch.tanh(
@@ -672,8 +706,10 @@ class ReferenceConditionedKVActivationGenerator(nn.Module):
     ) -> tuple[
         torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
     ]:
-        dense = logits.float().softmax(dim=-1).to(logits.dtype)
-        selection_logits = logits.float()
+        temperature = self._router_temperature()
+        tempered_logits = logits.float() / temperature
+        dense = tempered_logits.softmax(dim=-1).to(logits.dtype)
+        selection_logits = tempered_logits
         if selection_bias is not None:
             selection_logits = selection_logits + (
                 self._selection_bias_scale() * selection_bias.float()
@@ -686,7 +722,7 @@ class ReferenceConditionedKVActivationGenerator(nn.Module):
                     selection_logits
                 ) * jitter
         indices = selection_logits.topk(int(top_k), dim=-1).indices
-        selected_logits = logits.gather(-1, indices)
+        selected_logits = tempered_logits.gather(-1, indices)
         weights = selected_logits.float().softmax(dim=-1).to(logits.dtype)
         sparse = torch.zeros_like(logits).scatter(-1, indices, weights)
         selected = torch.zeros_like(logits).scatter(
@@ -709,6 +745,20 @@ class ReferenceConditionedKVActivationGenerator(nn.Module):
             self._routing_step - self.expert_bias_update_steps
         ) / max(1, width)
 
+    def _router_temperature(self) -> float:
+        if not self.router_temperature_steps:
+            return self.router_temperature_end
+        progress = min(1.0, self._routing_step / self.router_temperature_steps)
+        return 1.0 + progress * (self.router_temperature_end - 1.0)
+
+    def _core_margin_target(self, name: str) -> float:
+        target = (
+            self.output_core_margin if name == "kv" else self.stream_core_margin
+        )
+        elapsed = max(0, self._routing_step - self.expert_specialization_start_step)
+        progress = min(1.0, elapsed / max(1, self.expert_specialization_steps))
+        return target * progress
+
     def _entropy_cap(self, name: str, top_k: int) -> float:
         target = (
             self.output_entropy_target
@@ -729,6 +779,8 @@ class ReferenceConditionedKVActivationGenerator(nn.Module):
         self._routing_specialization_terms.clear()
         for values in self._routing_entropies.values():
             values.clear()
+        for values in self._routing_margins.values():
+            values.clear()
 
     def _record_routing(
         self,
@@ -741,6 +793,7 @@ class ReferenceConditionedKVActivationGenerator(nn.Module):
         dense_probabilities: torch.Tensor,
         selections: torch.Tensor,
         top_k: int,
+        router_logits: torch.Tensor,
         *,
         usage_kind: int | None = None,
     ) -> None:
@@ -776,10 +829,24 @@ class ReferenceConditionedKVActivationGenerator(nn.Module):
             * probabilities.float()
         ).sum(dim=-1).mean()
         self._routing_entropies[name].append(entropy)
-        entropy_cap = self._entropy_cap(name, top_k)
-        self._routing_specialization_terms.append(
-            F.relu(entropy - entropy_cap).square()
+        core_experts = (
+            self.output_core_experts if name == "kv" else self.stream_core_experts
         )
+        if core_experts:
+            ordered = router_logits.float().sort(dim=-1, descending=True).values
+            margin = (
+                ordered[..., core_experts - 1] - ordered[..., core_experts]
+            ).mean()
+            margin_target = self._core_margin_target(name)
+            self._routing_margins[name].append(margin)
+            self._routing_specialization_terms.append(
+                F.relu(margin_target - margin).square()
+            )
+        else:
+            entropy_cap = self._entropy_cap(name, top_k)
+            self._routing_specialization_terms.append(
+                F.relu(entropy - entropy_cap).square()
+            )
         with torch.no_grad():
             usage_rows.mul_(self.expert_usage_decay).add_(
                 current, alpha=1.0 - self.expert_usage_decay
@@ -825,6 +892,15 @@ class ReferenceConditionedKVActivationGenerator(nn.Module):
             metrics[f"{name}_entropy_cap"] = zero.new_tensor(
                 self._entropy_cap(name, top_k)
             )
+            margins = self._routing_margins[name]
+            margin = torch.stack(margins).mean() if margins else zero
+            metrics[f"{name}_core_logit_margin"] = margin.detach()
+            metrics[f"{name}_core_margin_target"] = zero.new_tensor(
+                self._core_margin_target(name)
+            )
+        metrics["router_temperature"] = zero.new_tensor(
+            self._router_temperature()
+        )
         if self.output_experts:
             metrics["kv_expert_max_usage"] = self.output_expert_usage.max().detach()
             metrics["kv_expert_max_load"] = self.output_expert_load.max().detach()
@@ -1484,6 +1560,26 @@ def _cross_style_queue_diversity(
     positive_cosine = F.relu(similarities).mean()
     loss = F.relu(similarities - float(cosine_cap)).square().mean()
     return loss, positive_cosine
+
+
+def _population_common_occupancy(
+    signature: torch.Tensor,
+    references: list[torch.Tensor],
+    *,
+    occupancy_cap: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Limit a detached artist population's shared direction without centering."""
+
+    if not references:
+        zero = signature.new_zeros(())
+        return zero, zero
+    population = torch.stack([*references, signature])
+    mean = population.mean(dim=0)
+    # Correct the 1/N queue dilution for the only live (current-artist) row.
+    mean = mean.detach() + len(population) * (mean - mean.detach())
+    occupancy = mean.float().square().sum()
+    loss = F.relu(occupancy - float(occupancy_cap)).square()
+    return loss, occupancy
 
 
 def _whole_model_curriculum(relative_step: int) -> dict[str, float]:
@@ -3628,6 +3724,33 @@ def train_direct_reference_kv_delta_320(
                     diversity_effective_weight = (
                         diversity_weight * constraint_progress
                     )
+                    population_common_weight = float(
+                        human_flow.get("population_common_weight", 0.0)
+                    )
+                    population_common_min_styles = int(
+                        human_flow.get("population_common_min_styles", 16)
+                    )
+                    if (
+                        population_common_weight
+                        and len(diversity_references)
+                        >= population_common_min_styles
+                    ):
+                        (
+                            population_common_loss,
+                            population_common_occupancy,
+                        ) = _population_common_occupancy(
+                            diversity_signature,
+                            diversity_references,
+                            occupancy_cap=float(
+                                human_flow.get("population_common_cap", 0.30)
+                            ),
+                        )
+                    else:
+                        population_common_loss = student_effect.new_zeros(())
+                        population_common_occupancy = student_effect.new_zeros(())
+                    population_common_effective_weight = (
+                        population_common_weight * constraint_progress
+                    )
                     flow_mse_weight = float(
                         human_flow.get(
                             "flow_mse_weight",
@@ -3694,6 +3817,11 @@ def train_direct_reference_kv_delta_320(
                         flow_loss = flow_loss + (
                             diversity_effective_weight * diversity_loss
                         )
+                    if population_common_effective_weight:
+                        flow_loss = flow_loss + (
+                            population_common_effective_weight
+                            * population_common_loss
+                        )
                     if prior_preservation_weight:
                         flow_loss = flow_loss + (
                             prior_preservation_weight * prior_preservation
@@ -3720,7 +3848,7 @@ def train_direct_reference_kv_delta_320(
                         * flow_loss
                     )
                 (weighted_flow / accumulation_steps).backward()
-                if diversity_weight:
+                if diversity_weight or population_common_weight:
                     # Updating an existing artist also refreshes its insertion
                     # order, so the bounded queue tracks the recent population.
                     cross_style_queue.pop(flow_style_id, None)
@@ -3872,6 +4000,20 @@ def train_direct_reference_kv_delta_320(
                 )
                 running["human_flow/diversity_queue_styles"].append(
                     float(len(cross_style_queue))
+                )
+                running["human_flow/population_common_occupancy"].append(
+                    float(population_common_occupancy.detach())
+                )
+                running["human_flow/population_common_loss"].append(
+                    float(population_common_loss.detach())
+                )
+                running["human_flow/population_common_weighted"].append(
+                    float(
+                        (
+                            population_common_effective_weight
+                            * population_common_loss
+                        ).detach()
+                    )
                 )
                 running["human_flow/block_keep_rate"].append(
                     float(block_mask.float().mean())
@@ -5072,6 +5214,27 @@ def sample_expert_kvo_specialized_flow_10k(
         config,
         destination,
         sample_config_key="kv_reference_expert_kvo_specialized_flow_10k_sample",
+    )
+
+
+def train_scheduled_expert_kvo_margin_flow_5k(
+    config: dict[str, Any], destination: Path
+) -> dict[str, Any]:
+    return train_scheduled_direct_reference_kv_delta_320(
+        config,
+        destination,
+        config_key="kv_reference_expert_kvo_margin_flow_5k",
+        sample_config_key="kv_reference_expert_kvo_margin_flow_5k_sample",
+    )
+
+
+def sample_expert_kvo_margin_flow_5k(
+    config: dict[str, Any], destination: Path
+) -> dict[str, Any]:
+    return sample_direct_reference_kv_delta_320(
+        config,
+        destination,
+        sample_config_key="kv_reference_expert_kvo_margin_flow_5k_sample",
     )
 
 

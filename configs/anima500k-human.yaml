@@ -1504,6 +1504,81 @@ kv_reference_expert_kvo_specialized_flow_10k_sample:
   batch_size: 4
   panel_tile_width: 384
 
+# Core-margin rerun. Unlike the previous entropy cap, the fourth/fifth K/V
+# and second/third O logit boundaries have a non-zero gradient at uniform
+# routing. A detached recent-artist queue limits only excessive population
+# common direction; no batch mean is subtracted from model outputs.
+kv_reference_expert_kvo_margin_flow_5k:
+  extends_config_key: kv_reference_expert_kvo_specialized_flow_10k
+  output_directory: kv_reference_expert_kv64x16_o16x16_margin_consistent_common_w768_l3_flow_5k_v1
+  seed: 20260828
+  model:
+    expert_balance_cap: 3.0
+    router_init_scale: 0.15
+    router_jitter: 0.0005
+    router_jitter_steps: 150
+    expert_bias_update_rate: 0.0015
+    expert_bias_decay: 0.999
+    expert_bias_max: 0.075
+    expert_bias_update_steps: 500
+    expert_bias_decay_end_step: 1000
+    output_core_experts: 4
+    stream_core_experts: 2
+    output_core_margin: 0.8
+    stream_core_margin: 0.8
+    expert_specialization_start_step: 100
+    expert_specialization_steps: 1900
+    router_temperature_end: 0.65
+    router_temperature_steps: 2000
+  training:
+    steps: 5000
+    human_flow:
+      expert_balance_weight: 0.02
+      expert_specialization_weight: 0.005
+      population_common_weight: 0.10
+      population_common_cap: 0.30
+      population_common_min_styles: 16
+      same_artist_consistency_weight: 0.02
+      same_artist_consistency_start_step: 250
+      same_artist_consistency_ramp_steps: 1250
+    generator_lr_schedule:
+      peak_lr: 0.000003
+      warmup_steps: 100
+      decay_start_step: 1500
+      decay_end_step: 4000
+      final_lr: 0.0000003
+      tail_decay_end_step: 5000
+      tail_final_lr: 0.0000001
+    reader_lr_schedule:
+      peak_lr: 0.000003
+      warmup_steps: 100
+      decay_start_step: 500
+      decay_end_step: 2000
+      final_lr: 0.0000003
+    checkpoint_every: 500
+    sample_every: 0
+    sample_steps: [500, 1000, 1500, 2000, 3000, 4000, 5000]
+    sample_output_root: diagnostics/kv-reference-expert-kv64x16-o16x16-margin-consistent-common-w768-l3-flow-5k-v1
+    # The directory is unique, so the first segment is fresh; later scheduled
+    # sample segments must resume the checkpoint produced by the prior target.
+    resume: true
+    wandb:
+      enabled: true
+      project: anima-style-adapter
+      name: kv-reference-expert-kv64x16-o16x16-margin-consistent-common-w768-l3-flow-5k-v1
+      id: kv-reference-expert-kv64x16-o16x16-margin-consistent-common-w768-l3-flow-5k-v1
+
+kv_reference_expert_kvo_margin_flow_5k_sample:
+  checkpoint: kv_reference_expert_kv64x16_o16x16_margin_consistent_common_w768_l3_flow_5k_v1/checkpoints/step-0005000.pt
+  output_directory: diagnostics/kv-reference-expert-kv64x16-o16x16-margin-consistent-common-w768-l3-flow-5k-v1-step5000
+  device: cuda
+  artists: 8
+  references: 4
+  reference_seed: 20260828
+  strengths: [1.0, 2.0]
+  batch_size: 4
+  panel_tile_width: 384
+
 # Reference-conditioned low-rank operator pilot. Unlike the direct activation
 # head above, the reference generates a fresh block-local linear operator and
 # applies it to every native text token.  Teacher factors remain offline
