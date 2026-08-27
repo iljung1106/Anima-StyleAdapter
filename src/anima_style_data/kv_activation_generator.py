@@ -3509,11 +3509,7 @@ def train_direct_reference_kv_delta_320(
                         int(human_flow.get("diversity_signature_width", 64)),
                     )
                     same_artist_loss = student_effect.new_zeros(())
-                    same_artist_metrics = {
-                        "same_artist_consistency_loss": same_artist_loss.detach(),
-                        "same_artist_signature_cosine": same_artist_loss.detach(),
-                        "same_artist_log_rms_error": same_artist_loss.detach(),
-                    }
+                    same_artist_metrics: dict[str, torch.Tensor] | None = None
                     same_artist_weight = float(
                         human_flow.get("same_artist_consistency_weight", 0.0)
                     )
@@ -3845,8 +3841,12 @@ def train_direct_reference_kv_delta_320(
                         ).detach()
                     )
                 )
-                for name, value in same_artist_metrics.items():
-                    running[f"human_flow/{name}"].append(float(value))
+                if same_artist_metrics is not None:
+                    for name, value in same_artist_metrics.items():
+                        running[f"human_flow/{name}"].append(float(value))
+                running["human_flow/same_artist_pair_available"].append(
+                    float(same_artist_metrics is not None)
+                )
                 running["human_flow/same_artist_consistency_weighted"].append(
                     float(
                         (
