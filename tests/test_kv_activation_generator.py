@@ -18,6 +18,7 @@ from anima_style_data.kv_activation_generator import (
     _mean_teacher_operator,
     _mixture_target,
     _prediction_population_metrics,
+    _same_artist_signature_consistency,
     _whole_model_curriculum,
 )
 from anima_style_data.kv_activation_modulation import apply_kv_factors
@@ -134,7 +135,7 @@ def test_sparse_expert_generator_routes_kv_and_independent_qo_paths() -> None:
     codes = model.prepare_stream_codes(style)
     q = model.stream_delta(stream, codes, 1, 0)
     o = model.stream_delta(stream, codes, 1, 1)
-    balance, metrics = model.routing_auxiliary()
+    balance, _, metrics = model.routing_auxiliary()
     assert kv.shape == (2, 2, 9, 40)
     assert q.shape == o.shape == stream.shape
     assert not torch.allclose(q, o)
@@ -211,7 +212,7 @@ def test_dense_overload_balance_reaches_unselected_router_logits() -> None:
         selected,
         2,
     )
-    balance, _ = model.routing_auxiliary()
+    balance, _, _ = model.routing_auxiliary()
     balance.backward()
     selected_experts = set(indices.flatten().tolist())
     unselected = [index for index in range(8) if index not in selected_experts]
@@ -239,6 +240,66 @@ def test_selection_bias_changes_topk_but_not_selected_mixture_weights() -> None:
     assert 2 in indices.flatten().tolist()
     expected = logits.gather(-1, indices).softmax(dim=-1)
     assert torch.allclose(weights, expected)
+
+
+def test_router_specialization_penalizes_uniform_topk_after_ramp() -> None:
+    model = ReferenceConditionedKVActivationGenerator(
+        style_dim=16,
+        context_dim=12,
+        output_dim=20,
+        blocks=1,
+        hidden_dim=16,
+        heads=4,
+        ff_dim=32,
+        output_rank=2,
+        output_experts=8,
+        output_top_k=4,
+        output_init_scale=1e-3,
+        output_entropy_target=torch.tensor(2.0).log().item(),
+        expert_specialization_steps=100,
+    )
+    model.set_routing_step(100)
+    logits = torch.zeros(2, 2, 8, requires_grad=True)
+    _, _, sparse, dense, selected = model._sparse_router(logits, 4)
+    model._record_routing(
+        "kv",
+        model.output_expert_usage,
+        model.output_expert_load,
+        model.output_expert_selection_bias,
+        0,
+        sparse,
+        dense,
+        selected,
+        4,
+    )
+    _, specialization, metrics = model.routing_auxiliary()
+    assert specialization > 0
+    assert torch.allclose(
+        metrics["kv_effective_experts"], torch.tensor(4.0), atol=1e-5
+    )
+    specialization.backward()
+    assert logits.grad is not None
+
+
+def test_same_artist_consistency_uses_cosine_and_rms_bands() -> None:
+    matching, matching_metrics = _same_artist_signature_consistency(
+        torch.tensor([1.0, 2.0]),
+        torch.tensor([1.0, 2.0]),
+        cosine_floor=0.75,
+        rms_ratio_tolerance=1.5,
+        magnitude_weight=0.25,
+    )
+    mismatching, mismatching_metrics = _same_artist_signature_consistency(
+        torch.tensor([2.0, 0.0]),
+        torch.tensor([0.0, 1.0]),
+        cosine_floor=0.75,
+        rms_ratio_tolerance=1.5,
+        magnitude_weight=0.25,
+    )
+    assert matching == 0
+    assert matching_metrics["same_artist_signature_cosine"] > 0.99
+    assert mismatching > 0
+    assert mismatching_metrics["same_artist_signature_cosine"] == 0
 
 
 def test_final_effect_constraints_use_absolute_pairwise_cap_without_centering() -> None:

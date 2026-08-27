@@ -105,6 +105,11 @@ class ReferenceConditionedKVActivationGenerator(nn.Module):
         expert_bias_update_rate: float = 0.0,
         expert_bias_decay: float = 0.999,
         expert_bias_max: float = 0.5,
+        expert_bias_update_steps: int = 0,
+        expert_bias_decay_end_step: int = 0,
+        output_entropy_target: float = -1.0,
+        stream_entropy_target: float = -1.0,
+        expert_specialization_steps: int = 0,
     ) -> None:
         super().__init__()
         if hidden_dim % heads:
@@ -148,6 +153,11 @@ class ReferenceConditionedKVActivationGenerator(nn.Module):
         self.expert_bias_update_rate = float(expert_bias_update_rate)
         self.expert_bias_decay = float(expert_bias_decay)
         self.expert_bias_max = float(expert_bias_max)
+        self.expert_bias_update_steps = int(expert_bias_update_steps)
+        self.expert_bias_decay_end_step = int(expert_bias_decay_end_step)
+        self.output_entropy_target = float(output_entropy_target)
+        self.stream_entropy_target = float(stream_entropy_target)
+        self.expert_specialization_steps = int(expert_specialization_steps)
         self._routing_step = 0
         if (
             self.router_init_scale < 0
@@ -156,9 +166,26 @@ class ReferenceConditionedKVActivationGenerator(nn.Module):
             or self.expert_bias_update_rate < 0
             or not 0.0 <= self.expert_bias_decay <= 1.0
             or self.expert_bias_max < 0
+            or self.expert_bias_update_steps < 0
+            or self.expert_bias_decay_end_step < 0
+            or self.expert_specialization_steps < 0
         ):
             raise ValueError("router exploration controls are invalid")
+        if (
+            self.expert_bias_decay_end_step
+            and self.expert_bias_decay_end_step < self.expert_bias_update_steps
+        ):
+            raise ValueError("expert bias decay must end after bias updates")
+        if self.output_experts and self.output_entropy_target > math.log(
+            self.output_top_k
+        ):
+            raise ValueError("output entropy target exceeds top-k entropy")
+        if self.stream_experts and self.stream_entropy_target > math.log(
+            self.stream_top_k
+        ):
+            raise ValueError("stream entropy target exceeds top-k entropy")
         self._routing_balance_terms: list[torch.Tensor] = []
+        self._routing_specialization_terms: list[torch.Tensor] = []
         self._routing_entropies: dict[str, list[torch.Tensor]] = {
             "kv": [], "qo": [],
         }
@@ -648,7 +675,9 @@ class ReferenceConditionedKVActivationGenerator(nn.Module):
         dense = logits.float().softmax(dim=-1).to(logits.dtype)
         selection_logits = logits.float()
         if selection_bias is not None:
-            selection_logits = selection_logits + selection_bias.float()
+            selection_logits = selection_logits + (
+                self._selection_bias_scale() * selection_bias.float()
+            )
         if self.training and self.router_jitter and self.router_jitter_steps:
             progress = min(1.0, self._routing_step / self.router_jitter_steps)
             jitter = self.router_jitter * (1.0 - progress)
@@ -668,8 +697,36 @@ class ReferenceConditionedKVActivationGenerator(nn.Module):
     def set_routing_step(self, step: int) -> None:
         self._routing_step = max(0, int(step))
 
+    def _selection_bias_scale(self) -> float:
+        if not self.expert_bias_decay_end_step:
+            return 1.0
+        if self._routing_step <= self.expert_bias_update_steps:
+            return 1.0
+        if self._routing_step >= self.expert_bias_decay_end_step:
+            return 0.0
+        width = self.expert_bias_decay_end_step - self.expert_bias_update_steps
+        return 1.0 - (
+            self._routing_step - self.expert_bias_update_steps
+        ) / max(1, width)
+
+    def _entropy_cap(self, name: str, top_k: int) -> float:
+        target = (
+            self.output_entropy_target
+            if name == "kv"
+            else self.stream_entropy_target
+        )
+        maximum = math.log(max(1, int(top_k)))
+        if target < 0:
+            return maximum
+        progress = min(
+            1.0,
+            self._routing_step / max(1, self.expert_specialization_steps),
+        )
+        return maximum + progress * (target - maximum)
+
     def reset_routing_records(self) -> None:
         self._routing_balance_terms.clear()
+        self._routing_specialization_terms.clear()
         for values in self._routing_entropies.values():
             values.clear()
 
@@ -719,6 +776,10 @@ class ReferenceConditionedKVActivationGenerator(nn.Module):
             * probabilities.float()
         ).sum(dim=-1).mean()
         self._routing_entropies[name].append(entropy)
+        entropy_cap = self._entropy_cap(name, top_k)
+        self._routing_specialization_terms.append(
+            F.relu(entropy - entropy_cap).square()
+        )
         with torch.no_grad():
             usage_rows.mul_(self.expert_usage_decay).add_(
                 current, alpha=1.0 - self.expert_usage_decay
@@ -726,7 +787,13 @@ class ReferenceConditionedKVActivationGenerator(nn.Module):
             load_rows.mul_(self.expert_usage_decay).add_(
                 current_load, alpha=1.0 - self.expert_usage_decay
             )
-            if self.expert_bias_update_rate:
+            if (
+                self.expert_bias_update_rate
+                and (
+                    not self.expert_bias_update_steps
+                    or self._routing_step <= self.expert_bias_update_steps
+                )
+            ):
                 excess = F.relu(load_rows.float() - load_threshold)
                 bias_rows.mul_(self.expert_bias_decay).add_(
                     excess, alpha=-self.expert_bias_update_rate
@@ -734,16 +801,29 @@ class ReferenceConditionedKVActivationGenerator(nn.Module):
                 bias_rows.sub_(bias_rows.mean(dim=-1, keepdim=True))
                 bias_rows.clamp_(-self.expert_bias_max, self.expert_bias_max)
 
-    def routing_auxiliary(self) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    def routing_auxiliary(
+        self,
+    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
         zero = next(self.parameters()).new_zeros((), dtype=torch.float32)
         balance = (
             torch.stack(self._routing_balance_terms).mean()
             if self._routing_balance_terms else zero
         )
-        metrics = {"expert_balance_loss": balance.detach()}
+        specialization = (
+            torch.stack(self._routing_specialization_terms).mean()
+            if self._routing_specialization_terms else zero
+        )
+        metrics = {
+            "expert_balance_loss": balance.detach(),
+            "expert_specialization_loss": specialization.detach(),
+        }
         for name, values in self._routing_entropies.items():
-            metrics[f"{name}_router_entropy"] = (
-                torch.stack(values).mean().detach() if values else zero
+            entropy = torch.stack(values).mean() if values else zero
+            metrics[f"{name}_router_entropy"] = entropy.detach()
+            metrics[f"{name}_effective_experts"] = entropy.detach().exp()
+            top_k = self.output_top_k if name == "kv" else self.stream_top_k
+            metrics[f"{name}_entropy_cap"] = zero.new_tensor(
+                self._entropy_cap(name, top_k)
             )
         if self.output_experts:
             metrics["kv_expert_max_usage"] = self.output_expert_usage.max().detach()
@@ -751,15 +831,16 @@ class ReferenceConditionedKVActivationGenerator(nn.Module):
             metrics["kv_expert_bias_span"] = (
                 self.output_expert_selection_bias.amax(dim=-1)
                 - self.output_expert_selection_bias.amin(dim=-1)
-            ).max().detach()
+            ).max().detach() * self._selection_bias_scale()
         if self.stream_experts:
             metrics["qo_expert_max_usage"] = self.stream_expert_usage.max().detach()
             metrics["qo_expert_max_load"] = self.stream_expert_load.max().detach()
             metrics["qo_expert_bias_span"] = (
                 self.stream_expert_selection_bias.amax(dim=-1)
                 - self.stream_expert_selection_bias.amin(dim=-1)
-            ).max().detach()
-        return balance, metrics
+            ).max().detach() * self._selection_bias_scale()
+        self.reset_routing_records()
+        return balance, specialization, metrics
 
 
 class _OperatorCrossBlock(nn.Module):
@@ -1337,6 +1418,8 @@ def _adapter_probe_signature(
     stream_input: torch.Tensor,
     blocks: list[int],
     signature_width: int = 64,
+    *,
+    normalize: bool = True,
 ) -> torch.Tensor:
     """Evaluate each artist adapter on the same compact K/V/Q/O probe."""
 
@@ -1355,7 +1438,35 @@ def _adapter_probe_signature(
                 for kind in range(2)
                 if generator.stream_kind_enabled(kind)
             )
-    return F.normalize(torch.cat(parts), dim=0)
+    signature = torch.cat(parts)
+    return F.normalize(signature, dim=0) if normalize else signature
+
+
+def _same_artist_signature_consistency(
+    student: torch.Tensor,
+    target: torch.Tensor,
+    *,
+    cosine_floor: float,
+    rms_ratio_tolerance: float,
+    magnitude_weight: float,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Match disjoint reference views without forcing exact equality."""
+
+    student_f = student.float().flatten()
+    target_f = target.detach().float().flatten()
+    cosine = F.cosine_similarity(student_f, target_f, dim=0)
+    direction = F.relu(float(cosine_floor) - cosine).square()
+    student_rms = student_f.square().mean().sqrt().clamp_min(1e-8)
+    target_rms = target_f.square().mean().sqrt().clamp_min(1e-8)
+    log_ratio = (student_rms.log() - target_rms.log()).abs()
+    tolerance = math.log(float(rms_ratio_tolerance))
+    magnitude = F.relu(log_ratio - tolerance).square()
+    loss = direction + float(magnitude_weight) * magnitude
+    return loss, {
+        "same_artist_consistency_loss": loss.detach(),
+        "same_artist_signature_cosine": cosine.detach(),
+        "same_artist_log_rms_error": log_ratio.detach(),
+    }
 
 
 def _cross_style_queue_diversity(
@@ -3397,6 +3508,100 @@ def train_direct_reference_kv_delta_320(
                         ],
                         int(human_flow.get("diversity_signature_width", 64)),
                     )
+                    same_artist_loss = student_effect.new_zeros(())
+                    same_artist_metrics = {
+                        "same_artist_consistency_loss": same_artist_loss.detach(),
+                        "same_artist_signature_cosine": same_artist_loss.detach(),
+                        "same_artist_log_rms_error": same_artist_loss.detach(),
+                    }
+                    same_artist_weight = float(
+                        human_flow.get("same_artist_consistency_weight", 0.0)
+                    )
+                    reference_count = int(flow_mask[0].sum())
+                    if same_artist_weight and reference_count >= 2:
+                        permutation = torch.randperm(
+                            reference_count,
+                            device=flow_references.device,
+                            generator=flow_rng,
+                        )
+                        split = (reference_count + 1) // 2
+                        left_indices = permutation[:split]
+                        right_indices = permutation[split:]
+                        left_references = flow_references[:1, left_indices]
+                        right_references = flow_references[:1, right_indices]
+                        left_mask = torch.ones(
+                            1, len(left_indices), device=device, dtype=torch.bool
+                        )
+                        right_mask = torch.ones(
+                            1, len(right_indices), device=device, dtype=torch.bool
+                        )
+                        # Alternate the optimized view. The other disjoint view
+                        # is a stop-gradient target, avoiding a jointly moving
+                        # pair while still training every reference position.
+                        if micro_step % 2 == 0:
+                            left_references, right_references = (
+                                right_references,
+                                left_references,
+                            )
+                            left_mask, right_mask = right_mask, left_mask
+                        left_style = reader(left_references, left_mask).tokens
+                        left_signature = _adapter_probe_signature(
+                            model,
+                            left_style,
+                            diversity_probe_context,
+                            diversity_probe_stream,
+                            [
+                                int(block)
+                                for block in human_flow.get(
+                                    "diversity_probe_blocks", [0, 7, 14, 21, 27]
+                                )
+                            ],
+                            int(human_flow.get("diversity_signature_width", 64)),
+                            normalize=False,
+                        )
+                        with torch.no_grad():
+                            right_style = reader(
+                                right_references, right_mask
+                            ).tokens
+                            right_signature = _adapter_probe_signature(
+                                model,
+                                right_style,
+                                diversity_probe_context,
+                                diversity_probe_stream,
+                                [
+                                    int(block)
+                                    for block in human_flow.get(
+                                        "diversity_probe_blocks", [0, 7, 14, 21, 27]
+                                    )
+                                ],
+                                int(
+                                    human_flow.get(
+                                        "diversity_signature_width", 64
+                                    )
+                                ),
+                                normalize=False,
+                            )
+                        same_artist_loss, same_artist_metrics = (
+                            _same_artist_signature_consistency(
+                                left_signature,
+                                right_signature,
+                                cosine_floor=float(
+                                    human_flow.get(
+                                        "same_artist_cosine_floor", 0.75
+                                    )
+                                ),
+                                rms_ratio_tolerance=float(
+                                    human_flow.get(
+                                        "same_artist_rms_ratio_tolerance", 1.5
+                                    )
+                                ),
+                                magnitude_weight=float(
+                                    human_flow.get(
+                                        "same_artist_magnitude_weight", 0.25
+                                    )
+                                ),
+                            )
+                        )
                     unique_flow_styles = set(flow_style_ids)
                     if diversity_weight and len(unique_flow_styles) != 1:
                         raise ValueError(
@@ -3449,12 +3654,34 @@ def train_direct_reference_kv_delta_320(
                         human_flow.get("prior_preservation_weight", 0.0)
                     )
                     if hasattr(model, "routing_auxiliary"):
-                        routing_balance, routing_metrics = model.routing_auxiliary()
+                        (
+                            routing_balance,
+                            routing_specialization,
+                            routing_metrics,
+                        ) = model.routing_auxiliary()
                     else:
                         routing_balance = flow_mse.new_zeros(())
+                        routing_specialization = flow_mse.new_zeros(())
                         routing_metrics = {}
                     routing_balance_weight = float(
                         human_flow.get("expert_balance_weight", 0.0)
+                    )
+                    routing_specialization_weight = float(
+                        human_flow.get("expert_specialization_weight", 0.0)
+                    )
+                    consistency_start = int(
+                        human_flow.get("same_artist_consistency_start_step", 0)
+                    )
+                    consistency_ramp = int(
+                        human_flow.get("same_artist_consistency_ramp_steps", 1)
+                    )
+                    consistency_progress = min(
+                        1.0,
+                        max(0, relative_step - consistency_start)
+                        / max(1, consistency_ramp),
+                    )
+                    same_artist_effective_weight = (
+                        same_artist_weight * consistency_progress
                     )
                     flow_loss = flow_mse_weight * flow_mse
                     if residual_huber_weight:
@@ -3478,6 +3705,15 @@ def train_direct_reference_kv_delta_320(
                     if routing_balance_weight:
                         flow_loss = flow_loss + (
                             routing_balance_weight * routing_balance
+                        )
+                    if routing_specialization_weight:
+                        flow_loss = flow_loss + (
+                            routing_specialization_weight
+                            * routing_specialization
+                        )
+                    if same_artist_effective_weight:
+                        flow_loss = flow_loss + (
+                            same_artist_effective_weight * same_artist_loss
                         )
                     if not bool(torch.isfinite(flow_loss)):
                         raise RuntimeError(
@@ -3600,6 +3836,23 @@ def train_direct_reference_kv_delta_320(
                 )
                 running["human_flow/expert_balance_weighted"].append(
                     float((routing_balance_weight * routing_balance).detach())
+                )
+                running["human_flow/expert_specialization_weighted"].append(
+                    float(
+                        (
+                            routing_specialization_weight
+                            * routing_specialization
+                        ).detach()
+                    )
+                )
+                for name, value in same_artist_metrics.items():
+                    running[f"human_flow/{name}"].append(float(value))
+                running["human_flow/same_artist_consistency_weighted"].append(
+                    float(
+                        (
+                            same_artist_effective_weight * same_artist_loss
+                        ).detach()
+                    )
                 )
                 for name, value in routing_metrics.items():
                     running[f"human_flow/{name}"].append(float(value))
@@ -4798,6 +5051,27 @@ def sample_expert_kvo_balanced_flow_10k(
         config,
         destination,
         sample_config_key="kv_reference_expert_kvo_balanced_flow_10k_sample",
+    )
+
+
+def train_scheduled_expert_kvo_specialized_flow_10k(
+    config: dict[str, Any], destination: Path
+) -> dict[str, Any]:
+    return train_scheduled_direct_reference_kv_delta_320(
+        config,
+        destination,
+        config_key="kv_reference_expert_kvo_specialized_flow_10k",
+        sample_config_key="kv_reference_expert_kvo_specialized_flow_10k_sample",
+    )
+
+
+def sample_expert_kvo_specialized_flow_10k(
+    config: dict[str, Any], destination: Path
+) -> dict[str, Any]:
+    return sample_direct_reference_kv_delta_320(
+        config,
+        destination,
+        sample_config_key="kv_reference_expert_kvo_specialized_flow_10k_sample",
     )
 
 
