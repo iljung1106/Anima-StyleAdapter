@@ -1958,6 +1958,40 @@ kv_reference_expert_kv_teacher_functional_consistent_500_sample:
   batch_size: 4
   panel_tile_width: 384
 
+# Positive-only matching admitted an artist-independent shortcut in v5. This
+# probe replaces it with symmetric InfoNCE: disjoint subsets of the same artist
+# are positives and every other artist in the update is an explicit negative.
+kv_reference_expert_kv_teacher_functional_infonce_250:
+  extends_config_key: kv_reference_expert_kv_teacher_functional_consistent_500
+  output_directory: kv_reference_expert_kv64x16_teacher_functional_infonce_w768_l3_250_v6
+  seed: 20260901
+  training:
+    steps: 250
+    validation_every: 125
+    checkpoint_every: 250
+    sample_steps: [250]
+    sample_output_root: diagnostics/kv-reference-expert-kv64x16-teacher-functional-infonce-w768-l3-250-v6
+    whole_model_functional:
+      functional_consistency_weight: 0.0
+      functional_contrastive_weight: 0.25
+      functional_contrastive_temperature: 0.10
+    wandb:
+      enabled: true
+      project: anima-style-adapter
+      name: kv-reference-expert-kv64x16-teacher-functional-infonce-w768-l3-250-v6
+      id: kv-reference-expert-kv64x16-teacher-functional-infonce-w768-l3-250-v6
+
+kv_reference_expert_kv_teacher_functional_infonce_250_sample:
+  checkpoint: kv_reference_expert_kv64x16_teacher_functional_infonce_w768_l3_250_v6/checkpoints/step-0000250.pt
+  output_directory: diagnostics/kv-reference-expert-kv64x16-teacher-functional-infonce-w768-l3-250-v6-step250
+  device: cuda
+  artists: 8
+  references: 4
+  reference_seed: 20260901
+  strengths: [1.0, 2.0]
+  batch_size: 4
+  panel_tile_width: 384
+
 # Reference-conditioned low-rank operator pilot. Unlike the direct activation
 # head above, the reference generates a fresh block-local linear operator and
 # applies it to every native text token.  Teacher factors remain offline

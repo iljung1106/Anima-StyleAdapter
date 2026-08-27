@@ -4507,6 +4507,9 @@ def train_direct_reference_kv_delta_320(
                     or float(
                         whole_model.get("functional_consistency_weight", 0.0)
                     ) > 0
+                    or float(
+                        whole_model.get("functional_contrastive_weight", 0.0)
+                    ) > 0
                 ):
                     split = max(1, single_images // 2)
                     consistency_counts = [min(count, split) for count in counts]
@@ -4589,6 +4592,8 @@ def train_direct_reference_kv_delta_320(
                 reader_consistency_metrics: dict[str, torch.Tensor] = {}
                 functional_consistency = style.new_zeros((), dtype=torch.float32)
                 functional_consistency_metrics: dict[str, torch.Tensor] = {}
+                functional_contrastive = style.new_zeros((), dtype=torch.float32)
+                functional_contrastive_metrics: dict[str, torch.Tensor] = {}
                 if (
                     consistency_left is not None
                     and consistency_left_mask is not None
@@ -4633,7 +4638,13 @@ def train_direct_reference_kv_delta_320(
                     functional_consistency_weight = float(
                         whole_model.get("functional_consistency_weight", 0.0)
                     )
-                    if functional_consistency_weight > 0:
+                    functional_contrastive_weight = float(
+                        whole_model.get("functional_contrastive_weight", 0.0)
+                    )
+                    if (
+                        functional_consistency_weight > 0
+                        or functional_contrastive_weight > 0
+                    ):
                         assert contexts is not None
                         probe_context = contexts[:1, :16]
                         probe_stream = torch.linspace(
@@ -4677,28 +4688,46 @@ def train_direct_reference_kv_delta_320(
                                 ),
                                 normalize=False,
                             )
-                        (
-                            functional_consistency,
-                            functional_consistency_metrics,
-                        ) = _same_artist_signature_consistency_batch(
-                            left_signature,
-                            right_signature,
-                            cosine_floor=float(
-                                whole_model.get(
-                                    "functional_consistency_cosine_floor", 0.75
-                                )
-                            ),
-                            rms_ratio_tolerance=float(
-                                whole_model.get(
-                                    "functional_consistency_rms_tolerance", 1.5
-                                )
-                            ),
-                            magnitude_weight=float(
-                                whole_model.get(
-                                    "functional_consistency_magnitude_weight", 0.25
-                                )
-                            ),
-                        )
+                        if functional_consistency_weight > 0:
+                            (
+                                functional_consistency,
+                                functional_consistency_metrics,
+                            ) = _same_artist_signature_consistency_batch(
+                                left_signature,
+                                right_signature,
+                                cosine_floor=float(
+                                    whole_model.get(
+                                        "functional_consistency_cosine_floor", 0.75
+                                    )
+                                ),
+                                rms_ratio_tolerance=float(
+                                    whole_model.get(
+                                        "functional_consistency_rms_tolerance", 1.5
+                                    )
+                                ),
+                                magnitude_weight=float(
+                                    whole_model.get(
+                                        "functional_consistency_magnitude_weight", 0.25
+                                    )
+                                ),
+                            )
+                        if functional_contrastive_weight > 0:
+                            (
+                                functional_contrastive,
+                                retrieval_values,
+                            ) = _final_effect_retrieval_loss(
+                                left_signature,
+                                right_signature,
+                                temperature=float(
+                                    whole_model.get(
+                                        "functional_contrastive_temperature", 0.10
+                                    )
+                                ),
+                            )
+                            functional_contrastive_metrics = {
+                                f"functional_{key}": value
+                                for key, value in retrieval_values.items()
+                            }
                 whole_loss = style.new_zeros((), dtype=torch.float32)
                 whole_metrics: dict[str, torch.Tensor] = {}
                 if whole_enabled:
@@ -4804,6 +4833,10 @@ def train_direct_reference_kv_delta_320(
                             whole_model.get("functional_consistency_weight", 0.0)
                         )
                         * functional_consistency
+                        + float(
+                            whole_model.get("functional_contrastive_weight", 0.0)
+                        )
+                        * functional_contrastive
                     )
                     whole_metrics = {
                         "whole/loss": whole_loss.detach(),
@@ -4826,6 +4859,10 @@ def train_direct_reference_kv_delta_320(
                         **{
                             f"whole/{key}": value
                             for key, value in functional_consistency_metrics.items()
+                        },
+                        **{
+                            f"whole/{key}": value
+                            for key, value in functional_contrastive_metrics.items()
                         },
                         **{f"whole/{key}": value for key, value in constraint_metrics.items()},
                     }
@@ -5147,6 +5184,85 @@ def train_direct_reference_kv_delta_320(
                             validation_rows[f"whole/{key}"].append(float(value))
                         for key, value in final_values.items():
                             validation_rows[f"whole/{key}"].append(float(value))
+                        if float(
+                            whole_model.get("functional_contrastive_weight", 0.0)
+                        ) > 0:
+                            split = max(1, single_images // 2)
+                            contrastive_count = min(4, split)
+                            left_refs, left_mask = _select_reference_tokens(
+                                single_bank,
+                                val_artists,
+                                reference_counts=[contrastive_count]
+                                * len(val_artists),
+                                reference_start=0,
+                                reference_stop=split,
+                                rng=random.Random(seed ^ step ^ 0x4C454654),
+                            )
+                            right_refs, right_mask = _select_reference_tokens(
+                                single_bank,
+                                val_artists,
+                                reference_counts=[contrastive_count]
+                                * len(val_artists),
+                                reference_start=split,
+                                reference_stop=single_images,
+                                rng=random.Random(seed ^ step ^ 0x52494748),
+                            )
+                            left_style = reader(left_refs, left_mask).tokens
+                            right_style = reader(right_refs, right_mask).tokens
+                            probe_context = contexts[:1, :16]
+                            probe_stream = torch.linspace(
+                                -1.0,
+                                1.0,
+                                16 * int(model.stream_dim),
+                                device=device,
+                                dtype=torch.bfloat16,
+                            ).reshape(1, 16, int(model.stream_dim))
+                            probe_blocks = [
+                                int(block)
+                                for block in whole_model.get(
+                                    "functional_consistency_blocks",
+                                    [0, 7, 14, 21, 27],
+                                )
+                            ]
+                            left_signature = _adapter_probe_signatures(
+                                model,
+                                left_style,
+                                probe_context,
+                                probe_stream,
+                                probe_blocks,
+                                int(
+                                    whole_model.get(
+                                        "functional_consistency_signature_width", 64
+                                    )
+                                ),
+                                normalize=False,
+                            )
+                            right_signature = _adapter_probe_signatures(
+                                model,
+                                right_style,
+                                probe_context,
+                                probe_stream,
+                                probe_blocks,
+                                int(
+                                    whole_model.get(
+                                        "functional_consistency_signature_width", 64
+                                    )
+                                ),
+                                normalize=False,
+                            )
+                            _, functional_values = _final_effect_retrieval_loss(
+                                left_signature,
+                                right_signature,
+                                temperature=float(
+                                    whole_model.get(
+                                        "functional_contrastive_temperature", 0.10
+                                    )
+                                ),
+                            )
+                            for key, value in functional_values.items():
+                                validation_rows[
+                                    f"whole/functional_{key}"
+                                ].append(float(value))
                     for kind, source_rows in rows_by_kind.items():
                         selected_rows = list(range(min(4, len(source_rows))))
                         mix_refs, mix_mask = _select_reference_tokens(
@@ -6021,6 +6137,31 @@ def sample_expert_kv_teacher_functional_consistent_500(
         destination,
         sample_config_key=(
             "kv_reference_expert_kv_teacher_functional_consistent_500_sample"
+        ),
+    )
+
+
+def train_scheduled_expert_kv_teacher_functional_infonce_250(
+    config: dict[str, Any], destination: Path
+) -> dict[str, Any]:
+    return train_scheduled_direct_reference_kv_delta_320(
+        config,
+        destination,
+        config_key="kv_reference_expert_kv_teacher_functional_infonce_250",
+        sample_config_key=(
+            "kv_reference_expert_kv_teacher_functional_infonce_250_sample"
+        ),
+    )
+
+
+def sample_expert_kv_teacher_functional_infonce_250(
+    config: dict[str, Any], destination: Path
+) -> dict[str, Any]:
+    return sample_direct_reference_kv_delta_320(
+        config,
+        destination,
+        sample_config_key=(
+            "kv_reference_expert_kv_teacher_functional_infonce_250_sample"
         ),
     )
 
