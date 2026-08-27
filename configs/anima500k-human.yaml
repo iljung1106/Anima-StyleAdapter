@@ -1761,6 +1761,79 @@ kv_reference_expert_kvo_flow_aligned_1k_no_o_sample:
   batch_size: 4
   panel_tile_width: 384
 
+# Low-variance causal test: K/V-only MoE learns the cached final velocity of
+# the exact 320 K/V LoRA teachers. No raw block matching and no human-flow
+# residual are active, so improvement must come from reference-conditioned
+# end-to-end functional style reconstruction. Persistent population routing
+# remains the primary load controller; its differentiable guard is overload-only.
+kv_reference_expert_kv_teacher_functional_2k:
+  extends_config_key: kv_reference_expert_kvo_lossfree_flow_5k
+  output_directory: kv_reference_expert_kv64x16_lossfree_teacher_functional_w768_l3_2k_v1
+  seed: 20260828
+  model:
+    enable_qo: false
+    enable_q: false
+    enable_o: false
+  training:
+    steps: 2000
+    flow_only: false
+    batch_size: 4
+    gradient_accumulation_steps: 1
+    blocks_per_step: 0
+    human_flow:
+      enabled: false
+    whole_model_functional:
+      enabled: true
+      require_all_mixture_references: true
+      effect_slice_lru_entries: 0
+      gpu_resident_effects: true
+      block_weight_scale: 0.0
+      whole_weight_override: 1.0
+      huber_beta: 0.10
+      direction_weight: 1.0
+      constraint_weight: 0.25
+      common_cap_weight: 0.05
+      relative_common_weight: 0.10
+      rms_band_weight: 1.0
+      common_cap: 0.55
+      common_cap_by_kind:
+        single: 0.30
+        pair: 0.55
+        triple: 0.55
+        amplified: 0.50
+        signed: 0.35
+      rms_floor: 0.0001
+      expert_balance_weight: 0.001
+    generator_learning_rate: 0.000003
+    reader_learning_rate: 0.0000005
+    warmup_steps: 100
+    validation_every: 250
+    checkpoint_every: 500
+    sample_every: 0
+    sample_steps: [500, 1000, 1500, 2000]
+    sample_output_root: diagnostics/kv-reference-expert-kv64x16-lossfree-teacher-functional-w768-l3-2k-v1
+    resume: true
+    ema:
+      enabled: true
+      decay: 0.999
+      sample: true
+    wandb:
+      enabled: true
+      project: anima-style-adapter
+      name: kv-reference-expert-kv64x16-lossfree-teacher-functional-w768-l3-2k-v1
+      id: kv-reference-expert-kv64x16-lossfree-teacher-functional-w768-l3-2k-v1
+
+kv_reference_expert_kv_teacher_functional_2k_sample:
+  checkpoint: kv_reference_expert_kv64x16_lossfree_teacher_functional_w768_l3_2k_v1/checkpoints/step-0002000.pt
+  output_directory: diagnostics/kv-reference-expert-kv64x16-lossfree-teacher-functional-w768-l3-2k-v1-step2000
+  device: cuda
+  artists: 8
+  references: 4
+  reference_seed: 20260828
+  strengths: [1.0, 2.0]
+  batch_size: 4
+  panel_tile_width: 384
+
 # Reference-conditioned low-rank operator pilot. Unlike the direct activation
 # head above, the reference generates a fresh block-local linear operator and
 # applies it to every native text token.  Teacher factors remain offline

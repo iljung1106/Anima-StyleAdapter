@@ -4395,6 +4395,13 @@ def train_direct_reference_kv_delta_320(
                 batch, -1, -1
             )
             curriculum = _whole_model_curriculum(relative_step)
+            curriculum["block_weight"] *= float(
+                whole_model.get("block_weight_scale", 1.0)
+            )
+            if "whole_weight_override" in whole_model:
+                curriculum["whole_weight"] = float(
+                    whole_model["whole_weight_override"]
+                )
             first_block = ((step - 1) * blocks_per_step) % model.blocks
             selected_blocks = [
                 (first_block + offset) % model.blocks for offset in range(blocks_per_step)
@@ -4445,11 +4452,15 @@ def train_direct_reference_kv_delta_320(
                         device=device, dtype=torch.bfloat16,
                     )
                     flow_injector.set_style(style)
+                    if hasattr(model, "set_routing_recording"):
+                        model.set_routing_recording(True)
                     final_prediction = anima(
                         final_noisy.unsqueeze(2), final_t,
                         context=final_context, padding_mask=final_padding,
                         target_input_ids=None,
                     ).squeeze(2).float()
+                    if hasattr(model, "set_routing_recording"):
+                        model.set_routing_recording(False)
                     flow_injector.disable()
                     final_student = final_prediction - final_base
                     final_scale = final_teacher.square().mean(
@@ -4581,6 +4592,15 @@ def train_direct_reference_kv_delta_320(
                     )
                 else:
                     loss = block_loss + common_direction_weight * common_direction
+                routing_metrics: dict[str, torch.Tensor] = {}
+                routing_balance = loss.new_zeros(())
+                if whole_enabled and hasattr(model, "routing_auxiliary"):
+                    routing_balance, _, routing_metrics = (
+                        model.routing_auxiliary()
+                    )
+                    loss = loss + float(
+                        whole_model.get("expert_balance_weight", 0.0)
+                    ) * routing_balance
                 consistency = loss.new_zeros(())
                 if alternative_style is not None and selected_blocks:
                     assert first_student is not None and first_teacher is not None
@@ -4614,7 +4634,14 @@ def train_direct_reference_kv_delta_320(
                 )
                 optimizer.param_groups[0]["lr"] = generator_lr * lr_scale * distill_lr
                 optimizer.param_groups[1]["lr"] = reader_lr * lr_scale * distill_lr
+                if hasattr(model, "apply_routing_population_update"):
+                    routing_metrics.update(
+                        model.apply_routing_population_update()
+                    )
                 optimizer.step()
+                if ema_model is not None and ema_reader is not None:
+                    _update_parameter_ema(ema_model, model, ema_decay)
+                    _update_parameter_ema(ema_reader, reader, ema_decay)
             else:
                 generator_grad = loss.new_zeros(())
                 reader_grad = loss.new_zeros(())
@@ -4645,6 +4672,19 @@ def train_direct_reference_kv_delta_320(
             for key, value in whole_metrics.items():
                 running[key].append(float(value))
                 running[f"{key}_by_kind/{category}"].append(float(value))
+            running["routing/balance_loss"].append(
+                float(routing_balance.detach())
+            )
+            running["routing/balance_weighted"].append(
+                float(
+                    (
+                        float(whole_model.get("expert_balance_weight", 0.0))
+                        * routing_balance
+                    ).detach()
+                )
+            )
+            for key, value in routing_metrics.items():
+                running[f"routing/{key}"].append(float(value))
             if accumulation_last and step % log_every == 0:
                 row = {key: sum(values) / len(values) for key, values in running.items()}
                 row["generator_lr"] = optimizer.param_groups[0]["lr"]
@@ -4839,6 +4879,14 @@ def train_direct_reference_kv_delta_320(
                     _save_training_state(
                         path, step=step, model=model, reader=reader,
                         optimizer=optimizer, cfg=cfg,
+                        ema_model=(
+                            _ema_checkpoint_state(model, ema_model)
+                            if ema_model is not None else None
+                        ),
+                        ema_reader=(
+                            _ema_checkpoint_state(reader, ema_reader)
+                            if ema_reader is not None else None
+                        ),
                     )
     finally:
         if flow_injector is not None:
@@ -5545,6 +5593,27 @@ def sample_expert_kvo_flow_aligned_1k_no_o(
         config,
         destination,
         sample_config_key="kv_reference_expert_kvo_flow_aligned_1k_no_o_sample",
+    )
+
+
+def train_scheduled_expert_kv_teacher_functional_2k(
+    config: dict[str, Any], destination: Path
+) -> dict[str, Any]:
+    return train_scheduled_direct_reference_kv_delta_320(
+        config,
+        destination,
+        config_key="kv_reference_expert_kv_teacher_functional_2k",
+        sample_config_key="kv_reference_expert_kv_teacher_functional_2k_sample",
+    )
+
+
+def sample_expert_kv_teacher_functional_2k(
+    config: dict[str, Any], destination: Path
+) -> dict[str, Any]:
+    return sample_direct_reference_kv_delta_320(
+        config,
+        destination,
+        sample_config_key="kv_reference_expert_kv_teacher_functional_2k_sample",
     )
 
 
