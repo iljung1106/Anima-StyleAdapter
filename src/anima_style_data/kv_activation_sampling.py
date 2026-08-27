@@ -191,16 +191,18 @@ class NativeKVActivationInjector:
                         f"Q/O projection widths {dimensions} do not match "
                         f"configured stream_dim={stream_dim}"
                     )
-                self.handles.append(
-                    cross.q_proj.register_forward_hook(
-                        self._stream_hook(block_index, 0)
+                if bool(getattr(model, "enable_q", True)):
+                    self.handles.append(
+                        cross.q_proj.register_forward_hook(
+                            self._stream_hook(block_index, 0)
+                        )
                     )
-                )
-                self.handles.append(
-                    cross.output_proj.register_forward_hook(
-                        self._stream_hook(block_index, 1)
+                if bool(getattr(model, "enable_o", True)):
+                    self.handles.append(
+                        cross.output_proj.register_forward_hook(
+                            self._stream_hook(block_index, 1)
+                        )
                     )
-                )
 
     def set_style(
         self,

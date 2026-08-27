@@ -50,6 +50,52 @@ from anima_style_data.style_transfer import (
 )
 
 
+def test_grouped_loader_uses_distinct_artists_in_one_optimizer_update():
+    loader = ProductionStyleLoader.__new__(ProductionStyleLoader)
+    loader.seed = 17
+    loader.gradient_accumulation_steps = 4
+    loader.distinct_style_groups_per_optimizer_update = True
+    loader.reference_curriculum = {}
+    loader.pilot_reference_schedule = []
+    loader.min_references = 1
+    loader.max_references = 2
+    loader.reference_count_weights = None
+    loader.same_style_target_min = 2
+    loader.same_style_target_max = 2
+    loader.self_reference_buckets = {}
+    shape = (32, 32)
+    styles = [f"artist-{index}" for index in range(6)]
+    loader.same_style_bucket_keys = [shape]
+    loader.same_style_bucket_weights = [len(styles)]
+    loader.same_style_targets_by_bucket = {
+        shape: {
+            style: list(range(index * 10, index * 10 + 6))
+            for index, style in enumerate(styles)
+        }
+    }
+    loader.same_style_shapes_by_style = {style: [shape] for style in styles}
+    loader.bucket_keys = [shape]
+    loader.bucket_weights = [len(styles) * 6]
+    loader.buckets = {
+        shape: [
+            image_id
+            for image_ids in loader.same_style_targets_by_bucket[shape].values()
+            for image_id in image_ids
+        ]
+    }
+    loader.by_style = dict(loader.same_style_targets_by_bucket[shape])
+    loader.text_variants = {
+        image_id: [0]
+        for image_ids in loader.by_style.values()
+        for image_id in image_ids
+    }
+
+    groups = [loader.episodes_for_step(step) for step in range(4)]
+    style_ids = [group[0].style_id for group in groups]
+    assert len(set(style_ids)) == 4
+    assert all(len({row.style_id for row in group}) == 1 for group in groups)
+
+
 def test_same_q_alpha_block_ablation_masks_and_restores_values():
     adapter = nn.Module()
     adapter.alpha = nn.Parameter(torch.tensor([0.1, 0.2, 0.3, 0.4]))

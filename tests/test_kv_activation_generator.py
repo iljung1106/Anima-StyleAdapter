@@ -147,6 +147,37 @@ def test_sparse_expert_generator_routes_kv_and_independent_qo_paths() -> None:
     assert model.stream_style_key[1].weight.grad is not None
 
 
+def test_sparse_expert_generator_can_disable_q_and_keep_o() -> None:
+    torch.manual_seed(29)
+    model = ReferenceConditionedKVActivationGenerator(
+        style_dim=32,
+        context_dim=24,
+        output_dim=40,
+        blocks=2,
+        hidden_dim=32,
+        heads=4,
+        ff_dim=64,
+        output_rank=4,
+        output_experts=8,
+        output_top_k=4,
+        output_init_scale=1e-3,
+        enable_qo=True,
+        enable_q=False,
+        enable_o=True,
+        stream_dim=40,
+        stream_rank=3,
+        stream_experts=6,
+        stream_top_k=3,
+    )
+    style = torch.randn(2, 7, 32)
+    stream = torch.randn(2, 11, 40)
+    codes = model.prepare_stream_codes(style)
+    q = model.stream_delta(stream, codes, 1, 0)
+    o = model.stream_delta(stream, codes, 1, 1)
+    assert torch.count_nonzero(q) == 0
+    assert torch.count_nonzero(o) > 0
+
+
 def test_final_effect_constraints_use_absolute_pairwise_cap_without_centering() -> None:
     teacher = torch.zeros(4, 1, 2, 4)
     for index in range(4):

@@ -91,6 +91,8 @@ class ReferenceConditionedKVActivationGenerator(nn.Module):
         normalize_attended: bool = True,
         use_block_embedding: bool = True,
         enable_qo: bool = False,
+        enable_q: bool = True,
+        enable_o: bool = True,
         stream_dim: int = 2048,
         stream_rank: int = 32,
         stream_experts: int = 0,
@@ -124,6 +126,10 @@ class ReferenceConditionedKVActivationGenerator(nn.Module):
         self.output_experts = int(output_experts)
         self.output_top_k = int(output_top_k)
         self.enable_qo = bool(enable_qo)
+        self.enable_q = bool(enable_q) and self.enable_qo
+        self.enable_o = bool(enable_o) and self.enable_qo
+        if self.enable_qo and not (self.enable_q or self.enable_o):
+            raise ValueError("Q/O modulation requires at least one enabled path")
         self.stream_dim = int(stream_dim)
         self.stream_rank = int(stream_rank)
         self.stream_experts = int(stream_experts)
@@ -421,6 +427,13 @@ class ReferenceConditionedKVActivationGenerator(nn.Module):
         if self.stream_experts:
             rows = []
             for kind in range(2):
+                if not self.stream_kind_enabled(kind):
+                    rows.append(
+                        style.new_zeros(
+                            batch, self.blocks, self.heads, self.head_dim
+                        )
+                    )
+                    continue
                 queries = self.stream_style_queries[:, kind][None].expand(
                     batch, -1, -1
                 ).reshape(
@@ -458,6 +471,13 @@ class ReferenceConditionedKVActivationGenerator(nn.Module):
             )
         return self.stream_code_norm(codes)
 
+    def stream_kind_enabled(self, kind: int) -> bool:
+        if int(kind) == 0:
+            return self.enable_q
+        if int(kind) == 1:
+            return self.enable_o
+        raise ValueError("stream kind must be Q=0 or O=1")
+
     def stream_delta(
         self,
         stream_input: torch.Tensor,
@@ -468,6 +488,8 @@ class ReferenceConditionedKVActivationGenerator(nn.Module):
         """Apply a reference-gated low-rank delta to Q (0) or O (1)."""
         if not self.enable_qo:
             raise RuntimeError("Q/O stream modulation is disabled")
+        if not self.stream_kind_enabled(kind):
+            return torch.zeros_like(stream_input)
         if stream_input.shape[-1] != self.stream_dim:
             raise ValueError(
                 f"Expected stream width {self.stream_dim}, "
@@ -1167,6 +1189,7 @@ def _adapter_probe_signature(
             parts.extend(
                 compact(generator.stream_delta(stream_input, stream_codes, block, kind))
                 for kind in range(2)
+                if generator.stream_kind_enabled(kind)
             )
     return F.normalize(torch.cat(parts), dim=0)
 
@@ -2692,6 +2715,14 @@ def train_direct_reference_kv_delta_320(
             "ram_resident_tokens": False,
             "reference_curriculum": {},
             "pilot_reference_schedule": [],
+            "gradient_accumulation_steps": int(
+                training.get("gradient_accumulation_steps", 1)
+            ),
+            "distinct_style_groups_per_optimizer_update": bool(
+                human_flow.get(
+                    "distinct_style_groups_per_optimizer_update", False
+                )
+            ),
         })
         if int(human_flow.get("same_style_target_min", 1)) > 1:
             flow_loader_cfg["prompt_modes"] = dict(

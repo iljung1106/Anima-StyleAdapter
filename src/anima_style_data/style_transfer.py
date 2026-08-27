@@ -138,6 +138,9 @@ class ProductionStyleLoader:
         self.gradient_accumulation_steps = max(
             1, int(cfg.get("gradient_accumulation_steps", 1))
         )
+        self.distinct_style_groups_per_optimizer_update = bool(
+            cfg.get("distinct_style_groups_per_optimizer_update", False)
+        )
         # Anima was trained with fixed 512-token post-LLM conditioning. Its
         # cross-attention does not receive a text padding mask, so the trailing
         # zero embeddings are part of the learned softmax normalization and
@@ -258,6 +261,21 @@ class ProductionStyleLoader:
                 len(self.same_style_targets_by_bucket[shape])
                 for shape in self.same_style_bucket_keys
             ]
+            self.same_style_shapes_by_style: dict[
+                str, list[tuple[int, int]]
+            ] = defaultdict(list)
+            for shape, grouped in self.same_style_targets_by_bucket.items():
+                for style_id in grouped:
+                    self.same_style_shapes_by_style[style_id].append(shape)
+            if (
+                self.distinct_style_groups_per_optimizer_update
+                and len(self.same_style_shapes_by_style)
+                < self.gradient_accumulation_steps
+            ):
+                raise RuntimeError(
+                    "Not enough eligible artists to keep optimizer-update "
+                    "style groups distinct"
+                )
         self.self_reference_buckets: dict[tuple[int, int], list[int]] = {}
         self.self_reference_target_ids: set[int] = set()
         if self.reference_curriculum and self.self_reference_target_images_per_style > 0:
@@ -351,14 +369,39 @@ class ProductionStyleLoader:
             bucket_keys = self.bucket_keys
             bucket_weights = self.bucket_weights
             target_buckets = self.buckets
-        if self.same_style_target_min > 1 and not use_self_reference_pool:
-            shape = rng.choices(
-                self.same_style_bucket_keys,
-                weights=self.same_style_bucket_weights,
-                k=1,
-            )[0]
-            grouped = self.same_style_targets_by_bucket[shape]
-            style_id = rng.choice(sorted(grouped))
+        if (
+            getattr(self, "same_style_target_min", 1) > 1
+            and not use_self_reference_pool
+        ):
+            if getattr(
+                self, "distinct_style_groups_per_optimizer_update", False
+            ):
+                accumulation = self.gradient_accumulation_steps
+                update_index = int(step) // accumulation
+                group_index = int(step) % accumulation
+                group_rng = random.Random(
+                    self.seed ^ 0x4D55_4C54 ^ (update_index * 1_000_003)
+                )
+                selected_styles = group_rng.sample(
+                    sorted(self.same_style_shapes_by_style), accumulation
+                )
+                selected_groups = [
+                    (
+                        style,
+                        group_rng.choice(self.same_style_shapes_by_style[style]),
+                    )
+                    for style in selected_styles
+                ]
+                style_id, shape = selected_groups[group_index]
+                grouped = self.same_style_targets_by_bucket[shape]
+            else:
+                shape = rng.choices(
+                    self.same_style_bucket_keys,
+                    weights=self.same_style_bucket_weights,
+                    k=1,
+                )[0]
+                grouped = self.same_style_targets_by_bucket[shape]
+                style_id = rng.choice(sorted(grouped))
             target_pool = grouped[style_id]
             target_upper = min(
                 self.same_style_target_max,
