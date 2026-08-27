@@ -148,6 +148,7 @@ def build_parser() -> argparse.ArgumentParser:
         ("kv-reference-expert-kvo-artist-invariant-5k-sample", "Render artist-invariant loss-free balanced K/V/O expert flow model"),
         ("kv-reference-expert-kvo-flow-aligned-2k-train", "Train flow-aligned loss-free balanced K/V/O expert model"),
         ("kv-reference-expert-kvo-flow-aligned-2k-sample", "Render flow-aligned loss-free balanced K/V/O expert model"),
+        ("kv-reference-expert-kvo-flow-aligned-1k-no-o-sample", "Render step-1000 flow-aligned model without O residuals"),
         ("kv-reference-bilinear-smoke", "Smoke-test reference-conditioned bilinear K/V operators"),
         ("kv-reference-bilinear-train", "Train reference-conditioned bilinear K/V operators"),
         ("kv-reference-bilinear-sample", "Render reference-conditioned bilinear K/V operators"),
@@ -861,6 +862,7 @@ def main() -> None:
             sample_expert_kvo_artist_invariant_flow_5k,
             train_scheduled_expert_kvo_flow_aligned_2k,
             sample_expert_kvo_flow_aligned_2k,
+            sample_expert_kvo_flow_aligned_1k_no_o,
         )
         from .kv_activation_sampling import (
             evaluate_kv_activation_reference_generalization,
@@ -928,6 +930,7 @@ def main() -> None:
             "kv-reference-expert-kvo-artist-invariant-5k-sample": sample_expert_kvo_artist_invariant_flow_5k,
             "kv-reference-expert-kvo-flow-aligned-2k-train": train_scheduled_expert_kvo_flow_aligned_2k,
             "kv-reference-expert-kvo-flow-aligned-2k-sample": sample_expert_kvo_flow_aligned_2k,
+            "kv-reference-expert-kvo-flow-aligned-1k-no-o-sample": sample_expert_kvo_flow_aligned_1k_no_o,
             "kv-reference-bilinear-smoke": smoke_test_reference_conditioned_bilinear_kv_operator,
             "kv-reference-bilinear-train": train_reference_conditioned_bilinear_kv_operator,
             "kv-reference-bilinear-sample": sample_reference_conditioned_bilinear_kv_operator,

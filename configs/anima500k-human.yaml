@@ -1746,6 +1746,21 @@ kv_reference_expert_kvo_flow_aligned_2k_sample:
   batch_size: 4
   panel_tile_width: 384
 
+# Exact step-1000 diagnostic: preserve K/V strength while removing only the
+# O-stream residual. This separates text-conditioning quality from global
+# stream/content interference without changing the trained checkpoint.
+kv_reference_expert_kvo_flow_aligned_1k_no_o_sample:
+  checkpoint: kv_reference_expert_kv64x16_o16x16_lossfree_flow_aligned_w768_l3_flow_2k_v1/checkpoints/step-0001000.pt
+  output_directory: diagnostics/kv-reference-expert-kv64x16-o16x16-lossfree-flow-aligned-w768-l3-flow-2k-v1-step1000-no-o
+  device: cuda
+  artists: 8
+  references: 4
+  reference_seed: 20260828
+  strengths: [1.0, 2.0]
+  stream_strength_scale: 0.0
+  batch_size: 4
+  panel_tile_width: 384
+
 # Reference-conditioned low-rank operator pilot. Unlike the direct activation
 # head above, the reference generates a fresh block-local linear operator and
 # applies it to every native text token.  Teacher factors remain offline

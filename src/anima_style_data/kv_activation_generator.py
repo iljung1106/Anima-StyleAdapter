@@ -4982,6 +4982,7 @@ def sample_direct_reference_kv_delta_320(
     activation_injector = NativeKVActivationInjector(anima, model)
     batch_size = int(sample_cfg.get("batch_size", 4))
     strengths = [float(value) for value in sample_cfg.get("strengths", [1.0, 2.0])]
+    stream_strength_scale = float(sample_cfg.get("stream_strength_scale", 1.0))
 
     def denoise(
         style_memory: torch.Tensor,
@@ -5001,7 +5002,9 @@ def sample_direct_reference_kv_delta_320(
                 activation_injector.disable()
             else:
                 activation_injector.set_style(
-                    style_memory[start:stop], strength=strength
+                    style_memory[start:stop],
+                    strength=strength,
+                    stream_strength=strength * stream_strength_scale,
                 )
             with torch.autocast("cuda", dtype=torch.bfloat16):
                 values.append(_sample_anima_batch(
@@ -5532,6 +5535,16 @@ def sample_expert_kvo_flow_aligned_2k(
         config,
         destination,
         sample_config_key="kv_reference_expert_kvo_flow_aligned_2k_sample",
+    )
+
+
+def sample_expert_kvo_flow_aligned_1k_no_o(
+    config: dict[str, Any], destination: Path
+) -> dict[str, Any]:
+    return sample_direct_reference_kv_delta_320(
+        config,
+        destination,
+        sample_config_key="kv_reference_expert_kvo_flow_aligned_1k_no_o_sample",
     )
 
 

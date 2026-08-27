@@ -866,6 +866,27 @@ def test_native_activation_injector_adds_reference_conditioned_q_and_o() -> None
     injector.close()
 
 
+def test_native_activation_injector_can_ablate_stream_without_changing_kv() -> None:
+    anima = _FakeAnima()
+    injector = NativeKVActivationInjector(anima, _ConstantKVOQDelta())
+    context = torch.randn(2, 5, 6)
+    values = torch.randn(2, 5, 8)
+    baseline_k = anima.blocks[0].cross_attn.k_proj(context)
+    baseline_o = anima.blocks[0].cross_attn.output_proj(values)
+    injector.set_style(
+        torch.randn(2, 3, 7), strength=1.5, stream_strength=0.0
+    )
+
+    torch.testing.assert_close(
+        anima.blocks[0].cross_attn.k_proj(context) - baseline_k,
+        torch.full_like(baseline_k, 1.5),
+    )
+    torch.testing.assert_close(
+        anima.blocks[0].cross_attn.output_proj(values), baseline_o
+    )
+    injector.close()
+
+
 def test_direct_generator_qo_path_is_style_conditioned_and_differentiable() -> None:
     model = ReferenceConditionedKVActivationGenerator(
         style_dim=12,

@@ -150,6 +150,7 @@ class NativeKVActivationInjector:
         self.kv_factors: tuple[torch.Tensor, torch.Tensor] | None = None
         self.stream_codes: torch.Tensor | None = None
         self.strength = 1.0
+        self.stream_strength = 1.0
         self.enabled = False
         self.block_mask: torch.Tensor | None = None
         self.handles: list[Any] = []
@@ -209,6 +210,7 @@ class NativeKVActivationInjector:
         style_memory: torch.Tensor,
         *,
         strength: float = 1.0,
+        stream_strength: float | None = None,
         block_mask: torch.Tensor | None = None,
     ) -> None:
         if style_memory.ndim != 3:
@@ -227,6 +229,11 @@ class NativeKVActivationInjector:
             else None
         )
         self.strength = float(strength)
+        self.stream_strength = (
+            self.strength
+            if stream_strength is None
+            else float(stream_strength)
+        )
         if block_mask is not None and block_mask.ndim != 1:
             raise ValueError("block_mask must be one-dimensional")
         self.block_mask = block_mask
@@ -276,7 +283,7 @@ class NativeKVActivationInjector:
         codes = _repeat_factor_rows(self.stream_codes, int(values.shape[0]))
         return self.model.stream_delta(
             values, codes, block_index, kind
-        ) * self.strength
+        ) * self.stream_strength
 
     def _stream_hook(self, block_index: int, kind: int):
         def hook(module, inputs, output):
