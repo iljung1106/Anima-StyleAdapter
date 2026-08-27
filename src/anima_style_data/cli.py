@@ -798,6 +798,7 @@ def main() -> None:
         "kv-reference-expert-kvo-artist-invariant-5k-sample",
         "kv-reference-expert-kvo-flow-aligned-2k-train",
         "kv-reference-expert-kvo-flow-aligned-2k-sample",
+        "kv-reference-expert-kvo-flow-aligned-1k-no-o-sample",
         "kv-reference-bilinear-smoke",
         "kv-reference-bilinear-train",
         "kv-reference-bilinear-sample",
