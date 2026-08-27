@@ -19,6 +19,7 @@ from anima_style_data.kv_activation_generator import (
     _mixture_target,
     _population_common_occupancy,
     _prediction_population_metrics,
+    _same_artist_queue_infonce,
     _same_artist_signature_consistency,
     _whole_model_curriculum,
 )
@@ -363,6 +364,32 @@ def test_same_artist_consistency_uses_cosine_and_rms_bands() -> None:
     assert matching_metrics["same_artist_signature_cosine"] > 0.99
     assert mismatching > 0
     assert mismatching_metrics["same_artist_signature_cosine"] == 0
+
+
+def test_same_artist_queue_infonce_prefers_matching_disjoint_view() -> None:
+    anchor = torch.tensor([1.0, 0.0])
+    matching, matching_metrics = _same_artist_queue_infonce(
+        anchor,
+        torch.tensor([1.0, 0.0]),
+        [torch.tensor([0.0, 1.0])],
+        temperature=0.1,
+    )
+    mismatching, mismatching_metrics = _same_artist_queue_infonce(
+        anchor,
+        torch.tensor([0.0, 1.0]),
+        [torch.tensor([1.0, 0.0])],
+        temperature=0.1,
+    )
+
+    assert matching < mismatching
+    assert (
+        matching_metrics["same_artist_contrastive_positive"]
+        > matching_metrics["same_artist_contrastive_hardest_negative"]
+    )
+    assert (
+        mismatching_metrics["same_artist_contrastive_positive"]
+        < mismatching_metrics["same_artist_contrastive_hardest_negative"]
+    )
 
 
 def test_final_effect_constraints_use_absolute_pairwise_cap_without_centering() -> None:

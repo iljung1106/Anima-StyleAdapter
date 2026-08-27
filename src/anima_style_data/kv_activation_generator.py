@@ -1646,6 +1646,38 @@ def _same_artist_signature_consistency(
     }
 
 
+def _same_artist_queue_infonce(
+    anchor: torch.Tensor,
+    positive: torch.Tensor,
+    negatives: list[torch.Tensor],
+    *,
+    temperature: float,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Identify an artist across disjoint references against recent artists."""
+
+    if not negatives:
+        zero = anchor.new_zeros(())
+        return zero, {
+            "same_artist_contrastive_positive": zero,
+            "same_artist_contrastive_hardest_negative": zero,
+        }
+    anchor_f = F.normalize(anchor.float().flatten(), dim=0)
+    positive_f = F.normalize(positive.detach().float().flatten(), dim=0)
+    negative_f = torch.stack(negatives).detach().float()
+    positive_logit = (anchor_f * positive_f).sum()
+    negative_logits = negative_f @ anchor_f
+    logits = torch.cat([positive_logit[None], negative_logits]) / float(
+        temperature
+    )
+    loss = F.cross_entropy(logits[None], logits.new_zeros(1, dtype=torch.long))
+    return loss, {
+        "same_artist_contrastive_positive": positive_logit.detach(),
+        "same_artist_contrastive_hardest_negative": (
+            negative_logits.max().detach()
+        ),
+    }
+
+
 def _cross_style_queue_diversity(
     signature: torch.Tensor,
     references: list[torch.Tensor],
@@ -3550,6 +3582,37 @@ def train_direct_reference_kv_delta_320(
                 flow_references, flow_mask = _sampling_reference_inputs(
                     flow_batch, device, "heldout"
                 )
+                flow_main_mask = flow_mask
+                subset_dropout = float(
+                    human_flow.get("reference_subset_dropout", 0.0)
+                )
+                available_references = int(flow_mask[0].sum())
+                if (
+                    subset_dropout
+                    and available_references >= 2
+                    and float(
+                        torch.rand((), device=device, generator=flow_rng)
+                    ) < subset_dropout
+                ):
+                    valid = flow_mask[0].nonzero(as_tuple=False).flatten()
+                    keep = int(
+                        torch.randint(
+                            1,
+                            available_references,
+                            (),
+                            device=device,
+                            generator=flow_rng,
+                        )
+                    )
+                    chosen = valid[
+                        torch.randperm(
+                            available_references,
+                            device=device,
+                            generator=flow_rng,
+                        )[:keep]
+                    ]
+                    flow_main_mask = torch.zeros_like(flow_mask)
+                    flow_main_mask[:, chosen] = flow_mask[:, chosen]
                 noise = torch.randn(
                     latents.shape,
                     device=device,
@@ -3606,7 +3669,7 @@ def train_direct_reference_kv_delta_320(
                         block_mask[block_rng.randrange(model.blocks)] = True
                     block_strength = 1.0 / (1.0 - block_dropout)
                 with torch.autocast("cuda", dtype=torch.bfloat16):
-                    flow_style = reader(flow_references, flow_mask).tokens
+                    flow_style = reader(flow_references, flow_main_mask).tokens
                     flow_injector.set_style(
                         flow_style,
                         strength=block_strength,
@@ -3716,6 +3779,8 @@ def train_direct_reference_kv_delta_320(
                     )
                     same_artist_loss = student_effect.new_zeros(())
                     same_artist_metrics: dict[str, torch.Tensor] | None = None
+                    left_signature: torch.Tensor | None = None
+                    right_signature: torch.Tensor | None = None
                     same_artist_weight = float(
                         human_flow.get("same_artist_consistency_weight", 0.0)
                     )
@@ -3815,6 +3880,35 @@ def train_direct_reference_kv_delta_320(
                         for style_id, value in cross_style_queue.items()
                         if style_id != flow_style_id
                     ]
+                    same_artist_contrastive_loss = student_effect.new_zeros(())
+                    same_artist_contrastive_metrics: dict[
+                        str, torch.Tensor
+                    ] | None = None
+                    contrastive_weight = float(
+                        human_flow.get("same_artist_contrastive_weight", 0.0)
+                    )
+                    contrastive_min_styles = int(
+                        human_flow.get("same_artist_contrastive_min_styles", 16)
+                    )
+                    if (
+                        contrastive_weight
+                        and left_signature is not None
+                        and right_signature is not None
+                        and len(diversity_references) >= contrastive_min_styles
+                    ):
+                        (
+                            same_artist_contrastive_loss,
+                            same_artist_contrastive_metrics,
+                        ) = _same_artist_queue_infonce(
+                            left_signature,
+                            right_signature,
+                            diversity_references,
+                            temperature=float(
+                                human_flow.get(
+                                    "same_artist_contrastive_temperature", 0.10
+                                )
+                            ),
+                        )
                     diversity_min_styles = int(
                         human_flow.get("diversity_queue_min_styles", 16)
                     )
@@ -3912,6 +4006,9 @@ def train_direct_reference_kv_delta_320(
                     same_artist_effective_weight = (
                         same_artist_weight * consistency_progress
                     )
+                    contrastive_effective_weight = (
+                        contrastive_weight * consistency_progress
+                    )
                     flow_loss = flow_mse_weight * flow_mse
                     if residual_huber_weight:
                         flow_loss = (
@@ -3949,6 +4046,11 @@ def train_direct_reference_kv_delta_320(
                         flow_loss = flow_loss + (
                             same_artist_effective_weight * same_artist_loss
                         )
+                    if contrastive_effective_weight:
+                        flow_loss = flow_loss + (
+                            contrastive_effective_weight
+                            * same_artist_contrastive_loss
+                        )
                     if not bool(torch.isfinite(flow_loss)):
                         raise RuntimeError(
                             f"Non-finite human-flow loss at step {step}"
@@ -3982,7 +4084,7 @@ def train_direct_reference_kv_delta_320(
                     with torch.autocast("cuda", dtype=torch.bfloat16):
                         wrong_style = reader(
                             flow_references.roll(1, dims=0),
-                            flow_mask.roll(1, dims=0),
+                            flow_main_mask.roll(1, dims=0),
                         ).tokens
                         flow_injector.set_style(wrong_style)
                         wrong_prediction = anima(
@@ -4096,6 +4198,17 @@ def train_direct_reference_kv_delta_320(
                         ).detach()
                     )
                 )
+                if same_artist_contrastive_metrics is not None:
+                    for name, value in same_artist_contrastive_metrics.items():
+                        running[f"human_flow/{name}"].append(float(value))
+                running["human_flow/same_artist_contrastive_weighted"].append(
+                    float(
+                        (
+                            contrastive_effective_weight
+                            * same_artist_contrastive_loss
+                        ).detach()
+                    )
+                )
                 for name, value in routing_metrics.items():
                     running[f"human_flow/{name}"].append(float(value))
                 running["human_flow/rms_band_outer_weighted"].append(
@@ -4147,6 +4260,9 @@ def train_direct_reference_kv_delta_320(
                 running["human_flow/timestep"].append(float(timesteps.mean()))
                 running["human_flow/reference_count"].append(
                     float(flow_mask.sum(dim=1).float().mean())
+                )
+                running["human_flow/main_reference_count"].append(
+                    float(flow_main_mask.sum(dim=1).float().mean())
                 )
                 running["human_flow/style_group_size"].append(
                     float(len(flow_style_ids))
@@ -5370,6 +5486,31 @@ def sample_expert_kvo_lossfree_flow_5k(
         config,
         destination,
         sample_config_key="kv_reference_expert_kvo_lossfree_flow_5k_sample",
+    )
+
+
+def train_scheduled_expert_kvo_artist_invariant_flow_5k(
+    config: dict[str, Any], destination: Path
+) -> dict[str, Any]:
+    return train_scheduled_direct_reference_kv_delta_320(
+        config,
+        destination,
+        config_key="kv_reference_expert_kvo_artist_invariant_flow_5k",
+        sample_config_key=(
+            "kv_reference_expert_kvo_artist_invariant_flow_5k_sample"
+        ),
+    )
+
+
+def sample_expert_kvo_artist_invariant_flow_5k(
+    config: dict[str, Any], destination: Path
+) -> dict[str, Any]:
+    return sample_direct_reference_kv_delta_320(
+        config,
+        destination,
+        sample_config_key=(
+            "kv_reference_expert_kvo_artist_invariant_flow_5k_sample"
+        ),
     )
 
 
