@@ -1372,6 +1372,89 @@ kv_reference_expert_kvo_flow_10k_sample:
   batch_size: 4
   panel_tile_width: 384
 
+# Fresh rerun with differentiable pre-top-k balancing. Hard expert dispatch is
+# unchanged, but historical overload acts on dense router probabilities and a
+# bounded selection-only bias can rotate dead experts into top-k. Early jitter
+# explores the bank before specialization; it is absent at inference.
+kv_reference_expert_kvo_balanced_flow_10k:
+  extends_config_key: kv_reference_direct_delta_320
+  replace_sections: [model]
+  output_directory: kv_reference_expert_kv64x16_o16x16_balanced_w768_l3_flow_10k_v1
+  seed: 20260827
+  model:
+    architecture: direct_cross_attention
+    hidden_dim: 768
+    heads: 16
+    ff_dim: 3072
+    ff_layers: 3
+    output_rank: 16
+    output_experts: 64
+    output_top_k: 8
+    output_init_scale: 0.000001
+    normalize_style: false
+    normalize_attended: false
+    use_block_embedding: false
+    enable_qo: true
+    enable_q: false
+    enable_o: true
+    stream_dim: 2048
+    stream_rank: 16
+    stream_experts: 16
+    stream_top_k: 4
+    expert_usage_decay: 0.99
+    expert_balance_cap: 2.0
+    router_init_scale: 0.0
+    router_jitter: 0.10
+    router_jitter_steps: 1000
+    expert_bias_update_rate: 0.01
+    expert_bias_decay: 0.999
+    expert_bias_max: 0.50
+  training:
+    steps: 10000
+    gradient_accumulation_steps: 4
+    generator_learning_rate: 0.000003
+    reader_learning_rate: 0.000003
+    human_flow:
+      # Selection bias handles gross imbalance; keep the differentiable loss
+      # weak enough not to overpower artist specialization.
+      expert_balance_weight: 0.02
+      distinct_style_groups_per_optimizer_update: true
+    generator_lr_schedule:
+      peak_lr: 0.000003
+      warmup_steps: 100
+      decay_start_step: 1500
+      decay_end_step: 5000
+      final_lr: 0.0000003
+      tail_decay_end_step: 10000
+      tail_final_lr: 0.0000001
+    reader_lr_schedule:
+      peak_lr: 0.000003
+      warmup_steps: 100
+      decay_start_step: 250
+      decay_end_step: 750
+      final_lr: 0.00000006
+    checkpoint_every: 1000
+    sample_every: 1000
+    sample_steps: []
+    sample_output_root: diagnostics/kv-reference-expert-kv64x16-o16x16-balanced-w768-l3-flow-10k-v1
+    resume: true
+    wandb:
+      enabled: true
+      project: anima-style-adapter
+      name: kv-reference-expert-kv64x16-o16x16-balanced-w768-l3-flow-10k-v1
+      id: kv-reference-expert-kv64x16-o16x16-balanced-w768-l3-flow-10k-v1
+
+kv_reference_expert_kvo_balanced_flow_10k_sample:
+  checkpoint: kv_reference_expert_kv64x16_o16x16_balanced_w768_l3_flow_10k_v1/checkpoints/step-0010000.pt
+  output_directory: diagnostics/kv-reference-expert-kv64x16-o16x16-balanced-w768-l3-flow-10k-v1-step10000
+  device: cuda
+  artists: 8
+  references: 4
+  reference_seed: 20260827
+  strengths: [1.0, 2.0]
+  batch_size: 4
+  panel_tile_width: 384
+
 # Reference-conditioned low-rank operator pilot. Unlike the direct activation
 # head above, the reference generates a fresh block-local linear operator and
 # applies it to every native text token.  Teacher factors remain offline

@@ -99,6 +99,12 @@ class ReferenceConditionedKVActivationGenerator(nn.Module):
         stream_top_k: int = 0,
         expert_usage_decay: float = 0.99,
         expert_balance_cap: float = 1.5,
+        router_init_scale: float = 1.0,
+        router_jitter: float = 0.0,
+        router_jitter_steps: int = 0,
+        expert_bias_update_rate: float = 0.0,
+        expert_bias_decay: float = 0.999,
+        expert_bias_max: float = 0.5,
     ) -> None:
         super().__init__()
         if hidden_dim % heads:
@@ -136,6 +142,22 @@ class ReferenceConditionedKVActivationGenerator(nn.Module):
         self.stream_top_k = int(stream_top_k)
         self.expert_usage_decay = float(expert_usage_decay)
         self.expert_balance_cap = float(expert_balance_cap)
+        self.router_init_scale = float(router_init_scale)
+        self.router_jitter = float(router_jitter)
+        self.router_jitter_steps = int(router_jitter_steps)
+        self.expert_bias_update_rate = float(expert_bias_update_rate)
+        self.expert_bias_decay = float(expert_bias_decay)
+        self.expert_bias_max = float(expert_bias_max)
+        self._routing_step = 0
+        if (
+            self.router_init_scale < 0
+            or self.router_jitter < 0
+            or self.router_jitter_steps < 0
+            or self.expert_bias_update_rate < 0
+            or not 0.0 <= self.expert_bias_decay <= 1.0
+            or self.expert_bias_max < 0
+        ):
+            raise ValueError("router exploration controls are invalid")
         self._routing_balance_terms: list[torch.Tensor] = []
         self._routing_entropies: dict[str, list[torch.Tensor]] = {
             "kv": [], "qo": [],
@@ -193,6 +215,17 @@ class ReferenceConditionedKVActivationGenerator(nn.Module):
                     (blocks, 2, self.output_experts),
                     1.0 / self.output_experts,
                 ),
+            )
+            self.register_buffer(
+                "output_expert_load",
+                torch.full(
+                    (blocks, 2, self.output_experts),
+                    self.output_top_k / self.output_experts,
+                ),
+            )
+            self.register_buffer(
+                "output_expert_selection_bias",
+                torch.zeros(blocks, 2, self.output_experts),
             )
             self.output_head = nn.ModuleList()
         elif self.output_rank:
@@ -261,6 +294,17 @@ class ReferenceConditionedKVActivationGenerator(nn.Module):
                         1.0 / self.stream_experts,
                     ),
                 )
+                self.register_buffer(
+                    "stream_expert_load",
+                    torch.full(
+                        (blocks, 2, self.stream_experts),
+                        self.stream_top_k / self.stream_experts,
+                    ),
+                )
+                self.register_buffer(
+                    "stream_expert_selection_bias",
+                    torch.zeros(blocks, 2, self.stream_experts),
+                )
             else:
                 self.stream_gates = nn.ModuleList(
                     nn.ModuleList(
@@ -285,6 +329,37 @@ class ReferenceConditionedKVActivationGenerator(nn.Module):
                 )
         self.reset_parameters(float(output_init_scale))
 
+    def _load_from_state_dict(
+        self,
+        state_dict: dict[str, torch.Tensor],
+        prefix: str,
+        local_metadata: dict[str, Any],
+        strict: bool,
+        missing_keys: list[str],
+        unexpected_keys: list[str],
+        error_msgs: list[str],
+    ) -> None:
+        # Expert checkpoints created before population load and selection bias
+        # existed remain usable for diagnostics. Fresh balanced runs still save
+        # and restore these buffers normally.
+        for name in (
+            "output_expert_load",
+            "output_expert_selection_bias",
+            "stream_expert_load",
+            "stream_expert_selection_bias",
+        ):
+            if hasattr(self, name) and prefix + name not in state_dict:
+                state_dict[prefix + name] = getattr(self, name).detach().clone()
+        super()._load_from_state_dict(
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs,
+        )
+
     def reset_parameters(self, output_init_scale: float) -> None:
         for module in self.modules():
             if isinstance(module, nn.Linear):
@@ -307,6 +382,10 @@ class ReferenceConditionedKVActivationGenerator(nn.Module):
                 for block in range(self.blocks):
                     for kind in range(2):
                         nn.init.zeros_(self.stream_routers[block][kind].bias)
+                        with torch.no_grad():
+                            self.stream_routers[block][kind].weight.mul_(
+                                self.router_init_scale
+                            )
                         nn.init.zeros_(self.stream_channel_gates[block][kind].bias)
                         nn.init.zeros_(self.stream_gain[block][kind].weight)
                         nn.init.constant_(
@@ -333,6 +412,8 @@ class ReferenceConditionedKVActivationGenerator(nn.Module):
             for block_routers in self.output_routers:
                 for router in block_routers:
                     nn.init.zeros_(router.bias)
+                    with torch.no_grad():
+                        router.weight.mul_(self.router_init_scale)
         elif not self.output_rank:
             for head in self.output_head:
                 with torch.no_grad():
@@ -393,11 +474,21 @@ class ReferenceConditionedKVActivationGenerator(nn.Module):
                 self.output_routers[block][kind](router_code[:, kind])
                 for kind in range(2)
             ], dim=1)
-            indices, weights, sparse = self._sparse_router(
-                logits, self.output_top_k
+            indices, weights, sparse, dense, selected = self._sparse_router(
+                logits,
+                self.output_top_k,
+                self.output_expert_selection_bias[block],
             )
             self._record_routing(
-                "kv", self.output_expert_usage, block, sparse
+                "kv",
+                self.output_expert_usage,
+                self.output_expert_load,
+                self.output_expert_selection_bias,
+                block,
+                sparse,
+                dense,
+                selected,
+                self.output_top_k,
             )
             down_bank = self.output_expert_down[block]
             up_bank = self.output_expert_up[block]
@@ -498,16 +589,25 @@ class ReferenceConditionedKVActivationGenerator(nn.Module):
         code = stream_codes[:, block_index, kind]
         if self.stream_experts:
             logits = self.stream_routers[block_index][kind](code)
-            indices, weights, sparse = self._sparse_router(
-                logits[:, None], self.stream_top_k
+            indices, weights, sparse, dense, selected = self._sparse_router(
+                logits[:, None],
+                self.stream_top_k,
+                self.stream_expert_selection_bias[
+                    block_index, kind : kind + 1
+                ],
             )
             indices = indices[:, 0]
             weights = weights[:, 0]
             self._record_routing(
                 "qo",
                 self.stream_expert_usage[:, kind : kind + 1],
+                self.stream_expert_load[:, kind : kind + 1],
+                self.stream_expert_selection_bias[:, kind : kind + 1],
                 block_index,
                 sparse,
+                dense,
+                selected,
+                self.stream_top_k,
                 usage_kind=0,
             )
             channels = torch.tanh(
@@ -537,15 +637,36 @@ class ReferenceConditionedKVActivationGenerator(nn.Module):
         hidden = self.stream_down[block_index][kind](stream_input)
         return self.stream_up[block_index][kind](hidden * gate[:, None, :])
 
-    @staticmethod
     def _sparse_router(
-        logits: torch.Tensor, top_k: int
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        indices = logits.topk(int(top_k), dim=-1).indices
+        self,
+        logits: torch.Tensor,
+        top_k: int,
+        selection_bias: torch.Tensor | None = None,
+    ) -> tuple[
+        torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
+    ]:
+        dense = logits.float().softmax(dim=-1).to(logits.dtype)
+        selection_logits = logits.float()
+        if selection_bias is not None:
+            selection_logits = selection_logits + selection_bias.float()
+        if self.training and self.router_jitter and self.router_jitter_steps:
+            progress = min(1.0, self._routing_step / self.router_jitter_steps)
+            jitter = self.router_jitter * (1.0 - progress)
+            if jitter:
+                selection_logits = selection_logits + torch.randn_like(
+                    selection_logits
+                ) * jitter
+        indices = selection_logits.topk(int(top_k), dim=-1).indices
         selected_logits = logits.gather(-1, indices)
         weights = selected_logits.float().softmax(dim=-1).to(logits.dtype)
         sparse = torch.zeros_like(logits).scatter(-1, indices, weights)
-        return indices, weights, sparse
+        selected = torch.zeros_like(logits).scatter(
+            -1, indices, torch.ones_like(weights)
+        )
+        return indices, weights, sparse, dense, selected
+
+    def set_routing_step(self, step: int) -> None:
+        self._routing_step = max(0, int(step))
 
     def reset_routing_records(self) -> None:
         self._routing_balance_terms.clear()
@@ -556,20 +677,43 @@ class ReferenceConditionedKVActivationGenerator(nn.Module):
         self,
         name: str,
         usage: torch.Tensor,
+        load: torch.Tensor,
+        selection_bias: torch.Tensor,
         block: int,
         probabilities: torch.Tensor,
+        dense_probabilities: torch.Tensor,
+        selections: torch.Tensor,
+        top_k: int,
         *,
         usage_kind: int | None = None,
     ) -> None:
         if not self.training:
             return
         current = probabilities.float().mean(dim=0)
+        current_dense = dense_probabilities.float().mean(dim=0)
+        current_load = selections.float().mean(dim=0)
         usage_rows = usage[block]
+        load_rows = load[block]
+        bias_rows = selection_bias[block]
         if usage_kind is not None:
             usage_rows = usage_rows[usage_kind : usage_kind + 1]
-        threshold = self.expert_balance_cap / probabilities.shape[-1]
-        overload = F.relu(usage_rows.detach().float() - threshold)
-        self._routing_balance_terms.append((current * overload).sum(dim=-1).mean())
+            load_rows = load_rows[usage_kind : usage_kind + 1]
+            bias_rows = bias_rows[usage_kind : usage_kind + 1]
+        experts = probabilities.shape[-1]
+        importance_threshold = self.expert_balance_cap / experts
+        load_threshold = self.expert_balance_cap * float(top_k) / experts
+        importance_overload = F.relu(
+            usage_rows.detach().float() - importance_threshold
+        )
+        load_overload = F.relu(
+            load_rows.detach().float() - load_threshold
+        )
+        # The dispatched output stays hard top-k, while every router logit gets
+        # gradient through the pre-top-k dense probability distribution.
+        overload = importance_overload + load_overload / max(1, int(top_k))
+        self._routing_balance_terms.append(
+            (current_dense * overload).sum(dim=-1).mean()
+        )
         entropy = -(
             probabilities.float().clamp_min(1e-8).log()
             * probabilities.float()
@@ -579,6 +723,16 @@ class ReferenceConditionedKVActivationGenerator(nn.Module):
             usage_rows.mul_(self.expert_usage_decay).add_(
                 current, alpha=1.0 - self.expert_usage_decay
             )
+            load_rows.mul_(self.expert_usage_decay).add_(
+                current_load, alpha=1.0 - self.expert_usage_decay
+            )
+            if self.expert_bias_update_rate:
+                excess = F.relu(load_rows.float() - load_threshold)
+                bias_rows.mul_(self.expert_bias_decay).add_(
+                    excess, alpha=-self.expert_bias_update_rate
+                )
+                bias_rows.sub_(bias_rows.mean(dim=-1, keepdim=True))
+                bias_rows.clamp_(-self.expert_bias_max, self.expert_bias_max)
 
     def routing_auxiliary(self) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         zero = next(self.parameters()).new_zeros((), dtype=torch.float32)
@@ -593,8 +747,18 @@ class ReferenceConditionedKVActivationGenerator(nn.Module):
             )
         if self.output_experts:
             metrics["kv_expert_max_usage"] = self.output_expert_usage.max().detach()
+            metrics["kv_expert_max_load"] = self.output_expert_load.max().detach()
+            metrics["kv_expert_bias_span"] = (
+                self.output_expert_selection_bias.amax(dim=-1)
+                - self.output_expert_selection_bias.amin(dim=-1)
+            ).max().detach()
         if self.stream_experts:
             metrics["qo_expert_max_usage"] = self.stream_expert_usage.max().detach()
+            metrics["qo_expert_max_load"] = self.stream_expert_load.max().detach()
+            metrics["qo_expert_bias_span"] = (
+                self.stream_expert_selection_bias.amax(dim=-1)
+                - self.stream_expert_selection_bias.amin(dim=-1)
+            ).max().detach()
         return balance, metrics
 
 
@@ -3048,6 +3212,8 @@ def train_direct_reference_kv_delta_320(
             accumulation_index = (micro_step - 1) % accumulation_steps
             accumulation_last = accumulation_index == accumulation_steps - 1
             relative_step = step - int(cfg.get("initial_step", 0))
+            if hasattr(model, "set_routing_step"):
+                model.set_routing_step(relative_step)
             if _direct_delta_flow_due(relative_step, human_flow):
                 assert flow_prefetched is not None
                 assert flow_injector is not None
@@ -4611,6 +4777,27 @@ def sample_expert_kvo_flow_10k(
         config,
         destination,
         sample_config_key="kv_reference_expert_kvo_flow_10k_sample",
+    )
+
+
+def train_scheduled_expert_kvo_balanced_flow_10k(
+    config: dict[str, Any], destination: Path
+) -> dict[str, Any]:
+    return train_scheduled_direct_reference_kv_delta_320(
+        config,
+        destination,
+        config_key="kv_reference_expert_kvo_balanced_flow_10k",
+        sample_config_key="kv_reference_expert_kvo_balanced_flow_10k_sample",
+    )
+
+
+def sample_expert_kvo_balanced_flow_10k(
+    config: dict[str, Any], destination: Path
+) -> dict[str, Any]:
+    return sample_direct_reference_kv_delta_320(
+        config,
+        destination,
+        sample_config_key="kv_reference_expert_kvo_balanced_flow_10k_sample",
     )
 
 

@@ -178,6 +178,69 @@ def test_sparse_expert_generator_can_disable_q_and_keep_o() -> None:
     assert torch.count_nonzero(o) > 0
 
 
+def test_dense_overload_balance_reaches_unselected_router_logits() -> None:
+    model = ReferenceConditionedKVActivationGenerator(
+        style_dim=16,
+        context_dim=12,
+        output_dim=20,
+        blocks=1,
+        hidden_dim=16,
+        heads=4,
+        ff_dim=32,
+        output_rank=2,
+        output_experts=8,
+        output_top_k=2,
+        output_init_scale=1e-3,
+        expert_balance_cap=1.5,
+    )
+    logits = torch.zeros(2, 2, 8, requires_grad=True)
+    indices, _, sparse, dense, selected = model._sparse_router(logits, 2)
+    model.output_expert_usage.zero_()
+    model.output_expert_load.zero_()
+    model.output_expert_usage[..., 0] = 0.75
+    model.output_expert_load[..., 0] = 1.0
+    model.reset_routing_records()
+    model._record_routing(
+        "kv",
+        model.output_expert_usage,
+        model.output_expert_load,
+        model.output_expert_selection_bias,
+        0,
+        sparse,
+        dense,
+        selected,
+        2,
+    )
+    balance, _ = model.routing_auxiliary()
+    balance.backward()
+    selected_experts = set(indices.flatten().tolist())
+    unselected = [index for index in range(8) if index not in selected_experts]
+    assert unselected
+    assert torch.count_nonzero(logits.grad[..., unselected]) > 0
+
+
+def test_selection_bias_changes_topk_but_not_selected_mixture_weights() -> None:
+    model = ReferenceConditionedKVActivationGenerator(
+        style_dim=16,
+        context_dim=12,
+        output_dim=20,
+        blocks=1,
+        hidden_dim=16,
+        heads=4,
+        ff_dim=32,
+        output_rank=2,
+        output_experts=4,
+        output_top_k=2,
+        output_init_scale=1e-3,
+    )
+    logits = torch.tensor([[[3.0, 2.0, 1.0, 0.0]]])
+    bias = torch.tensor([[0.0, 0.0, 4.0, 0.0]])
+    indices, weights, _, _, _ = model._sparse_router(logits, 2, bias)
+    assert 2 in indices.flatten().tolist()
+    expected = logits.gather(-1, indices).softmax(dim=-1)
+    assert torch.allclose(weights, expected)
+
+
 def test_final_effect_constraints_use_absolute_pairwise_cap_without_centering() -> None:
     teacher = torch.zeros(4, 1, 2, 4)
     for index in range(4):
