@@ -1858,6 +1858,18 @@ kv_reference_expert_kv_teacher_retrieval_1k_sample:
   checkpoint: kv_reference_expert_kv64x16_lossfree_teacher_retrieval_w768_l3_1k_v3/checkpoints/step-0001000.pt
   output_directory: diagnostics/kv-reference-expert-kv64x16-lossfree-teacher-retrieval-w768-l3-1k-v3-step1000
 
+kv_reference_expert_kv_teacher_retrieval_250_raw_sample:
+  checkpoint: kv_reference_expert_kv64x16_lossfree_teacher_retrieval_w768_l3_1k_v3/checkpoints/step-0000250.pt
+  output_directory: diagnostics/kv-reference-expert-kv64x16-lossfree-teacher-retrieval-w768-l3-1k-v3-step250-raw
+  device: cuda
+  artists: 8
+  references: 4
+  reference_seed: 20260829
+  strengths: [1.0, 2.0]
+  batch_size: 4
+  panel_tile_width: 384
+  use_ema: false
+
 # Reference-conditioned low-rank operator pilot. Unlike the direct activation
 # head above, the reference generates a fresh block-local linear operator and
 # applies it to every native text token.  Teacher factors remain offline

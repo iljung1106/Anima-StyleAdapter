@@ -153,6 +153,7 @@ def build_parser() -> argparse.ArgumentParser:
         ("kv-reference-expert-kv-teacher-functional-2k-sample", "Render final-velocity-trained K/V experts"),
         ("kv-reference-expert-kv-teacher-retrieval-1k-train", "Train K/V experts with artist-discriminative final velocity"),
         ("kv-reference-expert-kv-teacher-retrieval-1k-sample", "Render artist-discriminative final-velocity K/V experts"),
+        ("kv-reference-expert-kv-teacher-retrieval-250-raw-sample", "Render raw step-250 artist-discriminative K/V experts"),
         ("kv-reference-bilinear-smoke", "Smoke-test reference-conditioned bilinear K/V operators"),
         ("kv-reference-bilinear-train", "Train reference-conditioned bilinear K/V operators"),
         ("kv-reference-bilinear-sample", "Render reference-conditioned bilinear K/V operators"),
@@ -807,6 +808,7 @@ def main() -> None:
         "kv-reference-expert-kv-teacher-functional-2k-sample",
         "kv-reference-expert-kv-teacher-retrieval-1k-train",
         "kv-reference-expert-kv-teacher-retrieval-1k-sample",
+        "kv-reference-expert-kv-teacher-retrieval-250-raw-sample",
         "kv-reference-bilinear-smoke",
         "kv-reference-bilinear-train",
         "kv-reference-bilinear-sample",
@@ -876,6 +878,7 @@ def main() -> None:
             sample_expert_kv_teacher_functional_2k,
             train_scheduled_expert_kv_teacher_retrieval_1k,
             sample_expert_kv_teacher_retrieval_1k,
+            sample_expert_kv_teacher_retrieval_250_raw,
         )
         from .kv_activation_sampling import (
             evaluate_kv_activation_reference_generalization,
@@ -948,6 +951,7 @@ def main() -> None:
             "kv-reference-expert-kv-teacher-functional-2k-sample": sample_expert_kv_teacher_functional_2k,
             "kv-reference-expert-kv-teacher-retrieval-1k-train": train_scheduled_expert_kv_teacher_retrieval_1k,
             "kv-reference-expert-kv-teacher-retrieval-1k-sample": sample_expert_kv_teacher_retrieval_1k,
+            "kv-reference-expert-kv-teacher-retrieval-250-raw-sample": sample_expert_kv_teacher_retrieval_250_raw,
             "kv-reference-bilinear-smoke": smoke_test_reference_conditioned_bilinear_kv_operator,
             "kv-reference-bilinear-train": train_reference_conditioned_bilinear_kv_operator,
             "kv-reference-bilinear-sample": sample_reference_conditioned_bilinear_kv_operator,

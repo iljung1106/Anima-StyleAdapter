@@ -5723,6 +5723,16 @@ def sample_expert_kv_teacher_retrieval_1k(
     )
 
 
+def sample_expert_kv_teacher_retrieval_250_raw(
+    config: dict[str, Any], destination: Path
+) -> dict[str, Any]:
+    return sample_direct_reference_kv_delta_320(
+        config,
+        destination,
+        sample_config_key="kv_reference_expert_kv_teacher_retrieval_250_raw_sample",
+    )
+
+
 def train_functional_reference_kv_operator(
     config: dict[str, Any],
     destination: Path,
