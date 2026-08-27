@@ -5514,6 +5514,27 @@ def sample_expert_kvo_artist_invariant_flow_5k(
     )
 
 
+def train_scheduled_expert_kvo_flow_aligned_2k(
+    config: dict[str, Any], destination: Path
+) -> dict[str, Any]:
+    return train_scheduled_direct_reference_kv_delta_320(
+        config,
+        destination,
+        config_key="kv_reference_expert_kvo_flow_aligned_2k",
+        sample_config_key="kv_reference_expert_kvo_flow_aligned_2k_sample",
+    )
+
+
+def sample_expert_kvo_flow_aligned_2k(
+    config: dict[str, Any], destination: Path
+) -> dict[str, Any]:
+    return sample_direct_reference_kv_delta_320(
+        config,
+        destination,
+        sample_config_key="kv_reference_expert_kvo_flow_aligned_2k_sample",
+    )
+
+
 def train_functional_reference_kv_operator(
     config: dict[str, Any],
     destination: Path,
