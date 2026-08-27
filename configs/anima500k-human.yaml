@@ -1460,7 +1460,7 @@ kv_reference_expert_kvo_balanced_flow_10k_sample:
 # must produce the same functional K/V/O effect on a shared probe.
 kv_reference_expert_kvo_specialized_flow_10k:
   extends_config_key: kv_reference_expert_kvo_balanced_flow_10k
-  output_directory: kv_reference_expert_kv64x16_o16x16_specialized_consistent_w768_l3_flow_10k_v1
+  output_directory: kv_reference_expert_kv64x16_o16x16_specialized_consistent_w768_l3_flow_10k_v2
   seed: 20260827
   model:
     expert_balance_cap: 3.0
@@ -1485,17 +1485,17 @@ kv_reference_expert_kvo_specialized_flow_10k:
       same_artist_cosine_floor: 0.75
       same_artist_rms_ratio_tolerance: 1.5
       same_artist_magnitude_weight: 0.25
-    sample_output_root: diagnostics/kv-reference-expert-kv64x16-o16x16-specialized-consistent-w768-l3-flow-10k-v1
+    sample_output_root: diagnostics/kv-reference-expert-kv64x16-o16x16-specialized-consistent-w768-l3-flow-10k-v2
     resume: true
     wandb:
       enabled: true
       project: anima-style-adapter
-      name: kv-reference-expert-kv64x16-o16x16-specialized-consistent-w768-l3-flow-10k-v1
-      id: kv-reference-expert-kv64x16-o16x16-specialized-consistent-w768-l3-flow-10k-v1
+      name: kv-reference-expert-kv64x16-o16x16-specialized-consistent-w768-l3-flow-10k-v2
+      id: kv-reference-expert-kv64x16-o16x16-specialized-consistent-w768-l3-flow-10k-v2
 
 kv_reference_expert_kvo_specialized_flow_10k_sample:
-  checkpoint: kv_reference_expert_kv64x16_o16x16_specialized_consistent_w768_l3_flow_10k_v1/checkpoints/step-0010000.pt
-  output_directory: diagnostics/kv-reference-expert-kv64x16-o16x16-specialized-consistent-w768-l3-flow-10k-v1-step10000
+  checkpoint: kv_reference_expert_kv64x16_o16x16_specialized_consistent_w768_l3_flow_10k_v2/checkpoints/step-0010000.pt
+  output_directory: diagnostics/kv-reference-expert-kv64x16-o16x16-specialized-consistent-w768-l3-flow-10k-v2-step10000
   device: cuda
   artists: 8
   references: 4
