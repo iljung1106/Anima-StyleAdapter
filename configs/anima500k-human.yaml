@@ -2529,6 +2529,7 @@ kv_reference_expert_external_velocity_5k:
     steps: 5000
     blocks_per_step: 0
     materialized_reference_bank_cache: kv_reference_expert_external_velocity_v14_reference_banks
+    materialization_local_cache_directory: /tmp/anima-external-training-reference-tokens
     validation_every: 500
     checkpoint_every: 500
     sample_every: 0

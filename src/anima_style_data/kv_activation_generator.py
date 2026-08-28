@@ -12,6 +12,7 @@ import copy
 import gc
 import math
 import random
+import shutil
 import time
 from collections import defaultdict
 from pathlib import Path
@@ -2926,6 +2927,43 @@ def _materialize_reference_token_bank(
     return torch.cat(chunks, dim=0)
 
 
+def _stage_reference_token_cache(source: Path, target: Path) -> Path:
+    """Copy an immutable token cache to local storage using sequential I/O."""
+
+    target.mkdir(parents=True, exist_ok=True)
+    files = [source / "manifest.parquet", *sorted(source.glob("part-*.safetensors"))]
+    if not files[0].exists() or len(files) == 1:
+        raise FileNotFoundError(f"Incomplete reference token cache: {source}")
+    total_bytes = sum(path.stat().st_size for path in files)
+    copied_bytes = 0
+    started = time.perf_counter()
+    for index, source_path in enumerate(files):
+        target_path = target / source_path.name
+        size = source_path.stat().st_size
+        if not target_path.exists() or target_path.stat().st_size != size:
+            temporary = target_path.with_suffix(target_path.suffix + ".tmp")
+            shutil.copyfile(source_path, temporary)
+            temporary.replace(target_path)
+            copied_bytes += size
+        if copied_bytes and (
+            index == len(files) - 1 or copied_bytes // 2**30 > (copied_bytes - size) // 2**30
+        ):
+            elapsed = max(time.perf_counter() - started, 1e-6)
+            print(
+                f"staging reference tokens {target.name}: "
+                f"{copied_bytes / 2**30:.1f}/{total_bytes / 2**30:.1f} GiB "
+                f"({copied_bytes / elapsed / 2**20:.1f} MiB/s)",
+                flush=True,
+            )
+    if copied_bytes == 0:
+        print(
+            f"reused local reference tokens {target.name}: "
+            f"{total_bytes / 2**30:.1f} GiB",
+            flush=True,
+        )
+    return target
+
+
 def _select_reference_tokens(
     bank: torch.Tensor,
     artist_indices: list[int],
@@ -3189,6 +3227,27 @@ def train_direct_reference_kv_delta_320(
         if contiguous_cache_value
         else None
     )
+    local_materialization_value = training.get(
+        "materialization_local_cache_directory"
+    )
+    local_materialization_root = (
+        Path(str(local_materialization_value))
+        if local_materialization_value
+        else None
+    )
+    staged_reference_roots: dict[str, Path] = {}
+
+    def local_reference_root(source: Path, label: str) -> Path:
+        if local_materialization_root is None:
+            return source
+        key = str(source.resolve())
+        cached = staged_reference_roots.get(key)
+        if cached is None:
+            cached = _stage_reference_token_cache(
+                source, local_materialization_root / label
+            )
+            staged_reference_roots[key] = cached
+        return cached
     single_images = int(training.get("single_reference_images", 8))
     mixture_images = int(training.get("mixture_reference_images", 4))
     single_counts = [
@@ -3323,6 +3382,10 @@ def train_direct_reference_kv_delta_320(
                     if isinstance(cache_values, list)
                     else [destination / str(cache_values)]
                 )
+                roots = [
+                    local_reference_root(root, f"native-{domain}-{index}")
+                    for index, root in enumerate(roots)
+                ]
                 available = {
                     str(row["style_id"])
                     for root in roots
@@ -3366,7 +3429,10 @@ def train_direct_reference_kv_delta_320(
                 ]
         if external_domains_enabled:
             external_cfg = dict(multi_domain["external_lora"])
-            external_root = destination / str(external_cfg["reference_cache"])
+            external_root = local_reference_root(
+                destination / str(external_cfg["reference_cache"]),
+                "external-lora",
+            )
             external_manifest = read_records(external_root / "manifest.parquet")
             external_style_ids = list(
                 dict.fromkeys(str(row["style_id"]) for row in external_manifest)
@@ -3671,6 +3737,12 @@ def train_direct_reference_kv_delta_320(
                 )
             ),
         })
+        flow_token_source = destination / str(
+            flow_loader_cfg["resampler_token_cache"]
+        )
+        flow_loader_cfg["resampler_token_cache"] = str(
+            local_reference_root(flow_token_source, "flow-human")
+        )
         if human_flow.get("style_manifest") is not None:
             flow_loader_cfg["style_manifest"] = str(
                 human_flow["style_manifest"]
