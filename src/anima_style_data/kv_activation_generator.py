@@ -5168,7 +5168,10 @@ def train_direct_reference_kv_delta_320(
             functional_context = query_bank.context(query_content)[None].expand(
                 batch, -1, -1
             )
-            curriculum = _whole_model_curriculum(relative_step)
+            curriculum = _whole_model_curriculum(
+                relative_step
+                + int(whole_model.get("rms_curriculum_step_offset", 0))
+            )
             curriculum["block_weight"] *= float(
                 whole_model.get("block_weight_scale", 1.0)
             )
@@ -6843,8 +6846,8 @@ def train_scheduled_expert_external_velocity_5k(
     return train_scheduled_direct_reference_kv_delta_320(
         config,
         destination,
-        config_key="kv_reference_expert_external_velocity_5k",
-        sample_config_key="kv_reference_expert_external_velocity_5k_sample",
+        config_key="kv_reference_expert_combined_rms_1500",
+        sample_config_key="kv_reference_expert_combined_rms_1500_sample",
     )
 
 
@@ -6854,7 +6857,7 @@ def sample_expert_external_velocity_5k(
     return sample_direct_reference_kv_delta_320(
         config,
         destination,
-        sample_config_key="kv_reference_expert_external_velocity_5k_sample",
+        sample_config_key="kv_reference_expert_combined_rms_1500_sample",
     )
 
 

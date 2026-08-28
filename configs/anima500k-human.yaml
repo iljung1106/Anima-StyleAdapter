@@ -2637,6 +2637,58 @@ kv_reference_expert_external_velocity_5k_sample:
   panel_style_cache: "."
   panel_style_manifest: final_manifest.parquet
 
+# v17 demonstrated that resetting the optimizer step also reset the RMS band to
+# its permissive 0.40 early-training floor. That let the external held-out
+# effect RMS fall from 0.62 to 0.53 despite warm-starting from the v16 optimum.
+# Keep the mature 0.75-1.25 band from the first update, strengthen only that
+# hinge, and return retrieval to a moderate weight so this experiment isolates
+# effect strength rather than changing the architecture or data mixture.
+kv_reference_expert_combined_rms_1500:
+  extends_config_key: kv_reference_expert_external_velocity_5k
+  output_directory: kv_reference_expert_combined_rms_b3_w768_l3_1500_v18
+  initial_checkpoint: kv_reference_expert_combined_velocity_b3_w768_l3_5k_v16/checkpoints/step-0001000.pt
+  initial_step: 0
+  reset_initial_step: true
+  training:
+    steps: 1500
+    validation_every: 250
+    checkpoint_every: 250
+    sample_steps: [250, 500, 1000, 1500]
+    sample_output_root: diagnostics/kv-reference-expert-combined-rms-b3-w768-l3-1500-v18
+    multi_domain_distillation:
+      loss_by_domain:
+        artist_synthetic: {huber_weight: 1.0, direction_weight: 1.0, retrieval_weight: 0.75}
+        artist_human: {huber_weight: 0.4, direction_weight: 1.0, retrieval_weight: 0.75}
+        lora_synthetic: {huber_weight: 1.0, direction_weight: 1.0, retrieval_weight: 0.75}
+        lora_human: {huber_weight: 0.4, direction_weight: 1.0, retrieval_weight: 0.75}
+        lora_mixture: {huber_weight: 1.0, direction_weight: 1.0, retrieval_weight: 1.0}
+        external_single: {huber_weight: 1.0, direction_weight: 1.0, retrieval_weight: 1.0}
+        external_mixture: {huber_weight: 1.0, direction_weight: 1.0, retrieval_weight: 1.0}
+    whole_model_functional:
+      rms_curriculum_step_offset: 2000
+      constraint_weight: 1.0
+      rms_band_weight: 2.0
+      relative_common_weight: 0.50
+    wandb:
+      enabled: true
+      project: anima-style-adapter
+      name: kv-reference-expert-combined-rms-b3-w768-l3-1500-v18
+      id: kv-reference-expert-combined-rms-b3-w768-l3-1500-v18
+      resume: allow
+
+kv_reference_expert_combined_rms_1500_sample:
+  checkpoint: kv_reference_expert_combined_rms_b3_w768_l3_1500_v18/checkpoints/step-0001500.pt
+  output_directory: diagnostics/kv-reference-expert-combined-rms-b3-w768-l3-1500-v18-step1500
+  device: cuda
+  artists: 8
+  references: 4
+  reference_seed: 20260909
+  strengths: [1.0, 2.0]
+  batch_size: 4
+  panel_tile_width: 384
+  panel_style_cache: "."
+  panel_style_manifest: final_manifest.parquet
+
 # Reference-conditioned low-rank operator pilot. Unlike the direct activation
 # head above, the reference generates a fresh block-local linear operator and
 # applies it to every native text token.  Teacher factors remain offline
