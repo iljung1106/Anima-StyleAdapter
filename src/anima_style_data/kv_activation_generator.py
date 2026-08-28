@@ -3069,6 +3069,7 @@ def train_direct_reference_kv_delta_320(
     from .kv_activation_sampling import NativeKVActivationInjector
     from .lora_functional_distillation import FunctionalLoRATeacherBank
     from .native_centered_teacher import NativeCenteredTeacherBank
+    from .native_centered_kv_training import _cached_reference_bank
     from .kv_real_query_distillation import _RealQueryBank
     from .query_style_tokenizer import _sampling_reference_inputs
     from .style_transfer import (
@@ -3165,6 +3166,12 @@ def train_direct_reference_kv_delta_320(
     reader_parameters = _open_direct_delta_reader(reader)
     chunk = int(training.get("materialization_style_chunk", 16))
     token_lru = int(training.get("token_lru_shards", 8))
+    contiguous_cache_value = training.get("materialized_reference_bank_cache")
+    contiguous_cache_root = (
+        destination / str(contiguous_cache_value)
+        if contiguous_cache_value
+        else None
+    )
     single_images = int(training.get("single_reference_images", 8))
     mixture_images = int(training.get("mixture_reference_images", 4))
     single_bank = None
@@ -3198,9 +3205,16 @@ def train_direct_reference_kv_delta_320(
                 references=single_images, seed=domain_seed,
                 token_lru_shards=token_lru, strict_style_ids=True,
             )
-            single_banks[str(domain)] = _materialize_reference_token_bank(
-                single_loader, artist_ids, references=single_images,
-                seed=domain_seed, chunk_size=chunk, device=device,
+            single_banks[str(domain)] = _cached_reference_bank(
+                single_loader,
+                artist_ids,
+                references=single_images,
+                seed=domain_seed,
+                chunk_size=chunk,
+                device=device,
+                cache_root=contiguous_cache_root,
+                split=f"lora-{domain}",
+                source=str(destination / str(cache_value)),
             )
         # Keep the established LoRA validation path on Human references when
         # both domains are active.  The per-update scheduler selects the exact
@@ -3215,10 +3229,17 @@ def train_direct_reference_kv_delta_320(
                 seed=seed ^ (sum(map(ord, kind)) * 1_000_003),
                 token_lru_shards=token_lru, strict_style_ids=True,
             )
-            mixture_banks[kind] = _materialize_reference_token_bank(
-                loader, style_ids, references=mixture_images,
-                seed=seed ^ (sum(map(ord, kind)) * 1_000_003),
-                chunk_size=chunk, device=device,
+            mixture_seed = seed ^ (sum(map(ord, kind)) * 1_000_003)
+            mixture_banks[kind] = _cached_reference_bank(
+                loader,
+                style_ids,
+                references=mixture_images,
+                seed=mixture_seed,
+                chunk_size=chunk,
+                device=device,
+                cache_root=contiguous_cache_root,
+                split=f"mixture-{kind}",
+                source=str(destination / str(cfg["mixture_reference_cache"])),
             )
         if multi_domain_enabled:
             native_bank = NativeCenteredTeacherBank.load(
@@ -3268,11 +3289,16 @@ def train_direct_reference_kv_delta_320(
                     references=single_images, seed=domain_seed,
                     token_lru_shards=token_lru, strict_style_ids=True,
                 )
-                native_reference_banks[str(domain)] = (
-                    _materialize_reference_token_bank(
-                        loader, domain_ids, references=single_images,
-                        seed=domain_seed, chunk_size=chunk, device=device,
-                    )
+                native_reference_banks[str(domain)] = _cached_reference_bank(
+                    loader,
+                    domain_ids,
+                    references=single_images,
+                    seed=domain_seed,
+                    chunk_size=chunk,
+                    device=device,
+                    cache_root=contiguous_cache_root,
+                    split=f"native-{domain}",
+                    source="|".join(str(root) for root in roots),
                 )
                 native_reference_teacher_indices[str(domain)] = [
                     native_bank.artist_to_index[style_id]
@@ -3470,6 +3496,9 @@ def train_direct_reference_kv_delta_320(
             split=str(detail_cfg.get("train_split", "train")),
         )
         flow_loader_cfg.update({
+            "style_cache": str(
+                human_flow.get("style_cache", flow_loader_cfg["style_cache"])
+            ),
             "batch_size": int(human_flow.get("batch_size", 4)),
             "same_style_target_min": int(
                 human_flow.get("same_style_target_min", 1)

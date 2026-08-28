@@ -2378,6 +2378,9 @@ kv_reference_expert_kv_raw_multidomain_10k:
     batch_size: 3
     gradient_accumulation_steps: 1
     blocks_per_step: 0
+    # Materialize the many small token shards once. Scheduled sampling restarts
+    # the trainer, so subsequent segments load these contiguous banks directly.
+    materialized_reference_bank_cache: kv_reference_expert_kv64x16_raw_multidomain_v13_reference_banks
     single_reference_images: 4
     mixture_reference_images: 4
     validation_every: 500
@@ -2432,6 +2435,9 @@ kv_reference_expert_kv_raw_multidomain_10k:
       expert_balance_weight: 0.001
     human_flow:
       enabled: true
+      # The dual-query manifest contains the same image/artist/split index the
+      # grouped Flow loader needs; the deleted 467 GB feature tensors do not.
+      style_cache: dual_query_reference_tokens_v8_step10000
       batch_size: 3
       same_style_target_min: 2
       same_style_target_max: 3
