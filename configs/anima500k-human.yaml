@@ -2437,9 +2437,9 @@ kv_reference_expert_kv_raw_multidomain_10k:
       expert_balance_weight: 0.001
     human_flow:
       enabled: true
-      # The dual-query manifest contains the same image/artist/split index the
-      # grouped Flow loader needs; the deleted 467 GB feature tensors do not.
-      style_cache: dual_query_reference_tokens_v8_step10000
+      # The root final_manifest supplies image/artist/split metadata and real
+      # local paths. Frozen visual tensors still come from the token cache.
+      style_cache: "."
       batch_size: 3
       same_style_target_min: 2
       same_style_target_max: 3
@@ -2508,6 +2508,9 @@ kv_reference_expert_kv_raw_multidomain_10k_sample:
   strengths: [1.0, 2.0]
   batch_size: 4
   panel_tile_width: 384
+  # Preserve the historical real-image target/reference rows without restoring
+  # the deleted 467 GB feature cache.
+  panel_style_cache: "."
 
 # Reference-conditioned low-rank operator pilot. Unlike the direct activation
 # head above, the reference generates a fresh block-local linear operator and

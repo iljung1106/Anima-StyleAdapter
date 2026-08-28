@@ -6069,8 +6069,11 @@ def sample_direct_reference_kv_delta_320(
 
     detail_cfg = dict(config["detail_preserving_style_cross_attention"])
     panel_loaders = []
+    panel_style_cache = sample_cfg.get("panel_style_cache")
     for split in (str(detail_cfg.get("train_split", "train")), str(detail_cfg.get("validation_split", "validation"))):
         loader_cfg = _loader_config(config, detail_cfg, split=split)
+        if panel_style_cache is not None:
+            loader_cfg["style_cache"] = str(panel_style_cache)
         loader_cfg["ram_resident_tokens"] = False
         panel_loaders.append(MultiPromptDualQueryCachedStyleLoader(destination, loader_cfg))
     panel_sampling = dict(detail_cfg.get("sampling", {}))
