@@ -2276,6 +2276,7 @@ kv_reference_expert_kv_native_centered_750:
       final_lr: 0.0000001
     native_centered:
       teacher_config_key: dual_domain_native_teacher
+      reference_bank_cache: native_centered_reference_tokens_4_v1
       reference_images: 4
       reference_counts: [1, 2, 4]
       reference_count_weights: [0.30, 0.30, 0.40]
@@ -2311,6 +2312,46 @@ kv_reference_expert_kv_native_centered_750:
 kv_reference_expert_kv_native_centered_750_sample:
   checkpoint: kv_reference_expert_kv64x16_native_centered_b3_w768_l3_750_v12/checkpoints/step-0000750.pt
   output_directory: diagnostics/kv-reference-expert-kv64x16-native-centered-b3-w768-l3-750-v12-step750
+  device: cuda
+  artists: 8
+  references: 4
+  reference_seed: 20260907
+  strengths: [1.0, 2.0]
+  batch_size: 4
+  panel_tile_width: 384
+
+# Long coverage run continuing the step-625 v12 checkpoint. Batch three needs
+# roughly 1,334 updates to expose all 4k train artists once; 4,500 native
+# updates provide about 3.4 population passes. Samples remain 500 updates apart.
+kv_reference_expert_kv_native_centered_5k:
+  extends_config_key: kv_reference_expert_kv_native_centered_750
+  training:
+    steps: 5000
+    validation_every: 100
+    checkpoint_every: 500
+    sample_steps: [1125, 1625, 2125, 2625, 3125, 3625, 4125, 4625, 5000]
+    sample_output_root: diagnostics/kv-reference-expert-kv64x16-native-centered-b3-w768-l3-5k-v12
+    generator_lr_schedule:
+      peak_lr: 0.000002
+      warmup_steps: 25
+      decay_start_step: 3000
+      decay_end_step: 4500
+      final_lr: 0.0000002
+    reader_lr_schedule:
+      peak_lr: 0.000001
+      warmup_steps: 25
+      decay_start_step: 1500
+      decay_end_step: 4000
+      final_lr: 0.0000001
+    wandb:
+      enabled: true
+      project: anima-style-adapter
+      name: kv-reference-expert-kv64x16-native-centered-b3-w768-l3-5k-v12
+      id: kv-reference-expert-kv64x16-native-centered-b3-w768-l3-5k-v12
+
+kv_reference_expert_kv_native_centered_5k_sample:
+  checkpoint: kv_reference_expert_kv64x16_native_centered_b3_w768_l3_750_v12/checkpoints/step-0005000.pt
+  output_directory: diagnostics/kv-reference-expert-kv64x16-native-centered-b3-w768-l3-5k-v12-step5000
   device: cuda
   artists: 8
   references: 4

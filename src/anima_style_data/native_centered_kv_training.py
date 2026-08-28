@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import gc
+import hashlib
 import math
 import random
 import time
@@ -13,6 +14,7 @@ from typing import Any
 
 import torch
 import torch.nn.functional as F
+from safetensors.torch import load_file, save_file
 
 from .dual_query_style_tokenizer import CachedTeacherReferenceLoader
 from .io import write_json
@@ -58,6 +60,74 @@ def fixed_train_population_target(
         int(content_index), int(timestep_index)
     ].float()
     return selected - offset
+
+
+def _reference_bank_signature(
+    style_ids: list[str], *, references: int, seed: int, source: str
+) -> dict[str, Any]:
+    digest = hashlib.sha256("\n".join(style_ids).encode("utf-8")).hexdigest()
+    return {
+        "styles": len(style_ids),
+        "style_ids_sha256": digest,
+        "references": int(references),
+        "seed": int(seed),
+        "source": str(source),
+    }
+
+
+def _cached_reference_bank(
+    loader: CachedTeacherReferenceLoader,
+    style_ids: list[str],
+    *,
+    references: int,
+    seed: int,
+    chunk_size: int,
+    device: str,
+    cache_root: Path | None,
+    split: str,
+    source: str,
+) -> torch.Tensor:
+    signature = _reference_bank_signature(
+        style_ids, references=references, seed=seed, source=source
+    )
+    tensor_path = cache_root / f"{split}.safetensors" if cache_root else None
+    summary_path = cache_root / f"{split}.json" if cache_root else None
+    if tensor_path is not None and summary_path is not None:
+        if tensor_path.exists() and summary_path.exists():
+            import json
+
+            summary = json.loads(summary_path.read_text(encoding="utf-8"))
+            if summary.get("signature") == signature:
+                values = load_file(tensor_path, device="cpu")["tokens"]
+                print(
+                    f"reused contiguous native reference bank {split}: "
+                    f"{tuple(values.shape)}",
+                    flush=True,
+                )
+                return values.to(
+                    device=device, dtype=torch.bfloat16, non_blocking=True
+                )
+    values = _materialize_reference_token_bank(
+        loader,
+        style_ids,
+        references=references,
+        seed=seed,
+        chunk_size=chunk_size,
+        device=device,
+    )
+    if tensor_path is not None and summary_path is not None:
+        cache_root.mkdir(parents=True, exist_ok=True)
+        cpu_values = values.detach().to(device="cpu", dtype=torch.bfloat16).contiguous()
+        temporary = tensor_path.with_name(f".{tensor_path.name}.tmp")
+        save_file({"tokens": cpu_values}, temporary)
+        temporary.replace(tensor_path)
+        write_json(
+            summary_path,
+            {"signature": signature, "tensor_shape": list(cpu_values.shape)},
+        )
+        del cpu_values
+        print(f"cached contiguous native reference bank {split}: {tensor_path}", flush=True)
+    return values
 
 
 def _scheduled_lr(relative_step: int, config: dict[str, Any]) -> float:
@@ -161,21 +231,31 @@ def train_native_centered_reference_kv(
         token_lru_shards=token_lru,
         strict_style_ids=True,
     )
-    train_reference_bank = _materialize_reference_token_bank(
+    cache_root_value = native_cfg.get("reference_bank_cache")
+    cache_root = (
+        destination / str(cache_root_value) if cache_root_value else None
+    )
+    train_reference_bank = _cached_reference_bank(
         train_loader,
         train_style_ids,
         references=reference_images,
         seed=seed ^ 0x54524149,
         chunk_size=chunk,
         device=device,
+        cache_root=cache_root,
+        split="train",
+        source=str(cfg["single_reference_cache"]),
     )
-    validation_reference_bank = _materialize_reference_token_bank(
+    validation_reference_bank = _cached_reference_bank(
         validation_loader,
         validation_style_ids,
         references=reference_images,
         seed=seed ^ 0x56414C49,
         chunk_size=chunk,
         device=device,
+        cache_root=cache_root,
+        split="validation",
+        source=str(cfg["single_reference_cache"]),
     )
 
     initial = torch.load(
@@ -556,11 +636,13 @@ def train_native_centered_reference_kv(
     return summary
 
 
-def train_scheduled_native_centered_reference_kv(
-    config: dict[str, Any], destination: Path
+def _train_scheduled_native_centered_reference_kv(
+    config: dict[str, Any],
+    destination: Path,
+    *,
+    config_key: str,
+    sample_key: str,
 ) -> dict[str, Any]:
-    config_key = "kv_reference_expert_kv_native_centered_750"
-    sample_key = "kv_reference_expert_kv_native_centered_750_sample"
     cfg = _resolved_experiment_config(config, config_key)
     training = dict(cfg["training"])
     steps = int(training["steps"])
@@ -610,6 +692,28 @@ def train_scheduled_native_centered_reference_kv(
     }
 
 
+def train_scheduled_native_centered_reference_kv(
+    config: dict[str, Any], destination: Path
+) -> dict[str, Any]:
+    return _train_scheduled_native_centered_reference_kv(
+        config,
+        destination,
+        config_key="kv_reference_expert_kv_native_centered_750",
+        sample_key="kv_reference_expert_kv_native_centered_750_sample",
+    )
+
+
+def train_scheduled_native_centered_reference_kv_5k(
+    config: dict[str, Any], destination: Path
+) -> dict[str, Any]:
+    return _train_scheduled_native_centered_reference_kv(
+        config,
+        destination,
+        config_key="kv_reference_expert_kv_native_centered_5k",
+        sample_key="kv_reference_expert_kv_native_centered_5k_sample",
+    )
+
+
 def sample_native_centered_reference_kv(
     config: dict[str, Any], destination: Path
 ) -> dict[str, Any]:
@@ -617,4 +721,14 @@ def sample_native_centered_reference_kv(
         config,
         destination,
         sample_config_key="kv_reference_expert_kv_native_centered_750_sample",
+    )
+
+
+def sample_native_centered_reference_kv_5k(
+    config: dict[str, Any], destination: Path
+) -> dict[str, Any]:
+    return sample_direct_reference_kv_delta_320(
+        config,
+        destination,
+        sample_config_key="kv_reference_expert_kv_native_centered_5k_sample",
     )
