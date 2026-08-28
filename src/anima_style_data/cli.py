@@ -839,6 +839,8 @@ def main() -> None:
         "kv-reference-expert-kv-teacher-flow-hybrid-b3-1k-sample",
         "kv-reference-expert-kv-human-teacher-500-train",
         "kv-reference-expert-kv-human-teacher-500-sample",
+        "kv-reference-expert-kv-human-teacher-flow-1k-train",
+        "kv-reference-expert-kv-human-teacher-flow-1k-sample",
         "kv-reference-bilinear-smoke",
         "kv-reference-bilinear-train",
         "kv-reference-bilinear-sample",
