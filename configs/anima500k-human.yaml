@@ -2871,7 +2871,7 @@ external_lora_reader_calibration:
 # the Reader is replaced by the independently calibrated EMA state.
 kv_reference_expert_external_calibrated_2000:
   extends_config_key: kv_reference_expert_external_reader_fp32_1000
-  output_directory: kv_reference_expert_external_calibrated_b3_w768_l3_2k_v22
+  output_directory: kv_reference_expert_external_calibrated_b3_w768_l3_2k_v23
   initial_checkpoint: kv_reference_expert_external_reader_fp32_b3_w768_l3_1k_v19/checkpoints/step-0000500.pt
   initial_use_ema_model: true
   initial_use_ema_reader: false
@@ -2890,7 +2890,13 @@ kv_reference_expert_external_calibrated_2000:
     validation_every: 250
     checkpoint_every: 250
     sample_steps: [250, 500, 1000, 1500, 2000]
-    sample_output_root: diagnostics/kv-reference-expert-external-calibrated-b3-w768-l3-2k-v22
+    sample_output_root: diagnostics/kv-reference-expert-external-calibrated-b3-w768-l3-2k-v23
+    # The calibrated Reader's observed early norm is 22-48.  The inherited
+    # fixed threshold 12 clipped every update, so collect its real distribution
+    # first and then clip only beyond a trailing p99 envelope.
+    reader_max_grad_norm: 100.0
+    adaptive_clip:
+      reader: {minimum_history: 50, window: 500, quantile: 0.99, multiplier: 1.5, floor: 20.0}
     multi_domain_distillation:
       schedule: [external_single, artist_synthetic, external_single, artist_human, external_mixture, external_single, artist_synthetic, external_mixture, artist_human]
     whole_model_functional:
@@ -2930,13 +2936,13 @@ kv_reference_expert_external_calibrated_2000:
     wandb:
       enabled: true
       project: anima-style-adapter
-      name: kv-reference-expert-external-calibrated-b3-w768-l3-2k-v22
-      id: kv-reference-expert-external-calibrated-b3-w768-l3-2k-v22
+      name: kv-reference-expert-external-calibrated-b3-w768-l3-2k-v23
+      id: kv-reference-expert-external-calibrated-b3-w768-l3-2k-v23
       resume: allow
 
 kv_reference_expert_external_calibrated_2000_sample:
-  checkpoint: kv_reference_expert_external_calibrated_b3_w768_l3_2k_v22/checkpoints/step-0002000.pt
-  output_directory: diagnostics/kv-reference-expert-external-calibrated-b3-w768-l3-2k-v22-step2000
+  checkpoint: kv_reference_expert_external_calibrated_b3_w768_l3_2k_v23/checkpoints/step-0002000.pt
+  output_directory: diagnostics/kv-reference-expert-external-calibrated-b3-w768-l3-2k-v23-step2000
   device: cuda
   artists: 8
   references: 4
