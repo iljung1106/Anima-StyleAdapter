@@ -7,8 +7,10 @@ import json
 import random
 import sys
 import time
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager
 from pathlib import Path
+from threading import Lock
 from typing import Any, Iterator
 
 import torch
@@ -29,11 +31,22 @@ class _ExternalAdapterPool:
     """Construct each external adapter once and keep inactive weights in CPU RAM."""
 
     def __init__(
-        self, config: dict[str, Any], anima: torch.nn.Module, device: str
+        self,
+        config: dict[str, Any],
+        anima: torch.nn.Module,
+        device: str,
+        *,
+        prefetch_workers: int = 4,
     ) -> None:
         self.anima = anima
         self.device = device
         self.networks: dict[int, torch.nn.Module] = {}
+        self.pending: dict[int, Future[tuple[torch.nn.Module, int]]] = {}
+        self.lock = Lock()
+        self.executor = ThreadPoolExecutor(
+            max_workers=max(1, int(prefetch_workers)),
+            thread_name_prefix="external-lora",
+        )
         self.cache_hits = 0
         self.cache_misses = 0
         sd_root = Path(str(config["anima_cache"]["sd_scripts_path"])).resolve()
@@ -47,14 +60,7 @@ class _ExternalAdapterPool:
             ) from error
         self.create_network_from_weights = create_network_from_weights
 
-    def _load(self, item: dict[str, Any]) -> tuple[torch.nn.Module, int]:
-        index = int(item["index"])
-        if index in self.networks:
-            self.cache_hits += 1
-            network = self.networks[index]
-            return network, len(network.unet_loras)
-
-        self.cache_misses += 1
+    def _build(self, item: dict[str, Any]) -> tuple[torch.nn.Module, int]:
         state = _normalize_external_lora_state(
             load_file(str(item["resolved_weight_path"]), device="cpu")
         )
@@ -75,24 +81,42 @@ class _ExternalAdapterPool:
                 f"{item['style_id']} has {len(missing)} unmatched Anima modules; "
                 f"first={missing[:3]}"
             )
-        network.apply_to([], self.anima, apply_text_encoder=False, apply_unet=True)
-        incompatible = network.load_state_dict(state, strict=False)
-        unexpected_unet = [
-            key
-            for key in incompatible.unexpected_keys
-            if key.startswith("lora_unet_")
-        ]
-        if unexpected_unet:
-            network.restore()
-            raise RuntimeError(
-                f"{item['style_id']} has unexpected Anima keys: "
-                f"{unexpected_unet[:3]}"
-            )
-        network.restore()
+        # create_network_from_weights has already copied every tensor through
+        # make_module_from_state_dict. Register the adapter modules without
+        # patching Anima or redundantly loading the full state dict a second time.
+        network.text_encoder_loras = []
+        network.loras = list(network.unet_loras)
+        for module in network.loras:
+            network.add_module(str(module.lora_name), module)
         network.to(device="cpu", dtype=torch.bfloat16).requires_grad_(False).eval()
-        self.networks[index] = network
         del state
         return network, len(actual)
+
+    def prefetch(self, item: dict[str, Any]) -> None:
+        index = int(item["index"])
+        with self.lock:
+            if index in self.networks or index in self.pending:
+                return
+            self.cache_misses += 1
+            self.pending[index] = self.executor.submit(self._build, item)
+
+    def _load(self, item: dict[str, Any]) -> tuple[torch.nn.Module, int]:
+        index = int(item["index"])
+        with self.lock:
+            network = self.networks.get(index)
+            if network is not None:
+                self.cache_hits += 1
+                return network, len(network.unet_loras)
+            future = self.pending.pop(index, None)
+            if future is None:
+                self.cache_misses += 1
+        result = future.result() if future is not None else self._build(item)
+        with self.lock:
+            self.networks[index] = result[0]
+        return result
+
+    def close(self) -> None:
+        self.executor.shutdown(wait=True, cancel_futures=False)
 
     @contextmanager
     def applied(
@@ -451,7 +475,13 @@ def cache_external_lora_functional_teacher(
     completed = 0
     started = time.perf_counter()
     effect_rms: dict[int, float] = {}
-    adapter_pool = _ExternalAdapterPool(config, anima, device)
+    prefetch_workers = int(cache_cfg.get("adapter_prefetch_workers", 4))
+    adapter_pool = _ExternalAdapterPool(
+        config,
+        anima,
+        device,
+        prefetch_workers=prefetch_workers,
+    )
     for shard_index, offset in enumerate(range(0, len(specs), shard_rows)):
         shard_path = output / f"effects-{shard_index:05d}.safetensors"
         part = specs[offset : offset + shard_rows]
@@ -510,12 +540,19 @@ def cache_external_lora_functional_teacher(
                 batch_rows=batch_rows,
             )
         trigger_rows = trigger_contents * len(trigger_timestep_indices)
+        for spec in specs[offset : min(offset + prefetch_workers, len(specs))]:
+            for component_index in spec.components:
+                adapter_pool.prefetch(bank[component_index])
         for local_index, spec in enumerate(part):
             components = [
                 (bank[index], weight)
                 for index, weight in zip(spec.components, spec.weights, strict=True)
             ]
             with adapter_pool.applied(components) as audit:
+                next_index = offset + local_index + prefetch_workers
+                if next_index < len(specs):
+                    for component_index in specs[next_index].components:
+                        adapter_pool.prefetch(bank[component_index])
                 prediction = _predict_frozen_anima_in_chunks(
                     anima, noisy, clean_context, timestep_tensor, batch_rows=batch_rows
                 )
@@ -613,9 +650,11 @@ def cache_external_lora_functional_teacher(
         "adapter_pool_resident": len(adapter_pool.networks),
         "adapter_pool_hits": adapter_pool.cache_hits,
         "adapter_pool_misses": adapter_pool.cache_misses,
+        "adapter_prefetch_workers": prefetch_workers,
         "elapsed_s": time.perf_counter() - started,
     }
     write_json(summary_path, summary)
+    adapter_pool.close()
     del anima, noisy, clean_context, base
     gc.collect()
     torch.cuda.empty_cache()
@@ -656,6 +695,8 @@ def validate_external_lora_teacher(
         anima, noisy, context, timestep, batch_rows=1
     )
     adapter_pool = _ExternalAdapterPool(config, anima, device)
+    for item in representatives:
+        adapter_pool.prefetch(item)
     results = []
     for representative_index, item in enumerate(representatives):
         with adapter_pool.applied([(item, 1.0)]) as audit:
@@ -674,6 +715,16 @@ def validate_external_lora_teacher(
                 )
             if not torch.equal(reused, styled):
                 raise RuntimeError("Re-applied adapter changed its prediction")
+        with _applied_adapters(config, anima, [(item, 1.0)], device):
+            legacy = _predict_frozen_anima_in_chunks(
+                anima, noisy, context, timestep, batch_rows=1
+            )
+        if not torch.equal(legacy, styled):
+            maximum_error = float((legacy - styled).float().abs().max())
+            raise RuntimeError(
+                f"Fast {item['format']} adapter differs from legacy loader: "
+                f"max_abs={maximum_error}"
+            )
         rms = float((styled - base).float().square().mean().sqrt())
         if not torch.isfinite(styled).all() or rms <= 0:
             raise RuntimeError(
@@ -688,6 +739,7 @@ def validate_external_lora_teacher(
             }
         )
     del anima
+    adapter_pool.close()
     gc.collect()
     torch.cuda.empty_cache()
     return {
