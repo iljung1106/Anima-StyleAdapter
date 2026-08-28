@@ -2527,6 +2527,7 @@ kv_reference_expert_external_velocity_5k:
   reset_initial_step: true
   training:
     steps: 5000
+    torch_num_threads: 4
     blocks_per_step: 0
     materialized_reference_bank_cache: kv_reference_expert_external_velocity_v14_reference_banks
     materialization_local_cache_directory: /tmp/anima-external-training-reference-tokens

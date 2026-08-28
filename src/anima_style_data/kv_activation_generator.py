@@ -3174,6 +3174,7 @@ def train_direct_reference_kv_delta_320(
     torch.cuda.manual_seed_all(seed)
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.set_float32_matmul_precision("high")
+    torch.set_num_threads(max(1, int(training.get("torch_num_threads", 4))))
 
     artist_ids, teacher_down, teacher_up = load_kv_lora_factor_bank(
         destination / str(cfg["lora_directory"]),
