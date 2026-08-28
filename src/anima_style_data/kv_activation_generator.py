@@ -6048,6 +6048,81 @@ def train_direct_reference_kv_delta_320(
                             validation_rows[f"external/{key}"].append(
                                 float(value)
                             )
+                        for external_kind, external_kind_rows in (
+                            external_rows_by_kind.items()
+                        ):
+                            kind_selected = external_kind_rows[:4]
+                            kind_positions = [
+                                external_reference_position[
+                                    str(row["mixture_style_id"])
+                                ]
+                                for row in kind_selected
+                            ]
+                            kind_refs, kind_mask = _select_reference_tokens(
+                                external_reference_bank,
+                                kind_positions,
+                                reference_counts=[single_images]
+                                * len(kind_selected),
+                                reference_start=0,
+                                reference_stop=single_images,
+                                rng=random.Random(
+                                    seed ^ step ^ sum(map(ord, external_kind))
+                                ),
+                            )
+                            kind_style = reader(kind_refs, kind_mask).tokens
+                            kind_count = len(kind_selected)
+                            kind_context = external_context[:1].expand(
+                                kind_count, -1, -1
+                            )
+                            kind_noisy = external_noisy[:1].expand(
+                                kind_count, -1, -1, -1
+                            )
+                            kind_base = external_base[:1].expand(
+                                kind_count, -1, -1, -1
+                            )
+                            kind_teacher = external_functional_bank.effect_rows(
+                                [int(row["index"]) for row in kind_selected],
+                                external_content,
+                                external_timestep,
+                            ).to(device=device, dtype=torch.float32)
+                            kind_times = external_times[:1].expand(kind_count)
+                            kind_padding = external_padding[:1].expand(
+                                kind_count, -1, -1, -1
+                            )
+                            flow_injector.set_style(kind_style)
+                            kind_prediction = anima(
+                                kind_noisy.unsqueeze(2),
+                                kind_times,
+                                context=kind_context,
+                                padding_mask=kind_padding,
+                                target_input_ids=None,
+                            ).squeeze(2).float()
+                            flow_injector.disable()
+                            kind_student = kind_prediction - kind_base
+                            kind_cosine = F.cosine_similarity(
+                                kind_student.flatten(1),
+                                kind_teacher.flatten(1),
+                                dim=-1,
+                            ).mean()
+                            _, kind_constraints = _final_effect_constraints(
+                                kind_student,
+                                kind_teacher,
+                                common_cap=float(
+                                    whole_model.get("common_cap", 0.55)
+                                ),
+                                rms_lower=curriculum["rms_lower"],
+                                rms_upper=curriculum["rms_upper"],
+                                rms_floor=float(
+                                    whole_model.get("rms_floor", 1e-4)
+                                ),
+                            )
+                            validation_rows[
+                                f"external_{external_kind}/cosine"
+                            ].append(float(kind_cosine))
+                            for key, value in kind_constraints.items():
+                                validation_rows[
+                                    f"external_{external_kind}/{key}"
+                                ].append(float(value))
                     for kind, source_rows in rows_by_kind.items():
                         selected_rows = list(range(min(4, len(source_rows))))
                         mix_refs, mix_mask = _select_reference_tokens(
