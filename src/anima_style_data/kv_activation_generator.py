@@ -6728,16 +6728,13 @@ def sample_direct_reference_kv_delta_320(
             token_lru_shards=2,
             strict_style_ids=True,
         )
-        external_bank = _cached_reference_bank(
+        external_bank = _materialize_reference_token_bank(
             external_loader,
             selected_style_ids,
             references=external_references,
             seed=int(external_panel_cfg.get("reference_seed", split_seed)),
             chunk_size=panel_count,
             device=device,
-            cache_root=None,
-            split="sample-external-heldout",
-            source=str(token_root),
         )
         external_mask = torch.ones(
             panel_count,
