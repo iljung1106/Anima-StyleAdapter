@@ -9591,6 +9591,8 @@ external_civitai_lora_references:
     writer_workers: 2
     pending_writes: 2
     latent_lru_shards: 4
+    local_input_cache_directory: /tmp/anima-external-reference-cache
+    input_stage_workers: 32
     amp_dtype: bfloat16
     semantic_dim: 1536
     vae_channels: 16

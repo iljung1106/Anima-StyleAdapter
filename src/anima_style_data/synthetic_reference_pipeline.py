@@ -3,6 +3,7 @@ from __future__ import annotations
 import gc
 import hashlib
 import json
+import shutil
 import time
 from collections import OrderedDict
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -49,6 +50,57 @@ def _teacher_split(row: dict[str, Any]) -> str:
     return "test" if value == "meta_test" else value
 
 
+def _stage_synthetic_reference_inputs(
+    root: Path,
+    rows: list[dict[str, Any]],
+    cache_cfg: dict[str, Any],
+) -> tuple[list[dict[str, Any]], Path]:
+    configured = cache_cfg.get("local_input_cache_directory")
+    if not configured:
+        return rows, root / "latents"
+    local_root = Path(str(configured))
+    image_root = local_root / "images"
+    latent_root = local_root / "latents"
+    image_root.mkdir(parents=True, exist_ok=True)
+    latent_root.mkdir(parents=True, exist_ok=True)
+
+    def copy_file(source: Path, target: Path) -> None:
+        size = source.stat().st_size
+        if target.exists() and target.stat().st_size == size:
+            return
+        temporary = target.with_suffix(target.suffix + ".tmp")
+        shutil.copyfile(source, temporary)
+        temporary.replace(target)
+
+    workers = max(1, int(cache_cfg.get("input_stage_workers", 32)))
+
+    def stage_image(row: dict[str, Any]) -> dict[str, Any]:
+        source = Path(str(row["local_path"]))
+        target = image_root / f"{int(row['id'])}{source.suffix.lower()}"
+        copy_file(source, target)
+        return {**row, "local_path": str(target)}
+
+    started = time.perf_counter()
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        staged_rows = list(executor.map(stage_image, rows))
+        latent_names = sorted({str(row["latent_shard"]) for row in rows})
+        list(
+            executor.map(
+                lambda name: copy_file(root / "latents" / name, latent_root / name),
+                latent_names,
+            )
+        )
+    elapsed = max(time.perf_counter() - started, 1e-6)
+    total_bytes = sum(Path(str(row["local_path"])).stat().st_size for row in staged_rows)
+    total_bytes += sum((latent_root / name).stat().st_size for name in latent_names)
+    print(
+        f"staged {len(staged_rows)} synthetic images and {len(latent_names)} latent shards "
+        f"to {local_root} ({total_bytes / 2**20:.1f} MiB, {elapsed:.1f}s)",
+        flush=True,
+    )
+    return staged_rows, latent_root
+
+
 def _cache_synthetic_dual_query_tokens(
     config: dict[str, Any], destination: Path, *, config_key: str
 ) -> dict[str, Any]:
@@ -87,6 +139,7 @@ def _cache_synthetic_dual_query_tokens(
             int(row["id"]),
         )
     )
+    rows, latent_root = _stage_synthetic_reference_inputs(root, rows, cache_cfg)
 
     checkpoint_value = cache_cfg.get(
         "resampler_checkpoint",
@@ -140,7 +193,7 @@ def _cache_synthetic_dual_query_tokens(
     writer_workers = int(cache_cfg.get("writer_workers", 2))
     maximum_pending_writes = int(cache_cfg.get("pending_writes", 2))
     latent_cache = _LatentShardCache(
-        root / "latents", int(cache_cfg.get("latent_lru_shards", 2))
+        latent_root, int(cache_cfg.get("latent_lru_shards", 2))
     )
     shard_groups = [
         rows[offset : offset + shard_rows]
