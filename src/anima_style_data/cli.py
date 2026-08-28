@@ -180,6 +180,8 @@ def build_parser() -> argparse.ArgumentParser:
         ("kv-reference-expert-kv-native-centered-5k-sample", "Render the long native-centered K/V run"),
         ("kv-reference-expert-kv-raw-multidomain-10k-train", "Train raw Artist/LoRA distillation with sparse Human flow"),
         ("kv-reference-expert-kv-raw-multidomain-10k-sample", "Render raw multi-domain K/V experts"),
+        ("kv-reference-expert-external-velocity-5k-train", "Train external LoRA velocity with Artist teachers and Human flow"),
+        ("kv-reference-expert-external-velocity-5k-sample", "Render external-LoRA velocity experts"),
         ("kv-reference-bilinear-smoke", "Smoke-test reference-conditioned bilinear K/V operators"),
         ("kv-reference-bilinear-train", "Train reference-conditioned bilinear K/V operators"),
         ("kv-reference-bilinear-sample", "Render reference-conditioned bilinear K/V operators"),
@@ -970,6 +972,8 @@ def main() -> None:
             sample_expert_kv_human_teacher_flow_1k,
             train_scheduled_expert_kv_raw_multidomain_10k,
             sample_expert_kv_raw_multidomain_10k,
+            train_scheduled_expert_external_velocity_5k,
+            sample_expert_external_velocity_5k,
         )
         from .kv_activation_sampling import (
             evaluate_kv_activation_reference_generalization,
@@ -1071,6 +1075,8 @@ def main() -> None:
             "kv-reference-expert-kv-native-centered-5k-sample": sample_native_centered_reference_kv_5k,
             "kv-reference-expert-kv-raw-multidomain-10k-train": train_scheduled_expert_kv_raw_multidomain_10k,
             "kv-reference-expert-kv-raw-multidomain-10k-sample": sample_expert_kv_raw_multidomain_10k,
+            "kv-reference-expert-external-velocity-5k-train": train_scheduled_expert_external_velocity_5k,
+            "kv-reference-expert-external-velocity-5k-sample": sample_expert_external_velocity_5k,
             "kv-reference-bilinear-smoke": smoke_test_reference_conditioned_bilinear_kv_operator,
             "kv-reference-bilinear-train": train_reference_conditioned_bilinear_kv_operator,
             "kv-reference-bilinear-sample": sample_reference_conditioned_bilinear_kv_operator,

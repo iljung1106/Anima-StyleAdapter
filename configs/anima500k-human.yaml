@@ -2514,6 +2514,117 @@ kv_reference_expert_kv_raw_multidomain_10k_sample:
   panel_style_cache: "."
   panel_style_manifest: final_manifest.parquet
 
+# First external-teacher run. Five distillation updates (two native Artist
+# domains plus three external-LoRA domains) alternate with one stronger grouped
+# Human flow update. External teachers supervise final velocity only; no local
+# K/V block target is fabricated from heterogeneous whole-model LoRAs.
+kv_reference_expert_external_velocity_5k:
+  extends_config_key: kv_reference_expert_kv_raw_multidomain_10k
+  output_directory: kv_reference_expert_external_velocity_b3_w768_l3_5k_v14
+  seed: 20260909
+  initial_checkpoint: kv_reference_expert_kv64x16_native_centered_b3_w768_l3_750_v12/checkpoints/step-0005000.pt
+  initial_step: 0
+  reset_initial_step: true
+  training:
+    steps: 5000
+    blocks_per_step: 0
+    materialized_reference_bank_cache: kv_reference_expert_external_velocity_v14_reference_banks
+    validation_every: 500
+    checkpoint_every: 500
+    sample_every: 0
+    sample_steps: [500, 1000, 1500, 2000, 3000, 4000, 5000]
+    sample_output_root: diagnostics/kv-reference-expert-external-velocity-b3-w768-l3-5k-v14
+    multi_domain_distillation:
+      enabled: true
+      schedule: [artist_synthetic, artist_human, external_single, external_mixture, external_mixture]
+      mixture_kind_schedule: [pair, triple, pair, amplified, pair, triple, signed]
+      native_teacher_config_key: raw_dual_domain_native_teacher
+      native_reference_caches:
+        human: dual_query_reference_tokens_v8_step10000
+        synthetic:
+          - synthetic_teacher_500x16/dual_query_reference_tokens_v8_step10000
+          - synthetic_teacher_additional_1500x6/dual_query_reference_tokens_v8_step10000
+      external_lora:
+        functional_teacher_cache: civitai_external/functional_teacher_298_mix384_clean24x8_trigger4x4_v1
+        reference_cache: civitai_external/synthetic_references_682x4_triggered_v1/dual_query_reference_tokens_v8_step10000
+        effect_slice_lru_entries: 2
+        validation_single_styles: 32
+      loss_by_domain:
+        artist_synthetic: {huber_weight: 1.0, direction_weight: 1.0, retrieval_weight: 0.5}
+        artist_human: {huber_weight: 0.4, direction_weight: 1.0, retrieval_weight: 0.75}
+        external_single: {huber_weight: 1.0, direction_weight: 1.0, retrieval_weight: 0.5}
+        external_mixture: {huber_weight: 1.0, direction_weight: 1.0, retrieval_weight: 0.5}
+    whole_model_functional:
+      enabled: true
+      block_weight_scale: 0.0
+      whole_weight_override: 1.0
+      huber_beta: 0.10
+      direction_weight: 1.0
+      retrieval_weight: 0.5
+      retrieval_temperature: 0.07
+      constraint_weight: 0.25
+      common_cap_weight: 0.05
+      relative_common_weight: 0.10
+      rms_band_weight: 1.0
+      common_cap: 0.55
+      rms_floor: 0.0001
+      reader_consistency_weight: 0.02
+      reader_consistency_cosine_floor: 0.85
+      functional_consistency_weight: 0.15
+      functional_consistency_cosine_floor: 0.80
+      functional_consistency_rms_tolerance: 1.5
+      functional_consistency_magnitude_weight: 0.25
+      functional_contrastive_weight: 0.25
+      functional_contrastive_temperature: 0.10
+      expert_balance_weight: 0.001
+    human_flow:
+      enabled: true
+      phases:
+        - {end_step: 5000, cycle: 6, slots: [5]}
+      flow_loss_weight: 2.5
+      prior_preservation_weight: 0.05
+      fixed_validation_every: 500
+      fixed_validation_batches: 4
+    generator_learning_rate: 0.0000015
+    reader_learning_rate: 0.0000008
+    generator_lr_schedule:
+      peak_lr: 0.0000015
+      warmup_steps: 200
+      decay_start_step: 3000
+      decay_end_step: 5000
+      final_lr: 0.0000003
+      tail_decay_end_step: 5000
+      tail_final_lr: 0.0000003
+    reader_lr_schedule:
+      peak_lr: 0.0000008
+      warmup_steps: 100
+      decay_start_step: 500
+      decay_end_step: 3000
+      final_lr: 0.0000001
+    ema:
+      enabled: true
+      decay: 0.999
+      sample: true
+    wandb:
+      enabled: true
+      project: anima-style-adapter
+      name: kv-reference-expert-external-velocity-b3-w768-l3-5k-v14
+      id: kv-reference-expert-external-velocity-b3-w768-l3-5k-v14
+      resume: allow
+
+kv_reference_expert_external_velocity_5k_sample:
+  checkpoint: kv_reference_expert_external_velocity_b3_w768_l3_5k_v14/checkpoints/step-0005000.pt
+  output_directory: diagnostics/kv-reference-expert-external-velocity-b3-w768-l3-5k-v14-step5000
+  device: cuda
+  artists: 8
+  references: 4
+  reference_seed: 20260909
+  strengths: [1.0, 2.0]
+  batch_size: 4
+  panel_tile_width: 384
+  panel_style_cache: "."
+  panel_style_manifest: final_manifest.parquet
+
 # Reference-conditioned low-rank operator pilot. Unlike the direct activation
 # head above, the reference generates a fresh block-local linear operator and
 # applies it to every native text token.  Teacher factors remain offline

@@ -3082,6 +3082,23 @@ def train_direct_reference_kv_delta_320(
     training = dict(cfg["training"])
     multi_domain = dict(training.get("multi_domain_distillation", {}))
     multi_domain_enabled = bool(multi_domain.get("enabled", False))
+    configured_distillation_schedule = tuple(
+        str(value)
+        for value in multi_domain.get(
+            "schedule",
+            (
+                "artist_synthetic",
+                "artist_human",
+                "lora_synthetic",
+                "lora_human",
+                "lora_mixture",
+            ),
+        )
+    )
+    external_domains_enabled = any(
+        value.startswith("external_")
+        for value in configured_distillation_schedule
+    )
     flow_only = bool(training.get("flow_only", False))
     steps = int(steps_override or training.get("steps", 4000))
     device = str(training.get("device", "cuda"))
@@ -3218,6 +3235,11 @@ def train_direct_reference_kv_delta_320(
     native_bank = None
     native_reference_banks: dict[str, torch.Tensor] = {}
     native_reference_teacher_indices: dict[str, list[int]] = {}
+    external_reference_bank = None
+    external_reference_position: dict[str, int] = {}
+    external_train_singles: list[dict[str, Any]] = []
+    external_validation_singles: list[dict[str, Any]] = []
+    external_rows_by_kind: dict[str, list[dict[str, Any]]] = {}
     contexts = None
     train_context_count = 0
     query_bank = None
@@ -3342,6 +3364,37 @@ def train_direct_reference_kv_delta_320(
                     native_bank.artist_to_index[style_id]
                     for style_id in domain_ids
                 ]
+        if external_domains_enabled:
+            external_cfg = dict(multi_domain["external_lora"])
+            external_root = destination / str(external_cfg["reference_cache"])
+            external_manifest = read_records(external_root / "manifest.parquet")
+            external_style_ids = list(
+                dict.fromkeys(str(row["style_id"]) for row in external_manifest)
+            )
+            external_reference_position = {
+                style_id: index for index, style_id in enumerate(external_style_ids)
+            }
+            external_loader = CachedTeacherReferenceLoader(
+                external_root,
+                split="train",
+                style_ids=external_style_ids,
+                batch_size=chunk,
+                references=single_images,
+                seed=seed ^ 0x4558544C,
+                token_lru_shards=token_lru,
+                strict_style_ids=True,
+            )
+            external_reference_bank = _cached_reference_bank(
+                external_loader,
+                external_style_ids,
+                references=single_images,
+                seed=seed ^ 0x4558544C,
+                chunk_size=chunk,
+                device=device,
+                cache_root=contiguous_cache_root,
+                split="external-lora",
+                source=str(external_root),
+            )
         contexts = load_file(
             destination / str(cfg["text_context_cache"]) / "base.safetensors",
             device="cpu",
@@ -3366,8 +3419,13 @@ def train_direct_reference_kv_delta_320(
     whole_model = dict(training.get("whole_model_functional", {}))
     whole_enabled = bool(whole_model.get("enabled", False))
     functional_bank = None
+    external_functional_bank = None
     functional_index_by_style: dict[str, int] = {}
-    if whole_enabled:
+    legacy_lora_domains_enabled = (
+        not multi_domain_enabled
+        or any(value.startswith("lora_") for value in configured_distillation_schedule)
+    )
+    if whole_enabled and legacy_lora_domains_enabled:
         functional_bank = FunctionalLoRATeacherBank(
             destination / str(cfg["functional_teacher_cache"]),
             effect_slice_lru_entries=int(
@@ -3396,6 +3454,60 @@ def train_direct_reference_kv_delta_320(
             str(row["mixture_style_id"]): int(row["index"])
             for row in functional_bank.mixtures
         }
+    if whole_enabled and external_domains_enabled:
+        external_cfg = dict(multi_domain["external_lora"])
+        external_functional_bank = FunctionalLoRATeacherBank(
+            destination / str(external_cfg["functional_teacher_cache"]),
+            effect_slice_lru_entries=int(
+                external_cfg.get("effect_slice_lru_entries", 2)
+            ),
+            load_population_mean=False,
+        )
+        if len(external_functional_bank.effect_indices) != len(
+            external_functional_bank.mixtures
+        ):
+            raise RuntimeError(
+                "External functional teacher cache is incomplete: "
+                f"{len(external_functional_bank.effect_indices)}/"
+                f"{len(external_functional_bank.mixtures)} effects"
+            )
+        external_rows = list(external_functional_bank.mixtures)
+        single_rows = [row for row in external_rows if str(row["kind"]) == "single"]
+        validation_count = int(external_cfg.get("validation_single_styles", 32))
+        if validation_count <= 0 or validation_count >= len(single_rows):
+            raise ValueError("External validation_single_styles is invalid")
+        split_rng = random.Random(seed ^ 0x45585641)
+        validation_indices = set(
+            split_rng.sample(range(len(single_rows)), validation_count)
+        )
+        external_train_singles = [
+            row for index, row in enumerate(single_rows)
+            if index not in validation_indices
+        ]
+        external_validation_singles = [
+            row for index, row in enumerate(single_rows)
+            if index in validation_indices
+        ]
+        heldout_components = {
+            int(row["components"][0]) for row in external_validation_singles
+        }
+        external_rows_by_kind = {
+            kind: [
+                row
+                for row in external_rows
+                if str(row["kind"]) == kind
+                and not any(
+                    int(component) in heldout_components
+                    for component in row["components"]
+                )
+                and bool(row.get("enabled", True))
+            ]
+            for kind in ("pair", "triple", "amplified", "signed")
+        }
+        if not external_train_singles or any(
+            not rows for rows in external_rows_by_kind.values()
+        ):
+            raise RuntimeError("External LoRA train/validation split is empty")
 
     model_cfg = dict(cfg["model"])
     model = _build_direct_delta_generator(
@@ -3642,19 +3754,11 @@ def train_direct_reference_kv_delta_320(
         float(value)
         for value in training.get("category_weights", [0.5, 0.125, 0.125, 0.125, 0.125])
     )
-    distillation_schedule = tuple(
-        str(value)
-        for value in multi_domain.get(
-            "schedule",
-            (
-                "artist_synthetic", "artist_human", "lora_synthetic",
-                "lora_human", "lora_mixture",
-            ),
-        )
-    )
+    distillation_schedule = configured_distillation_schedule
     allowed_multi_domains = {
         "artist_synthetic", "artist_human",
         "lora_synthetic", "lora_human", "lora_mixture",
+        "external_single", "external_mixture",
     }
     if multi_domain_enabled and (
         not distillation_schedule
@@ -4699,6 +4803,7 @@ def train_direct_reference_kv_delta_320(
 
             rng = random.Random(seed + micro_step * 1_000_003)
             native_category = False
+            external_category = False
             distillation_domain = "legacy"
             if multi_domain_enabled:
                 distillation_index = (
@@ -4710,7 +4815,10 @@ def train_direct_reference_kv_delta_320(
                 ]
                 distillation_domain = schedule_entry
                 native_category = schedule_entry.startswith("artist_")
+                external_category = schedule_entry.startswith("external_")
                 if native_category or schedule_entry.startswith("lora_"):
+                    category = "single"
+                if schedule_entry == "external_single":
                     category = "single"
                 if schedule_entry == "lora_mixture":
                     available_kinds = [
@@ -4719,6 +4827,21 @@ def train_direct_reference_kv_delta_320(
                     ]
                     if not available_kinds:
                         raise RuntimeError("No configured LoRA mixture kind is available")
+                    mixture_update = 1 + (
+                        (distillation_index - 1) // len(distillation_schedule)
+                    )
+                    category = available_kinds[
+                        (mixture_update - 1) % len(available_kinds)
+                    ]
+                if schedule_entry == "external_mixture":
+                    available_kinds = [
+                        kind for kind in mixture_kind_schedule
+                        if external_rows_by_kind.get(kind)
+                    ]
+                    if not available_kinds:
+                        raise RuntimeError(
+                            "No configured external LoRA mixture kind is available"
+                        )
                     mixture_update = 1 + (
                         (distillation_index - 1) // len(distillation_schedule)
                     )
@@ -4735,7 +4858,71 @@ def train_direct_reference_kv_delta_320(
             consistency_left_mask = None
             consistency_right = None
             consistency_right_mask = None
-            if native_category:
+            if external_category:
+                assert external_reference_bank is not None
+                if distillation_domain == "external_single":
+                    selected = rng.sample(external_train_singles, batch)
+                    counts = rng.choices(
+                        single_counts, weights=single_count_weights, k=batch
+                    )
+                else:
+                    selected = rng.sample(external_rows_by_kind[category], batch)
+                    counts = rng.choices(
+                        mixture_counts, weights=mixture_count_weights, k=batch
+                    )
+                local_styles = [
+                    external_reference_position[str(row["mixture_style_id"])]
+                    for row in selected
+                ]
+                references, reference_mask = _select_reference_tokens(
+                    external_reference_bank,
+                    local_styles,
+                    reference_counts=counts,
+                    reference_start=0,
+                    reference_stop=single_images,
+                    rng=rng,
+                )
+                alternative_references, alternative_mask = _select_reference_tokens(
+                    external_reference_bank,
+                    local_styles,
+                    reference_counts=counts,
+                    reference_start=0,
+                    reference_stop=single_images,
+                    rng=random.Random(seed ^ (step * 97_409)),
+                )
+                if (
+                    float(whole_model.get("reader_consistency_weight", 0.0)) > 0
+                    or float(
+                        whole_model.get("functional_consistency_weight", 0.0)
+                    ) > 0
+                    or float(
+                        whole_model.get("functional_contrastive_weight", 0.0)
+                    ) > 0
+                ):
+                    split = max(1, single_images // 2)
+                    consistency_counts = [min(count, split) for count in counts]
+                    consistency_left, consistency_left_mask = _select_reference_tokens(
+                        external_reference_bank,
+                        local_styles,
+                        reference_counts=consistency_counts,
+                        reference_start=0,
+                        reference_stop=split,
+                        rng=random.Random(seed ^ (step * 193_939)),
+                    )
+                    consistency_right, consistency_right_mask = _select_reference_tokens(
+                        external_reference_bank,
+                        local_styles,
+                        reference_counts=consistency_counts,
+                        reference_start=split,
+                        reference_stop=single_images,
+                        rng=random.Random(seed ^ (step * 389_357)),
+                    )
+                functional_effect_indices = [int(row["index"]) for row in selected]
+                components = torch.zeros(
+                    batch, 1, device=device, dtype=torch.long
+                )
+                weights = torch.ones(batch, 1, device=device)
+            elif native_category:
                 assert native_bank is not None
                 native_domain = distillation_domain.removeprefix("artist_")
                 native_reference_bank = native_reference_banks[native_domain]
@@ -5095,13 +5282,21 @@ def train_direct_reference_kv_delta_320(
                 whole_loss = style.new_zeros((), dtype=torch.float32)
                 whole_metrics: dict[str, torch.Tensor] = {}
                 if whole_enabled:
-                    assert functional_bank is not None
                     assert flow_injector is not None
                     assert anima is not None
+                    active_functional_bank = (
+                        external_functional_bank
+                        if external_category
+                        else functional_bank
+                    )
+                    if not native_category and active_functional_bank is None:
+                        raise RuntimeError(
+                            f"No functional teacher bank for {distillation_domain}"
+                        )
                     functional_base = (
                         native_bank.tensors
                         if native_category and native_bank is not None
-                        else functional_bank.base
+                        else active_functional_bank.base
                     )
                     functional_content = rng.randrange(
                         int(functional_base["noisy_inputs"].shape[0])
@@ -5126,7 +5321,7 @@ def train_direct_reference_kv_delta_320(
                             functional_timestep,
                         ).to(device=device, dtype=torch.float32)
                     else:
-                        final_teacher = functional_bank.effect_rows(
+                        final_teacher = active_functional_bank.effect_rows(
                             functional_effect_indices,
                             functional_content,
                             functional_timestep,
@@ -5511,8 +5706,7 @@ def train_direct_reference_kv_delta_320(
                                 validation_rows[f"single_r{reference_count}/{key}"].append(
                                     float(value)
                                 )
-                    if whole_enabled:
-                        assert functional_bank is not None
+                    if whole_enabled and functional_bank is not None:
                         assert flow_injector is not None
                         assert anima is not None
                         final_content = int(
@@ -5739,6 +5933,121 @@ def train_direct_reference_kv_delta_320(
                                 validation_rows[
                                     f"whole/teacher_signature_{key}"
                                 ].append(float(value))
+                    if external_functional_bank is not None:
+                        assert external_reference_bank is not None
+                        assert flow_injector is not None
+                        external_selected = external_validation_singles[
+                            : min(8, len(external_validation_singles))
+                        ]
+                        external_positions = [
+                            external_reference_position[
+                                str(row["mixture_style_id"])
+                            ]
+                            for row in external_selected
+                        ]
+                        external_indices = [
+                            int(row["index"]) for row in external_selected
+                        ]
+                        external_refs, external_mask = _select_reference_tokens(
+                            external_reference_bank,
+                            external_positions,
+                            reference_counts=[single_images]
+                            * len(external_positions),
+                            reference_start=0,
+                            reference_stop=single_images,
+                            rng=random.Random(seed ^ step ^ 0x45585641),
+                        )
+                        external_style = reader(
+                            external_refs, external_mask
+                        ).tokens
+                        external_content = int(
+                            external_functional_bank.base[
+                                "noisy_inputs"
+                            ].shape[0]
+                        ) - 1
+                        external_timestep = int(
+                            external_functional_bank.base[
+                                "noisy_inputs"
+                            ].shape[1]
+                        ) // 2
+                        external_context = external_functional_bank.base[
+                            "base_context"
+                        ][external_content : external_content + 1].to(
+                            device=device, dtype=torch.bfloat16
+                        ).expand(len(external_selected), -1, -1)
+                        external_noisy = external_functional_bank.base[
+                            "noisy_inputs"
+                        ][external_content, external_timestep].to(
+                            device=device, dtype=torch.bfloat16
+                        )[None].expand(len(external_selected), -1, -1, -1)
+                        external_base = external_functional_bank.base[
+                            "base_predictions"
+                        ][external_content, external_timestep].to(
+                            device=device, dtype=torch.float32
+                        )[None].expand(len(external_selected), -1, -1, -1)
+                        external_teacher = external_functional_bank.effect_rows(
+                            external_indices,
+                            external_content,
+                            external_timestep,
+                        ).to(device=device, dtype=torch.float32)
+                        external_times = external_functional_bank.base[
+                            "timesteps"
+                        ][external_timestep].to(
+                            device=device, dtype=torch.bfloat16
+                        ).expand(len(external_selected))
+                        external_padding = torch.zeros(
+                            len(external_selected),
+                            1,
+                            external_noisy.shape[-2],
+                            external_noisy.shape[-1],
+                            device=device,
+                            dtype=torch.bfloat16,
+                        )
+                        flow_injector.set_style(external_style)
+                        external_prediction = anima(
+                            external_noisy.unsqueeze(2),
+                            external_times,
+                            context=external_context,
+                            padding_mask=external_padding,
+                            target_input_ids=None,
+                        ).squeeze(2).float()
+                        flow_injector.disable()
+                        external_student = external_prediction - external_base
+                        external_cosine = F.cosine_similarity(
+                            external_student.flatten(1),
+                            external_teacher.flatten(1),
+                            dim=-1,
+                        ).mean()
+                        _, external_retrieval = _final_effect_retrieval_loss(
+                            external_student,
+                            external_teacher,
+                            temperature=float(
+                                whole_model.get("retrieval_temperature", 0.07)
+                            ),
+                        )
+                        _, external_constraints = _final_effect_constraints(
+                            external_student,
+                            external_teacher,
+                            common_cap=float(
+                                whole_model.get("common_cap", 0.55)
+                            ),
+                            rms_lower=curriculum["rms_lower"],
+                            rms_upper=curriculum["rms_upper"],
+                            rms_floor=float(
+                                whole_model.get("rms_floor", 1e-4)
+                            ),
+                        )
+                        validation_rows["external/heldout_cosine"].append(
+                            float(external_cosine)
+                        )
+                        for key, value in external_retrieval.items():
+                            validation_rows[f"external/{key}"].append(
+                                float(value)
+                            )
+                        for key, value in external_constraints.items():
+                            validation_rows[f"external/{key}"].append(
+                                float(value)
+                            )
                     for kind, source_rows in rows_by_kind.items():
                         selected_rows = list(range(min(4, len(source_rows))))
                         mix_refs, mix_mask = _select_reference_tokens(
@@ -6331,6 +6640,27 @@ def sample_expert_kv_raw_multidomain_10k(
         config,
         destination,
         sample_config_key="kv_reference_expert_kv_raw_multidomain_10k_sample",
+    )
+
+
+def train_scheduled_expert_external_velocity_5k(
+    config: dict[str, Any], destination: Path
+) -> dict[str, Any]:
+    return train_scheduled_direct_reference_kv_delta_320(
+        config,
+        destination,
+        config_key="kv_reference_expert_external_velocity_5k",
+        sample_config_key="kv_reference_expert_external_velocity_5k_sample",
+    )
+
+
+def sample_expert_external_velocity_5k(
+    config: dict[str, Any], destination: Path
+) -> dict[str, Any]:
+    return sample_direct_reference_kv_delta_320(
+        config,
+        destination,
+        sample_config_key="kv_reference_expert_external_velocity_5k_sample",
     )
 
 
