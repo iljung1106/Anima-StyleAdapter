@@ -92,15 +92,21 @@ def _load_teacher_bank(
         groups[str(row["teacher_shard"])].append(row)
     for shard, shard_rows in groups.items():
         with safe_open(root / shard, framework="pt", device="cpu") as handle:
-            shard_tokens = handle.get_slice("tokens")
-            shard_descriptors = handle.get_slice("descriptors")
-            for row in shard_rows:
-                destination = id_to_index[int(row["id"])]
-                source = int(row["teacher_row"])
-                tokens[destination].copy_(shard_tokens[source : source + 1][0])
-                descriptors[destination].copy_(
-                    shard_descriptors[source : source + 1][0]
-                )
+            # Network-volume random slices are much slower than one contiguous
+            # read. Each shard is only ~84 MiB, so materialize it once and copy
+            # all selected rows together.
+            shard_tokens = handle.get_tensor("tokens")
+            shard_descriptors = handle.get_tensor("descriptors")
+            source = torch.tensor(
+                [int(row["teacher_row"]) for row in shard_rows], dtype=torch.long
+            )
+            target = torch.tensor(
+                [id_to_index[int(row["id"])] for row in shard_rows], dtype=torch.long
+            )
+            tokens.index_copy_(0, target, shard_tokens.index_select(0, source))
+            descriptors.index_copy_(
+                0, target, shard_descriptors.index_select(0, source)
+            )
     if pin_memory:
         tokens = tokens.pin_memory()
         descriptors = descriptors.pin_memory()
