@@ -2758,6 +2758,64 @@ kv_reference_expert_external_reader_fp32_1000_sample:
   panel_style_cache: "."
   panel_style_manifest: final_manifest.parquet
 
+# v19 proved that FP32 updates restore Reader learning, but consistency alone
+# raised both same-style and cross-style similarity. Continue from its raw
+# Reader at step 500 while retaining the EMA generator, add direct Reader-memory
+# retrieval negatives, and reduce the unopposed same-style attraction.
+kv_reference_expert_external_reader_contrastive_1000:
+  extends_config_key: kv_reference_expert_external_reader_fp32_1000
+  output_directory: kv_reference_expert_external_reader_contrastive_b3_w768_l3_1k_v20
+  initial_checkpoint: kv_reference_expert_external_reader_fp32_b3_w768_l3_1k_v19/checkpoints/step-0000500.pt
+  initial_step: 0
+  reset_initial_step: true
+  initial_use_ema_model: true
+  initial_use_ema_reader: false
+  training:
+    steps: 1000
+    validation_every: 250
+    checkpoint_every: 250
+    sample_steps: [250, 500, 1000]
+    sample_output_root: diagnostics/kv-reference-expert-external-reader-contrastive-b3-w768-l3-1k-v20
+    whole_model_functional:
+      reader_consistency_weight: 0.25
+      reader_consistency_cosine_floor: 0.85
+      reader_contrastive_weight: 1.0
+      reader_contrastive_temperature: 0.10
+      functional_contrastive_weight: 0.50
+    generator_lr_schedule:
+      peak_lr: 0.0000005
+      warmup_steps: 50
+      decay_start_step: 500
+      decay_end_step: 1000
+      final_lr: 0.0000001
+      tail_decay_end_step: 1000
+      tail_final_lr: 0.0000001
+    reader_lr_schedule:
+      peak_lr: 0.000005
+      warmup_steps: 50
+      decay_start_step: 500
+      decay_end_step: 1000
+      final_lr: 0.0000005
+    wandb:
+      enabled: true
+      project: anima-style-adapter
+      name: kv-reference-expert-external-reader-contrastive-b3-w768-l3-1k-v20
+      id: kv-reference-expert-external-reader-contrastive-b3-w768-l3-1k-v20
+      resume: allow
+
+kv_reference_expert_external_reader_contrastive_1000_sample:
+  checkpoint: kv_reference_expert_external_reader_contrastive_b3_w768_l3_1k_v20/checkpoints/step-0001000.pt
+  output_directory: diagnostics/kv-reference-expert-external-reader-contrastive-b3-w768-l3-1k-v20-step1000
+  device: cuda
+  artists: 8
+  references: 4
+  reference_seed: 20260910
+  strengths: [1.0, 2.0]
+  batch_size: 4
+  panel_tile_width: 384
+  panel_style_cache: "."
+  panel_style_manifest: final_manifest.parquet
+
 # Reference-conditioned low-rank operator pilot. Unlike the direct activation
 # head above, the reference generates a fresh block-local linear operator and
 # applies it to every native text token.  Teacher factors remain offline

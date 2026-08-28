@@ -3678,14 +3678,20 @@ def train_direct_reference_kv_delta_320(
             weights_only=False,
         )
         use_initial_ema = bool(cfg.get("initial_use_ema", False))
+        use_initial_ema_model = bool(
+            cfg.get("initial_use_ema_model", use_initial_ema)
+        )
+        use_initial_ema_reader = bool(
+            cfg.get("initial_use_ema_reader", use_initial_ema)
+        )
         model.load_state_dict(
             initial.get("ema_model", initial["model"])
-            if use_initial_ema else initial["model"],
+            if use_initial_ema_model else initial["model"],
             strict=True,
         )
         reader.load_state_dict(
             initial.get("ema_reader", initial["reader"])
-            if use_initial_ema else initial["reader"],
+            if use_initial_ema_reader else initial["reader"],
             strict=True,
         )
         reset_initial_step = bool(cfg.get("reset_initial_step", False))
@@ -5246,6 +5252,8 @@ def train_direct_reference_kv_delta_320(
                 )
                 reader_consistency = style.new_zeros((), dtype=torch.float32)
                 reader_consistency_metrics: dict[str, torch.Tensor] = {}
+                reader_contrastive = style.new_zeros((), dtype=torch.float32)
+                reader_contrastive_metrics: dict[str, torch.Tensor] = {}
                 functional_consistency = style.new_zeros((), dtype=torch.float32)
                 functional_consistency_metrics: dict[str, torch.Tensor] = {}
                 functional_contrastive = style.new_zeros((), dtype=torch.float32)
@@ -5293,6 +5301,24 @@ def train_direct_reference_kv_delta_320(
                             ),
                         )
                     )
+                    if float(
+                        whole_model.get("reader_contrastive_weight", 0.0)
+                    ) > 0:
+                        reader_contrastive, retrieval_values = (
+                            _final_effect_retrieval_loss(
+                                left_memory,
+                                right_memory,
+                                temperature=float(
+                                    whole_model.get(
+                                        "reader_contrastive_temperature", 0.10
+                                    )
+                                ),
+                            )
+                        )
+                        reader_contrastive_metrics = {
+                            f"reader_{key}": value
+                            for key, value in retrieval_values.items()
+                        }
                     functional_consistency_weight = float(
                         whole_model.get("functional_consistency_weight", 0.0)
                     )
@@ -5589,6 +5615,8 @@ def train_direct_reference_kv_delta_320(
                         + retrieval_weighted
                         + float(whole_model.get("reader_consistency_weight", 0.0))
                         * reader_consistency
+                        + float(whole_model.get("reader_contrastive_weight", 0.0))
+                        * reader_contrastive
                         + float(
                             whole_model.get("functional_consistency_weight", 0.0)
                         )
@@ -5620,6 +5648,10 @@ def train_direct_reference_kv_delta_320(
                         **{
                             f"whole/{key}": value
                             for key, value in reader_consistency_metrics.items()
+                        },
+                        **{
+                            f"whole/{key}": value
+                            for key, value in reader_contrastive_metrics.items()
                         },
                         **{
                             f"whole/{key}": value
@@ -6895,8 +6927,8 @@ def train_scheduled_expert_external_velocity_5k(
     return train_scheduled_direct_reference_kv_delta_320(
         config,
         destination,
-        config_key="kv_reference_expert_external_reader_fp32_1000",
-        sample_config_key="kv_reference_expert_external_reader_fp32_1000_sample",
+        config_key="kv_reference_expert_external_reader_contrastive_1000",
+        sample_config_key="kv_reference_expert_external_reader_contrastive_1000_sample",
     )
 
 
@@ -6906,7 +6938,7 @@ def sample_expert_external_velocity_5k(
     return sample_direct_reference_kv_delta_320(
         config,
         destination,
-        sample_config_key="kv_reference_expert_external_reader_fp32_1000_sample",
+        sample_config_key="kv_reference_expert_external_reader_contrastive_1000_sample",
     )
 
 
