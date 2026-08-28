@@ -332,6 +332,7 @@ def build_parser() -> argparse.ArgumentParser:
         ("pure-token-style-tokenizer-train", "Train the 32-slot tokenizer by native text-context injection"),
         ("pure-token-style-tokenizer-smoke", "Smoke-test native-context pure token injection"),
         ("dual-query-resampler-train", "Pretrain the C-RADIO/Qwen-VAE dual-query Resampler"),
+        ("dual-query-resampler-recover", "Recover the deleted Resampler from frozen token targets"),
         ("dual-query-resampler-smoke", "Run two synthetic dual-query Resampler steps"),
         ("dual-query-style-cache", "Cache frozen Dual-query Resampler outputs"),
         ("dual-query-style-external-cache", "Cache the seven fixed external references"),
@@ -1298,15 +1299,18 @@ def main() -> None:
     elif args.command in {
         "dual-query-resampler-train",
         "dual-query-resampler-smoke",
+        "dual-query-resampler-recover",
     }:
         from .dual_query_training import (
             smoke_test_dual_query_resampler,
             train_dual_query_resampler,
         )
+        from .dual_query_recovery import recover_dual_query_resampler
 
         stage = {
             "dual-query-resampler-train": train_dual_query_resampler,
             "dual-query-resampler-smoke": smoke_test_dual_query_resampler,
+            "dual-query-resampler-recover": recover_dual_query_resampler,
         }[args.command]
         _run(stage, config, destination)
     elif args.command in {

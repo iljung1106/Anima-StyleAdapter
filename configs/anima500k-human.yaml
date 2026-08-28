@@ -4552,6 +4552,43 @@ dual_query_resampler:
       name: dual-query-resampler-bprime-v8-balanced-bootstrap
       id: dual-query-resampler-bprime-v8-balanced-bootstrap
 
+# The original step-10000 Resampler checkpoint was removed during network-volume
+# cleanup, while its 8,000 Anima-generated inputs and exact frozen outputs remain.
+# Recover the same 84x1024 token coordinate system directly on that synthetic
+# distribution, with 32 artists held out entirely for validation.
+dual_query_resampler_recovery:
+  output_directory: dual_query_resampler_bprime_v8_token_recovery
+  source_directory: synthetic_teacher_500x16
+  feature_directory: style_features
+  latent_directory: latents
+  teacher_token_cache: dual_query_reference_tokens_v8_step10000
+  seed: 20260829
+  training:
+    device: cuda
+    steps: 10000
+    batch_size: 16
+    validation_styles: 32
+    learning_rate: 0.0001
+    warmup_steps: 250
+    minimum_lr_ratio: 0.10
+    weight_decay: 0.01
+    betas: [0.9, 0.95]
+    epsilon: 0.00000001
+    fused_adamw: true
+    max_grad_norm: 1.0
+    prefetch_workers: 4
+    prefetch_batches: 8
+    log_every: 20
+    validation_every: 250
+    validation_batches: 8
+    checkpoint_every: 250
+    resume: true
+    wandb:
+      enabled: true
+      project: anima-style-adapter
+      name: dual-query-resampler-bprime-v8-token-recovery
+      id: dual-query-resampler-bprime-v8-token-recovery
+
 # Frozen Dual-query Resampler outputs are materialized once, then a compact
 # permutation-invariant tokenizer learns native Anima context tokens. This is
 # intentionally separate from every earlier StyleTokenizer/IP-Adapter runner.
@@ -9544,7 +9581,7 @@ external_civitai_lora_references:
   prefetch_styles: 8
   dual_query_token_cache:
     output_directory: dual_query_reference_tokens_v8_step10000
-    resampler_checkpoint: dual_query_resampler_bprime_v8/checkpoints/step-010000.pt
+    resampler_checkpoint: dual_query_resampler_bprime_v8_token_recovery/checkpoints/step-010000.pt
     device: cuda
     batch_size: 32
     shard_rows: 512
