@@ -2514,13 +2514,12 @@ kv_reference_expert_kv_raw_multidomain_10k_sample:
   panel_style_cache: "."
   panel_style_manifest: final_manifest.parquet
 
-# First external-teacher run. Five distillation updates (two native Artist
-# domains plus three external-LoRA domains) alternate with one stronger grouped
-# Human flow update. External teachers supervise final velocity only; no local
-# K/V block target is fabricated from heterogeneous whole-model LoRAs.
+# Combined native/external-teacher run. Artist-tag, original LoRA, and external
+# LoRA domains share one final-velocity curriculum with a stronger grouped Human
+# flow update every sixth optimizer step. No heterogeneous block target is used.
 kv_reference_expert_external_velocity_5k:
   extends_config_key: kv_reference_expert_kv_raw_multidomain_10k
-  output_directory: kv_reference_expert_external_velocity_b3_w768_l3_5k_v15
+  output_directory: kv_reference_expert_combined_velocity_b3_w768_l3_5k_v16
   seed: 20260909
   initial_checkpoint: kv_reference_expert_kv64x16_native_centered_b3_w768_l3_750_v12/checkpoints/step-0005000.pt
   initial_step: 0
@@ -2535,10 +2534,10 @@ kv_reference_expert_external_velocity_5k:
     checkpoint_every: 500
     sample_every: 0
     sample_steps: [500, 1000, 1500, 2000, 3000, 4000, 5000]
-    sample_output_root: diagnostics/kv-reference-expert-external-velocity-b3-w768-l3-5k-v15
+    sample_output_root: diagnostics/kv-reference-expert-combined-velocity-b3-w768-l3-5k-v16
     multi_domain_distillation:
       enabled: true
-      schedule: [artist_synthetic, artist_human, external_single, external_mixture, external_mixture]
+      schedule: [artist_synthetic, artist_human, lora_synthetic, lora_human, lora_mixture, external_single, external_mixture, external_mixture]
       mixture_kind_schedule: [pair, triple, pair, amplified, pair, triple, signed]
       native_teacher_config_key: raw_dual_domain_native_teacher
       native_reference_caches:
@@ -2549,7 +2548,7 @@ kv_reference_expert_external_velocity_5k:
       external_lora:
         functional_teacher_cache: civitai_external/functional_teacher_298_mix384_clean24x8_trigger4x4_v1
         reference_cache: civitai_external/synthetic_references_682x4_triggered_v1/dual_query_reference_tokens_v8_step10000
-        effect_slice_lru_entries: 2
+        effect_slice_lru_entries: 1
         validation_single_styles: 32
         # Two downloaded adapters have exactly zero final-velocity effect on
         # every cached content/timestep. Relative direction/RMS supervision is
@@ -2562,6 +2561,10 @@ kv_reference_expert_external_velocity_5k:
         external_mixture: {huber_weight: 1.0, direction_weight: 1.0, retrieval_weight: 0.5}
     whole_model_functional:
       enabled: true
+      # Keep one original-LoRA and one external-LoRA effect shard resident.
+      # The inherited all-GPU legacy bank would exceed the 80 GB training peak.
+      effect_slice_lru_entries: 1
+      gpu_resident_effects: false
       block_weight_scale: 0.0
       whole_weight_override: 1.0
       huber_beta: 0.10
@@ -2614,13 +2617,13 @@ kv_reference_expert_external_velocity_5k:
     wandb:
       enabled: true
       project: anima-style-adapter
-      name: kv-reference-expert-external-velocity-b3-w768-l3-5k-v15
-      id: kv-reference-expert-external-velocity-b3-w768-l3-5k-v15
+      name: kv-reference-expert-combined-velocity-b3-w768-l3-5k-v16
+      id: kv-reference-expert-combined-velocity-b3-w768-l3-5k-v16
       resume: allow
 
 kv_reference_expert_external_velocity_5k_sample:
-  checkpoint: kv_reference_expert_external_velocity_b3_w768_l3_5k_v15/checkpoints/step-0005000.pt
-  output_directory: diagnostics/kv-reference-expert-external-velocity-b3-w768-l3-5k-v15-step5000
+  checkpoint: kv_reference_expert_combined_velocity_b3_w768_l3_5k_v16/checkpoints/step-0005000.pt
+  output_directory: diagnostics/kv-reference-expert-combined-velocity-b3-w768-l3-5k-v16-step5000
   device: cuda
   artists: 8
   references: 4
