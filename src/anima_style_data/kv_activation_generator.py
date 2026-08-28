@@ -2901,30 +2901,58 @@ def _materialize_reference_token_bank(
 ) -> torch.Tensor:
     """Keep cached frozen-Resampler tokens resident on the training GPU."""
 
-    chunks: list[torch.Tensor] = []
+    selected: list[list[dict[str, Any]]] = []
+    for index, style_id in enumerate(style_ids):
+        if style_id not in loader.by_style:
+            raise KeyError(f"Reference cache is missing style {style_id}")
+        rng = random.Random(int(seed) + index * 1_000_003)
+        selected.append(rng.sample(loader.by_style[style_id], references))
+    rows = [row for group in selected for row in group]
+    grouped_rows: dict[
+        tuple[int, str], list[tuple[int, dict[str, Any]]]
+    ] = defaultdict(list)
+    for position, row in enumerate(rows):
+        grouped_rows[
+            (int(row["_token_root_index"]), str(row["token_shard"]))
+        ].append((position, row))
+
+    output: torch.Tensor | None = None
+    copied = 0
     started = time.perf_counter()
-    for offset in range(0, len(style_ids), chunk_size):
-        ids = style_ids[offset : offset + chunk_size]
-        loaded = loader.load_styles(
-            ids,
-            references_per_style=references,
-            seed=seed + offset * 1_000_003,
-        )
-        chunks.append(
-            loaded["tokens"].to(
-                device=device, dtype=torch.bfloat16, non_blocking=True
+    groups = sorted(grouped_rows.items())
+    for group_index, ((root_index, shard_name), shard_rows) in enumerate(groups):
+        shard = loader.shards[root_index].get(shard_name)
+        if output is None:
+            output = torch.empty(
+                len(rows),
+                *shard.shape[1:],
+                device=device,
+                dtype=torch.bfloat16,
             )
+        source = torch.tensor(
+            [int(row["token_row"]) for _, row in shard_rows], dtype=torch.long
         )
-        if offset + len(ids) == len(style_ids) or (offset // chunk_size + 1) % 5 == 0:
+        destination = torch.tensor(
+            [position for position, _ in shard_rows],
+            device=device,
+            dtype=torch.long,
+        )
+        values = shard.index_select(0, source).to(
+            device=device, dtype=torch.bfloat16
+        )
+        output.index_copy_(0, destination, values)
+        copied += len(shard_rows)
+        if group_index == len(groups) - 1 or (group_index + 1) % 20 == 0:
             print(
                 "materialized raw reference tokens "
-                f"{offset + len(ids)}/{len(style_ids)} "
+                f"{copied}/{len(rows)} rows from "
+                f"{group_index + 1}/{len(groups)} shards "
                 f"({time.perf_counter() - started:.1f}s)",
                 flush=True,
             )
-    if not chunks:
+    if output is None:
         raise ValueError("Cannot materialize an empty reference bank")
-    return torch.cat(chunks, dim=0)
+    return output.reshape(len(style_ids), references, *output.shape[1:])
 
 
 def _stage_reference_token_cache(source: Path, target: Path) -> Path:
