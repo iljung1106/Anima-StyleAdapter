@@ -39,6 +39,7 @@ def main() -> None:
     parser.add_argument("--config", default="configs/anima500k-human.yaml")
     parser.add_argument("--experiment", default="kv_reference_expert_combined_rms_1500")
     parser.add_argument("--checkpoint", required=True)
+    parser.add_argument("--compare-checkpoint")
     parser.add_argument("--styles", type=int, default=128)
     parser.add_argument("--device", default="cuda")
     args = parser.parse_args()
@@ -72,6 +73,26 @@ def main() -> None:
     )
     checkpoint_path = destination / args.checkpoint
     checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    if args.compare_checkpoint:
+        comparison_path = destination / args.compare_checkpoint
+        comparison = torch.load(comparison_path, map_location="cpu", weights_only=False)
+        baseline = comparison.get("ema_reader", comparison["reader"])
+        current = checkpoint["reader"]
+        differences = torch.cat(
+            [
+                (current[name].float() - baseline[name].float()).abs().flatten()
+                for name in current
+            ]
+        )
+        print(
+            "reader_parameter_change",
+            {
+                "baseline": str(comparison_path),
+                "changed_fraction": float((differences > 0).float().mean()),
+                "mean_absolute": float(differences.mean()),
+                "maximum_absolute": float(differences.max()),
+            },
+        )
     raw_left = bank[:, :2].mean(dim=1)
     raw_right = bank[:, 2:].mean(dim=1)
     mask = torch.ones(len(style_ids), 2, device=args.device, dtype=torch.bool)
