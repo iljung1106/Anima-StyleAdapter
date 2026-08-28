@@ -55,7 +55,7 @@ class _ExternalAdapterPool:
             return network, len(network.unet_loras)
 
         self.cache_misses += 1
-        state = _normalize_diffusers_lora(
+        state = _normalize_external_lora_state(
             load_file(str(item["resolved_weight_path"]), device="cpu")
         )
         expected = _expected_unet_modules(state)
@@ -159,6 +159,23 @@ def _normalize_diffusers_lora(state: dict[str, torch.Tensor]) -> dict[str, torch
     return converted
 
 
+def _normalize_external_lora_state(
+    state: dict[str, torch.Tensor],
+) -> dict[str, torch.Tensor]:
+    """Normalize external Anima variants to the LyCORIS inference schema."""
+
+    state = _normalize_diffusers_lora(state)
+    normalized: dict[str, torch.Tensor] = {}
+    for key, value in state.items():
+        # networks.lora_anima saves RMSNorm weight deltas as Full ``diff``.
+        # LyCORIS Full supports Linear/Conv only; its Norm module represents the
+        # same additive weight delta as ``w_norm`` and supports Anima RMSNorm.
+        if key.endswith("_norm.diff"):
+            key = key.removesuffix(".diff") + ".w_norm"
+        normalized[key] = value
+    return normalized
+
+
 def _expected_unet_modules(state: dict[str, torch.Tensor]) -> set[str]:
     return {
         key.split(".", 1)[0]
@@ -191,7 +208,7 @@ def _applied_adapters(
     expected_modules = 0
     try:
         for item, multiplier in components:
-            state = _normalize_diffusers_lora(
+            state = _normalize_external_lora_state(
                 load_file(str(item["resolved_weight_path"]), device="cpu")
             )
             expected = _expected_unet_modules(state)
