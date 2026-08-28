@@ -2382,6 +2382,8 @@ kv_reference_expert_kv_raw_multidomain_10k:
     # the trainer, so subsequent segments load these contiguous banks directly.
     materialized_reference_bank_cache: kv_reference_expert_kv64x16_raw_multidomain_v13_reference_banks
     single_reference_images: 4
+    single_reference_counts: [1, 2, 4]
+    single_reference_count_weights: [0.40, 0.35, 0.25]
     mixture_reference_images: 4
     validation_every: 500
     checkpoint_every: 500

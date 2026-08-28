@@ -3174,6 +3174,44 @@ def train_direct_reference_kv_delta_320(
     )
     single_images = int(training.get("single_reference_images", 8))
     mixture_images = int(training.get("mixture_reference_images", 4))
+    single_counts = [
+        int(value)
+        for value in training.get("single_reference_counts", [1, 2, 4, 8])
+    ]
+    single_count_weights = [
+        float(value)
+        for value in training.get(
+            "single_reference_count_weights", [0.30, 0.25, 0.25, 0.20]
+        )
+    ]
+    mixture_counts = [
+        int(value)
+        for value in training.get("mixture_reference_counts", [1, 2, 4])
+    ]
+    mixture_count_weights = [
+        float(value)
+        for value in training.get(
+            "mixture_reference_count_weights", [0.40, 0.35, 0.25]
+        )
+    ]
+    if (
+        not single_counts
+        or len(single_counts) != len(single_count_weights)
+        or min(single_counts) < 1
+        or max(single_counts) > single_images
+    ):
+        raise ValueError(
+            "single_reference_counts must fit the materialized reference bank"
+        )
+    if (
+        not mixture_counts
+        or len(mixture_counts) != len(mixture_count_weights)
+        or min(mixture_counts) < 1
+        or max(mixture_counts) > mixture_images
+    ):
+        raise ValueError(
+            "mixture_reference_counts must fit the materialized reference bank"
+        )
     single_bank = None
     single_banks: dict[str, torch.Tensor] = {}
     mixture_banks: dict[str, torch.Tensor] = {}
@@ -3628,10 +3666,6 @@ def train_direct_reference_kv_delta_320(
             "mixture_kind_schedule", ("pair", "triple", "amplified", "signed")
         )
     )
-    single_counts = [int(value) for value in training.get("single_reference_counts", [1, 2, 4, 8])]
-    single_count_weights = [float(value) for value in training.get("single_reference_count_weights", [0.30, 0.25, 0.25, 0.20])]
-    mixture_counts = [int(value) for value in training.get("mixture_reference_counts", [1, 2, 4])]
-    mixture_count_weights = [float(value) for value in training.get("mixture_reference_count_weights", [0.40, 0.35, 0.25])]
     direction_weight = float(training.get("direction_weight", 0.3))
     magnitude_weight = float(training.get("magnitude_weight", 0.15))
     consistency_weight = float(training.get("reference_consistency_weight", 0.1))
