@@ -2243,6 +2243,82 @@ kv_reference_expert_kv_human_teacher_flow_1k_sample:
   batch_size: 4
   panel_tile_width: 384
 
+# Exact artist-disjoint bridge: every row uses the same cached content, noise,
+# timestep and base text.  The target is native @artist final velocity relative
+# to one frozen 4k-train-artist population mean; no minibatch mean is removed.
+# Start from the v10 EMA and render after only 125 expensive full-DiT updates.
+kv_reference_expert_kv_native_centered_750:
+  extends_config_key: kv_reference_expert_kv_human_teacher_500
+  output_directory: kv_reference_expert_kv64x16_native_centered_b3_w768_l3_750_v12
+  seed: 20260907
+  initial_checkpoint: kv_reference_expert_kv64x16_human_teacher_w768_l3_500_v10/checkpoints/step-0000500.pt
+  initial_step: 500
+  initial_use_ema: true
+  training:
+    steps: 750
+    batch_size: 3
+    resume: true
+    validation_every: 25
+    checkpoint_every: 125
+    sample_steps: [625, 750]
+    sample_output_root: diagnostics/kv-reference-expert-kv64x16-native-centered-b3-w768-l3-750-v12
+    generator_lr_schedule:
+      peak_lr: 0.000002
+      warmup_steps: 25
+      decay_start_step: 100
+      decay_end_step: 250
+      final_lr: 0.0000005
+    reader_lr_schedule:
+      peak_lr: 0.000001
+      warmup_steps: 25
+      decay_start_step: 75
+      decay_end_step: 250
+      final_lr: 0.0000001
+    native_centered:
+      teacher_config_key: dual_domain_native_teacher
+      reference_images: 4
+      reference_counts: [1, 2, 4]
+      reference_count_weights: [0.30, 0.30, 0.40]
+      materialization_style_chunk: 16
+      token_lru_shards: 8
+      validation_artists: 16
+      validation_batch_size: 3
+      expert_balance_weight: 0.001
+      loss:
+        huber_weight: 1.0
+        huber_beta: 0.10
+        direction_weight: 1.0
+        retrieval_weight: 0.5
+        retrieval_temperature: 0.07
+        constraint_weight: 0.25
+        common_cap: 0.40
+        common_cap_weight: 0.05
+        relative_common_weight: 0.10
+        rms_lower: 0.80
+        rms_upper: 1.40
+        rms_band_weight: 1.0
+        rms_floor: 0.0001
+    ema:
+      enabled: true
+      decay: 0.995
+      sample: true
+    wandb:
+      enabled: true
+      project: anima-style-adapter
+      name: kv-reference-expert-kv64x16-native-centered-b3-w768-l3-750-v12
+      id: kv-reference-expert-kv64x16-native-centered-b3-w768-l3-750-v12
+
+kv_reference_expert_kv_native_centered_750_sample:
+  checkpoint: kv_reference_expert_kv64x16_native_centered_b3_w768_l3_750_v12/checkpoints/step-0000750.pt
+  output_directory: diagnostics/kv-reference-expert-kv64x16-native-centered-b3-w768-l3-750-v12-step750
+  device: cuda
+  artists: 8
+  references: 4
+  reference_seed: 20260907
+  strengths: [1.0, 2.0]
+  batch_size: 4
+  panel_tile_width: 384
+
 # Reference-conditioned low-rank operator pilot. Unlike the direct activation
 # head above, the reference generates a fresh block-local linear operator and
 # applies it to every native text token.  Teacher factors remain offline

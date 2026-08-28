@@ -31,6 +31,21 @@ from anima_style_data.kv_real_query_distillation import (
     _operator_factors,
     _selected_content_indices,
 )
+from anima_style_data.native_centered_kv_training import (
+    fixed_train_population_target,
+)
+
+
+def test_native_target_uses_fixed_train_population_not_batch_mean() -> None:
+    source = torch.tensor([0.0, 2.0, 8.0, 10.0]).reshape(4, 1, 1, 1)
+    # The frozen train population is rows 0 and 1, whose source mean is 1.
+    train_offset = torch.tensor([1.0]).reshape(1, 1, 1)
+    target = fixed_train_population_target(
+        source, train_offset, [2, 3], 0, 0
+    )
+
+    torch.testing.assert_close(target.flatten(), torch.tensor([7.0, 9.0]))
+    assert target.mean() != 0
 
 
 def test_final_effect_retrieval_loss_rewards_correct_style_matching() -> None:

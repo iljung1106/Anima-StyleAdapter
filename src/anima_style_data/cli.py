@@ -170,6 +170,8 @@ def build_parser() -> argparse.ArgumentParser:
         ("kv-reference-expert-kv-human-teacher-500-sample", "Render real-reference K/V teacher retrieval"),
         ("kv-reference-expert-kv-human-teacher-flow-1k-train", "Bridge real-reference K/V teachers with artist-disjoint human flow"),
         ("kv-reference-expert-kv-human-teacher-flow-1k-sample", "Render the real-reference teacher and human-flow bridge"),
+        ("kv-reference-expert-kv-native-centered-750-train", "Train K/V experts on fixed-population native final velocity"),
+        ("kv-reference-expert-kv-native-centered-750-sample", "Render fixed-population native-centered K/V experts"),
         ("kv-reference-bilinear-smoke", "Smoke-test reference-conditioned bilinear K/V operators"),
         ("kv-reference-bilinear-train", "Train reference-conditioned bilinear K/V operators"),
         ("kv-reference-bilinear-sample", "Render reference-conditioned bilinear K/V operators"),
@@ -841,6 +843,8 @@ def main() -> None:
         "kv-reference-expert-kv-human-teacher-500-sample",
         "kv-reference-expert-kv-human-teacher-flow-1k-train",
         "kv-reference-expert-kv-human-teacher-flow-1k-sample",
+        "kv-reference-expert-kv-native-centered-750-train",
+        "kv-reference-expert-kv-native-centered-750-sample",
         "kv-reference-bilinear-smoke",
         "kv-reference-bilinear-train",
         "kv-reference-bilinear-sample",
@@ -932,6 +936,10 @@ def main() -> None:
             evaluate_kv_activation_reference_generalization,
             sample_kv_activation_modulator,
         )
+        from .native_centered_kv_training import (
+            sample_native_centered_reference_kv,
+            train_scheduled_native_centered_reference_kv,
+        )
         from .kv_visual_projector import (
             smoke_test_kv_activation_visual_projector,
             train_kv_activation_visual_projector,
@@ -1016,6 +1024,8 @@ def main() -> None:
             "kv-reference-expert-kv-human-teacher-500-sample": sample_expert_kv_human_teacher_500,
             "kv-reference-expert-kv-human-teacher-flow-1k-train": train_scheduled_expert_kv_human_teacher_flow_1k,
             "kv-reference-expert-kv-human-teacher-flow-1k-sample": sample_expert_kv_human_teacher_flow_1k,
+            "kv-reference-expert-kv-native-centered-750-train": train_scheduled_native_centered_reference_kv,
+            "kv-reference-expert-kv-native-centered-750-sample": sample_native_centered_reference_kv,
             "kv-reference-bilinear-smoke": smoke_test_reference_conditioned_bilinear_kv_operator,
             "kv-reference-bilinear-train": train_reference_conditioned_bilinear_kv_operator,
             "kv-reference-bilinear-sample": sample_reference_conditioned_bilinear_kv_operator,
