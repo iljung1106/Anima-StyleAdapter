@@ -3559,6 +3559,10 @@ def train_direct_reference_kv_delta_320(
                 )
             ),
         })
+        if human_flow.get("style_manifest") is not None:
+            flow_loader_cfg["style_manifest"] = str(
+                human_flow["style_manifest"]
+            )
         if int(human_flow.get("same_style_target_min", 1)) > 1:
             flow_loader_cfg["prompt_modes"] = dict(
                 human_flow.get(
@@ -6070,10 +6074,13 @@ def sample_direct_reference_kv_delta_320(
     detail_cfg = dict(config["detail_preserving_style_cross_attention"])
     panel_loaders = []
     panel_style_cache = sample_cfg.get("panel_style_cache")
+    panel_style_manifest = sample_cfg.get("panel_style_manifest")
     for split in (str(detail_cfg.get("train_split", "train")), str(detail_cfg.get("validation_split", "validation"))):
         loader_cfg = _loader_config(config, detail_cfg, split=split)
         if panel_style_cache is not None:
             loader_cfg["style_cache"] = str(panel_style_cache)
+        if panel_style_manifest is not None:
+            loader_cfg["style_manifest"] = str(panel_style_manifest)
         loader_cfg["ram_resident_tokens"] = False
         panel_loaders.append(MultiPromptDualQueryCachedStyleLoader(destination, loader_cfg))
     panel_sampling = dict(detail_cfg.get("sampling", {}))

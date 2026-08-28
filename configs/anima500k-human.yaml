@@ -2440,6 +2440,7 @@ kv_reference_expert_kv_raw_multidomain_10k:
       # The root final_manifest supplies image/artist/split metadata and real
       # local paths. Frozen visual tensors still come from the token cache.
       style_cache: "."
+      style_manifest: final_manifest.parquet
       batch_size: 3
       same_style_target_min: 2
       same_style_target_max: 3
@@ -2511,6 +2512,7 @@ kv_reference_expert_kv_raw_multidomain_10k_sample:
   # Preserve the historical real-image target/reference rows without restoring
   # the deleted 467 GB feature cache.
   panel_style_cache: "."
+  panel_style_manifest: final_manifest.parquet
 
 # Reference-conditioned low-rank operator pilot. Unlike the direct activation
 # head above, the reference generates a fresh block-local linear operator and

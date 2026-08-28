@@ -159,7 +159,12 @@ class ProductionStyleLoader:
         self.style_root = style_root
         self.text_root = text_root
         self.latent_root = latent_root
-        style_rows = read_records(style_root / "manifest.parquet")
+        style_manifest = cfg.get("style_manifest")
+        style_rows = read_records(
+            destination / str(style_manifest)
+            if style_manifest is not None
+            else style_root / "manifest.parquet"
+        )
         text_rows = read_records(text_root / "manifest.parquet")
         latent_rows = read_records(latent_root / "manifest.parquet")
 
