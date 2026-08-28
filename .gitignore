@@ -4,3 +4,4 @@ __pycache__/
 .tagger_space_inspect/
 .venv/
 data/
+CivitAI_Models/
