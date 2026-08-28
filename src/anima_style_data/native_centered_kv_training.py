@@ -62,6 +62,16 @@ def fixed_train_population_target(
     return selected - offset
 
 
+def fixed_validation_case(
+    batch_index: int,
+    *,
+    content_count: int,
+    timestep_count: int,
+) -> tuple[int, int]:
+    """Return a stable, spread-out cache probe for a validation artist batch."""
+    return batch_index % content_count, (2 * batch_index + 1) % timestep_count
+
+
 def _reference_bank_signature(
     style_ids: list[str], *, references: int, seed: int, source: str
 ) -> dict[str, Any]:
@@ -481,14 +491,14 @@ def train_native_centered_reference_kv(
                 reference_counts=[reference_images] * len(local_indices),
                 reference_start=0,
                 reference_stop=reference_images,
-                rng=random.Random(seed ^ step ^ offset),
+                # Compare identical reference evidence at every validation.
+                rng=random.Random(seed ^ 0x56414C ^ offset),
             )
-            content = (offset // validation_batch) % int(
-                teacher_bank.tensors["noisy_inputs"].shape[0]
+            content, timestep = fixed_validation_case(
+                offset // validation_batch,
+                content_count=int(teacher_bank.tensors["noisy_inputs"].shape[0]),
+                timestep_count=int(teacher_bank.tensors["noisy_inputs"].shape[1]),
             )
-            timestep = (
-                step // max(1, validation_every) + 2 * (offset // validation_batch)
-            ) % int(teacher_bank.tensors["noisy_inputs"].shape[1])
             with torch.autocast("cuda", dtype=torch.bfloat16):
                 style = reader(references, mask).tokens
                 student = forward_effect(style, content, timestep)

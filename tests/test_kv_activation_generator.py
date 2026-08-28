@@ -32,6 +32,7 @@ from anima_style_data.kv_real_query_distillation import (
     _selected_content_indices,
 )
 from anima_style_data.native_centered_kv_training import (
+    fixed_validation_case,
     fixed_train_population_target,
 )
 
@@ -46,6 +47,13 @@ def test_native_target_uses_fixed_train_population_not_batch_mean() -> None:
 
     torch.testing.assert_close(target.flatten(), torch.tensor([7.0, 9.0]))
     assert target.mean() != 0
+
+
+def test_native_validation_cases_are_stable_and_spread_out() -> None:
+    assert [
+        fixed_validation_case(index, content_count=4, timestep_count=8)
+        for index in range(6)
+    ] == [(0, 1), (1, 3), (2, 5), (3, 7), (0, 1), (1, 3)]
 
 
 def test_final_effect_retrieval_loss_rewards_correct_style_matching() -> None:
