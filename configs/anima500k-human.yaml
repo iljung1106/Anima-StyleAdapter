@@ -4600,7 +4600,10 @@ dual_query_style_tokenizer:
   seed: 20260816
   train_split: train
   validation_split: validation
-  resampler_checkpoint: dual_query_resampler_bprime_v8/checkpoints/step-010000.pt
+  # The original checkpoint was deleted with the historical experiment volume.
+  # Use the functionally recovered and held-out-validated replacement for all
+  # fixed-reference sampling that reads this shared configuration section.
+  resampler_checkpoint: dual_query_resampler_bprime_v8_token_recovery/checkpoints/step-010000.pt
   cache:
     output_directory: dual_query_reference_tokens_v8_step10000
     device: cuda
