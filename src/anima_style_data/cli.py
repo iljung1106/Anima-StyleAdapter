@@ -118,6 +118,8 @@ def build_parser() -> argparse.ArgumentParser:
         ("lora-functional-teacher-cache", "Cache single and mixed LoRA functional effects"),
         ("external-civitai-lora-functional-cache", "Cache heterogeneous CivitAI LoRA effects"),
         ("external-civitai-lora-validate", "Validate each external LoRA storage format"),
+        ("external-civitai-lora-reference-generate", "Generate triggered external LoRA references"),
+        ("external-civitai-lora-reference-token-cache", "Cache external LoRA reference tokens"),
         ("kv-lora-functional-teacher-cache", "Cache K/V-only LoRA effects"),
         ("kv-lora-functional-teacher-320-cache", "Cache all 320 K/V-only LoRA and mixture effects"),
         ("kv-lora-fixed-teacher-compare", "Compare K/V LoRAs on one prompt and seed"),
@@ -528,17 +530,24 @@ def main() -> None:
     elif args.command in {
         "external-civitai-lora-functional-cache",
         "external-civitai-lora-validate",
+        "external-civitai-lora-reference-generate",
     }:
         from .external_lora_teacher import (
             cache_external_lora_functional_teacher,
+            generate_external_lora_references,
             validate_external_lora_teacher,
         )
 
         stage = {
             "external-civitai-lora-functional-cache": cache_external_lora_functional_teacher,
             "external-civitai-lora-validate": validate_external_lora_teacher,
+            "external-civitai-lora-reference-generate": generate_external_lora_references,
         }[args.command]
         _run(stage, config, destination)
+    elif args.command == "external-civitai-lora-reference-token-cache":
+        from .synthetic_reference_pipeline import cache_external_lora_dual_query_tokens
+
+        _run(cache_external_lora_dual_query_tokens, config, destination)
     elif args.command in {
         "artist-lora-diverse-plan",
         "artist-lora-diverse-train",

@@ -16,15 +16,21 @@ from typing import Any, Iterator
 import torch
 from safetensors.torch import load_file, save_file
 
-from .io import write_json, write_records
+from .io import read_records, write_json, write_records
 from .lora_functional_distillation import (
     MixtureSpec,
     _cached_training_probe_bank,
+    _preview_pixels,
     _predict_frozen_anima_in_chunks,
     build_mixture_specs,
 )
 from .style_calibration import _encode_prompts
-from .style_transfer import _optimize_frozen_anima, _resolve_anima_model
+from .style_transfer import (
+    _load_sampling_vae,
+    _optimize_frozen_anima,
+    _resolve_anima_model,
+)
+from .synthetic_teacher import _sample_anima_batch
 
 
 class _EmbeddingLoRA(torch.nn.Module):
@@ -731,6 +737,269 @@ def cache_external_lora_functional_teacher(
     write_json(summary_path, summary)
     adapter_pool.close()
     del anima, noisy, clean_context, base
+    gc.collect()
+    torch.cuda.empty_cache()
+    return summary
+
+
+def generate_external_lora_references(
+    config: dict[str, Any], destination: Path
+) -> dict[str, Any]:
+    """Render trigger-conditioned references for every external LoRA mixture.
+
+    The functional cache already contains four independently selected content
+    prompts per mixture, encoded with the union of the active adapters' trigger
+    words. Reusing those exact contexts keeps reference generation aligned with
+    the teacher while avoiding a second multi-gigabyte text-conditioning cache.
+    """
+
+    cfg = dict(config["external_civitai_lora_references"])
+    teacher_cfg = dict(config[str(cfg["functional_config_key"])])
+    cache_cfg = dict(teacher_cfg["teacher_cache"])
+    teacher_root = destination / str(cache_cfg["output_directory"])
+    teacher_summary_path = teacher_root / "summary.json"
+    if not teacher_summary_path.exists():
+        raise FileNotFoundError(teacher_summary_path)
+    teacher_summary = json.loads(teacher_summary_path.read_text(encoding="utf-8"))
+    expected_mixtures = int(teacher_summary["mixtures"])
+    if int(teacher_summary.get("complete_mixtures", -1)) != expected_mixtures:
+        raise RuntimeError("External functional teacher cache is incomplete")
+
+    records = sorted(
+        read_records(teacher_root / "mixtures.parquet"),
+        key=lambda row: int(row["index"]),
+    )
+    if [int(row["index"]) for row in records] != list(range(expected_mixtures)):
+        raise RuntimeError("External mixture manifest is not dense and ordered")
+    content_rows = read_records(teacher_root / "content_manifest.parquet")
+    images_per_style = int(cfg.get("images_per_style", 4))
+    trigger_contents = int(cache_cfg.get("trigger_probe_contents", 4))
+    if images_per_style != trigger_contents:
+        raise ValueError(
+            "images_per_style must equal teacher_cache.trigger_probe_contents "
+            "so every image uses a cached trigger-conditioned content"
+        )
+    shard_rows = int(cache_cfg.get("shard_mixtures", 8))
+    expected_context_shards = (len(records) + shard_rows - 1) // shard_rows
+    missing_contexts = [
+        index
+        for index in range(expected_context_shards)
+        if not (teacher_root / f"trigger-contexts-{index:05d}.safetensors").exists()
+    ]
+    if missing_contexts:
+        raise RuntimeError(
+            f"Missing trigger context shards: first={missing_contexts[:8]}"
+        )
+
+    output = destination / str(cfg["output_directory"])
+    for name in ("images", "latents", "manifests"):
+        (output / name).mkdir(parents=True, exist_ok=True)
+    bank = _load_bank(destination, str(teacher_cfg["bank_manifest"]))
+    device = str(cfg.get("device", "cuda"))
+    anima = _resolve_anima_model(config, destination, device).requires_grad_(False).eval()
+    _optimize_frozen_anima(
+        anima, low_precision_rmsnorm=True, fuse_attention_projections=False
+    )
+    pool = _ExternalAdapterPool(
+        config,
+        anima,
+        device,
+        prefetch_workers=int(cfg.get("adapter_prefetch_workers", 4)),
+    )
+    vae = _load_sampling_vae(config, destination).to(
+        device=device, dtype=torch.bfloat16
+    )
+    vae.requires_grad_(False).eval()
+    negative = load_file(
+        destination / str(cfg["negative_conditioning_file"]), device="cpu"
+    )["conditioning"].to(device=device, dtype=torch.bfloat16)
+    negative = negative.expand(images_per_style, -1, -1)
+    width, height = int(cfg.get("width", 512)), int(cfg.get("height", 512))
+    steps = int(cfg.get("steps", 20))
+    shift = float(cfg.get("flow_shift", 3.0))
+    sigmas = torch.linspace(1.0, 0.0, steps + 1, device=device, dtype=torch.float32)
+    sigmas = sigmas * shift / (1 + (shift - 1) * sigmas)
+    text_cfg = float(cfg.get("text_cfg", 4.0))
+    seed_base = int(cfg.get("seed", 20260829))
+    image_id_base = int(cfg.get("image_id_base", 40_000_000_000))
+    webp_quality = int(cfg.get("webp_quality", 95))
+    completed_rows: list[dict[str, Any]] = []
+    started = time.perf_counter()
+    context_shard_index = -1
+    context_shard: dict[str, torch.Tensor] | None = None
+
+    try:
+        for position, record in enumerate(records):
+            mixture_index = int(record["index"])
+            part_path = output / "manifests" / f"part-{mixture_index:05d}.parquet"
+            if part_path.exists():
+                completed_rows.extend(read_records(part_path))
+                continue
+
+            # Keep CPU construction overlapped with the current GPU render.
+            for upcoming in records[position : position + int(cfg.get("prefetch_styles", 8))]:
+                for component in upcoming["components"]:
+                    pool.prefetch(bank[int(component)])
+
+            required_shard = mixture_index // shard_rows
+            if context_shard is None or required_shard != context_shard_index:
+                context_shard = load_file(
+                    teacher_root / f"trigger-contexts-{required_shard:05d}.safetensors",
+                    device="cpu",
+                )
+                context_shard_index = required_shard
+            local_index = mixture_index - required_shard * shard_rows
+            cached_index = int(context_shard["mixture_indices"][local_index])
+            if cached_index != mixture_index:
+                raise RuntimeError(
+                    f"Trigger context index mismatch: {cached_index} != {mixture_index}"
+                )
+            positive = context_shard["contexts"][local_index].to(
+                device=device, dtype=torch.bfloat16
+            )
+            content_indices = [
+                int(value)
+                for value in context_shard["content_indices"][local_index].tolist()
+            ]
+            seeds = [
+                seed_base + mixture_index * 100_003 + image_index * 1009
+                for image_index in range(images_per_style)
+            ]
+            noise = torch.stack(
+                [
+                    torch.randn(
+                        16,
+                        1,
+                        height // 8,
+                        width // 8,
+                        generator=torch.Generator(device=device).manual_seed(seed),
+                        device=device,
+                        dtype=torch.bfloat16,
+                    )
+                    for seed in seeds
+                ]
+            )
+            components = [
+                (bank[int(component)], float(weight))
+                for component, weight in zip(
+                    record["components"], record["weights"], strict=True
+                )
+            ]
+            with pool.applied(components), torch.inference_mode(), torch.autocast(
+                "cuda", dtype=torch.bfloat16
+            ):
+                latents = _sample_anima_batch(
+                    anima,
+                    noise,
+                    positive,
+                    negative,
+                    sigmas,
+                    text_cfg=text_cfg,
+                    speed=None,
+                    generation_seeds=seeds,
+                )
+                decoded = vae.decode_to_pixels(latents)
+            if not torch.isfinite(latents).all():
+                raise RuntimeError(
+                    f"Non-finite external reference latent at mixture {mixture_index}"
+                )
+            images = _preview_pixels(decoded)
+            latent_name = f"part-{mixture_index:05d}.safetensors"
+            save_file(
+                {
+                    "latents": latents[:, :, 0]
+                    .to("cpu", dtype=torch.float16)
+                    .contiguous()
+                },
+                output / "latents" / latent_name,
+            )
+            style_id = str(record["mixture_style_id"])
+            image_dir = output / "images" / style_id
+            image_dir.mkdir(exist_ok=True)
+            rows = []
+            for image_index, (image, content_index, seed) in enumerate(
+                zip(images, content_indices, seeds, strict=True)
+            ):
+                image_path = image_dir / f"content-{image_index:02d}.webp"
+                image.save(image_path, format="WEBP", quality=webp_quality)
+                kind = "artist" if str(record["kind"]) == "single" else "lora_mixture"
+                content_prompt = str(
+                    content_rows[content_index].get(
+                        "caption", content_rows[content_index].get("prompt", "")
+                    )
+                )
+                triggered_prompt = _trigger_prompt(
+                    content_prompt, list(record.get("trigger_words") or [])
+                )
+                rows.append(
+                    {
+                        "id": image_id_base
+                        + mixture_index * images_per_style
+                        + image_index,
+                        "kind": kind,
+                        "mixture_kind": str(record["kind"]),
+                        "mixture_index": mixture_index,
+                        "artist_index": mixture_index,
+                        "artist": style_id,
+                        "style_id": style_id,
+                        "artist_split": "train",
+                        "split": "train",
+                        "content_index": image_index,
+                        "source_content_index": content_index,
+                        "generation_seed": seed,
+                        "content_prompt": content_prompt,
+                        "artist_prompt": triggered_prompt,
+                        "artist_tag": ", ".join(record.get("trigger_words") or []),
+                        "trigger_words": list(record.get("trigger_words") or []),
+                        "components": list(record["components"]),
+                        "weights": list(record["weights"]),
+                        "local_path": str(image_path.resolve()),
+                        "width": width,
+                        "height": height,
+                        "latent_height": height // 8,
+                        "latent_width": width // 8,
+                        "steps": steps,
+                        "text_cfg": text_cfg,
+                        "flow_shift": shift,
+                        "attention_backend": str(cfg.get("attention_mode", "torch")),
+                        "latent_shard": latent_name,
+                        "latent_row": image_index,
+                    }
+                )
+            write_records(part_path, rows)
+            completed_rows.extend(rows)
+            print(
+                f"external LoRA references {position + 1}/{len(records)} "
+                f"kind={record['kind']} images={len(completed_rows)} "
+                f"elapsed={time.perf_counter() - started:.1f}s",
+                flush=True,
+            )
+    finally:
+        pool.close()
+
+    completed_rows.sort(key=lambda row: int(row["id"]))
+    expected_images = len(records) * images_per_style
+    if len(completed_rows) != expected_images:
+        raise RuntimeError(
+            f"External reference manifest incomplete: "
+            f"{len(completed_rows)}/{expected_images}"
+        )
+    write_records(output / "manifest.parquet", completed_rows)
+    summary = {
+        "styles": len(records),
+        "single_styles": sum(str(row["kind"]) == "single" for row in records),
+        "mixture_styles": sum(str(row["kind"]) != "single" for row in records),
+        "images": len(completed_rows),
+        "images_per_style": images_per_style,
+        "content_policy": "four distinct cached-training contents per style",
+        "prompt_policy": "content plus union of component trigger words",
+        "functional_teacher_cache": str(teacher_root),
+        "adapter_pool_hits": pool.cache_hits,
+        "adapter_pool_misses": pool.cache_misses,
+        "elapsed_s": time.perf_counter() - started,
+    }
+    write_json(output / "generation_summary.json", summary)
+    del anima, vae
     gc.collect()
     torch.cuda.empty_cache()
     return summary

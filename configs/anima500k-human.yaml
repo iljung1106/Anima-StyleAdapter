@@ -9409,3 +9409,42 @@ external_civitai_lora_teacher:
     signed_l1_maximum: 1.50
     stable_effect_ratio_range: [0.25, 4.00]
     shard_mixtures: 8
+
+# Every external single LoRA and materialized pair/triple/amplified/signed
+# mixture gets four references with distinct content. Prompt conditioning is
+# reused from the completed functional cache: it already contains the union of
+# component trigger words and rotates over the 24-content bank per style.
+external_civitai_lora_references:
+  functional_config_key: external_civitai_lora_teacher
+  output_directory: civitai_external/synthetic_references_682x4_triggered_v1
+  negative_conditioning_file: synthetic_teacher_500x16/text/negative.safetensors
+  seed: 20260829
+  image_id_base: 40000000000
+  images_per_style: 4
+  width: 512
+  height: 512
+  steps: 20
+  flow_shift: 3.0
+  text_cfg: 4.0
+  device: cuda
+  attention_mode: torch
+  webp_quality: 95
+  adapter_prefetch_workers: 4
+  prefetch_styles: 8
+  dual_query_token_cache:
+    output_directory: dual_query_reference_tokens_v8_step10000
+    resampler_checkpoint: dual_query_resampler_bprime_v8/checkpoints/step-010000.pt
+    device: cuda
+    batch_size: 32
+    shard_rows: 512
+    reader_workers: 16
+    prefetch_batches: 8
+    writer_workers: 2
+    pending_writes: 2
+    latent_lru_shards: 4
+    amp_dtype: bfloat16
+    semantic_dim: 1536
+    vae_channels: 16
+    preprocess:
+      max_side: 512
+      max_pixels: 262144
