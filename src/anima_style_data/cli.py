@@ -888,6 +888,7 @@ def main() -> None:
         "kv-reference-expert-kv-raw-multidomain-10k-sample",
         "kv-reference-expert-external-velocity-5k-train",
         "kv-reference-expert-external-velocity-5k-sample",
+        "external-lora-reader-calibrate",
         "kv-reference-bilinear-smoke",
         "kv-reference-bilinear-train",
         "kv-reference-bilinear-sample",
