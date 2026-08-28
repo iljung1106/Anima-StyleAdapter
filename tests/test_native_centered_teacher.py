@@ -38,6 +38,28 @@ def test_train_population_offset_is_persisted_and_reused(tmp_path):
     )
 
 
+def test_raw_effect_rows_restore_cached_population_mean(tmp_path):
+    centered = torch.tensor([-2.0, 2.0], dtype=torch.float16).reshape(
+        2, 1, 1, 1
+    )
+    bank = NativeCenteredTeacherBank(
+        tensors={
+            "centered_teacher": centered,
+            "population_mean": torch.tensor(
+                [[[5.0]]], dtype=torch.float16
+            ),
+        },
+        summary={"train_style_ids": ["artist:0", "artist:1"]},
+        artist_to_index={"artist:0": 0, "artist:1": 1},
+        root=tmp_path,
+    )
+
+    assert torch.equal(
+        bank.raw_effect_rows([0, 1], 0, 0).flatten(),
+        torch.tensor([3.0, 7.0]),
+    )
+
+
 def test_teacher_spec_can_pair_full_artist_manifest_with_probe_controls(tmp_path):
     artist_rows = [
         {

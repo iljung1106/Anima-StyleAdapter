@@ -174,6 +174,8 @@ def build_parser() -> argparse.ArgumentParser:
         ("kv-reference-expert-kv-native-centered-750-sample", "Render fixed-population native-centered K/V experts"),
         ("kv-reference-expert-kv-native-centered-5k-train", "Continue native-centered K/V experts through full artist coverage"),
         ("kv-reference-expert-kv-native-centered-5k-sample", "Render the long native-centered K/V run"),
+        ("kv-reference-expert-kv-raw-multidomain-10k-train", "Train raw Artist/LoRA distillation with sparse Human flow"),
+        ("kv-reference-expert-kv-raw-multidomain-10k-sample", "Render raw multi-domain K/V experts"),
         ("kv-reference-bilinear-smoke", "Smoke-test reference-conditioned bilinear K/V operators"),
         ("kv-reference-bilinear-train", "Train reference-conditioned bilinear K/V operators"),
         ("kv-reference-bilinear-sample", "Render reference-conditioned bilinear K/V operators"),
@@ -334,6 +336,10 @@ def build_parser() -> argparse.ArgumentParser:
         (
             "dual-domain-centered-teacher-cache",
             "Cache 500-artist centered native flow targets",
+        ),
+        (
+            "raw-dual-domain-native-teacher-cache",
+            "Cache full native @artist effects with a recoverable mean",
         ),
         (
             "synthetic-dual-query-style-cache",
@@ -849,6 +855,8 @@ def main() -> None:
         "kv-reference-expert-kv-native-centered-750-sample",
         "kv-reference-expert-kv-native-centered-5k-train",
         "kv-reference-expert-kv-native-centered-5k-sample",
+        "kv-reference-expert-kv-raw-multidomain-10k-train",
+        "kv-reference-expert-kv-raw-multidomain-10k-sample",
         "kv-reference-bilinear-smoke",
         "kv-reference-bilinear-train",
         "kv-reference-bilinear-sample",
@@ -935,6 +943,8 @@ def main() -> None:
             sample_expert_kv_human_teacher_500,
             train_scheduled_expert_kv_human_teacher_flow_1k,
             sample_expert_kv_human_teacher_flow_1k,
+            train_scheduled_expert_kv_raw_multidomain_10k,
+            sample_expert_kv_raw_multidomain_10k,
         )
         from .kv_activation_sampling import (
             evaluate_kv_activation_reference_generalization,
@@ -1034,6 +1044,8 @@ def main() -> None:
             "kv-reference-expert-kv-native-centered-750-sample": sample_native_centered_reference_kv,
             "kv-reference-expert-kv-native-centered-5k-train": train_scheduled_native_centered_reference_kv_5k,
             "kv-reference-expert-kv-native-centered-5k-sample": sample_native_centered_reference_kv_5k,
+            "kv-reference-expert-kv-raw-multidomain-10k-train": train_scheduled_expert_kv_raw_multidomain_10k,
+            "kv-reference-expert-kv-raw-multidomain-10k-sample": sample_expert_kv_raw_multidomain_10k,
             "kv-reference-bilinear-smoke": smoke_test_reference_conditioned_bilinear_kv_operator,
             "kv-reference-bilinear-train": train_reference_conditioned_bilinear_kv_operator,
             "kv-reference-bilinear-sample": sample_reference_conditioned_bilinear_kv_operator,
@@ -1271,6 +1283,7 @@ def main() -> None:
         "dual-query-style-external-cache",
         "native-centered-teacher-cache",
         "dual-domain-centered-teacher-cache",
+        "raw-dual-domain-native-teacher-cache",
         "synthetic-dual-query-style-cache",
         "dual-domain-style-distill",
         "dual-domain-style-distill-smoke",
@@ -1308,6 +1321,7 @@ def main() -> None:
         from .native_centered_teacher import (
             cache_dual_domain_centered_teacher,
             cache_native_centered_teacher,
+            cache_raw_dual_domain_teacher,
         )
         from .dual_query_style_training import (
             compare_artist_summary_tokens,
@@ -1341,6 +1355,9 @@ def main() -> None:
             "native-centered-teacher-cache": cache_native_centered_teacher,
             "dual-domain-centered-teacher-cache": (
                 cache_dual_domain_centered_teacher
+            ),
+            "raw-dual-domain-native-teacher-cache": (
+                cache_raw_dual_domain_teacher
             ),
             "synthetic-dual-query-style-cache": (
                 cache_synthetic_dual_query_style_tokens

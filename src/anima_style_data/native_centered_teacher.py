@@ -309,6 +309,13 @@ def _cache_native_centered_teacher(
         len(artists), contents, len(timesteps), *latent_shape,
         dtype=torch.float16,
     )
+    # Preserve the legitimate reference-independent part of the native
+    # @artist intervention.  Earlier caches retained only the centered rows,
+    # which made exact full-effect distillation impossible without regenerating
+    # every tagged prediction.
+    population_mean = torch.empty(
+        contents, len(timesteps), *latent_shape, dtype=torch.float16
+    )
 
     anima = _resolve_anima_model(config, destination, device).requires_grad_(False).eval()
     _optimize_frozen_anima(
@@ -444,9 +451,13 @@ def _cache_native_centered_teacher(
                         target_input_ids=None,
                     ).squeeze(2).float()
                     effects[offset : offset + count].copy_(prediction - base)
-                centered = effects - effects.mean(dim=0, keepdim=True)
+                mean_effect = effects.mean(dim=0)
+                centered = effects - mean_effect.unsqueeze(0)
                 noisy_inputs[content_index, timestep_index] = noisy[0].cpu()
                 base_predictions[content_index, timestep_index] = base[0].cpu()
+                population_mean[content_index, timestep_index] = mean_effect.to(
+                    device="cpu", dtype=torch.float16
+                )
                 centered_teacher[:, content_index, timestep_index] = centered.to(
                     device="cpu", dtype=torch.float16
                 )
@@ -467,6 +478,7 @@ def _cache_native_centered_teacher(
         "noisy_inputs": noisy_inputs,
         "base_predictions": base_predictions,
         "centered_teacher": centered_teacher,
+        "population_mean": population_mean,
         "timesteps": torch.tensor(timesteps, dtype=torch.float32),
     }
     save_file(tensors, tensor_path)
@@ -513,12 +525,45 @@ def cache_dual_domain_centered_teacher(
     )
 
 
+def cache_raw_dual_domain_teacher(
+    config: dict[str, Any], destination: Path
+) -> dict[str, Any]:
+    """Cache the full 5k native bank with its recoverable population mean."""
+
+    return _cache_native_centered_teacher(
+        config, destination, config_key="raw_dual_domain_native_teacher"
+    )
+
+
 @dataclass
 class NativeCenteredTeacherBank:
     tensors: dict[str, torch.Tensor]
     summary: dict[str, Any]
     artist_to_index: dict[str, int]
     root: Path
+
+    def raw_effect_rows(
+        self,
+        artist_indices: list[int] | torch.Tensor,
+        content_index: int,
+        timestep_index: int,
+    ) -> torch.Tensor:
+        """Return the uncentered native @artist final-velocity effects."""
+
+        population_mean = self.tensors.get("population_mean")
+        if population_mean is None:
+            raise RuntimeError(
+                "Native teacher bank has no population_mean; regenerate it "
+                "with the raw-effect cache format"
+            )
+        indices = torch.as_tensor(artist_indices, dtype=torch.long, device="cpu")
+        centered = self.tensors["centered_teacher"].index_select(0, indices)[
+            :, int(content_index), int(timestep_index)
+        ].float()
+        mean = population_mean[
+            int(content_index), int(timestep_index)
+        ].float()
+        return centered + mean
 
     def train_population_offset(self) -> torch.Tensor:
         cached = self.tensors.get("train_population_offset")

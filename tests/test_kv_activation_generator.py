@@ -629,6 +629,20 @@ def test_whole_model_flow_schedule_is_three_of_four_after_5000() -> None:
     ]
 
 
+def test_multidomain_flow_schedule_transitions_from_eight_to_five_distills() -> None:
+    config = {
+        "enabled": True,
+        "phases": [
+            {"end_step": 18, "cycle": 9, "slots": [8]},
+            {"end_step": 30, "cycle": 6, "slots": [5]},
+        ],
+    }
+    assert [step for step in range(1, 31) if _direct_delta_flow_due(step, config)] == [
+        9, 18, 24, 30
+    ]
+    assert _direct_delta_flow_updates_through(30, config) == 4
+
+
 def test_mixture_target_matches_exact_weighted_factor_effect() -> None:
     torch.manual_seed(11)
     context = torch.randn(2, 7, 6)

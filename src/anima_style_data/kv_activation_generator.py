@@ -3008,6 +3008,23 @@ def _direct_delta_flow_due(relative_step: int, config: dict[str, Any]) -> bool:
 
     if relative_step <= 0 or not bool(config.get("enabled", False)):
         return False
+    phases = list(config.get("phases", []))
+    if phases:
+        phase_start = 1
+        for phase in phases:
+            phase_end = int(phase["end_step"])
+            if phase_end < phase_start:
+                raise ValueError("human_flow phase end_step values must increase")
+            cycle = int(phase["cycle"])
+            if cycle <= 0:
+                raise ValueError("human_flow phase cycle must be positive")
+            if relative_step <= phase_end:
+                slots = {
+                    int(value) % cycle for value in phase.get("slots", [cycle - 1])
+                }
+                return (relative_step - phase_start) % cycle in slots
+            phase_start = phase_end + 1
+        return False
     if "start_step" in config:
         start = int(config["start_step"])
         if relative_step <= start:
@@ -3051,6 +3068,7 @@ def train_direct_reference_kv_delta_320(
     from .global_query_style_tokenizer import MultiPromptDualQueryCachedStyleLoader
     from .kv_activation_sampling import NativeKVActivationInjector
     from .lora_functional_distillation import FunctionalLoRATeacherBank
+    from .native_centered_teacher import NativeCenteredTeacherBank
     from .kv_real_query_distillation import _RealQueryBank
     from .query_style_tokenizer import _sampling_reference_inputs
     from .style_transfer import (
@@ -3061,6 +3079,8 @@ def train_direct_reference_kv_delta_320(
 
     cfg = _resolved_experiment_config(config, config_key)
     training = dict(cfg["training"])
+    multi_domain = dict(training.get("multi_domain_distillation", {}))
+    multi_domain_enabled = bool(multi_domain.get("enabled", False))
     flow_only = bool(training.get("flow_only", False))
     steps = int(steps_override or training.get("steps", 4000))
     device = str(training.get("device", "cuda"))
@@ -3148,29 +3168,44 @@ def train_direct_reference_kv_delta_320(
     single_images = int(training.get("single_reference_images", 8))
     mixture_images = int(training.get("mixture_reference_images", 4))
     single_bank = None
+    single_banks: dict[str, torch.Tensor] = {}
     mixture_banks: dict[str, torch.Tensor] = {}
+    native_bank = None
+    native_reference_banks: dict[str, torch.Tensor] = {}
+    native_reference_teacher_indices: dict[str, list[int]] = {}
     contexts = None
     train_context_count = 0
     query_bank = None
     train_query_count = 0
     probes = []
     if not flow_only:
-        single_reference_cache = str(
-            cfg.get("single_reference_cache", cfg["synthetic_reference_cache"])
-        )
-        single_reference_seed = int(
-            cfg.get("single_reference_seed", seed ^ 0x53594E54)
-        )
-        single_loader = CachedTeacherReferenceLoader(
-            destination / single_reference_cache,
-            split="train", style_ids=artist_ids, batch_size=chunk,
-            references=single_images, seed=single_reference_seed,
-            token_lru_shards=token_lru, strict_style_ids=True,
-        )
-        single_bank = _materialize_reference_token_bank(
-            single_loader, artist_ids, references=single_images,
-            seed=single_reference_seed, chunk_size=chunk, device=device,
-        )
+        configured_single_caches = dict(
+            multi_domain.get("lora_reference_caches", {})
+        ) if multi_domain_enabled else {}
+        if not configured_single_caches:
+            configured_single_caches = {
+                "default": cfg.get(
+                    "single_reference_cache", cfg["synthetic_reference_cache"]
+                )
+            }
+        for domain, cache_value in configured_single_caches.items():
+            domain_seed = seed ^ (
+                0x48554D41 if str(domain) == "human" else 0x53594E54
+            )
+            single_loader = CachedTeacherReferenceLoader(
+                destination / str(cache_value),
+                split="train", style_ids=artist_ids, batch_size=chunk,
+                references=single_images, seed=domain_seed,
+                token_lru_shards=token_lru, strict_style_ids=True,
+            )
+            single_banks[str(domain)] = _materialize_reference_token_bank(
+                single_loader, artist_ids, references=single_images,
+                seed=domain_seed, chunk_size=chunk, device=device,
+            )
+        # Keep the established LoRA validation path on Human references when
+        # both domains are active.  The per-update scheduler selects the exact
+        # bank below.
+        single_bank = single_banks.get("human", next(iter(single_banks.values())))
         for kind, rows in rows_by_kind.items():
             style_ids = [str(row["mixture_style_id"]) for row in rows]
             loader = CachedTeacherReferenceLoader(
@@ -3185,6 +3220,64 @@ def train_direct_reference_kv_delta_320(
                 seed=seed ^ (sum(map(ord, kind)) * 1_000_003),
                 chunk_size=chunk, device=device,
             )
+        if multi_domain_enabled:
+            native_bank = NativeCenteredTeacherBank.load(
+                config,
+                destination,
+                config_key=str(multi_domain["native_teacher_config_key"]),
+            )
+            if "population_mean" not in native_bank.tensors:
+                raise RuntimeError(
+                    "Multi-domain training requires a raw native teacher bank "
+                    "with population_mean"
+                )
+            native_train_ids = [
+                str(value) for value in native_bank.summary["train_style_ids"]
+            ]
+            for domain, cache_values in dict(
+                multi_domain["native_reference_caches"]
+            ).items():
+                roots = (
+                    [destination / str(value) for value in cache_values]
+                    if isinstance(cache_values, list)
+                    else [destination / str(cache_values)]
+                )
+                available = {
+                    str(row["style_id"])
+                    for root in roots
+                    for row in read_records(root / "manifest.parquet")
+                    if str(
+                        row.get("artist_split", row.get("split", "train"))
+                    ) == "train"
+                }
+                domain_ids = [
+                    style_id for style_id in native_train_ids
+                    if style_id in available
+                ]
+                if len(domain_ids) < int(training.get("batch_size", 8)):
+                    raise RuntimeError(
+                        f"Native {domain} reference domain has only "
+                        f"{len(domain_ids)} usable artists"
+                    )
+                domain_seed = seed ^ (
+                    0x4E48554D if str(domain) == "human" else 0x4E53594E
+                )
+                loader = CachedTeacherReferenceLoader(
+                    roots if len(roots) > 1 else roots[0],
+                    split="train", style_ids=domain_ids, batch_size=chunk,
+                    references=single_images, seed=domain_seed,
+                    token_lru_shards=token_lru, strict_style_ids=True,
+                )
+                native_reference_banks[str(domain)] = (
+                    _materialize_reference_token_bank(
+                        loader, domain_ids, references=single_images,
+                        seed=domain_seed, chunk_size=chunk, device=device,
+                    )
+                )
+                native_reference_teacher_indices[str(domain)] = [
+                    native_bank.artist_to_index[style_id]
+                    for style_id in domain_ids
+                ]
         contexts = load_file(
             destination / str(cfg["text_context_cache"]) / "base.safetensors",
             device="cpu",
@@ -3284,10 +3377,27 @@ def train_direct_reference_kv_delta_320(
             map_location="cpu",
             weights_only=False,
         )
-        model.load_state_dict(initial["model"], strict=True)
-        reader.load_state_dict(initial["reader"], strict=True)
-        start_step = int(cfg.get("initial_step", initial.get("step", 0)))
-        if start_step != int(initial.get("step", start_step)):
+        use_initial_ema = bool(cfg.get("initial_use_ema", False))
+        model.load_state_dict(
+            initial.get("ema_model", initial["model"])
+            if use_initial_ema else initial["model"],
+            strict=True,
+        )
+        reader.load_state_dict(
+            initial.get("ema_reader", initial["reader"])
+            if use_initial_ema else initial["reader"],
+            strict=True,
+        )
+        reset_initial_step = bool(cfg.get("reset_initial_step", False))
+        start_step = (
+            0
+            if reset_initial_step
+            else int(cfg.get("initial_step", initial.get("step", 0)))
+        )
+        if (
+            not reset_initial_step
+            and start_step != int(initial.get("step", start_step))
+        ):
             raise ValueError("initial_step must match the warm-start checkpoint")
     if (
         hasattr(model, "set_routing_recording")
@@ -3460,6 +3570,34 @@ def train_direct_reference_kv_delta_320(
     category_weights = tuple(
         float(value)
         for value in training.get("category_weights", [0.5, 0.125, 0.125, 0.125, 0.125])
+    )
+    distillation_schedule = tuple(
+        str(value)
+        for value in multi_domain.get(
+            "schedule",
+            (
+                "artist_synthetic", "artist_human", "lora_synthetic",
+                "lora_human", "lora_mixture",
+            ),
+        )
+    )
+    allowed_multi_domains = {
+        "artist_synthetic", "artist_human",
+        "lora_synthetic", "lora_human", "lora_mixture",
+    }
+    if multi_domain_enabled and (
+        not distillation_schedule
+        or not set(distillation_schedule) <= allowed_multi_domains
+    ):
+        raise ValueError(
+            "Invalid multi-domain distillation schedule: "
+            f"{distillation_schedule}"
+        )
+    mixture_kind_schedule = tuple(
+        str(value)
+        for value in multi_domain.get(
+            "mixture_kind_schedule", ("pair", "triple", "amplified", "signed")
+        )
     )
     single_counts = [int(value) for value in training.get("single_reference_counts", [1, 2, 4, 8])]
     single_count_weights = [float(value) for value in training.get("single_reference_count_weights", [0.30, 0.25, 0.25, 0.20])]
@@ -4491,23 +4629,61 @@ def train_direct_reference_kv_delta_320(
                 continue
 
             rng = random.Random(seed + micro_step * 1_000_003)
-            category = rng.choices(categories, weights=category_weights, k=1)[0]
+            native_category = False
+            distillation_domain = "legacy"
+            if multi_domain_enabled:
+                distillation_index = (
+                    relative_step
+                    - _direct_delta_flow_updates_through(relative_step, human_flow)
+                )
+                schedule_entry = distillation_schedule[
+                    (distillation_index - 1) % len(distillation_schedule)
+                ]
+                distillation_domain = schedule_entry
+                native_category = schedule_entry.startswith("artist_")
+                if native_category or schedule_entry.startswith("lora_"):
+                    category = "single"
+                if schedule_entry == "lora_mixture":
+                    available_kinds = [
+                        kind for kind in mixture_kind_schedule
+                        if rows_by_kind.get(kind)
+                    ]
+                    if not available_kinds:
+                        raise RuntimeError("No configured LoRA mixture kind is available")
+                    mixture_update = 1 + (
+                        (distillation_index - 1) // len(distillation_schedule)
+                    )
+                    category = available_kinds[
+                        (mixture_update - 1) % len(available_kinds)
+                    ]
+            else:
+                category = rng.choices(
+                    categories, weights=category_weights, k=1
+                )[0]
             alternative_references = None
             alternative_mask = None
             consistency_left = None
             consistency_left_mask = None
             consistency_right = None
             consistency_right_mask = None
-            if category == "single":
-                artists = rng.sample(train_artists, batch)
-                functional_effect_indices = list(artists)
+            if native_category:
+                assert native_bank is not None
+                native_domain = distillation_domain.removeprefix("artist_")
+                native_reference_bank = native_reference_banks[native_domain]
+                local_artists = rng.sample(
+                    range(len(native_reference_bank)), batch
+                )
+                functional_effect_indices = [
+                    native_reference_teacher_indices[native_domain][index]
+                    for index in local_artists
+                ]
                 counts = rng.choices(single_counts, weights=single_count_weights, k=batch)
                 references, reference_mask = _select_reference_tokens(
-                    single_bank, artists, reference_counts=counts,
+                    native_reference_bank, local_artists, reference_counts=counts,
                     reference_start=0, reference_stop=single_images, rng=rng,
                 )
                 alternative_references, alternative_mask = _select_reference_tokens(
-                    single_bank, artists, reference_counts=counts,
+                    native_reference_bank, local_artists, reference_counts=counts,
                     reference_start=0, reference_stop=single_images,
                     rng=random.Random(seed ^ (step * 97_409)),
                 )
@@ -4523,13 +4699,57 @@ def train_direct_reference_kv_delta_320(
                     split = max(1, single_images // 2)
                     consistency_counts = [min(count, split) for count in counts]
                     consistency_left, consistency_left_mask = _select_reference_tokens(
-                        single_bank, artists,
+                        native_reference_bank, local_artists,
                         reference_counts=consistency_counts,
                         reference_start=0, reference_stop=split,
                         rng=random.Random(seed ^ (step * 193_939)),
                     )
                     consistency_right, consistency_right_mask = _select_reference_tokens(
-                        single_bank, artists,
+                        native_reference_bank, local_artists,
+                        reference_counts=consistency_counts,
+                        reference_start=split, reference_stop=single_images,
+                        rng=random.Random(seed ^ (step * 389_357)),
+                    )
+                components = torch.zeros(
+                    batch, 1, device=device, dtype=torch.long
+                )
+                weights = torch.ones(batch, 1, device=device)
+            elif category == "single":
+                artists = rng.sample(train_artists, batch)
+                functional_effect_indices = list(artists)
+                counts = rng.choices(single_counts, weights=single_count_weights, k=batch)
+                selected_single_bank = single_bank
+                if multi_domain_enabled:
+                    lora_domain = distillation_domain.removeprefix("lora_")
+                    selected_single_bank = single_banks[lora_domain]
+                references, reference_mask = _select_reference_tokens(
+                    selected_single_bank, artists, reference_counts=counts,
+                    reference_start=0, reference_stop=single_images, rng=rng,
+                )
+                alternative_references, alternative_mask = _select_reference_tokens(
+                    selected_single_bank, artists, reference_counts=counts,
+                    reference_start=0, reference_stop=single_images,
+                    rng=random.Random(seed ^ (step * 97_409)),
+                )
+                if (
+                    float(whole_model.get("reader_consistency_weight", 0.0)) > 0
+                    or float(
+                        whole_model.get("functional_consistency_weight", 0.0)
+                    ) > 0
+                    or float(
+                        whole_model.get("functional_contrastive_weight", 0.0)
+                    ) > 0
+                ):
+                    split = max(1, single_images // 2)
+                    consistency_counts = [min(count, split) for count in counts]
+                    consistency_left, consistency_left_mask = _select_reference_tokens(
+                        selected_single_bank, artists,
+                        reference_counts=consistency_counts,
+                        reference_start=0, reference_stop=split,
+                        rng=random.Random(seed ^ (step * 193_939)),
+                    )
+                    consistency_right, consistency_right_mask = _select_reference_tokens(
+                        selected_single_bank, artists,
                         reference_counts=consistency_counts,
                         reference_start=split, reference_stop=single_images,
                         rng=random.Random(seed ^ (step * 389_357)),
@@ -4809,27 +5029,40 @@ def train_direct_reference_kv_delta_320(
                     assert functional_bank is not None
                     assert flow_injector is not None
                     assert anima is not None
+                    functional_base = (
+                        native_bank.tensors
+                        if native_category and native_bank is not None
+                        else functional_bank.base
+                    )
                     functional_content = rng.randrange(
-                        int(functional_bank.base["noisy_inputs"].shape[0])
+                        int(functional_base["noisy_inputs"].shape[0])
                     )
                     functional_timestep = rng.randrange(
-                        int(functional_bank.base["noisy_inputs"].shape[1])
+                        int(functional_base["noisy_inputs"].shape[1])
                     )
-                    final_context = functional_bank.base["base_context"][
+                    final_context = functional_base["base_context"][
                         functional_content : functional_content + 1
                     ].to(device=device, dtype=torch.bfloat16).expand(batch, -1, -1)
-                    final_noisy = functional_bank.base["noisy_inputs"][
+                    final_noisy = functional_base["noisy_inputs"][
                         functional_content, functional_timestep
                     ].to(device=device, dtype=torch.bfloat16)[None].expand(batch, -1, -1, -1)
-                    final_base = functional_bank.base["base_predictions"][
+                    final_base = functional_base["base_predictions"][
                         functional_content, functional_timestep
                     ].to(device=device, dtype=torch.float32)[None].expand(batch, -1, -1, -1)
-                    final_teacher = functional_bank.effect_rows(
-                        functional_effect_indices,
-                        functional_content,
-                        functional_timestep,
-                    ).to(device=device, dtype=torch.float32)
-                    final_t = functional_bank.base["timesteps"][
+                    if native_category:
+                        assert native_bank is not None
+                        final_teacher = native_bank.raw_effect_rows(
+                            functional_effect_indices,
+                            functional_content,
+                            functional_timestep,
+                        ).to(device=device, dtype=torch.float32)
+                    else:
+                        final_teacher = functional_bank.effect_rows(
+                            functional_effect_indices,
+                            functional_content,
+                            functional_timestep,
+                        ).to(device=device, dtype=torch.float32)
+                    final_t = functional_base["timesteps"][
                         functional_timestep
                     ].to(device=device, dtype=torch.bfloat16).expand(batch)
                     final_padding = torch.zeros(
@@ -4892,11 +5125,28 @@ def train_direct_reference_kv_delta_320(
                         )
                     )
                     retrieval_weighted = float(
-                        whole_model.get("retrieval_weight", 0.0)
+                        dict(
+                            multi_domain.get("loss_by_domain", {})
+                        ).get(distillation_domain, {}).get(
+                            "retrieval_weight",
+                            whole_model.get("retrieval_weight", 0.0),
+                        )
                     ) * retrieval_loss
+                    domain_loss = dict(
+                        dict(multi_domain.get("loss_by_domain", {})).get(
+                            distillation_domain, {}
+                        )
+                    )
+                    huber_weight = float(domain_loss.get("huber_weight", 1.0))
+                    direction_domain_weight = float(
+                        domain_loss.get(
+                            "direction_weight",
+                            whole_model.get("direction_weight", 1.0),
+                        )
+                    )
                     whole_loss = (
-                        final_huber
-                        + float(whole_model.get("direction_weight", 1.0))
+                        huber_weight * final_huber
+                        + direction_domain_weight
                         * (1.0 - final_cosine)
                         + float(whole_model.get("constraint_weight", 1.0))
                         * constraint_loss
@@ -4917,6 +5167,10 @@ def train_direct_reference_kv_delta_320(
                     whole_metrics = {
                         "whole/loss": whole_loss.detach(),
                         "whole/normalized_huber": final_huber.detach(),
+                        "whole/huber_weight": final_huber.new_tensor(huber_weight),
+                        "whole/direction_weight": final_huber.new_tensor(
+                            direction_domain_weight
+                        ),
                         "whole/cosine": final_cosine.detach(),
                         "whole/retrieval_weighted_loss": (
                             retrieval_weighted.detach()
@@ -5099,6 +5353,7 @@ def train_direct_reference_kv_delta_320(
             running["curriculum/whole_weight"].append(curriculum["whole_weight"])
             running["update/distillation"].append(1.0)
             running[f"category/{category}"].append(1.0)
+            running[f"domain/{distillation_domain}"].append(1.0)
             if block_metrics:
                 for key in block_metrics[0]:
                     running[key].append(
@@ -5108,6 +5363,9 @@ def train_direct_reference_kv_delta_320(
             for key, value in whole_metrics.items():
                 running[key].append(float(value))
                 running[f"{key}_by_kind/{category}"].append(float(value))
+                running[f"{key}_by_domain/{distillation_domain}"].append(
+                    float(value)
+                )
             running["routing/balance_loss"].append(
                 float(routing_balance.detach())
             )
@@ -5978,6 +6236,27 @@ def train_scheduled_direct_reference_kv_delta_320(
         "segments": segments,
         "samples": samples,
     }
+
+
+def train_scheduled_expert_kv_raw_multidomain_10k(
+    config: dict[str, Any], destination: Path
+) -> dict[str, Any]:
+    return train_scheduled_direct_reference_kv_delta_320(
+        config,
+        destination,
+        config_key="kv_reference_expert_kv_raw_multidomain_10k",
+        sample_config_key="kv_reference_expert_kv_raw_multidomain_10k_sample",
+    )
+
+
+def sample_expert_kv_raw_multidomain_10k(
+    config: dict[str, Any], destination: Path
+) -> dict[str, Any]:
+    return sample_direct_reference_kv_delta_320(
+        config,
+        destination,
+        sample_config_key="kv_reference_expert_kv_raw_multidomain_10k_sample",
+    )
 
 
 def train_scheduled_low_rank_kvoq_flow_50k(

@@ -2360,6 +2360,140 @@ kv_reference_expert_kv_native_centered_5k_sample:
   batch_size: 4
   panel_tile_width: 384
 
+# Full-effect continuation of v12. Five explicit distillation domains are
+# followed by one stronger grouped Human flow update. Synthetic references
+# carry exact absolute supervision; Human references emphasize direction,
+# retrieval, and disjoint-subset functional consistency.
+kv_reference_expert_kv_raw_multidomain_10k:
+  extends_config_key: kv_reference_expert_kv_native_centered_5k
+  output_directory: kv_reference_expert_kv64x16_raw_multidomain_flow_b3_w768_l3_10k_v13
+  seed: 20260908
+  initial_checkpoint: kv_reference_expert_kv64x16_native_centered_b3_w768_l3_750_v12/checkpoints/step-0005000.pt
+  initial_step: 0
+  reset_initial_step: true
+  single_reference_cache: dual_query_reference_tokens_v8_step10000
+  training:
+    steps: 10000
+    flow_only: false
+    batch_size: 3
+    gradient_accumulation_steps: 1
+    blocks_per_step: 0
+    single_reference_images: 4
+    mixture_reference_images: 4
+    validation_every: 500
+    checkpoint_every: 500
+    sample_every: 0
+    sample_steps: [500, 1000, 1500, 2000, 3000, 4000, 5000, 6000, 7000, 8000, 9000, 10000]
+    sample_output_root: diagnostics/kv-reference-expert-kv64x16-raw-multidomain-flow-b3-w768-l3-10k-v13
+    multi_domain_distillation:
+      enabled: true
+      schedule: [artist_synthetic, artist_human, lora_synthetic, lora_human, lora_mixture]
+      mixture_kind_schedule: [pair, triple, pair, amplified, pair, triple, signed]
+      native_teacher_config_key: raw_dual_domain_native_teacher
+      native_reference_caches:
+        human: dual_query_reference_tokens_v8_step10000
+        synthetic:
+          - synthetic_teacher_500x16/dual_query_reference_tokens_v8_step10000
+          - synthetic_teacher_additional_1500x6/dual_query_reference_tokens_v8_step10000
+      lora_reference_caches:
+        human: dual_query_reference_tokens_v8_step10000
+        synthetic: kv_lora_teacher_references_rank16_320x8_realq_v2/dual_query_reference_tokens_v8_step10000
+      loss_by_domain:
+        artist_synthetic: {huber_weight: 1.0, direction_weight: 1.0, retrieval_weight: 0.5}
+        artist_human: {huber_weight: 0.4, direction_weight: 1.0, retrieval_weight: 0.75}
+        lora_synthetic: {huber_weight: 1.0, direction_weight: 1.0, retrieval_weight: 0.5}
+        lora_human: {huber_weight: 0.4, direction_weight: 1.0, retrieval_weight: 0.75}
+        lora_mixture: {huber_weight: 1.0, direction_weight: 1.0, retrieval_weight: 0.5}
+    whole_model_functional:
+      enabled: true
+      require_all_mixture_references: true
+      effect_slice_lru_entries: 0
+      gpu_resident_effects: true
+      block_weight_scale: 0.0
+      whole_weight_override: 1.0
+      huber_beta: 0.10
+      direction_weight: 1.0
+      retrieval_weight: 0.5
+      retrieval_temperature: 0.07
+      constraint_weight: 0.25
+      common_cap_weight: 0.0
+      relative_common_weight: 0.10
+      rms_band_weight: 1.0
+      common_cap: 1.0
+      rms_floor: 0.0001
+      functional_consistency_weight: 0.15
+      functional_consistency_cosine_floor: 0.80
+      functional_consistency_rms_tolerance: 1.5
+      functional_consistency_magnitude_weight: 0.25
+      functional_consistency_blocks: [0, 7, 14, 21, 27]
+      functional_consistency_signature_width: 64
+      functional_contrastive_weight: 0.25
+      functional_contrastive_temperature: 0.10
+      expert_balance_weight: 0.001
+    human_flow:
+      enabled: true
+      batch_size: 3
+      same_style_target_min: 2
+      same_style_target_max: 3
+      prompt_modes: {full: 0.25, tag_dropout: 0.45, short: 0.30, empty: 0.0}
+      phases:
+        - {end_step: 504, cycle: 9, slots: [8]}
+        - {end_step: 10000, cycle: 6, slots: [5]}
+      flow_loss_weight: 2.0
+      flow_mse_weight: 1.0
+      residual_huber_weight: 0.0
+      direction_weight: 0.0
+      output_band_weight: 0.0
+      prior_preservation_weight: 0.05
+      cross_style_diversity_weight: 0.0
+      population_common_weight: 0.0
+      reference_subset_dropout: 0.25
+      timestep_sampling: shift
+      timestep_stratified_quantiles: true
+      sigmoid_scale: 1.0
+      sigmoid_bias: 0.0
+      discrete_flow_shift: 3.0
+      group_shared_block_dropout: 0.10
+      expert_balance_weight: 0.001
+      fixed_validation_every: 500
+      fixed_validation_batches: 4
+      prefetch_workers: 4
+      prefetch_batches: 8
+    generator_learning_rate: 0.000001
+    reader_learning_rate: 0.0000005
+    generator_lr_schedule:
+      peak_lr: 0.000001
+      warmup_steps: 200
+      decay_start_step: 7000
+      decay_end_step: 10000
+      final_lr: 0.0000002
+    reader_lr_schedule:
+      peak_lr: 0.0000005
+      warmup_steps: 200
+      decay_start_step: 2500
+      decay_end_step: 8000
+      final_lr: 0.0000001
+    ema:
+      enabled: true
+      decay: 0.995
+      sample: true
+    wandb:
+      enabled: true
+      project: anima-style-adapter
+      name: kv-reference-expert-kv64x16-raw-multidomain-flow-b3-w768-l3-10k-v13
+      id: kv-reference-expert-kv64x16-raw-multidomain-flow-b3-w768-l3-10k-v13
+
+kv_reference_expert_kv_raw_multidomain_10k_sample:
+  checkpoint: kv_reference_expert_kv64x16_raw_multidomain_flow_b3_w768_l3_10k_v13/checkpoints/step-0010000.pt
+  output_directory: diagnostics/kv-reference-expert-kv64x16-raw-multidomain-flow-b3-w768-l3-10k-v13-step10000
+  device: cuda
+  artists: 8
+  references: 4
+  reference_seed: 20260908
+  strengths: [1.0, 2.0]
+  batch_size: 4
+  panel_tile_width: 384
+
 # Reference-conditioned low-rank operator pilot. Unlike the direct activation
 # head above, the reference generates a fresh block-local linear operator and
 # applies it to every native text token.  Teacher factors remain offline
@@ -5176,6 +5310,24 @@ dual_domain_native_teacher:
   content_count: 4
   timesteps: [0.10, 0.25, 0.40, 0.55, 0.70, 0.82, 0.90, 0.97]
   seed: 20260820
+  text_batch_size: 64
+  artist_batch_size: 32
+  artist_batch_candidates: [16, 32, 48, 64]
+  gpu_resident_text: true
+
+# Regenerated full-effect bank.  It retains both centered artist rows and the
+# population mean, so training can reconstruct raw (@artist - untagged)
+# velocity without a Common branch or any batch/population subtraction.
+raw_dual_domain_native_teacher:
+  output_directory: native_artist_raw_flow_teacher_5000_v3
+  artist_manifest: dual_query_reference_tokens_v8_step10000/manifest.parquet
+  probe_manifest: synthetic_teacher_500x16/manifest.parquet
+  probe_latent_directory: synthetic_teacher_500x16/latents
+  artist_count: 5000
+  device: cuda
+  content_count: 4
+  timesteps: [0.10, 0.25, 0.40, 0.55, 0.70, 0.82, 0.90, 0.97]
+  seed: 20260908
   text_batch_size: 64
   artist_batch_size: 32
   artist_batch_candidates: [16, 32, 48, 64]
