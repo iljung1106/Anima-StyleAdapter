@@ -2473,6 +2473,10 @@ kv_reference_expert_kv_raw_multidomain_10k:
       decay_start_step: 7000
       decay_end_step: 10000
       final_lr: 0.0000002
+      # Clear the inherited v4 5k tail. The main cosine decay already ends at
+      # the final 10k step, so the tail is intentionally a no-op.
+      tail_decay_end_step: 10000
+      tail_final_lr: 0.0000002
     reader_lr_schedule:
       peak_lr: 0.0000005
       warmup_steps: 200
