@@ -2519,13 +2519,13 @@ kv_reference_expert_kv_raw_multidomain_10k_sample:
 # flow update every sixth optimizer step. No heterogeneous block target is used.
 kv_reference_expert_external_velocity_5k:
   extends_config_key: kv_reference_expert_kv_raw_multidomain_10k
-  output_directory: kv_reference_expert_combined_velocity_b3_w768_l3_5k_v16
+  output_directory: kv_reference_expert_combined_diversity_b3_w768_l3_2k_v17
   seed: 20260909
-  initial_checkpoint: kv_reference_expert_kv64x16_native_centered_b3_w768_l3_750_v12/checkpoints/step-0005000.pt
+  initial_checkpoint: kv_reference_expert_combined_velocity_b3_w768_l3_5k_v16/checkpoints/step-0001000.pt
   initial_step: 0
   reset_initial_step: true
   training:
-    steps: 5000
+    steps: 2000
     torch_num_threads: 4
     blocks_per_step: 0
     materialized_reference_bank_cache: kv_reference_expert_external_velocity_v14_reference_banks
@@ -2533,8 +2533,8 @@ kv_reference_expert_external_velocity_5k:
     validation_every: 500
     checkpoint_every: 500
     sample_every: 0
-    sample_steps: [500, 1000, 1500, 2000, 3000, 4000, 5000]
-    sample_output_root: diagnostics/kv-reference-expert-combined-velocity-b3-w768-l3-5k-v16
+    sample_steps: [500, 1000, 1500, 2000]
+    sample_output_root: diagnostics/kv-reference-expert-combined-diversity-b3-w768-l3-2k-v17
     multi_domain_distillation:
       enabled: true
       schedule: [artist_synthetic, artist_human, lora_synthetic, lora_human, lora_mixture, external_single, external_mixture, external_mixture]
@@ -2555,10 +2555,13 @@ kv_reference_expert_external_velocity_5k:
         # undefined for those rows; all 296 effective singles are retained.
         minimum_effect_rms: 0.001
       loss_by_domain:
-        artist_synthetic: {huber_weight: 1.0, direction_weight: 1.0, retrieval_weight: 0.5}
-        artist_human: {huber_weight: 0.4, direction_weight: 1.0, retrieval_weight: 0.75}
-        external_single: {huber_weight: 1.0, direction_weight: 1.0, retrieval_weight: 0.5}
-        external_mixture: {huber_weight: 1.0, direction_weight: 1.0, retrieval_weight: 0.5}
+        artist_synthetic: {huber_weight: 1.0, direction_weight: 1.0, retrieval_weight: 0.75}
+        artist_human: {huber_weight: 0.4, direction_weight: 1.0, retrieval_weight: 1.0}
+        lora_synthetic: {huber_weight: 1.0, direction_weight: 1.0, retrieval_weight: 1.0}
+        lora_human: {huber_weight: 0.4, direction_weight: 1.0, retrieval_weight: 1.0}
+        lora_mixture: {huber_weight: 1.0, direction_weight: 1.0, retrieval_weight: 1.25}
+        external_single: {huber_weight: 1.0, direction_weight: 1.0, retrieval_weight: 1.5}
+        external_mixture: {huber_weight: 1.0, direction_weight: 1.0, retrieval_weight: 1.5}
     whole_model_functional:
       enabled: true
       # Keep one original-LoRA and one external-LoRA effect shard resident.
@@ -2572,8 +2575,8 @@ kv_reference_expert_external_velocity_5k:
       retrieval_weight: 0.5
       retrieval_temperature: 0.07
       constraint_weight: 0.25
-      common_cap_weight: 0.05
-      relative_common_weight: 0.10
+      common_cap_weight: 0.10
+      relative_common_weight: 0.75
       rms_band_weight: 1.0
       common_cap: 0.55
       rms_floor: 0.0001
@@ -2589,27 +2592,27 @@ kv_reference_expert_external_velocity_5k:
     human_flow:
       enabled: true
       phases:
-        - {end_step: 5000, cycle: 6, slots: [5]}
+        - {end_step: 2000, cycle: 6, slots: [5]}
       flow_loss_weight: 2.5
       prior_preservation_weight: 0.05
       fixed_validation_every: 500
       fixed_validation_batches: 4
-    generator_learning_rate: 0.0000015
-    reader_learning_rate: 0.0000008
+    generator_learning_rate: 0.000001
+    reader_learning_rate: 0.0000005
     generator_lr_schedule:
-      peak_lr: 0.0000015
-      warmup_steps: 200
-      decay_start_step: 3000
-      decay_end_step: 5000
-      final_lr: 0.0000003
-      tail_decay_end_step: 5000
-      tail_final_lr: 0.0000003
-    reader_lr_schedule:
-      peak_lr: 0.0000008
+      peak_lr: 0.000001
       warmup_steps: 100
+      decay_start_step: 1000
+      decay_end_step: 2000
+      final_lr: 0.0000002
+      tail_decay_end_step: 2000
+      tail_final_lr: 0.0000002
+    reader_lr_schedule:
+      peak_lr: 0.0000005
+      warmup_steps: 50
       decay_start_step: 500
-      decay_end_step: 3000
-      final_lr: 0.0000001
+      decay_end_step: 1500
+      final_lr: 0.00000005
     ema:
       enabled: true
       decay: 0.999
@@ -2617,13 +2620,13 @@ kv_reference_expert_external_velocity_5k:
     wandb:
       enabled: true
       project: anima-style-adapter
-      name: kv-reference-expert-combined-velocity-b3-w768-l3-5k-v16
-      id: kv-reference-expert-combined-velocity-b3-w768-l3-5k-v16
+      name: kv-reference-expert-combined-diversity-b3-w768-l3-2k-v17
+      id: kv-reference-expert-combined-diversity-b3-w768-l3-2k-v17
       resume: allow
 
 kv_reference_expert_external_velocity_5k_sample:
-  checkpoint: kv_reference_expert_combined_velocity_b3_w768_l3_5k_v16/checkpoints/step-0005000.pt
-  output_directory: diagnostics/kv-reference-expert-combined-velocity-b3-w768-l3-5k-v16-step5000
+  checkpoint: kv_reference_expert_combined_diversity_b3_w768_l3_2k_v17/checkpoints/step-0002000.pt
+  output_directory: diagnostics/kv-reference-expert-combined-diversity-b3-w768-l3-2k-v17-step2000
   device: cuda
   artists: 8
   references: 4
