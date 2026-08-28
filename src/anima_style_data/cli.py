@@ -885,6 +885,8 @@ def main() -> None:
         "kv-reference-expert-kv-native-centered-5k-sample",
         "kv-reference-expert-kv-raw-multidomain-10k-train",
         "kv-reference-expert-kv-raw-multidomain-10k-sample",
+        "kv-reference-expert-external-velocity-5k-train",
+        "kv-reference-expert-external-velocity-5k-sample",
         "kv-reference-bilinear-smoke",
         "kv-reference-bilinear-train",
         "kv-reference-bilinear-sample",
