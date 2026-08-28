@@ -2492,6 +2492,9 @@ kv_reference_expert_kv_raw_multidomain_10k:
       project: anima-style-adapter
       name: kv-reference-expert-kv64x16-raw-multidomain-flow-b3-w768-l3-10k-v13
       id: kv-reference-expert-kv64x16-raw-multidomain-flow-b3-w768-l3-10k-v13
+      # The first launch created this empty run before a config preflight
+      # failure. Reattach to it; no optimizer metrics or checkpoints exist.
+      resume: allow
 
 kv_reference_expert_kv_raw_multidomain_10k_sample:
   checkpoint: kv_reference_expert_kv64x16_raw_multidomain_flow_b3_w768_l3_10k_v13/checkpoints/step-0010000.pt

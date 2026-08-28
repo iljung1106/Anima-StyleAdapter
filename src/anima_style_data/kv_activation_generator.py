@@ -3726,7 +3726,9 @@ def train_direct_reference_kv_delta_320(
             project=str(wandb_cfg.get("project", "anima-style-adapter")),
             name=str(wandb_cfg.get("name", "kv-reference-direct-delta-320")),
             id=str(wandb_cfg.get("id", "kv-reference-direct-delta-320")),
-            resume="allow" if resumed else "never",
+            resume=str(
+                wandb_cfg.get("resume", "allow" if resumed else "never")
+            ),
             config={config_key: cfg},
         )
 
