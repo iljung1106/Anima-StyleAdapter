@@ -13,6 +13,7 @@ from typing import Any, Mapping
 
 import torch
 from safetensors import safe_open
+from safetensors.torch import load_file
 from torch.nn import functional as F
 
 from .dual_query_training import (
@@ -106,37 +107,38 @@ def _attach_teacher_rows(
     return joined
 
 
-def _load_teacher_bank(
-    root: Path, rows: list[dict[str, Any]], *, pin_memory: bool
-) -> tuple[torch.Tensor, torch.Tensor, dict[int, int]]:
-    ordered = sorted(rows, key=lambda row: int(row["id"]))
-    id_to_index = {int(row["id"]): index for index, row in enumerate(ordered)}
-    tokens = torch.empty(len(ordered), 84, 1024, dtype=torch.bfloat16)
-    descriptors = torch.empty(len(ordered), 512, dtype=torch.bfloat16)
-    groups: dict[str, list[dict[str, Any]]] = defaultdict(list)
-    for row in ordered:
-        groups[str(row["teacher_shard"])].append(row)
-    for shard, shard_rows in groups.items():
-        with safe_open(root / shard, framework="pt", device="cpu") as handle:
-            # Network-volume random slices are much slower than one contiguous
-            # read. Each shard is only ~84 MiB, so materialize it once and copy
-            # all selected rows together.
-            shard_tokens = handle.get_tensor("tokens")
-            shard_descriptors = handle.get_tensor("descriptors")
-            source = torch.tensor(
-                [int(row["teacher_row"]) for row in shard_rows], dtype=torch.long
-            )
-            target = torch.tensor(
-                [id_to_index[int(row["id"])] for row in shard_rows], dtype=torch.long
-            )
-            tokens.index_copy_(0, target, shard_tokens.index_select(0, source))
+class _TeacherShardBank:
+    def __init__(self, root: Path, rows: list[dict[str, Any]]) -> None:
+        self.locations = {
+            int(row["id"]): (str(row["teacher_shard"]), int(row["teacher_row"]))
+            for row in rows
+        }
+        self.shards = {
+            name: load_file(root / name, device="cpu")
+            for name in sorted({location[0] for location in self.locations.values()})
+        }
+
+    def batch(
+        self, image_ids: list[int], *, pin_memory: bool
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        tokens = torch.empty(len(image_ids), 84, 1024, dtype=torch.bfloat16)
+        descriptors = torch.empty(len(image_ids), 512, dtype=torch.bfloat16)
+        groups: dict[str, list[tuple[int, int]]] = defaultdict(list)
+        for destination, image_id in enumerate(image_ids):
+            shard, source = self.locations[image_id]
+            groups[shard].append((destination, source))
+        for shard, entries in groups.items():
+            destination = torch.tensor([item[0] for item in entries], dtype=torch.long)
+            source = torch.tensor([item[1] for item in entries], dtype=torch.long)
+            tensors = self.shards[shard]
+            tokens.index_copy_(0, destination, tensors["tokens"].index_select(0, source))
             descriptors.index_copy_(
-                0, target, shard_descriptors.index_select(0, source)
+                0, destination, tensors["descriptors"].index_select(0, source)
             )
-    if pin_memory:
-        tokens = tokens.pin_memory()
-        descriptors = descriptors.pin_memory()
-    return tokens, descriptors, id_to_index
+        if pin_memory:
+            tokens = tokens.pin_memory()
+            descriptors = descriptors.pin_memory()
+        return tokens, descriptors
 
 
 def _split_styles(
@@ -365,12 +367,10 @@ def recover_dual_query_resampler(
         optimizer_kwargs["fused"] = True
     optimizer = torch.optim.AdamW(trainable, **optimizer_kwargs)
 
-    print(f"loading {len(rows)} frozen teacher-token rows into host RAM", flush=True)
-    target_tokens, target_descriptors, target_indices = _load_teacher_bank(
-        token_root, rows, pin_memory=False
-    )
+    teacher_bank = _TeacherShardBank(token_root, rows)
     print(
-        f"teacher-token bank ready: {target_tokens.numel() * target_tokens.element_size() / 2**30:.2f} GiB",
+        f"teacher-token bank mapped: {len(rows)} rows across "
+        f"{len(teacher_bank.shards)} local shards",
         flush=True,
     )
 
@@ -382,15 +382,9 @@ def recover_dual_query_resampler(
             semantic_layers,
             pin_memory=device.startswith("cuda"),
         )
-        indices = torch.tensor(
-            [target_indices[image_id] for image_id in episode.image_ids],
-            dtype=torch.long,
+        selected_tokens, selected_descriptors = teacher_bank.batch(
+            episode.image_ids, pin_memory=device.startswith("cuda")
         )
-        selected_tokens = target_tokens.index_select(0, indices)
-        selected_descriptors = target_descriptors.index_select(0, indices)
-        if device.startswith("cuda"):
-            selected_tokens = selected_tokens.pin_memory()
-            selected_descriptors = selected_descriptors.pin_memory()
         return RecoveryBatch(
             inputs=episode,
             target_tokens=selected_tokens,
