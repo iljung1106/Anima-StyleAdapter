@@ -72,20 +72,22 @@ def main() -> None:
     )
     checkpoint_path = destination / args.checkpoint
     checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-    reader = _load_reader(config, destination, cfg, args.device)
-    reader.load_state_dict(checkpoint.get("ema_reader", checkpoint["reader"]), strict=True)
-    reader.requires_grad_(False).eval()
-
     raw_left = bank[:, :2].mean(dim=1)
     raw_right = bank[:, 2:].mean(dim=1)
     mask = torch.ones(len(style_ids), 2, device=args.device, dtype=torch.bool)
-    with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
-        memory_left = reader(bank[:, :2], mask).tokens
-        memory_right = reader(bank[:, 2:], mask).tokens
 
     print(f"styles={len(style_ids)} checkpoint={checkpoint_path}")
     print("raw_tokens", retrieval_metrics(raw_left, raw_right))
-    print("reader_memory", retrieval_metrics(memory_left, memory_right))
+    for state_name in ("reader", "ema_reader"):
+        if state_name not in checkpoint:
+            continue
+        reader = _load_reader(config, destination, cfg, args.device)
+        reader.load_state_dict(checkpoint[state_name], strict=True)
+        reader.requires_grad_(False).eval()
+        with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
+            memory_left = reader(bank[:, :2], mask).tokens
+            memory_right = reader(bank[:, 2:], mask).tokens
+        print(state_name, retrieval_metrics(memory_left, memory_right))
 
 
 if __name__ == "__main__":
