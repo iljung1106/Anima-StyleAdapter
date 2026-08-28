@@ -334,7 +334,7 @@ def recover_dual_query_resampler(
 
     print(f"loading {len(rows)} frozen teacher-token rows into host RAM", flush=True)
     target_tokens, target_descriptors, target_indices = _load_teacher_bank(
-        token_root, rows, pin_memory=device.startswith("cuda")
+        token_root, rows, pin_memory=False
     )
     print(
         f"teacher-token bank ready: {target_tokens.numel() * target_tokens.element_size() / 2**30:.2f} GiB",
@@ -353,10 +353,15 @@ def recover_dual_query_resampler(
             [target_indices[image_id] for image_id in episode.image_ids],
             dtype=torch.long,
         )
+        selected_tokens = target_tokens.index_select(0, indices)
+        selected_descriptors = target_descriptors.index_select(0, indices)
+        if device.startswith("cuda"):
+            selected_tokens = selected_tokens.pin_memory()
+            selected_descriptors = selected_descriptors.pin_memory()
         return RecoveryBatch(
             inputs=episode,
-            target_tokens=target_tokens.index_select(0, indices),
-            target_descriptors=target_descriptors.index_select(0, indices),
+            target_tokens=selected_tokens,
+            target_descriptors=selected_descriptors,
         )
 
     output = destination / str(cfg["output_directory"])
