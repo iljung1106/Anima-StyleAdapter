@@ -6679,6 +6679,133 @@ def sample_direct_reference_kv_delta_320(
         tile_width=int(sample_cfg.get("panel_tile_width", 384)),
     )
 
+    external_panel: Path | None = None
+    external_panel_style_ids: list[str] = []
+    external_panel_cfg = dict(sample_cfg.get("external_panel", {}))
+    if bool(external_panel_cfg.get("enabled", False)):
+        token_root = destination / str(external_panel_cfg["reference_cache"])
+        source_manifest = destination / str(external_panel_cfg["source_manifest"])
+        functional_root = destination / str(
+            external_panel_cfg["functional_teacher_cache"]
+        )
+        functional_rows = read_records(functional_root / "mixtures.parquet")
+        minimum_effect_rms = float(
+            external_panel_cfg.get("minimum_effect_rms", 0.001)
+        )
+        single_rows = [
+            row
+            for row in functional_rows
+            if str(row["kind"]) == "single"
+            and bool(row.get("enabled", True))
+            and float(row.get("effect_rms", 0.0)) >= minimum_effect_rms
+        ]
+        validation_count = int(
+            external_panel_cfg.get("validation_single_styles", 32)
+        )
+        split_seed = int(external_panel_cfg["training_seed"]) ^ 0x45585641
+        split_rng = random.Random(split_seed)
+        validation_indices = sorted(
+            split_rng.sample(range(len(single_rows)), validation_count)
+        )
+        panel_count = min(
+            int(external_panel_cfg.get("styles", 8)), len(validation_indices)
+        )
+        selected_rows = [
+            single_rows[index] for index in validation_indices[:panel_count]
+        ]
+        selected_style_ids = [
+            str(row["mixture_style_id"]) for row in selected_rows
+        ]
+        external_panel_style_ids = selected_style_ids
+        external_references = int(external_panel_cfg.get("references", 4))
+        external_loader = CachedTeacherReferenceLoader(
+            token_root,
+            split="train",
+            style_ids=selected_style_ids,
+            batch_size=panel_count,
+            references=external_references,
+            seed=int(external_panel_cfg.get("reference_seed", split_seed)),
+            token_lru_shards=2,
+            strict_style_ids=True,
+        )
+        external_bank = _cached_reference_bank(
+            external_loader,
+            selected_style_ids,
+            references=external_references,
+            seed=int(external_panel_cfg.get("reference_seed", split_seed)),
+            chunk_size=panel_count,
+            device=device,
+            cache_root=None,
+            split="sample-external-heldout",
+            source=str(token_root),
+        )
+        external_mask = torch.ones(
+            panel_count,
+            external_references,
+            device=device,
+            dtype=torch.bool,
+        )
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            external_memory = reader(external_bank, external_mask).tokens
+        external_positive = fixed_positive[:1].expand(panel_count, -1, -1)
+        external_negative = fixed_negative[:1].expand(panel_count, -1, -1)
+        external_noise = fixed_noise[:1].expand(panel_count, -1, -1, -1, -1)
+        external_seeds = [fixed_seed] * panel_count
+        external_base = denoise(
+            external_memory,
+            external_positive,
+            external_negative,
+            external_noise,
+            fixed_sigmas,
+            external_seeds,
+            text_cfg=float(generation["cfg"]),
+            strength=None,
+        )
+        external_predicted = {
+            strength: denoise(
+                external_memory,
+                external_positive,
+                external_negative,
+                external_noise,
+                fixed_sigmas,
+                external_seeds,
+                text_cfg=float(generation["cfg"]),
+                strength=strength,
+            )
+            for strength in strengths
+        }
+        source_rows = read_records(source_manifest)
+        source_by_style: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        for row in source_rows:
+            source_by_style[str(row["style_id"])].append(row)
+        reference_images = []
+        for style_id in selected_style_ids:
+            rows = sorted(
+                source_by_style[style_id],
+                key=lambda row: int(row.get("content_index", 0)),
+            )
+            reference_images.append(
+                Image.open(str(rows[0]["local_path"])).convert("RGB")
+            )
+        external_images: dict[str, list[Image.Image]] = {
+            "Held-out external reference": reference_images,
+            "Frozen Anima": decode(external_base),
+            **{
+                f"Predicted {strength:g}x": decode(values)
+                for strength, values in external_predicted.items()
+            },
+        }
+        external_output = output / "external-heldout"
+        external_output.mkdir(parents=True, exist_ok=True)
+        external_panel = _save_panel(
+            external_output,
+            selected_style_ids,
+            external_images,
+            list(external_images),
+            tile_width=int(sample_cfg.get("panel_tile_width", 384)),
+        )
+        del external_bank, external_memory, external_base, external_predicted
+
     detail_cfg = dict(config["detail_preserving_style_cross_attention"])
     panel_loaders = []
     panel_style_cache = sample_cfg.get("panel_style_cache")
@@ -6775,10 +6902,14 @@ def sample_direct_reference_kv_delta_320(
     activation_injector.close()
     torch.cuda.empty_cache()
     summary = {
-        "sampling_contract": "fixed_test_sample_1_7_and_episodic_4_plus_4_v1",
+        "sampling_contract": "fixed_external_heldout_and_episodic_4_plus_4_v2",
         "checkpoint": str(checkpoint_path),
         "weights": "ema" if use_ema and "ema_model" in checkpoint else "raw",
         "fixed_reference_panel": str(fixed_panel),
+        "external_heldout_panel": (
+            str(external_panel) if external_panel is not None else None
+        ),
+        "external_heldout_style_ids": external_panel_style_ids,
         "panel_overview": str(panel_overview),
         "panel_sheets": panel_sheets,
         "panel_episode_indices": [episode for _, _, episode, _ in requests],
@@ -6859,10 +6990,20 @@ def train_scheduled_direct_reference_kv_delta_320(
                     summary["panel_overview"],
                     caption=f"legacy panel step {target}",
                 ),
+                **(
+                    {
+                        "samples/external_heldout": wandb.Image(
+                            summary["external_heldout_panel"],
+                            caption=f"external held-out reference step {target}",
+                        )
+                    }
+                    if summary.get("external_heldout_panel")
+                    else {}
+                ),
             },
         )
         run.finish()
-    sampling_contract = "fixed_test_sample_1_7_and_episodic_4_plus_4_v1"
+    sampling_contract = "fixed_external_heldout_and_episodic_4_plus_4_v2"
     previous_targets = (
         [target for target in configured_targets if target <= completed]
         if configured_targets else range(sample_every, completed + 1, sample_every)
@@ -6948,8 +7089,8 @@ def train_scheduled_expert_external_velocity_5k(
     return train_scheduled_direct_reference_kv_delta_320(
         config,
         destination,
-        config_key="kv_reference_expert_external_calibrated_2000",
-        sample_config_key="kv_reference_expert_external_calibrated_2000_sample",
+        config_key="kv_reference_expert_combined_calibrated_3000",
+        sample_config_key="kv_reference_expert_combined_calibrated_3000_sample",
     )
 
 
@@ -6959,7 +7100,7 @@ def sample_expert_external_velocity_5k(
     return sample_direct_reference_kv_delta_320(
         config,
         destination,
-        sample_config_key="kv_reference_expert_external_calibrated_2000_sample",
+        sample_config_key="kv_reference_expert_combined_calibrated_3000_sample",
     )
 
 
