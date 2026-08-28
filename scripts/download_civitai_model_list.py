@@ -9,6 +9,7 @@ import os
 import time
 import urllib.parse
 import urllib.request
+import urllib.error
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
@@ -126,7 +127,7 @@ def download_one(
     headers = {"User-Agent": "Anima-StyleAdapter-CivitAI-Downloader/1.0"}
     if token:
         headers["Authorization"] = f"Bearer {token}"
-    for attempt in range(5):
+    for attempt in range(8):
         offset = partial.stat().st_size if partial.exists() else 0
         request_headers = dict(headers)
         if offset:
@@ -143,10 +144,15 @@ def download_one(
                     while chunk := response.read(8 * 1024 * 1024):
                         handle.write(chunk)
             break
-        except Exception:
-            if attempt == 4:
+        except Exception as error:
+            if attempt == 7:
                 raise
-            time.sleep(2**attempt)
+            retry_after = (
+                int(error.headers.get("Retry-After", "0") or 0)
+                if isinstance(error, urllib.error.HTTPError)
+                else 0
+            )
+            time.sleep(max(retry_after, min(60, 2**attempt)))
     expected_hash = entry.get("sha256")
     if expected_hash and sha256(partial) != str(expected_hash).upper():
         raise RuntimeError(f"SHA-256 mismatch: {partial}")
@@ -203,6 +209,8 @@ def main() -> None:
                 )
             except Exception as error:
                 error_summary = type(error).__name__
+                if isinstance(error, urllib.error.HTTPError):
+                    error_summary += f" (HTTP {error.code})"
                 failures.append(
                     {"version_id": item["version_id"], "error": error_summary}
                 )

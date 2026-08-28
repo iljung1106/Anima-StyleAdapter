@@ -116,6 +116,8 @@ def build_parser() -> argparse.ArgumentParser:
         ("kv-lora-reference-320-token-cache", "Cache 320-teacher K/V-only reference tokens"),
         ("kv-activation-mixture-reference-token-cache", "Cache Resampler tokens for K/V mixture images"),
         ("lora-functional-teacher-cache", "Cache single and mixed LoRA functional effects"),
+        ("external-civitai-lora-functional-cache", "Cache heterogeneous CivitAI LoRA effects"),
+        ("external-civitai-lora-validate", "Validate each external LoRA storage format"),
         ("kv-lora-functional-teacher-cache", "Cache K/V-only LoRA effects"),
         ("kv-lora-functional-teacher-320-cache", "Cache all 320 K/V-only LoRA and mixture effects"),
         ("kv-lora-fixed-teacher-compare", "Compare K/V LoRAs on one prompt and seed"),
@@ -523,6 +525,20 @@ def main() -> None:
         _run(cache_all_anima_inputs, config, destination)
     elif args.command == "anima-cache-validate":
         _run(validate_anima_caches, config, destination)
+    elif args.command in {
+        "external-civitai-lora-functional-cache",
+        "external-civitai-lora-validate",
+    }:
+        from .external_lora_teacher import (
+            cache_external_lora_functional_teacher,
+            validate_external_lora_teacher,
+        )
+
+        stage = {
+            "external-civitai-lora-functional-cache": cache_external_lora_functional_teacher,
+            "external-civitai-lora-validate": validate_external_lora_teacher,
+        }[args.command]
+        _run(stage, config, destination)
     elif args.command in {
         "artist-lora-diverse-plan",
         "artist-lora-diverse-train",
