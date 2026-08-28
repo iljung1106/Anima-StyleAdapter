@@ -25,6 +25,98 @@ from .style_calibration import _encode_prompts
 from .style_transfer import _optimize_frozen_anima, _resolve_anima_model
 
 
+class _ExternalAdapterPool:
+    """Construct each external adapter once and keep inactive weights in CPU RAM."""
+
+    def __init__(
+        self, config: dict[str, Any], anima: torch.nn.Module, device: str
+    ) -> None:
+        self.anima = anima
+        self.device = device
+        self.networks: dict[int, torch.nn.Module] = {}
+        self.cache_hits = 0
+        self.cache_misses = 0
+        sd_root = Path(str(config["anima_cache"]["sd_scripts_path"])).resolve()
+        if str(sd_root) not in sys.path:
+            sys.path.insert(0, str(sd_root))
+        try:
+            from lycoris.kohya import create_network_from_weights
+        except ImportError as error:
+            raise RuntimeError(
+                "External LoRA caching requires lycoris_lora>=3.4"
+            ) from error
+        self.create_network_from_weights = create_network_from_weights
+
+    def _load(self, item: dict[str, Any]) -> tuple[torch.nn.Module, int]:
+        index = int(item["index"])
+        if index in self.networks:
+            self.cache_hits += 1
+            network = self.networks[index]
+            return network, len(network.unet_loras)
+
+        self.cache_misses += 1
+        state = _normalize_diffusers_lora(
+            load_file(str(item["resolved_weight_path"]), device="cpu")
+        )
+        expected = _expected_unet_modules(state)
+        network, _ = self.create_network_from_weights(
+            1.0,
+            str(item["resolved_weight_path"]),
+            None,
+            [],
+            self.anima,
+            weights_sd=state,
+            for_inference=True,
+        )
+        actual = {str(module.lora_name) for module in network.unet_loras}
+        missing = sorted(expected - actual)
+        if missing:
+            raise RuntimeError(
+                f"{item['style_id']} has {len(missing)} unmatched Anima modules; "
+                f"first={missing[:3]}"
+            )
+        network.apply_to([], self.anima, apply_text_encoder=False, apply_unet=True)
+        incompatible = network.load_state_dict(state, strict=False)
+        unexpected_unet = [
+            key
+            for key in incompatible.unexpected_keys
+            if key.startswith("lora_unet_")
+        ]
+        if unexpected_unet:
+            network.restore()
+            raise RuntimeError(
+                f"{item['style_id']} has unexpected Anima keys: "
+                f"{unexpected_unet[:3]}"
+            )
+        network.restore()
+        network.to(device="cpu", dtype=torch.bfloat16).requires_grad_(False).eval()
+        self.networks[index] = network
+        del state
+        return network, len(actual)
+
+    @contextmanager
+    def applied(
+        self, components: list[tuple[dict[str, Any], float]]
+    ) -> Iterator[dict[str, int]]:
+        active: list[torch.nn.Module] = []
+        loaded_modules = 0
+        try:
+            for item, multiplier in components:
+                network, count = self._load(item)
+                network.set_multiplier(float(multiplier))
+                network.to(device=self.device, dtype=torch.bfloat16)
+                network.apply_to(
+                    [], self.anima, apply_text_encoder=False, apply_unet=True
+                )
+                active.append(network)
+                loaded_modules += count
+            yield {"loaded_modules": loaded_modules}
+        finally:
+            for network in reversed(active):
+                network.restore()
+                network.to(device="cpu", dtype=torch.bfloat16)
+
+
 def _load_bank(destination: Path, path: str) -> list[dict[str, Any]]:
     payload = json.loads((destination / path).read_text(encoding="utf-8"))
     rows = [dict(item) for item in payload["items"]]
@@ -342,6 +434,7 @@ def cache_external_lora_functional_teacher(
     completed = 0
     started = time.perf_counter()
     effect_rms: dict[int, float] = {}
+    adapter_pool = _ExternalAdapterPool(config, anima, device)
     for shard_index, offset in enumerate(range(0, len(specs), shard_rows)):
         shard_path = output / f"effects-{shard_index:05d}.safetensors"
         part = specs[offset : offset + shard_rows]
@@ -363,41 +456,61 @@ def cache_external_lora_functional_teacher(
         )
         clean_effects, triggered_effects, triggered_bases = [], [], []
         loaded_counts = []
-        for local_index, spec in enumerate(part):
-            components = [
-                (bank[index], weight)
-                for index, weight in zip(spec.components, spec.weights, strict=True)
-            ]
-            with _applied_adapters(config, anima, components, device) as audit:
-                prediction = _predict_frozen_anima_in_chunks(
-                    anima, noisy, clean_context, timestep_tensor, batch_rows=batch_rows
-                )
-                loaded_counts.append(audit["loaded_modules"])
-                if trigger_cache is not None:
-                    content_indices = trigger_cache["content_indices"][local_index]
-                    trigger_context = trigger_cache["contexts"][local_index].to(
-                        device=device, dtype=torch.bfloat16
-                    )
-                    trigger_noisy = torch.stack(
+        trigger_noisy_all = trigger_context_all = trigger_time_all = None
+        trigger_base_all = None
+        if trigger_cache is not None:
+            trigger_noisy_parts = []
+            for content_indices in trigger_cache["content_indices"]:
+                trigger_noisy_parts.append(
+                    torch.stack(
                         [
                             noisy[int(content) * len(timesteps) + timestep_index]
                             for content in content_indices
                             for timestep_index in trigger_timestep_indices
                         ]
                     )
-                    trigger_time = torch.tensor(
-                        [timesteps[index] for _ in content_indices for index in trigger_timestep_indices],
-                        device=device,
-                        dtype=torch.bfloat16,
-                    )
-                    trigger_context_flat = trigger_context.repeat_interleave(
-                        len(trigger_timestep_indices), dim=0
-                    )
+                )
+            trigger_noisy_all = torch.cat(trigger_noisy_parts)
+            trigger_context_all = trigger_cache["contexts"].to(
+                device=device, dtype=torch.bfloat16
+            ).reshape(-1, *trigger_cache["contexts"].shape[2:]).repeat_interleave(
+                len(trigger_timestep_indices), dim=0
+            )
+            trigger_time_all = torch.tensor(
+                [
+                    timesteps[index]
+                    for _ in range(len(part) * trigger_contents)
+                    for index in trigger_timestep_indices
+                ],
+                device=device,
+                dtype=torch.bfloat16,
+            )
+            trigger_base_all = _predict_frozen_anima_in_chunks(
+                anima,
+                trigger_noisy_all,
+                trigger_context_all,
+                trigger_time_all,
+                batch_rows=batch_rows,
+            )
+        trigger_rows = trigger_contents * len(trigger_timestep_indices)
+        for local_index, spec in enumerate(part):
+            components = [
+                (bank[index], weight)
+                for index, weight in zip(spec.components, spec.weights, strict=True)
+            ]
+            with adapter_pool.applied(components) as audit:
+                prediction = _predict_frozen_anima_in_chunks(
+                    anima, noisy, clean_context, timestep_tensor, batch_rows=batch_rows
+                )
+                loaded_counts.append(audit["loaded_modules"])
+                if trigger_cache is not None:
+                    start = local_index * trigger_rows
+                    end = start + trigger_rows
                     triggered = _predict_frozen_anima_in_chunks(
                         anima,
-                        trigger_noisy,
-                        trigger_context_flat,
-                        trigger_time,
+                        trigger_noisy_all[start:end],
+                        trigger_context_all[start:end],
+                        trigger_time_all[start:end],
                         batch_rows=batch_rows,
                     )
             clean_effects.append(
@@ -406,13 +519,9 @@ def cache_external_lora_functional_teacher(
                 ).to(torch.bfloat16)
             )
             if trigger_cache is not None:
-                trigger_base = _predict_frozen_anima_in_chunks(
-                    anima,
-                    trigger_noisy,
-                    trigger_context_flat,
-                    trigger_time,
-                    batch_rows=batch_rows,
-                )
+                start = local_index * trigger_rows
+                end = start + trigger_rows
+                trigger_base = trigger_base_all[start:end]
                 triggered_bases.append(trigger_base.to(torch.bfloat16))
                 triggered_effects.append(
                     (triggered - trigger_base).reshape(
@@ -484,6 +593,9 @@ def cache_external_lora_functional_teacher(
         "query_policy": "clean functional target plus isolated trigger-conditioned probe",
         "actual_multi_adapter_forward": True,
         "adapter_application": "native-rank removable LyCORIS wrappers",
+        "adapter_pool_resident": len(adapter_pool.networks),
+        "adapter_pool_hits": adapter_pool.cache_hits,
+        "adapter_pool_misses": adapter_pool.cache_misses,
         "elapsed_s": time.perf_counter() - started,
     }
     write_json(summary_path, summary)
@@ -526,12 +638,25 @@ def validate_external_lora_teacher(
     base = _predict_frozen_anima_in_chunks(
         anima, noisy, context, timestep, batch_rows=1
     )
+    adapter_pool = _ExternalAdapterPool(config, anima, device)
     results = []
-    for item in representatives:
-        with _applied_adapters(config, anima, [(item, 1.0)], device) as audit:
+    for representative_index, item in enumerate(representatives):
+        with adapter_pool.applied([(item, 1.0)]) as audit:
             styled = _predict_frozen_anima_in_chunks(
                 anima, noisy, context, timestep, batch_rows=1
             )
+        restored = _predict_frozen_anima_in_chunks(
+            anima, noisy, context, timestep, batch_rows=1
+        )
+        if not torch.equal(restored, base):
+            raise RuntimeError(f"{item['format']} adapter did not restore exactly")
+        if representative_index == 0:
+            with adapter_pool.applied([(item, 1.0)]):
+                reused = _predict_frozen_anima_in_chunks(
+                    anima, noisy, context, timestep, batch_rows=1
+                )
+            if not torch.equal(reused, styled):
+                raise RuntimeError("Re-applied adapter changed its prediction")
         rms = float((styled - base).float().square().mean().sqrt())
         if not torch.isfinite(styled).all() or rms <= 0:
             raise RuntimeError(
@@ -548,4 +673,9 @@ def validate_external_lora_teacher(
     del anima
     gc.collect()
     torch.cuda.empty_cache()
-    return {"formats": len(results), "results": results}
+    return {
+        "formats": len(results),
+        "adapter_pool_hits": adapter_pool.cache_hits,
+        "adapter_pool_misses": adapter_pool.cache_misses,
+        "results": results,
+    }
