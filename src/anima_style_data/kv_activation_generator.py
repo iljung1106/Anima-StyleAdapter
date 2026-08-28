@@ -2293,7 +2293,18 @@ def _load_reader(
     detail = _oracle_detail_config(config, dict(config["kv_lora_oracle_bootstrap"]))
     reader = DetailPreservingTypedSlotReader(**dict(detail["model"]))
     reader.load_state_dict(state["reader"], strict=True)
-    return reader.to(device=device, dtype=torch.bfloat16).requires_grad_(False).eval()
+    reader_dtype_name = str(
+        dict(cfg.get("training", {})).get("reader_master_dtype", "bfloat16")
+    )
+    if reader_dtype_name == "float32":
+        reader_dtype = torch.float32
+    elif reader_dtype_name == "bfloat16":
+        reader_dtype = torch.bfloat16
+    else:
+        raise ValueError(
+            "reader_master_dtype must be 'float32' or 'bfloat16'"
+        )
+    return reader.to(device=device, dtype=reader_dtype).requires_grad_(False).eval()
 
 
 def _materialize_style_codes(
@@ -4981,13 +4992,51 @@ def train_direct_reference_kv_delta_320(
                 assert external_reference_bank is not None
                 if distillation_domain == "external_single":
                     selected = rng.sample(external_train_singles, batch)
+                    external_counts = [
+                        int(value)
+                        for value in training.get(
+                            "external_single_reference_counts", single_counts
+                        )
+                    ]
+                    external_count_weights = [
+                        float(value)
+                        for value in training.get(
+                            "external_single_reference_count_weights",
+                            (
+                                single_count_weights
+                                if external_counts == single_counts
+                                else [1.0] * len(external_counts)
+                            ),
+                        )
+                    ]
                     counts = rng.choices(
-                        single_counts, weights=single_count_weights, k=batch
+                        external_counts,
+                        weights=external_count_weights,
+                        k=batch,
                     )
                 else:
                     selected = rng.sample(external_rows_by_kind[category], batch)
+                    external_counts = [
+                        int(value)
+                        for value in training.get(
+                            "external_mixture_reference_counts", mixture_counts
+                        )
+                    ]
+                    external_count_weights = [
+                        float(value)
+                        for value in training.get(
+                            "external_mixture_reference_count_weights",
+                            (
+                                mixture_count_weights
+                                if external_counts == mixture_counts
+                                else [1.0] * len(external_counts)
+                            ),
+                        )
+                    ]
                     counts = rng.choices(
-                        mixture_counts, weights=mixture_count_weights, k=batch
+                        external_counts,
+                        weights=external_count_weights,
+                        k=batch,
                     )
                 local_styles = [
                     external_reference_position[str(row["mixture_style_id"])]
@@ -6846,8 +6895,8 @@ def train_scheduled_expert_external_velocity_5k(
     return train_scheduled_direct_reference_kv_delta_320(
         config,
         destination,
-        config_key="kv_reference_expert_combined_rms_1500",
-        sample_config_key="kv_reference_expert_combined_rms_1500_sample",
+        config_key="kv_reference_expert_external_reader_fp32_1000",
+        sample_config_key="kv_reference_expert_external_reader_fp32_1000_sample",
     )
 
 
@@ -6857,7 +6906,7 @@ def sample_expert_external_velocity_5k(
     return sample_direct_reference_kv_delta_320(
         config,
         destination,
-        sample_config_key="kv_reference_expert_combined_rms_1500_sample",
+        sample_config_key="kv_reference_expert_external_reader_fp32_1000_sample",
     )
 
 

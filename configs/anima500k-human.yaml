@@ -2689,6 +2689,75 @@ kv_reference_expert_combined_rms_1500_sample:
   panel_style_cache: "."
   panel_style_manifest: final_manifest.parquet
 
+# Reader gradients in v18 were non-zero, but BF16 parameters plus a 5e-7 LR
+# produced only 3.5e-8 mean absolute change over 1k updates. Keep FP32 Reader
+# master weights under autocast, emphasize exact external singles, and use all
+# four available content-diverse references while learning their shared style.
+kv_reference_expert_external_reader_fp32_1000:
+  extends_config_key: kv_reference_expert_combined_rms_1500
+  output_directory: kv_reference_expert_external_reader_fp32_b3_w768_l3_1k_v19
+  initial_checkpoint: kv_reference_expert_combined_rms_b3_w768_l3_1500_v18/checkpoints/step-0000500.pt
+  initial_step: 0
+  reset_initial_step: true
+  training:
+    steps: 1000
+    reader_master_dtype: float32
+    external_single_reference_counts: [4]
+    external_single_reference_count_weights: [1.0]
+    external_mixture_reference_counts: [4]
+    external_mixture_reference_count_weights: [1.0]
+    validation_every: 250
+    checkpoint_every: 250
+    sample_steps: [250, 500, 1000]
+    sample_output_root: diagnostics/kv-reference-expert-external-reader-fp32-b3-w768-l3-1k-v19
+    multi_domain_distillation:
+      schedule: [external_single, artist_synthetic, external_single, artist_human, external_single, lora_synthetic, external_mixture, lora_human, external_single, lora_mixture, external_mixture]
+    whole_model_functional:
+      reader_consistency_weight: 1.0
+      reader_consistency_cosine_floor: 0.90
+      functional_consistency_weight: 0.25
+      functional_consistency_cosine_floor: 0.85
+      functional_contrastive_weight: 0.50
+    generator_learning_rate: 0.0000005
+    reader_learning_rate: 0.00001
+    generator_lr_schedule:
+      peak_lr: 0.0000005
+      warmup_steps: 50
+      decay_start_step: 500
+      decay_end_step: 1000
+      final_lr: 0.0000001
+      tail_decay_end_step: 1000
+      tail_final_lr: 0.0000001
+    reader_lr_schedule:
+      peak_lr: 0.00001
+      warmup_steps: 50
+      decay_start_step: 500
+      decay_end_step: 1000
+      final_lr: 0.000001
+    ema:
+      enabled: true
+      decay: 0.995
+      sample: true
+    wandb:
+      enabled: true
+      project: anima-style-adapter
+      name: kv-reference-expert-external-reader-fp32-b3-w768-l3-1k-v19
+      id: kv-reference-expert-external-reader-fp32-b3-w768-l3-1k-v19
+      resume: allow
+
+kv_reference_expert_external_reader_fp32_1000_sample:
+  checkpoint: kv_reference_expert_external_reader_fp32_b3_w768_l3_1k_v19/checkpoints/step-0001000.pt
+  output_directory: diagnostics/kv-reference-expert-external-reader-fp32-b3-w768-l3-1k-v19-step1000
+  device: cuda
+  artists: 8
+  references: 4
+  reference_seed: 20260910
+  strengths: [1.0, 2.0]
+  batch_size: 4
+  panel_tile_width: 384
+  panel_style_cache: "."
+  panel_style_manifest: final_manifest.parquet
+
 # Reference-conditioned low-rank operator pilot. Unlike the direct activation
 # head above, the reference generates a fresh block-local linear operator and
 # applies it to every native text token.  Teacher factors remain offline
