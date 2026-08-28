@@ -2816,6 +2816,137 @@ kv_reference_expert_external_reader_contrastive_1000_sample:
   panel_style_cache: "."
   panel_style_manifest: final_manifest.parquet
 
+# The frozen visual tokens already contain a weak artist signal, but the full
+# DiT loop can expose only three styles per optimizer update.  Calibrate the
+# FP32 Reader separately with 64 simultaneous external styles and random
+# disjoint 2+2 views of each style's four content-diverse references.  The same
+# 32 single LoRAs (and every mixture containing them) remain fully held out.
+external_lora_reader_calibration:
+  source_experiment_key: kv_reference_expert_external_reader_fp32_1000
+  output_directory: external_lora_reader_calibration_fp32_b64_v21
+  initial_checkpoint: kv_reference_expert_external_reader_fp32_b3_w768_l3_1k_v19/checkpoints/step-0000500.pt
+  initial_use_ema_reader: false
+  seed: 20260909
+  device: cuda
+  local_cache_directory: /tmp/anima-external-reader-calibration-v21
+  materialization_chunk: 32
+  token_lru_shards: 6
+  steps: 1000
+  batch_size: 64
+  single_fraction: 0.5
+  learning_rate: 0.00002
+  final_learning_rate: 0.000002
+  warmup_steps: 50
+  decay_start_step: 500
+  temperature: 0.07
+  same_style_cosine_floor: 0.80
+  same_style_cosine_weight: 0.10
+  # This is an overload-only pairwise guard, not batch-mean subtraction.
+  pairwise_cosine_cap: 0.70
+  pairwise_overload_weight: 0.05
+  rms_ratio_lower: 0.80
+  rms_ratio_upper: 1.25
+  rms_band_weight: 0.05
+  max_grad_norm: 100.0
+  ema_decay: 0.995
+  validation_every: 50
+  checkpoint_every: 100
+  early_stop_minimum_step: 300
+  early_stop_patience: 8
+  minimum_score_improvement: 0.002
+  log_every: 10
+  resume: true
+  fused_adamw: true
+  wandb:
+    enabled: true
+    project: anima-style-adapter
+    name: external-lora-reader-calibration-fp32-b64-v21
+    id: external-lora-reader-calibration-fp32-b64-v21
+    resume: allow
+
+# First post-calibration model: external LoRA final velocity plus Human and
+# Synthetic artist-tag teachers and sparse real-image flow.  Original 320-LoRA
+# teachers are deliberately absent so this is the requested external-only
+# causal test.  The generator starts from v19's best external checkpoint while
+# the Reader is replaced by the independently calibrated EMA state.
+kv_reference_expert_external_calibrated_2000:
+  extends_config_key: kv_reference_expert_external_reader_fp32_1000
+  output_directory: kv_reference_expert_external_calibrated_b3_w768_l3_2k_v22
+  initial_checkpoint: kv_reference_expert_external_reader_fp32_b3_w768_l3_1k_v19/checkpoints/step-0000500.pt
+  initial_use_ema_model: true
+  initial_use_ema_reader: false
+  initial_reader_checkpoint: external_lora_reader_calibration_fp32_b64_v21/best.pt
+  initial_reader_use_ema: true
+  initial_step: 0
+  reset_initial_step: true
+  seed: 20260909
+  training:
+    steps: 2000
+    reader_master_dtype: float32
+    external_single_reference_counts: [4]
+    external_single_reference_count_weights: [1.0]
+    external_mixture_reference_counts: [4]
+    external_mixture_reference_count_weights: [1.0]
+    validation_every: 250
+    checkpoint_every: 250
+    sample_steps: [250, 500, 1000, 1500, 2000]
+    sample_output_root: diagnostics/kv-reference-expert-external-calibrated-b3-w768-l3-2k-v22
+    multi_domain_distillation:
+      schedule: [external_single, artist_synthetic, external_single, artist_human, external_mixture, external_single, artist_synthetic, external_mixture, artist_human]
+    whole_model_functional:
+      reader_consistency_weight: 0.10
+      reader_consistency_cosine_floor: 0.80
+      reader_contrastive_weight: 0.25
+      reader_contrastive_temperature: 0.10
+      functional_consistency_weight: 0.25
+      functional_contrastive_weight: 0.50
+    human_flow:
+      phases:
+        - {end_step: 2000, cycle: 6, slots: [5]}
+      flow_loss_weight: 2.5
+      prior_preservation_weight: 0.05
+      fixed_validation_every: 250
+      fixed_validation_batches: 4
+    generator_learning_rate: 0.0000005
+    reader_learning_rate: 0.000002
+    generator_lr_schedule:
+      peak_lr: 0.0000005
+      warmup_steps: 50
+      decay_start_step: 1000
+      decay_end_step: 2000
+      final_lr: 0.0000001
+      tail_decay_end_step: 2000
+      tail_final_lr: 0.0000001
+    reader_lr_schedule:
+      peak_lr: 0.000002
+      warmup_steps: 50
+      decay_start_step: 500
+      decay_end_step: 1500
+      final_lr: 0.0000002
+    ema:
+      enabled: true
+      decay: 0.995
+      sample: true
+    wandb:
+      enabled: true
+      project: anima-style-adapter
+      name: kv-reference-expert-external-calibrated-b3-w768-l3-2k-v22
+      id: kv-reference-expert-external-calibrated-b3-w768-l3-2k-v22
+      resume: allow
+
+kv_reference_expert_external_calibrated_2000_sample:
+  checkpoint: kv_reference_expert_external_calibrated_b3_w768_l3_2k_v22/checkpoints/step-0002000.pt
+  output_directory: diagnostics/kv-reference-expert-external-calibrated-b3-w768-l3-2k-v22-step2000
+  device: cuda
+  artists: 8
+  references: 4
+  reference_seed: 20260911
+  strengths: [1.0, 2.0]
+  batch_size: 4
+  panel_tile_width: 384
+  panel_style_cache: "."
+  panel_style_manifest: final_manifest.parquet
+
 # Reference-conditioned low-rank operator pilot. Unlike the direct activation
 # head above, the reference generates a fresh block-local linear operator and
 # applies it to every native text token.  Teacher factors remain offline

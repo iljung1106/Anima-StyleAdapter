@@ -3705,6 +3705,27 @@ def train_direct_reference_kv_delta_320(
             and start_step != int(initial.get("step", start_step))
         ):
             raise ValueError("initial_step must match the warm-start checkpoint")
+    if not resumed and cfg.get("initial_reader_checkpoint"):
+        reader_initial = torch.load(
+            destination / str(cfg["initial_reader_checkpoint"]),
+            map_location="cpu",
+            weights_only=False,
+        )
+        reader_key = (
+            "ema_reader"
+            if bool(cfg.get("initial_reader_use_ema", True))
+            else "reader"
+        )
+        if reader_key not in reader_initial:
+            raise KeyError(
+                f"Initial Reader checkpoint has no {reader_key!r} state"
+            )
+        reader.load_state_dict(reader_initial[reader_key], strict=True)
+        print(
+            "loaded separate initial Reader "
+            f"{cfg['initial_reader_checkpoint']} ({reader_key})",
+            flush=True,
+        )
     if (
         hasattr(model, "set_routing_recording")
         and bool(getattr(model, "expert_bias_population_update", False))
@@ -6927,8 +6948,8 @@ def train_scheduled_expert_external_velocity_5k(
     return train_scheduled_direct_reference_kv_delta_320(
         config,
         destination,
-        config_key="kv_reference_expert_external_reader_contrastive_1000",
-        sample_config_key="kv_reference_expert_external_reader_contrastive_1000_sample",
+        config_key="kv_reference_expert_external_calibrated_2000",
+        sample_config_key="kv_reference_expert_external_calibrated_2000_sample",
     )
 
 
@@ -6938,7 +6959,7 @@ def sample_expert_external_velocity_5k(
     return sample_direct_reference_kv_delta_320(
         config,
         destination,
-        sample_config_key="kv_reference_expert_external_reader_contrastive_1000_sample",
+        sample_config_key="kv_reference_expert_external_calibrated_2000_sample",
     )
 
 

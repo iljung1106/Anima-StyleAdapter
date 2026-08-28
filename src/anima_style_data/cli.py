@@ -182,6 +182,7 @@ def build_parser() -> argparse.ArgumentParser:
         ("kv-reference-expert-kv-raw-multidomain-10k-sample", "Render raw multi-domain K/V experts"),
         ("kv-reference-expert-external-velocity-5k-train", "Train external LoRA velocity with Artist teachers and Human flow"),
         ("kv-reference-expert-external-velocity-5k-sample", "Render external-LoRA velocity experts"),
+        ("external-lora-reader-calibrate", "Calibrate the visual Reader on content-disjoint external LoRA references"),
         ("kv-reference-bilinear-smoke", "Smoke-test reference-conditioned bilinear K/V operators"),
         ("kv-reference-bilinear-train", "Train reference-conditioned bilinear K/V operators"),
         ("kv-reference-bilinear-sample", "Render reference-conditioned bilinear K/V operators"),
@@ -978,6 +979,9 @@ def main() -> None:
             train_scheduled_expert_external_velocity_5k,
             sample_expert_external_velocity_5k,
         )
+        from .external_reader_calibration import (
+            train_external_lora_reader_calibration,
+        )
         from .kv_activation_sampling import (
             evaluate_kv_activation_reference_generalization,
             sample_kv_activation_modulator,
@@ -1080,6 +1084,7 @@ def main() -> None:
             "kv-reference-expert-kv-raw-multidomain-10k-sample": sample_expert_kv_raw_multidomain_10k,
             "kv-reference-expert-external-velocity-5k-train": train_scheduled_expert_external_velocity_5k,
             "kv-reference-expert-external-velocity-5k-sample": sample_expert_external_velocity_5k,
+            "external-lora-reader-calibrate": train_external_lora_reader_calibration,
             "kv-reference-bilinear-smoke": smoke_test_reference_conditioned_bilinear_kv_operator,
             "kv-reference-bilinear-train": train_reference_conditioned_bilinear_kv_operator,
             "kv-reference-bilinear-sample": sample_reference_conditioned_bilinear_kv_operator,
