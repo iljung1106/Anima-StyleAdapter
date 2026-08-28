@@ -2520,7 +2520,7 @@ kv_reference_expert_kv_raw_multidomain_10k_sample:
 # K/V block target is fabricated from heterogeneous whole-model LoRAs.
 kv_reference_expert_external_velocity_5k:
   extends_config_key: kv_reference_expert_kv_raw_multidomain_10k
-  output_directory: kv_reference_expert_external_velocity_b3_w768_l3_5k_v14
+  output_directory: kv_reference_expert_external_velocity_b3_w768_l3_5k_v15
   seed: 20260909
   initial_checkpoint: kv_reference_expert_kv64x16_native_centered_b3_w768_l3_750_v12/checkpoints/step-0005000.pt
   initial_step: 0
@@ -2535,7 +2535,7 @@ kv_reference_expert_external_velocity_5k:
     checkpoint_every: 500
     sample_every: 0
     sample_steps: [500, 1000, 1500, 2000, 3000, 4000, 5000]
-    sample_output_root: diagnostics/kv-reference-expert-external-velocity-b3-w768-l3-5k-v14
+    sample_output_root: diagnostics/kv-reference-expert-external-velocity-b3-w768-l3-5k-v15
     multi_domain_distillation:
       enabled: true
       schedule: [artist_synthetic, artist_human, external_single, external_mixture, external_mixture]
@@ -2551,6 +2551,10 @@ kv_reference_expert_external_velocity_5k:
         reference_cache: civitai_external/synthetic_references_682x4_triggered_v1/dual_query_reference_tokens_v8_step10000
         effect_slice_lru_entries: 2
         validation_single_styles: 32
+        # Two downloaded adapters have exactly zero final-velocity effect on
+        # every cached content/timestep. Relative direction/RMS supervision is
+        # undefined for those rows; all 296 effective singles are retained.
+        minimum_effect_rms: 0.001
       loss_by_domain:
         artist_synthetic: {huber_weight: 1.0, direction_weight: 1.0, retrieval_weight: 0.5}
         artist_human: {huber_weight: 0.4, direction_weight: 1.0, retrieval_weight: 0.75}
@@ -2610,13 +2614,13 @@ kv_reference_expert_external_velocity_5k:
     wandb:
       enabled: true
       project: anima-style-adapter
-      name: kv-reference-expert-external-velocity-b3-w768-l3-5k-v14
-      id: kv-reference-expert-external-velocity-b3-w768-l3-5k-v14
+      name: kv-reference-expert-external-velocity-b3-w768-l3-5k-v15
+      id: kv-reference-expert-external-velocity-b3-w768-l3-5k-v15
       resume: allow
 
 kv_reference_expert_external_velocity_5k_sample:
-  checkpoint: kv_reference_expert_external_velocity_b3_w768_l3_5k_v14/checkpoints/step-0005000.pt
-  output_directory: diagnostics/kv-reference-expert-external-velocity-b3-w768-l3-5k-v14-step5000
+  checkpoint: kv_reference_expert_external_velocity_b3_w768_l3_5k_v15/checkpoints/step-0005000.pt
+  output_directory: diagnostics/kv-reference-expert-external-velocity-b3-w768-l3-5k-v15-step5000
   device: cuda
   artists: 8
   references: 4

@@ -3567,7 +3567,24 @@ def train_direct_reference_kv_delta_320(
                 f"{len(external_functional_bank.mixtures)} effects"
             )
         external_rows = list(external_functional_bank.mixtures)
-        single_rows = [row for row in external_rows if str(row["kind"]) == "single"]
+        minimum_effect_rms = float(external_cfg.get("minimum_effect_rms", 0.0))
+        single_rows_all = [
+            row for row in external_rows if str(row["kind"]) == "single"
+        ]
+        single_rows = [
+            row
+            for row in single_rows_all
+            if bool(row.get("enabled", True))
+            and float(row.get("effect_rms", 0.0)) >= minimum_effect_rms
+        ]
+        excluded_single_rows = len(single_rows_all) - len(single_rows)
+        if excluded_single_rows:
+            print(
+                "excluded degenerate external single teachers "
+                f"below effect_rms={minimum_effect_rms:g}: "
+                f"{excluded_single_rows}/{len(single_rows_all)}",
+                flush=True,
+            )
         validation_count = int(external_cfg.get("validation_single_styles", 32))
         if validation_count <= 0 or validation_count >= len(single_rows):
             raise ValueError("External validation_single_styles is invalid")
@@ -3596,6 +3613,7 @@ def train_direct_reference_kv_delta_320(
                     for component in row["components"]
                 )
                 and bool(row.get("enabled", True))
+                and float(row.get("effect_rms", 0.0)) >= minimum_effect_rms
             ]
             for kind in ("pair", "triple", "amplified", "signed")
         }
