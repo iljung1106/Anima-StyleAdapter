@@ -259,6 +259,11 @@ def cache_external_lora_functional_teacher(
         signed_l1_maximum=float(cache_cfg.get("signed_l1_maximum", 1.5)),
         seed=int(cache_cfg.get("seed", 20260828)),
     )
+    summary_path = output / "summary.json"
+    if summary_path.exists() and (output / "base.safetensors").exists():
+        previous = json.loads(summary_path.read_text(encoding="utf-8"))
+        if int(previous.get("complete_mixtures", -1)) == len(specs):
+            return {**previous, "reused": True}
     records = _spec_records(bank, specs)
     write_records(output / "mixtures.parquet", records)
 
@@ -477,10 +482,11 @@ def cache_external_lora_functional_teacher(
         "single_effect_rms_median": median,
         "disabled_unstable_mixtures": sum(not row["enabled"] for row in records),
         "query_policy": "clean functional target plus isolated trigger-conditioned probe",
-        "actual_merged_lora_forward": True,
+        "actual_multi_adapter_forward": True,
+        "adapter_application": "native-rank removable LyCORIS wrappers",
         "elapsed_s": time.perf_counter() - started,
     }
-    write_json(output / "summary.json", summary)
+    write_json(summary_path, summary)
     del anima, noisy, clean_context, base
     gc.collect()
     torch.cuda.empty_cache()
