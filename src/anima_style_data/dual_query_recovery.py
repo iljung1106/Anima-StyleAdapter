@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import math
 import random
+import shutil
 import time
 from collections import defaultdict
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -37,6 +38,31 @@ class RecoveryBatch:
             target_descriptors=self.target_descriptors.to(
                 device, non_blocking=non_blocking
             ),
+        )
+
+
+def _stage_cache_directory(source: Path, target: Path) -> None:
+    target.mkdir(parents=True, exist_ok=True)
+    files = [source / "manifest.parquet", *sorted(source.glob("part-*.safetensors"))]
+    if not files[0].exists() or len(files) == 1:
+        raise FileNotFoundError(f"Incomplete recovery source cache: {source}")
+    total_bytes = sum(path.stat().st_size for path in files)
+    copied_bytes = 0
+    started = time.perf_counter()
+    for source_path in files:
+        target_path = target / source_path.name
+        size = source_path.stat().st_size
+        if not target_path.exists() or target_path.stat().st_size != size:
+            temporary = target_path.with_suffix(target_path.suffix + ".tmp")
+            shutil.copyfile(source_path, temporary)
+            temporary.replace(target_path)
+        copied_bytes += size
+        elapsed = max(time.perf_counter() - started, 1e-6)
+        print(
+            f"staging {source.name}: {copied_bytes / 2**30:.2f}/"
+            f"{total_bytes / 2**30:.2f} GiB "
+            f"({copied_bytes / elapsed / 2**20:.1f} MiB/s)",
+            flush=True,
         )
 
 
@@ -280,12 +306,19 @@ def recover_dual_query_resampler(
     cfg = dict(config["dual_query_resampler_recovery"])
     training = dict(cfg["training"])
     source_root = destination / str(cfg["source_directory"])
+    local_root = Path(str(cfg.get("local_cache_directory", "/tmp/anima-resampler-recovery")))
+    feature_name = str(cfg.get("feature_directory", "style_features"))
+    latent_name = str(cfg.get("latent_directory", "latents"))
+    token_name = str(cfg["teacher_token_cache"])
+    _stage_cache_directory(source_root / feature_name, local_root / feature_name)
+    _stage_cache_directory(source_root / latent_name, local_root / latent_name)
+    _stage_cache_directory(source_root / token_name, local_root / token_name)
     cache_cfg = {
-        "feature_directory": str(source_root / str(cfg.get("feature_directory", "style_features"))),
-        "latent_directory": str(source_root / str(cfg.get("latent_directory", "latents"))),
+        "feature_directory": str(local_root / feature_name),
+        "latent_directory": str(local_root / latent_name),
     }
     feature_root, latent_root, rows = _intersect_cache_rows(destination, cache_cfg)
-    token_root = source_root / str(cfg["teacher_token_cache"])
+    token_root = local_root / token_name
     rows = _attach_teacher_rows(rows, token_root / "manifest.parquet")
     seed = int(cfg.get("seed", 20260829))
     train_groups, validation_groups = _split_styles(

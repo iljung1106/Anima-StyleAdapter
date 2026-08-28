@@ -4562,6 +4562,7 @@ dual_query_resampler_recovery:
   feature_directory: style_features
   latent_directory: latents
   teacher_token_cache: dual_query_reference_tokens_v8_step10000
+  local_cache_directory: /tmp/anima-resampler-recovery
   seed: 20260829
   training:
     device: cuda
