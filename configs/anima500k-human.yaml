@@ -2188,6 +2188,61 @@ kv_reference_expert_kv_human_teacher_500_sample:
   batch_size: 4
   panel_tile_width: 384
 
+# Warm-start from the real-reference teacher probe, then spend one update in
+# five on grouped image flow from the 4,000 training artists.  The fixed flow
+# validation split contains 500 disjoint artists, so this tests whether the
+# learned reference-to-K/V mapping transfers beyond the 320 teacher identities.
+kv_reference_expert_kv_human_teacher_flow_1k:
+  extends_config_key: kv_reference_expert_kv_human_teacher_500
+  output_directory: kv_reference_expert_kv64x16_human_teacher_flow_b3_w768_l3_1k_v11
+  seed: 20260906
+  initial_checkpoint: kv_reference_expert_kv64x16_human_teacher_w768_l3_500_v10/checkpoints/step-0000500.pt
+  initial_step: 500
+  training:
+    steps: 1000
+    human_flow:
+      enabled: true
+      batch_size: 3
+      same_style_target_min: 2
+      same_style_target_max: 3
+      start_step: 0
+      cycle: 5
+      slots: [0]
+      fixed_validation_every: 125
+      fixed_validation_batches: 4
+    validation_every: 125
+    checkpoint_every: 250
+    sample_steps: [750, 1000]
+    sample_output_root: diagnostics/kv-reference-expert-kv64x16-human-teacher-flow-b3-w768-l3-1k-v11
+    generator_lr_schedule:
+      peak_lr: 0.000002
+      warmup_steps: 50
+      decay_start_step: 250
+      decay_end_step: 500
+      final_lr: 0.0000005
+    reader_lr_schedule:
+      peak_lr: 0.000001
+      warmup_steps: 50
+      decay_start_step: 200
+      decay_end_step: 500
+      final_lr: 0.0000001
+    wandb:
+      enabled: true
+      project: anima-style-adapter
+      name: kv-reference-expert-kv64x16-human-teacher-flow-b3-w768-l3-1k-v11
+      id: kv-reference-expert-kv64x16-human-teacher-flow-b3-w768-l3-1k-v11
+
+kv_reference_expert_kv_human_teacher_flow_1k_sample:
+  checkpoint: kv_reference_expert_kv64x16_human_teacher_flow_b3_w768_l3_1k_v11/checkpoints/step-0001000.pt
+  output_directory: diagnostics/kv-reference-expert-kv64x16-human-teacher-flow-b3-w768-l3-1k-v11-step1000
+  device: cuda
+  artists: 8
+  references: 4
+  reference_seed: 20260906
+  strengths: [1.0, 2.0]
+  batch_size: 4
+  panel_tile_width: 384
+
 # Reference-conditioned low-rank operator pilot. Unlike the direct activation
 # head above, the reference generates a fresh block-local linear operator and
 # applies it to every native text token.  Teacher factors remain offline
