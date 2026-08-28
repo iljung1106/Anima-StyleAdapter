@@ -27,6 +27,57 @@ from .style_calibration import _encode_prompts
 from .style_transfer import _optimize_frozen_anima, _resolve_anima_model
 
 
+class _EmbeddingLoRA(torch.nn.Module):
+    """Factorized LoRA delta for an ``nn.Embedding`` weight matrix."""
+
+    def __init__(
+        self,
+        lora_name: str,
+        embedding: torch.nn.Embedding,
+        down: torch.Tensor,
+        up: torch.Tensor,
+        alpha: torch.Tensor | None,
+    ) -> None:
+        super().__init__()
+        rank = int(down.shape[0])
+        if tuple(down.shape) != (rank, embedding.embedding_dim):
+            raise RuntimeError(
+                f"{lora_name} down shape {tuple(down.shape)} does not match "
+                f"Embedding(*, {embedding.embedding_dim})"
+            )
+        if tuple(up.shape) != (embedding.num_embeddings, rank):
+            raise RuntimeError(
+                f"{lora_name} up shape {tuple(up.shape)} does not match "
+                f"Embedding({embedding.num_embeddings}, *)"
+            )
+        self.lora_name = lora_name
+        self.lora_down = torch.nn.Linear(embedding.embedding_dim, rank, bias=False)
+        self.lora_up = torch.nn.Linear(rank, embedding.num_embeddings, bias=False)
+        self.lora_down.weight.data.copy_(down)
+        self.lora_up.weight.data.copy_(up)
+        alpha_value = rank if alpha is None or float(alpha) == 0 else float(alpha)
+        self.register_buffer("alpha", torch.tensor(alpha_value), persistent=True)
+        self.scale = alpha_value / rank
+        self.multiplier = 1.0
+        self.org_module = [embedding]
+        self.org_forward = embedding.forward
+
+    def apply_to(self) -> None:
+        self.org_forward = self.org_module[0].forward
+        self.org_module[0].forward = self.forward
+
+    def restore(self) -> None:
+        self.org_module[0].forward = self.org_forward
+
+    def forward(self, input: torch.Tensor, *args: Any, **kwargs: Any) -> torch.Tensor:
+        base = self.org_forward(input, *args, **kwargs)
+        low_rank_rows = torch.nn.functional.embedding(input, self.lora_up.weight)
+        delta = torch.nn.functional.linear(
+            low_rank_rows, self.lora_down.weight.transpose(0, 1)
+        )
+        return base + delta.to(base.dtype) * self.multiplier * self.scale
+
+
 class _ExternalAdapterPool:
     """Construct each external adapter once and keep inactive weights in CPU RAM."""
 
@@ -47,6 +98,11 @@ class _ExternalAdapterPool:
             max_workers=max(1, int(prefetch_workers)),
             thread_name_prefix="external-lora",
         )
+        self.embedding_targets = {
+            "lora_unet_" + name.replace(".", "_"): module
+            for name, module in anima.named_modules()
+            if isinstance(module, torch.nn.Embedding)
+        }
         self.cache_hits = 0
         self.cache_misses = 0
         sd_root = Path(str(config["anima_cache"]["sd_scripts_path"])).resolve()
@@ -65,15 +121,34 @@ class _ExternalAdapterPool:
             load_file(str(item["resolved_weight_path"]), device="cpu")
         )
         expected = _expected_unet_modules(state)
+        factory_state = dict(state)
+        embedding_loras = []
+        for lora_name, embedding in self.embedding_targets.items():
+            up_key = f"{lora_name}.lora_up.weight"
+            down_key = f"{lora_name}.lora_down.weight"
+            if up_key not in factory_state:
+                continue
+            embedding_loras.append(
+                _EmbeddingLoRA(
+                    lora_name,
+                    embedding,
+                    factory_state[down_key],
+                    factory_state[up_key],
+                    factory_state.get(f"{lora_name}.alpha"),
+                )
+            )
+            for suffix in ("lora_down.weight", "lora_up.weight", "alpha"):
+                factory_state.pop(f"{lora_name}.{suffix}", None)
         network, _ = self.create_network_from_weights(
             1.0,
             str(item["resolved_weight_path"]),
             None,
             [],
             self.anima,
-            weights_sd=state,
+            weights_sd=factory_state,
             for_inference=True,
         )
+        network.unet_loras.extend(embedding_loras)
         actual = {str(module.lora_name) for module in network.unet_loras}
         missing = sorted(expected - actual)
         if missing:
@@ -89,7 +164,7 @@ class _ExternalAdapterPool:
         for module in network.loras:
             network.add_module(str(module.lora_name), module)
         network.to(device="cpu", dtype=torch.bfloat16).requires_grad_(False).eval()
-        del state
+        del state, factory_state
         return network, len(actual)
 
     def prefetch(self, item: dict[str, Any]) -> None:
