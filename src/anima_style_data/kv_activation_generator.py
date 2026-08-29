@@ -3399,6 +3399,10 @@ def train_direct_reference_kv_delta_320(
         value.startswith("external_")
         for value in configured_distillation_schedule
     )
+    native_domains_enabled = multi_domain_enabled and any(
+        value.startswith("artist_")
+        for value in configured_distillation_schedule
+    )
     flow_only = bool(training.get("flow_only", False))
     steps = int(steps_override or training.get("steps", 4000))
     device = str(training.get("device", "cuda"))
@@ -3624,7 +3628,7 @@ def train_direct_reference_kv_delta_320(
                 split=f"mixture-{kind}",
                 source=str(destination / str(cfg["mixture_reference_cache"])),
             )
-        if multi_domain_enabled:
+        if native_domains_enabled:
             native_bank = NativeCenteredTeacherBank.load(
                 config,
                 destination,
@@ -7780,6 +7784,27 @@ def sample_expert_external_velocity_5k(
         config,
         destination,
         sample_config_key="kv_reference_expert_combined_standard_flow_1500_sample",
+    )
+
+
+def train_scheduled_expert_lora_only_20k(
+    config: dict[str, Any], destination: Path
+) -> dict[str, Any]:
+    return train_scheduled_direct_reference_kv_delta_320(
+        config,
+        destination,
+        config_key="kv_reference_expert_lora_only_20000",
+        sample_config_key="kv_reference_expert_lora_only_20000_sample",
+    )
+
+
+def sample_expert_lora_only_20k(
+    config: dict[str, Any], destination: Path
+) -> dict[str, Any]:
+    return sample_direct_reference_kv_delta_320(
+        config,
+        destination,
+        sample_config_key="kv_reference_expert_lora_only_20000_sample",
     )
 
 
