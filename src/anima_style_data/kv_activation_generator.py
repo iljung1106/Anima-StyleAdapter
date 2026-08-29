@@ -7406,8 +7406,8 @@ def train_scheduled_expert_external_velocity_5k(
     return train_scheduled_direct_reference_kv_delta_320(
         config,
         destination,
-        config_key="kv_reference_expert_external_block_residual_2000",
-        sample_config_key="kv_reference_expert_external_block_residual_2000_sample",
+        config_key="kv_reference_expert_external_flow_alignment_1000",
+        sample_config_key="kv_reference_expert_external_flow_alignment_1000_sample",
     )
 
 
@@ -7417,7 +7417,7 @@ def sample_expert_external_velocity_5k(
     return sample_direct_reference_kv_delta_320(
         config,
         destination,
-        sample_config_key="kv_reference_expert_external_block_residual_2000_sample",
+        sample_config_key="kv_reference_expert_external_flow_alignment_1000_sample",
     )
 
 

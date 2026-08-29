@@ -3132,6 +3132,87 @@ kv_reference_expert_external_block_residual_2000_sample:
     reference_cache: civitai_external/synthetic_references_682x4_triggered_v1/dual_query_reference_tokens_v8_step10000
     source_manifest: civitai_external/synthetic_references_682x4_triggered_v1/manifest.parquet
 
+# v25's broader block path improves mixture fitting but worsens both held-out
+# external singles and fixed real-image flow by step 1000. This causal follow-up
+# returns to the strongest stable v24 checkpoint and changes the objective, not
+# capacity: every second update is grouped Human flow, while the intervening
+# update retains external/artist functional supervision. A stronger prior and
+# low LR make this a short alignment stage rather than another flow-only run.
+kv_reference_expert_external_flow_alignment_1000:
+  extends_config_key: kv_reference_expert_combined_calibrated_3000
+  output_directory: kv_reference_expert_external_flowalign_half_b3_w768_l3_1k_v26
+  initial_checkpoint: kv_reference_expert_combined_calibrated_b3_w768_l3_3k_v24/checkpoints/step-0000500.pt
+  initial_use_ema_model: true
+  initial_use_ema_reader: true
+  initial_step: 0
+  reset_initial_step: true
+  seed: 20260909
+  training:
+    steps: 1000
+    validation_every: 250
+    checkpoint_every: 250
+    sample_steps: [250, 500, 1000]
+    sample_output_root: diagnostics/kv-reference-expert-external-flowalign-half-b3-w768-l3-1k-v26
+    generator_learning_rate: 0.0000002
+    reader_learning_rate: 0.00000002
+    generator_lr_schedule:
+      peak_lr: 0.0000002
+      warmup_steps: 25
+      decay_start_step: 500
+      decay_end_step: 1000
+      final_lr: 0.00000004
+      tail_decay_end_step: 1000
+      tail_final_lr: 0.00000004
+    reader_lr_schedule:
+      peak_lr: 0.00000002
+      warmup_steps: 25
+      decay_start_step: 250
+      decay_end_step: 750
+      final_lr: 0.000000005
+    multi_domain_distillation:
+      schedule: [external_single, artist_synthetic, external_mixture, artist_human]
+    human_flow:
+      phases:
+        - {end_step: 1000, cycle: 2, slots: [1]}
+      flow_loss_weight: 3.0
+      prior_preservation_weight: 0.25
+      fixed_validation_every: 250
+      fixed_validation_batches: 4
+    ema:
+      enabled: true
+      decay: 0.995
+      sample: true
+    wandb:
+      enabled: true
+      project: anima-style-adapter
+      name: kv-reference-expert-external-flowalign-half-b3-w768-l3-1k-v26
+      id: kv-reference-expert-external-flowalign-half-b3-w768-l3-1k-v26
+      resume: allow
+
+kv_reference_expert_external_flow_alignment_1000_sample:
+  checkpoint: kv_reference_expert_external_flowalign_half_b3_w768_l3_1k_v26/checkpoints/step-0001000.pt
+  output_directory: diagnostics/kv-reference-expert-external-flowalign-half-b3-w768-l3-1k-v26-step1000
+  device: cuda
+  artists: 8
+  references: 4
+  reference_seed: 20260916
+  strengths: [1.0, 2.0]
+  batch_size: 4
+  panel_tile_width: 384
+  panel_style_cache: "."
+  panel_style_manifest: final_manifest.parquet
+  external_panel:
+    enabled: true
+    training_seed: 20260909
+    validation_single_styles: 32
+    styles: 8
+    references: 4
+    reference_seed: 20260917
+    minimum_effect_rms: 0.001
+    functional_teacher_cache: civitai_external/functional_teacher_298_mix384_clean24x8_trigger4x4_v1
+    reference_cache: civitai_external/synthetic_references_682x4_triggered_v1/dual_query_reference_tokens_v8_step10000
+    source_manifest: civitai_external/synthetic_references_682x4_triggered_v1/manifest.parquet
+
 # Reference-conditioned low-rank operator pilot. Unlike the direct activation
 # head above, the reference generates a fresh block-local linear operator and
 # applies it to every native text token.  Teacher factors remain offline
