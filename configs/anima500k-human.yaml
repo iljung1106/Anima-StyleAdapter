@@ -3576,6 +3576,51 @@ kv_reference_expert_combined_dual_flow_anchor_1500_sample:
   external_panel:
     reference_seed: 20260927
 
+# The normalized target-minus-base residual is dominated by the frozen base
+# model's content error and conflicts with cached LoRA velocity.  Return image
+# updates to ordinary flow matching as in the visually successful v4 run.
+# Flow uses the v4-scale LR; distillation updates retain the stable v30 LR.
+kv_reference_expert_combined_standard_flow_1500:
+  extends_config_key: kv_reference_expert_combined_dual_flow_1500
+  output_directory: kv_reference_expert_combined_standardflow_b4_w768_l3_1500_v32
+  training:
+    sample_output_root: diagnostics/kv-reference-expert-combined-standardflow-b4-w768-l3-1500-v32
+    generator_lr_schedule:
+      peak_lr: 0.000003
+      warmup_steps: 50
+      decay_start_step: 500
+      decay_end_step: 1500
+      final_lr: 0.0000003
+      tail_decay_end_step: 1500
+      tail_final_lr: 0.0000003
+    reader_lr_schedule:
+      peak_lr: 0.000001
+      warmup_steps: 50
+      decay_start_step: 250
+      decay_end_step: 750
+      final_lr: 0.00000006
+    human_flow:
+      flow_mse_weight: 1.0
+      residual_huber_weight: 0.0
+      direction_weight: 0.0
+      output_band_weight: 2.0
+      prior_preservation_weight: 0.05
+      distillation_lr_multiplier: 0.3333333333
+    wandb:
+      enabled: true
+      project: anima-style-adapter
+      name: kv-reference-expert-combined-standardflow-b4-w768-l3-1500-v32
+      id: kv-reference-expert-combined-standardflow-b4-w768-l3-1500-v32
+      resume: allow
+
+kv_reference_expert_combined_standard_flow_1500_sample:
+  extends_config_key: kv_reference_expert_combined_dual_flow_1500_sample
+  checkpoint: kv_reference_expert_combined_standardflow_b4_w768_l3_1500_v32/checkpoints/step-0001500.pt
+  output_directory: diagnostics/kv-reference-expert-combined-standardflow-b4-w768-l3-1500-v32-step1500
+  reference_seed: 20260928
+  external_panel:
+    reference_seed: 20260929
+
 # Reference-conditioned low-rank operator pilot. Unlike the direct activation
 # head above, the reference generates a fresh block-local linear operator and
 # applies it to every native text token.  Teacher factors remain offline
