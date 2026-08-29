@@ -98,6 +98,12 @@ class ReferenceConditionedKVActivationGenerator(nn.Module):
         stream_rank: int = 32,
         stream_experts: int = 0,
         stream_top_k: int = 0,
+        enable_self_vo: bool = False,
+        enable_self_v: bool = True,
+        enable_self_o: bool = True,
+        self_stream_rank: int = 16,
+        self_stream_experts: int = 0,
+        self_stream_top_k: int = 0,
         enable_block_residual: bool = False,
         block_residual_rank: int = 16,
         block_residual_experts: int = 0,
@@ -131,12 +137,19 @@ class ReferenceConditionedKVActivationGenerator(nn.Module):
             raise ValueError("hidden_dim must be divisible by heads")
         if ff_layers <= 0 or output_rank < 0:
             raise ValueError("ff_layers must be positive and output_rank non-negative")
-        if output_experts < 0 or stream_experts < 0 or block_residual_experts < 0:
+        if (
+            output_experts < 0
+            or stream_experts < 0
+            or self_stream_experts < 0
+            or block_residual_experts < 0
+        ):
             raise ValueError("expert counts must be non-negative")
         if output_experts and not 0 < output_top_k <= output_experts:
             raise ValueError("output_top_k must select existing experts")
         if stream_experts and not 0 < stream_top_k <= stream_experts:
             raise ValueError("stream_top_k must select existing experts")
+        if self_stream_experts and not 0 < self_stream_top_k <= self_stream_experts:
+            raise ValueError("self_stream_top_k must select existing experts")
         if block_residual_experts and not 0 < block_residual_top_k <= block_residual_experts:
             raise ValueError("block_residual_top_k must select existing experts")
         if not 0.0 <= expert_usage_decay < 1.0 or expert_balance_cap < 1.0:
@@ -162,6 +175,14 @@ class ReferenceConditionedKVActivationGenerator(nn.Module):
         self.stream_rank = int(stream_rank)
         self.stream_experts = int(stream_experts)
         self.stream_top_k = int(stream_top_k)
+        self.enable_self_vo = bool(enable_self_vo)
+        self.enable_self_v = bool(enable_self_v) and self.enable_self_vo
+        self.enable_self_o = bool(enable_self_o) and self.enable_self_vo
+        if self.enable_self_vo and not (self.enable_self_v or self.enable_self_o):
+            raise ValueError("self-attention V/O modulation requires an enabled path")
+        self.self_stream_rank = int(self_stream_rank)
+        self.self_stream_experts = int(self_stream_experts)
+        self.self_stream_top_k = int(self_stream_top_k)
         self.enable_block_residual = bool(enable_block_residual)
         self.block_residual_rank = int(block_residual_rank)
         self.block_residual_experts = int(block_residual_experts)
@@ -242,10 +263,10 @@ class ReferenceConditionedKVActivationGenerator(nn.Module):
         self._routing_balance_terms: list[torch.Tensor] = []
         self._routing_specialization_terms: list[torch.Tensor] = []
         self._routing_entropies: dict[str, list[torch.Tensor]] = {
-            "kv": [], "qo": [], "block": [],
+            "kv": [], "qo": [], "self": [], "block": [],
         }
         self._routing_margins: dict[str, list[torch.Tensor]] = {
-            "kv": [], "qo": [], "block": [],
+            "kv": [], "qo": [], "self": [], "block": [],
         }
         self._routing_record_enabled = True
         self._routing_population_records: list[
@@ -253,6 +274,10 @@ class ReferenceConditionedKVActivationGenerator(nn.Module):
         ] = []
         if self.enable_qo and self.stream_rank <= 0:
             raise ValueError("stream_rank must be positive when Q/O is enabled")
+        if self.enable_self_vo and self.self_stream_rank <= 0:
+            raise ValueError(
+                "self_stream_rank must be positive when self V/O is enabled"
+            )
         self.style_norm = (
             nn.LayerNorm(style_dim) if bool(normalize_style) else nn.Identity()
         )
@@ -416,6 +441,100 @@ class ReferenceConditionedKVActivationGenerator(nn.Module):
                     )
                     for _ in range(blocks)
                 )
+        if self.enable_self_vo:
+            # Self-attention V and O act on live image tokens. They use their
+            # own reference codes and expert banks rather than sharing the
+            # cross-attention O basis, so the two attention domains can learn
+            # different style operators while Q/K remain frozen.
+            self.self_stream_style_queries = nn.Parameter(
+                torch.empty(blocks, 2, hidden_dim)
+            )
+            self.self_stream_code_norm = nn.LayerNorm(hidden_dim)
+            if self.self_stream_experts:
+                self.self_stream_style_key = nn.ModuleList(
+                    nn.Linear(style_dim, hidden_dim, bias=False) for _ in range(2)
+                )
+                self.self_stream_style_value = nn.ModuleList(
+                    nn.Linear(style_dim, hidden_dim, bias=False) for _ in range(2)
+                )
+                self.self_stream_routers = nn.ModuleList(
+                    nn.ModuleList(
+                        nn.Linear(hidden_dim, self.self_stream_experts, bias=True)
+                        for _ in range(2)
+                    )
+                    for _ in range(blocks)
+                )
+                self.self_stream_channel_gates = nn.ModuleList(
+                    nn.ModuleList(
+                        nn.Linear(
+                            hidden_dim,
+                            self.self_stream_experts * self.self_stream_rank,
+                            bias=True,
+                        )
+                        for _ in range(2)
+                    )
+                    for _ in range(blocks)
+                )
+                self.self_stream_gain = nn.ModuleList(
+                    nn.ModuleList(
+                        nn.Linear(hidden_dim, 1, bias=True) for _ in range(2)
+                    )
+                    for _ in range(blocks)
+                )
+                self.self_stream_expert_down = nn.Parameter(torch.empty(
+                    blocks,
+                    2,
+                    self.self_stream_experts,
+                    self.self_stream_rank,
+                    stream_dim,
+                ))
+                self.self_stream_expert_up = nn.Parameter(torch.empty(
+                    blocks,
+                    2,
+                    self.self_stream_experts,
+                    self.self_stream_rank,
+                    stream_dim,
+                ))
+                self.register_buffer(
+                    "self_stream_expert_usage",
+                    torch.full(
+                        (blocks, 2, self.self_stream_experts),
+                        1.0 / self.self_stream_experts,
+                    ),
+                )
+                self.register_buffer(
+                    "self_stream_expert_load",
+                    torch.full(
+                        (blocks, 2, self.self_stream_experts),
+                        self.self_stream_top_k / self.self_stream_experts,
+                    ),
+                )
+                self.register_buffer(
+                    "self_stream_expert_selection_bias",
+                    torch.zeros(blocks, 2, self.self_stream_experts),
+                )
+            else:
+                self.self_stream_gates = nn.ModuleList(
+                    nn.ModuleList(
+                        nn.Linear(hidden_dim, self.self_stream_rank, bias=True)
+                        for _ in range(2)
+                    )
+                    for _ in range(blocks)
+                )
+                self.self_stream_down = nn.ModuleList(
+                    nn.ModuleList(
+                        nn.Linear(stream_dim, self.self_stream_rank, bias=False)
+                        for _ in range(2)
+                    )
+                    for _ in range(blocks)
+                )
+                self.self_stream_up = nn.ModuleList(
+                    nn.ModuleList(
+                        nn.Linear(self.self_stream_rank, stream_dim, bias=False)
+                        for _ in range(2)
+                    )
+                    for _ in range(blocks)
+                )
         if self.enable_block_residual:
             # A full external LoRA changes self-attention, MLP, and sometimes
             # AdaLN in addition to cross-attention.  One style-conditioned
@@ -498,6 +617,8 @@ class ReferenceConditionedKVActivationGenerator(nn.Module):
             "output_expert_selection_bias",
             "stream_expert_load",
             "stream_expert_selection_bias",
+            "self_stream_expert_load",
+            "self_stream_expert_selection_bias",
             "block_residual_expert_load",
             "block_residual_expert_selection_bias",
         ):
@@ -550,6 +671,44 @@ class ReferenceConditionedKVActivationGenerator(nn.Module):
                     for gate in block_gates:
                         nn.init.zeros_(gate.bias)
                 for block_heads in self.stream_up:
+                    for head in block_heads:
+                        with torch.no_grad():
+                            head.weight.mul_(output_init_scale)
+        if self.enable_self_vo:
+            nn.init.normal_(
+                self.self_stream_style_queries, std=self.hidden_dim**-0.5
+            )
+            if self.self_stream_experts:
+                nn.init.normal_(
+                    self.self_stream_expert_down, std=self.stream_dim**-0.5
+                )
+                nn.init.normal_(
+                    self.self_stream_expert_up,
+                    std=self.self_stream_rank**-0.5 * output_init_scale,
+                )
+                for block in range(self.blocks):
+                    for kind in range(2):
+                        nn.init.zeros_(
+                            self.self_stream_routers[block][kind].bias
+                        )
+                        with torch.no_grad():
+                            self.self_stream_routers[block][kind].weight.mul_(
+                                self.router_init_scale
+                            )
+                        nn.init.zeros_(
+                            self.self_stream_channel_gates[block][kind].bias
+                        )
+                        nn.init.zeros_(
+                            self.self_stream_gain[block][kind].weight
+                        )
+                        nn.init.zeros_(
+                            self.self_stream_gain[block][kind].bias
+                        )
+            else:
+                for block_gates in self.self_stream_gates:
+                    for gate in block_gates:
+                        nn.init.zeros_(gate.bias)
+                for block_heads in self.self_stream_up:
                     for head in block_heads:
                         with torch.no_grad():
                             head.weight.mul_(output_init_scale)
@@ -814,6 +973,139 @@ class ReferenceConditionedKVActivationGenerator(nn.Module):
         hidden = self.stream_down[block_index][kind](stream_input)
         return self.stream_up[block_index][kind](hidden * gate[:, None, :])
 
+    def prepare_self_stream_codes(
+        self, style_memory: torch.Tensor
+    ) -> torch.Tensor:
+        """Read reference memory once for self-attention V/O adapters."""
+        if not self.enable_self_vo:
+            raise RuntimeError("self-attention V/O modulation is disabled")
+        style = self.style_norm(style_memory)
+        batch = int(style.shape[0])
+        if self.self_stream_experts:
+            rows = []
+            for kind in range(2):
+                if not self.self_stream_kind_enabled(kind):
+                    rows.append(
+                        style.new_zeros(
+                            batch, self.blocks, self.heads, self.head_dim
+                        )
+                    )
+                    continue
+                queries = self.self_stream_style_queries[:, kind][None].expand(
+                    batch, -1, -1
+                ).reshape(
+                    batch, self.blocks, self.heads, self.head_dim
+                ).transpose(1, 2)
+                key = self.self_stream_style_key[kind](style).reshape(
+                    batch, style.shape[1], self.heads, self.head_dim
+                ).transpose(1, 2)
+                value = self.self_stream_style_value[kind](style).reshape(
+                    batch, style.shape[1], self.heads, self.head_dim
+                ).transpose(1, 2)
+                code = F.scaled_dot_product_attention(queries, key, value)
+                rows.append(code.transpose(1, 2))
+            codes = torch.stack(rows, dim=2).reshape(
+                batch, self.blocks, 2, self.hidden_dim
+            )
+        else:
+            key = self.style_key(style)
+            value = self.style_value(style)
+            queries = self.self_stream_style_queries.reshape(
+                self.blocks * 2, self.hidden_dim
+            )[None].expand(batch, -1, -1)
+            queries = queries.reshape(
+                batch, self.blocks * 2, self.heads, self.head_dim
+            ).transpose(1, 2)
+            key = key.reshape(
+                batch, style.shape[1], self.heads, self.head_dim
+            ).transpose(1, 2)
+            value = value.reshape(
+                batch, style.shape[1], self.heads, self.head_dim
+            ).transpose(1, 2)
+            codes = F.scaled_dot_product_attention(queries, key, value)
+            codes = codes.transpose(1, 2).reshape(
+                batch, self.blocks, 2, self.hidden_dim
+            )
+        return self.self_stream_code_norm(codes)
+
+    def self_stream_kind_enabled(self, kind: int) -> bool:
+        if int(kind) == 0:
+            return self.enable_self_v
+        if int(kind) == 1:
+            return self.enable_self_o
+        raise ValueError("self stream kind must be V=0 or O=1")
+
+    def self_stream_delta(
+        self,
+        stream_input: torch.Tensor,
+        stream_codes: torch.Tensor,
+        block_index: int,
+        kind: int,
+    ) -> torch.Tensor:
+        """Apply a reference-gated low-rank delta to self V (0) or O (1)."""
+        if not self.enable_self_vo:
+            raise RuntimeError("self-attention V/O modulation is disabled")
+        if not self.self_stream_kind_enabled(kind):
+            return torch.zeros_like(stream_input)
+        if stream_input.shape[-1] != self.stream_dim:
+            raise ValueError(
+                f"Expected self stream width {self.stream_dim}, "
+                f"got {stream_input.shape[-1]}"
+            )
+        code = stream_codes[:, block_index, kind]
+        if self.self_stream_experts:
+            logits = self.self_stream_routers[block_index][kind](code)
+            indices, weights, sparse, dense, selected = self._sparse_router(
+                logits[:, None],
+                self.self_stream_top_k,
+                self.self_stream_expert_selection_bias[
+                    block_index, kind : kind + 1
+                ],
+            )
+            indices = indices[:, 0]
+            weights = weights[:, 0]
+            self._record_routing(
+                "self",
+                self.self_stream_expert_usage,
+                self.self_stream_expert_load,
+                self.self_stream_expert_selection_bias,
+                block_index,
+                sparse,
+                dense,
+                selected,
+                self.self_stream_top_k,
+                logits[:, None],
+                usage_kind=kind,
+            )
+            channels = torch.tanh(
+                self.self_stream_channel_gates[block_index][kind](code).reshape(
+                    len(code), self.self_stream_experts, self.self_stream_rank
+                )
+            )
+            batch_rows = torch.arange(len(code), device=code.device)[:, None]
+            selected_channels = channels[batch_rows, indices]
+            selected_down = self.self_stream_expert_down[
+                block_index, kind
+            ][indices]
+            selected_up = self.self_stream_expert_up[
+                block_index, kind
+            ][indices]
+            hidden = torch.einsum(
+                "bnc,bkrc->bknr", stream_input, selected_down
+            ) * selected_channels[:, :, None]
+            delta = torch.einsum(
+                "bknr,bkro,bk->bno", hidden, selected_up, weights
+            )
+            gain = 2.0 * torch.sigmoid(
+                self.self_stream_gain[block_index][kind](code).float()
+            ).to(delta.dtype)
+            return delta * gain[:, None]
+        gate = torch.tanh(self.self_stream_gates[block_index][kind](code))
+        hidden = self.self_stream_down[block_index][kind](stream_input)
+        return self.self_stream_up[block_index][kind](
+            hidden * gate[:, None, :]
+        )
+
     def prepare_block_residual_codes(
         self, style_memory: torch.Tensor
     ) -> torch.Tensor:
@@ -960,7 +1252,7 @@ class ReferenceConditionedKVActivationGenerator(nn.Module):
 
     def _core_margin_target(self, name: str) -> float:
         target = self.output_core_margin if name == "kv" else (
-            self.stream_core_margin if name == "qo" else 0.0
+            self.stream_core_margin if name in ("qo", "self") else 0.0
         )
         elapsed = max(0, self._routing_step - self.expert_specialization_start_step)
         progress = min(1.0, elapsed / max(1, self.expert_specialization_steps))
@@ -968,7 +1260,7 @@ class ReferenceConditionedKVActivationGenerator(nn.Module):
 
     def _entropy_cap(self, name: str, top_k: int) -> float:
         target = self.output_entropy_target if name == "kv" else (
-            self.stream_entropy_target if name == "qo" else -1.0
+            self.stream_entropy_target if name in ("qo", "self") else -1.0
         )
         maximum = math.log(max(1, int(top_k)))
         if target < 0:
@@ -1035,7 +1327,7 @@ class ReferenceConditionedKVActivationGenerator(nn.Module):
         ).sum(dim=-1).mean()
         self._routing_entropies[name].append(entropy)
         core_experts = self.output_core_experts if name == "kv" else (
-            self.stream_core_experts if name == "qo" else 0
+            self.stream_core_experts if name in ("qo", "self") else 0
         )
         if core_experts:
             ordered = router_logits.float().sort(dim=-1, descending=True).values
@@ -1116,6 +1408,19 @@ class ReferenceConditionedKVActivationGenerator(nn.Module):
                 ]
                 top_k = self.stream_top_k
                 experts = self.stream_experts
+            elif name == "self":
+                assert kind is not None
+                usage_rows = self.self_stream_expert_usage[
+                    block, kind : kind + 1
+                ]
+                load_rows = self.self_stream_expert_load[
+                    block, kind : kind + 1
+                ]
+                bias_rows = self.self_stream_expert_selection_bias[
+                    block, kind : kind + 1
+                ]
+                top_k = self.self_stream_top_k
+                experts = self.self_stream_experts
             else:
                 assert name == "block" and kind == 0
                 usage_rows = self.block_residual_expert_usage[
@@ -1152,6 +1457,12 @@ class ReferenceConditionedKVActivationGenerator(nn.Module):
             ("kv", getattr(self, "output_expert_load", None), self.output_top_k, self.output_experts),
             ("qo", getattr(self, "stream_expert_load", None), self.stream_top_k, self.stream_experts),
             (
+                "self",
+                getattr(self, "self_stream_expert_load", None),
+                self.self_stream_top_k,
+                self.self_stream_experts,
+            ),
+            (
                 "block",
                 getattr(self, "block_residual_expert_load", None),
                 self.block_residual_top_k,
@@ -1162,6 +1473,9 @@ class ReferenceConditionedKVActivationGenerator(nn.Module):
                 continue
             if name == "qo" and self.enable_qo and not self.enable_q:
                 load = load[:, 1:2]
+            if name == "self" and self.enable_self_vo:
+                enabled = [self.enable_self_v, self.enable_self_o]
+                load = load[:, enabled]
             target = float(top_k) / experts
             router_max = load.float().amax(dim=-1).flatten()
             metrics[f"{name}_population_groups"] = zero.new_tensor(
@@ -1200,7 +1514,11 @@ class ReferenceConditionedKVActivationGenerator(nn.Module):
             top_k = self.output_top_k if name == "kv" else (
                 self.stream_top_k
                 if name == "qo"
-                else self.block_residual_top_k
+                else (
+                    self.self_stream_top_k
+                    if name == "self"
+                    else self.block_residual_top_k
+                )
             )
             metrics[f"{name}_entropy_cap"] = zero.new_tensor(
                 self._entropy_cap(name, top_k)
@@ -1227,6 +1545,17 @@ class ReferenceConditionedKVActivationGenerator(nn.Module):
             metrics["qo_expert_bias_span"] = (
                 self.stream_expert_selection_bias.amax(dim=-1)
                 - self.stream_expert_selection_bias.amin(dim=-1)
+            ).max().detach() * self._selection_bias_scale()
+        if self.enable_self_vo and self.self_stream_experts:
+            metrics["self_expert_max_usage"] = (
+                self.self_stream_expert_usage.max().detach()
+            )
+            metrics["self_expert_max_load"] = (
+                self.self_stream_expert_load.max().detach()
+            )
+            metrics["self_expert_bias_span"] = (
+                self.self_stream_expert_selection_bias.amax(dim=-1)
+                - self.self_stream_expert_selection_bias.amin(dim=-1)
             ).max().detach() * self._selection_bias_scale()
         if self.enable_block_residual:
             metrics["block_expert_max_usage"] = (
@@ -1891,6 +2220,18 @@ def _adapter_probe_signature(
                 for kind in range(2)
                 if generator.stream_kind_enabled(kind)
             )
+    if generator.enable_self_vo:
+        self_stream_codes = generator.prepare_self_stream_codes(style)
+        for block in blocks:
+            parts.extend(
+                compact(
+                    generator.self_stream_delta(
+                        stream_input, self_stream_codes, block, kind
+                    )
+                )
+                for kind in range(2)
+                if generator.self_stream_kind_enabled(kind)
+            )
     signature = torch.cat(parts)
     return F.normalize(signature, dim=0) if normalize else signature
 
@@ -1926,6 +2267,18 @@ def _adapter_probe_signatures(
                 compact(generator.stream_delta(stream_input, stream_codes, block, kind))
                 for kind in range(2)
                 if generator.stream_kind_enabled(kind)
+            )
+    if generator.enable_self_vo:
+        self_stream_codes = generator.prepare_self_stream_codes(style_memory)
+        for block in blocks:
+            parts.extend(
+                compact(
+                    generator.self_stream_delta(
+                        stream_input, self_stream_codes, block, kind
+                    )
+                )
+                for kind in range(2)
+                if generator.self_stream_kind_enabled(kind)
             )
     signatures = torch.cat(parts, dim=1)
     return F.normalize(signatures, dim=1) if normalize else signatures
@@ -3403,6 +3756,13 @@ def train_direct_reference_kv_delta_320(
         value.startswith("artist_")
         for value in configured_distillation_schedule
     )
+    legacy_lora_domains_enabled = (
+        not multi_domain_enabled
+        or any(
+            value.startswith("lora_")
+            for value in configured_distillation_schedule
+        )
+    )
     flow_only = bool(training.get("flow_only", False))
     steps = int(steps_override or training.get("steps", 4000))
     device = str(training.get("device", "cuda"))
@@ -3478,7 +3838,7 @@ def train_direct_reference_kv_delta_320(
     }
     if any(not rows for rows in rows_by_kind.values()):
         raise RuntimeError("Every direct-delta mixture category needs rows")
-    if not flow_only:
+    if not flow_only and legacy_lora_domains_enabled:
         teacher_down = teacher_down.to(device=device, dtype=torch.bfloat16)
         teacher_up = teacher_up.to(device=device, dtype=torch.bfloat16)
 
@@ -3573,61 +3933,63 @@ def train_direct_reference_kv_delta_320(
     train_query_count = 0
     probes = []
     if not flow_only:
-        configured_single_caches = dict(
-            multi_domain.get("lora_reference_caches", {})
-        ) if multi_domain_enabled else {}
-        if not configured_single_caches:
-            configured_single_caches = {
-                "default": cfg.get(
-                    "single_reference_cache", cfg["synthetic_reference_cache"]
+        if legacy_lora_domains_enabled:
+            configured_single_caches = dict(
+                multi_domain.get("lora_reference_caches", {})
+            ) if multi_domain_enabled else {}
+            if not configured_single_caches:
+                configured_single_caches = {
+                    "default": cfg.get(
+                        "single_reference_cache", cfg["synthetic_reference_cache"]
+                    )
+                }
+            for domain, cache_value in configured_single_caches.items():
+                domain_seed = seed ^ (
+                    0x48554D41 if str(domain) == "human" else 0x53594E54
                 )
-            }
-        for domain, cache_value in configured_single_caches.items():
-            domain_seed = seed ^ (
-                0x48554D41 if str(domain) == "human" else 0x53594E54
+                single_loader = CachedTeacherReferenceLoader(
+                    destination / str(cache_value),
+                    split="train", style_ids=artist_ids, batch_size=chunk,
+                    references=single_images, seed=domain_seed,
+                    token_lru_shards=token_lru, strict_style_ids=True,
+                )
+                single_banks[str(domain)] = _cached_reference_bank(
+                    single_loader,
+                    artist_ids,
+                    references=single_images,
+                    seed=domain_seed,
+                    chunk_size=chunk,
+                    device=device,
+                    cache_root=contiguous_cache_root,
+                    split=f"lora-{domain}",
+                    source=str(destination / str(cache_value)),
+                )
+            # Keep the established LoRA validation path on Human references
+            # when both domains are active.
+            single_bank = single_banks.get(
+                "human", next(iter(single_banks.values()))
             )
-            single_loader = CachedTeacherReferenceLoader(
-                destination / str(cache_value),
-                split="train", style_ids=artist_ids, batch_size=chunk,
-                references=single_images, seed=domain_seed,
-                token_lru_shards=token_lru, strict_style_ids=True,
-            )
-            single_banks[str(domain)] = _cached_reference_bank(
-                single_loader,
-                artist_ids,
-                references=single_images,
-                seed=domain_seed,
-                chunk_size=chunk,
-                device=device,
-                cache_root=contiguous_cache_root,
-                split=f"lora-{domain}",
-                source=str(destination / str(cache_value)),
-            )
-        # Keep the established LoRA validation path on Human references when
-        # both domains are active.  The per-update scheduler selects the exact
-        # bank below.
-        single_bank = single_banks.get("human", next(iter(single_banks.values())))
-        for kind, rows in rows_by_kind.items():
-            style_ids = [str(row["mixture_style_id"]) for row in rows]
-            loader = CachedTeacherReferenceLoader(
-                destination / str(cfg["mixture_reference_cache"]),
-                split="train", style_ids=style_ids, batch_size=chunk,
-                references=mixture_images,
-                seed=seed ^ (sum(map(ord, kind)) * 1_000_003),
-                token_lru_shards=token_lru, strict_style_ids=True,
-            )
-            mixture_seed = seed ^ (sum(map(ord, kind)) * 1_000_003)
-            mixture_banks[kind] = _cached_reference_bank(
-                loader,
-                style_ids,
-                references=mixture_images,
-                seed=mixture_seed,
-                chunk_size=chunk,
-                device=device,
-                cache_root=contiguous_cache_root,
-                split=f"mixture-{kind}",
-                source=str(destination / str(cfg["mixture_reference_cache"])),
-            )
+            for kind, rows in rows_by_kind.items():
+                style_ids = [str(row["mixture_style_id"]) for row in rows]
+                loader = CachedTeacherReferenceLoader(
+                    destination / str(cfg["mixture_reference_cache"]),
+                    split="train", style_ids=style_ids, batch_size=chunk,
+                    references=mixture_images,
+                    seed=seed ^ (sum(map(ord, kind)) * 1_000_003),
+                    token_lru_shards=token_lru, strict_style_ids=True,
+                )
+                mixture_seed = seed ^ (sum(map(ord, kind)) * 1_000_003)
+                mixture_banks[kind] = _cached_reference_bank(
+                    loader,
+                    style_ids,
+                    references=mixture_images,
+                    seed=mixture_seed,
+                    chunk_size=chunk,
+                    device=device,
+                    cache_root=contiguous_cache_root,
+                    split=f"mixture-{kind}",
+                    source=str(destination / str(cfg["mixture_reference_cache"])),
+                )
         if native_domains_enabled:
             native_bank = NativeCenteredTeacherBank.load(
                 config,
@@ -3755,10 +4117,6 @@ def train_direct_reference_kv_delta_320(
     functional_bank = None
     external_functional_bank = None
     functional_index_by_style: dict[str, int] = {}
-    legacy_lora_domains_enabled = (
-        not multi_domain_enabled
-        or any(value.startswith("lora_") for value in configured_distillation_schedule)
-    )
     if whole_enabled and legacy_lora_domains_enabled:
         functional_bank = FunctionalLoRATeacherBank(
             destination / str(cfg["functional_teacher_cache"]),
@@ -7805,6 +8163,27 @@ def sample_expert_lora_only_20k(
         config,
         destination,
         sample_config_key="kv_reference_expert_lora_only_20000_sample",
+    )
+
+
+def train_scheduled_expert_external_kvo_selfvo_5k(
+    config: dict[str, Any], destination: Path
+) -> dict[str, Any]:
+    return train_scheduled_direct_reference_kv_delta_320(
+        config,
+        destination,
+        config_key="kv_reference_expert_external_kvo_selfvo_5000",
+        sample_config_key="kv_reference_expert_external_kvo_selfvo_5000_sample",
+    )
+
+
+def sample_expert_external_kvo_selfvo_5k(
+    config: dict[str, Any], destination: Path
+) -> dict[str, Any]:
+    return sample_direct_reference_kv_delta_320(
+        config,
+        destination,
+        sample_config_key="kv_reference_expert_external_kvo_selfvo_5000_sample",
     )
 
 

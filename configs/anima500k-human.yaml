@@ -3701,6 +3701,104 @@ kv_reference_expert_lora_only_20000_sample:
   external_panel:
     reference_seed: 20261001
 
+# Full external-LoRA functional student. Cross-attention keeps the existing
+# reference-conditioned K/V experts and adds O; self-attention adds only V/O,
+# leaving both Q and self K frozen to protect content geometry. The target is
+# cached final velocity from external CivitAI singles and mixtures only. Exact
+# normalized regression and direction dominate; retrieval is only a weak
+# anti-collision signal rather than the primary objective.
+kv_reference_expert_external_kvo_selfvo_5000:
+  extends_config_key: kv_reference_expert_lora_only_20000
+  output_directory: kv_reference_expert_external_kvo_selfvo_b4_w768_l3_5k_v34
+  initial_checkpoint: null
+  initial_reader_checkpoint: null
+  initial_step: 0
+  reset_initial_step: true
+  seed: 20261002
+  model:
+    enable_qo: true
+    enable_q: false
+    enable_o: true
+    stream_rank: 16
+    stream_experts: 16
+    stream_top_k: 4
+    enable_self_vo: true
+    enable_self_v: true
+    enable_self_o: true
+    self_stream_rank: 16
+    self_stream_experts: 8
+    self_stream_top_k: 4
+  training:
+    steps: 5000
+    batch_size: 4
+    gradient_accumulation_steps: 1
+    # Scheduled checkpoints already render the fixed and external panels. Skip
+    # the legacy 320-LoRA numeric validation loop in this external-only run.
+    validation_every: 0
+    checkpoint_every: 500
+    sample_every: 0
+    sample_steps: [500, 1000, 2000, 3000, 4000, 5000]
+    sample_output_root: diagnostics/kv-reference-expert-external-kvo-selfvo-b4-w768-l3-5k-v34
+    multi_domain_distillation:
+      enabled: true
+      schedule:
+        - external_single
+        - external_mixture
+        - external_single
+        - external_mixture
+        - external_single
+      mixture_kind_schedule: [pair, triple, pair, amplified, signed]
+      loss_by_domain:
+        external_single: {huber_weight: 2.0, direction_weight: 2.0, retrieval_weight: 0.25}
+        external_mixture: {huber_weight: 2.0, direction_weight: 2.0, retrieval_weight: 0.25}
+    whole_model_functional:
+      block_weight_scale: 0.0
+      whole_weight_override: 1.0
+      huber_beta: 0.10
+      direction_weight: 2.0
+      retrieval_weight: 0.25
+      reader_consistency_weight: 0.05
+      reader_contrastive_weight: 0.05
+      functional_consistency_weight: 0.25
+      functional_contrastive_weight: 0.10
+      teacher_signature_weight: 0.0
+    human_flow:
+      enabled: false
+    generator_learning_rate: 0.000003
+    reader_learning_rate: 0.0000005
+    generator_lr_schedule:
+      peak_lr: 0.000003
+      warmup_steps: 200
+      decay_start_step: 3000
+      decay_end_step: 5000
+      final_lr: 0.0000003
+      tail_decay_end_step: 5000
+      tail_final_lr: 0.0000003
+    reader_lr_schedule:
+      peak_lr: 0.0000005
+      warmup_steps: 200
+      decay_start_step: 1000
+      decay_end_step: 4000
+      final_lr: 0.00000005
+    ema:
+      enabled: true
+      decay: 0.999
+      sample: true
+    wandb:
+      enabled: true
+      project: anima-style-adapter
+      name: kv-reference-expert-external-kvo-selfvo-b4-w768-l3-5k-v34
+      id: kv-reference-expert-external-kvo-selfvo-b4-w768-l3-5k-v34
+      resume: allow
+
+kv_reference_expert_external_kvo_selfvo_5000_sample:
+  extends_config_key: kv_reference_expert_combined_calibrated_3000_sample
+  checkpoint: kv_reference_expert_external_kvo_selfvo_b4_w768_l3_5k_v34/checkpoints/step-0005000.pt
+  output_directory: diagnostics/kv-reference-expert-external-kvo-selfvo-b4-w768-l3-5k-v34-step5000
+  reference_seed: 20261002
+  external_panel:
+    reference_seed: 20261003
+
 # Reference-conditioned low-rank operator pilot. Unlike the direct activation
 # head above, the reference generates a fresh block-local linear operator and
 # applies it to every native text token.  Teacher factors remain offline

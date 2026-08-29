@@ -149,6 +149,7 @@ class NativeKVActivationInjector:
         self.style_memory: torch.Tensor | None = None
         self.kv_factors: tuple[torch.Tensor, torch.Tensor] | None = None
         self.stream_codes: torch.Tensor | None = None
+        self.self_stream_codes: torch.Tensor | None = None
         self.block_residual_codes: torch.Tensor | None = None
         self.strength = 1.0
         self.stream_strength = 1.0
@@ -206,6 +207,63 @@ class NativeKVActivationInjector:
                             self._stream_hook(block_index, 1)
                         )
                     )
+            if bool(getattr(model, "enable_self_vo", False)):
+                self_attention = block.self_attn
+                stream_dim = int(model.stream_dim)
+                if not hasattr(self_attention, "output_proj"):
+                    raise TypeError(
+                        "self-attention V/O generation requires output_proj"
+                    )
+                output_dimensions = (
+                    int(self_attention.output_proj.in_features),
+                    int(self_attention.output_proj.out_features),
+                )
+                if output_dimensions != (stream_dim, stream_dim):
+                    raise ValueError(
+                        f"self-attention O widths {output_dimensions} do not "
+                        f"match configured stream_dim={stream_dim}"
+                    )
+                if bool(getattr(model, "enable_self_v", True)):
+                    if hasattr(self_attention, "qkv_proj"):
+                        qkv_dimensions = (
+                            int(self_attention.qkv_proj.in_features),
+                            int(self_attention.qkv_proj.out_features),
+                        )
+                        if qkv_dimensions != (stream_dim, 3 * stream_dim):
+                            raise ValueError(
+                                f"self-attention QKV widths {qkv_dimensions} do "
+                                f"not match configured stream_dim={stream_dim}"
+                            )
+                        self.handles.append(
+                            self_attention.qkv_proj.register_forward_hook(
+                                self._self_v_fused_hook(block_index)
+                            )
+                        )
+                    elif hasattr(self_attention, "v_proj"):
+                        v_dimensions = (
+                            int(self_attention.v_proj.in_features),
+                            int(self_attention.v_proj.out_features),
+                        )
+                        if v_dimensions != (stream_dim, stream_dim):
+                            raise ValueError(
+                                f"self-attention V widths {v_dimensions} do not "
+                                f"match configured stream_dim={stream_dim}"
+                            )
+                        self.handles.append(
+                            self_attention.v_proj.register_forward_hook(
+                                self._self_stream_hook(block_index, 0)
+                            )
+                        )
+                    else:
+                        raise TypeError(
+                            "self-attention exposes neither qkv_proj nor v_proj"
+                        )
+                if bool(getattr(model, "enable_self_o", True)):
+                    self.handles.append(
+                        self_attention.output_proj.register_forward_hook(
+                            self._self_stream_hook(block_index, 1)
+                        )
+                    )
             if bool(getattr(model, "enable_block_residual", False)):
                 self.handles.append(
                     block.register_forward_hook(
@@ -237,6 +295,11 @@ class NativeKVActivationInjector:
             if bool(getattr(self.model, "enable_qo", False))
             else None
         )
+        self.self_stream_codes = (
+            self.model.prepare_self_stream_codes(style_memory)
+            if bool(getattr(self.model, "enable_self_vo", False))
+            else None
+        )
         self.block_residual_codes = (
             self.model.prepare_block_residual_codes(style_memory)
             if bool(getattr(self.model, "enable_block_residual", False))
@@ -263,6 +326,7 @@ class NativeKVActivationInjector:
         self.block_mask = None
         self.kv_factors = None
         self.stream_codes = None
+        self.self_stream_codes = None
         self.block_residual_codes = None
 
     def _block_enabled(self, block_index: int) -> bool:
@@ -312,6 +376,40 @@ class NativeKVActivationInjector:
             return output + self._stream_delta(
                 inputs[0], block_index, kind
             ).to(output.dtype)
+
+        return hook
+
+    def _self_stream_delta(
+        self, values: torch.Tensor, block_index: int, kind: int
+    ) -> torch.Tensor:
+        if self.self_stream_codes is None:
+            raise RuntimeError("No active self-attention V/O stream codes")
+        codes = _repeat_factor_rows(
+            self.self_stream_codes, int(values.shape[0])
+        )
+        return self.model.self_stream_delta(
+            values, codes, block_index, kind
+        ) * self.stream_strength
+
+    def _self_stream_hook(self, block_index: int, kind: int):
+        def hook(module, inputs, output):
+            if not self.enabled or not self._block_enabled(block_index):
+                return output
+            return output + self._self_stream_delta(
+                inputs[0], block_index, kind
+            ).to(output.dtype)
+
+        return hook
+
+    def _self_v_fused_hook(self, block_index: int):
+        def hook(module, inputs, output):
+            if not self.enabled or not self._block_enabled(block_index):
+                return output
+            delta = self._self_stream_delta(inputs[0], block_index, 0)
+            zero = torch.zeros_like(delta)
+            return output + torch.cat((zero, zero, delta), dim=-1).to(
+                output.dtype
+            )
 
         return hook
 
