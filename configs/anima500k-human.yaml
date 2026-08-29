@@ -3522,6 +3522,59 @@ kv_reference_expert_combined_dual_flow_1500_sample:
   external_panel:
     reference_seed: 20260925
 
+# Image-flow residuals contain the frozen base model's content-specific error
+# as well as the LoRA style effect.  Anchor every external synthetic flow
+# update to the exact cached velocity teacher for the same style, while Human
+# flow remains a generalization-only objective without an unavailable teacher.
+kv_reference_expert_combined_dual_flow_anchor_1500:
+  extends_config_key: kv_reference_expert_combined_dual_flow_1500
+  output_directory: kv_reference_expert_combined_dualflow_anchor_b4_w768_l3_1500_v31
+  training:
+    human_flow:
+      training_sources:
+        - name: external_synthetic
+          style_cache: civitai_external/synthetic_references_682x4_triggered_v1
+          style_manifest: civitai_external/synthetic_references_682x4_triggered_v1/manifest.parquet
+          latent_cache: civitai_external/synthetic_references_682x4_triggered_v1/latents
+          text_cache: civitai_external/synthetic_references_682x4_triggered_v1/flow_text_clean_content_v1
+          resampler_token_cache: civitai_external/synthetic_references_682x4_triggered_v1/dual_query_reference_tokens_v8_step10000
+          single_prompt_cache: true
+          split: train
+          batch_size: 4
+          min_references: 2
+          max_references: 3
+          same_style_target_min: 1
+          same_style_target_max: 1
+          artist_balanced: true
+          exclude_external_heldout: true
+          validate_external_heldout: true
+          validation_batch_size: 4
+          validation_batches: 4
+          teacher_anchor_weight: 0.5
+          teacher_anchor_huber_weight: 1.0
+          teacher_anchor_direction_weight: 1.0
+        - name: human_real
+          batch_size: 3
+          min_references: 1
+          max_references: 4
+          same_style_target_min: 2
+          same_style_target_max: 3
+          artist_balanced: true
+    wandb:
+      enabled: true
+      project: anima-style-adapter
+      name: kv-reference-expert-combined-dualflow-anchor-b4-w768-l3-1500-v31
+      id: kv-reference-expert-combined-dualflow-anchor-b4-w768-l3-1500-v31
+      resume: allow
+
+kv_reference_expert_combined_dual_flow_anchor_1500_sample:
+  extends_config_key: kv_reference_expert_combined_dual_flow_1500_sample
+  checkpoint: kv_reference_expert_combined_dualflow_anchor_b4_w768_l3_1500_v31/checkpoints/step-0001500.pt
+  output_directory: diagnostics/kv-reference-expert-combined-dualflow-anchor-b4-w768-l3-1500-v31-step1500
+  reference_seed: 20260926
+  external_panel:
+    reference_seed: 20260927
+
 # Reference-conditioned low-rank operator pilot. Unlike the direct activation
 # head above, the reference generates a fresh block-local linear operator and
 # applies it to every native text token.  Teacher factors remain offline

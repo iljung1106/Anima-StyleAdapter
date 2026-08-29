@@ -3559,6 +3559,7 @@ def train_direct_reference_kv_delta_320(
     native_reference_teacher_indices: dict[str, list[int]] = {}
     external_reference_bank = None
     external_reference_position: dict[str, int] = {}
+    external_single_effect_index: dict[str, int] = {}
     external_train_singles: list[dict[str, Any]] = []
     external_validation_singles: list[dict[str, Any]] = []
     external_rows_by_kind: dict[str, list[dict[str, Any]]] = {}
@@ -3811,6 +3812,10 @@ def train_direct_reference_kv_delta_320(
             if bool(row.get("enabled", True))
             and float(row.get("effect_rms", 0.0)) >= minimum_effect_rms
         ]
+        external_single_effect_index = {
+            str(row["mixture_style_id"]): int(row["index"])
+            for row in single_rows
+        }
         excluded_single_rows = len(single_rows_all) - len(single_rows)
         if excluded_single_rows:
             print(
@@ -4051,6 +4056,7 @@ def train_direct_reference_kv_delta_320(
             )
     flow_injector = None
     flow_prefetched_by_source: dict[str, Any] = {}
+    flow_source_options: dict[str, dict[str, Any]] = {}
     flow_source_schedule = ["human"]
     flow_validation_batches: list[dict[str, Any]] = []
     external_flow_validation_batches: list[dict[str, Any]] = []
@@ -4129,6 +4135,7 @@ def train_direct_reference_kv_delta_320(
                 raise ValueError(
                     f"Duplicate human-flow source name: {flow_source_name}"
                 )
+            flow_source_options[flow_source_name] = training_source_cfg
             flow_loader_cfg = dict(human_flow_loader_cfg)
             for key in (
                 "style_cache",
@@ -4673,6 +4680,7 @@ def train_direct_reference_kv_delta_320(
                 active_flow_source = flow_source_schedule[
                     flow_update_index % len(flow_source_schedule)
                 ]
+                active_flow_options = flow_source_options[active_flow_source]
                 flow_batch = next(
                     flow_prefetched_by_source[active_flow_source]
                 )
@@ -4848,6 +4856,114 @@ def train_direct_reference_kv_delta_320(
                     flow_style_ids = [
                         str(item.style_id) for item in flow_batch["episodes"]
                     ]
+                    teacher_anchor_weight = float(
+                        active_flow_options.get("teacher_anchor_weight", 0.0)
+                    )
+                    teacher_anchor_loss = flow_mse.new_zeros(())
+                    teacher_anchor_huber = flow_mse.new_zeros(())
+                    teacher_anchor_cosine = flow_mse.new_zeros(())
+                    if teacher_anchor_weight:
+                        if external_functional_bank is None:
+                            raise RuntimeError(
+                                "Flow teacher anchoring requires the external "
+                                "functional teacher cache"
+                            )
+                        missing_anchor_styles = [
+                            style_id for style_id in flow_style_ids
+                            if style_id not in external_single_effect_index
+                        ]
+                        if missing_anchor_styles:
+                            raise RuntimeError(
+                                "Flow teacher anchoring has no exact external "
+                                "single teacher for: "
+                                + ", ".join(sorted(set(missing_anchor_styles))[:8])
+                            )
+                        anchor_rng = random.Random(
+                            seed ^ 0x414E4348 ^ (micro_step * 1_000_033)
+                        )
+                        anchor_base_bank = external_functional_bank.base
+                        anchor_content = anchor_rng.randrange(
+                            int(anchor_base_bank["noisy_inputs"].shape[0])
+                        )
+                        anchor_timestep = anchor_rng.randrange(
+                            int(anchor_base_bank["noisy_inputs"].shape[1])
+                        )
+                        anchor_context = anchor_base_bank["base_context"][
+                            anchor_content : anchor_content + 1
+                        ].to(device=device, dtype=torch.bfloat16).expand(
+                            len(flow_style_ids), -1, -1
+                        )
+                        anchor_noisy = anchor_base_bank["noisy_inputs"][
+                            anchor_content, anchor_timestep
+                        ].to(device=device, dtype=torch.bfloat16)[None].expand(
+                            len(flow_style_ids), -1, -1, -1
+                        )
+                        anchor_base = anchor_base_bank["base_predictions"][
+                            anchor_content, anchor_timestep
+                        ].to(device=device, dtype=torch.float32)[None].expand(
+                            len(flow_style_ids), -1, -1, -1
+                        )
+                        anchor_t = anchor_base_bank["timesteps"][
+                            anchor_timestep
+                        ].to(device=device, dtype=torch.bfloat16).expand(
+                            len(flow_style_ids)
+                        )
+                        anchor_padding = torch.zeros(
+                            len(flow_style_ids), 1,
+                            anchor_noisy.shape[-2], anchor_noisy.shape[-1],
+                            device=device, dtype=torch.bfloat16,
+                        )
+                        anchor_indices = [
+                            external_single_effect_index[style_id]
+                            for style_id in flow_style_ids
+                        ]
+                        anchor_teacher = external_functional_bank.effect_rows(
+                            anchor_indices, anchor_content, anchor_timestep
+                        ).to(device=device, dtype=torch.float32)
+                        flow_injector.set_style(flow_style)
+                        anchor_prediction = anima(
+                            anchor_noisy.unsqueeze(2), anchor_t,
+                            context=anchor_context,
+                            padding_mask=anchor_padding,
+                            target_input_ids=None,
+                        ).squeeze(2).float()
+                        flow_injector.disable()
+                        anchor_student = anchor_prediction - anchor_base
+                        anchor_scale = anchor_teacher.square().mean(
+                            dim=tuple(range(1, anchor_teacher.ndim)),
+                            keepdim=True,
+                        ).sqrt().clamp_min(
+                            float(human_flow.get("rms_floor", 1e-4))
+                        )
+                        teacher_anchor_huber = F.smooth_l1_loss(
+                            anchor_student / anchor_scale,
+                            anchor_teacher / anchor_scale,
+                            beta=float(
+                                active_flow_options.get(
+                                    "teacher_anchor_huber_beta",
+                                    whole_model.get("huber_beta", 0.1),
+                                )
+                            ),
+                        )
+                        teacher_anchor_cosine = F.cosine_similarity(
+                            anchor_student.flatten(1),
+                            anchor_teacher.flatten(1),
+                            dim=-1,
+                        ).mean()
+                        teacher_anchor_loss = (
+                            float(
+                                active_flow_options.get(
+                                    "teacher_anchor_huber_weight", 1.0
+                                )
+                            )
+                            * teacher_anchor_huber
+                            + float(
+                                active_flow_options.get(
+                                    "teacher_anchor_direction_weight", 1.0
+                                )
+                            )
+                            * (1.0 - teacher_anchor_cosine)
+                        )
                     cross_style_mask = torch.tensor(
                         [
                             left != right
@@ -5123,6 +5239,10 @@ def train_direct_reference_kv_delta_320(
                         contrastive_weight * consistency_progress
                     )
                     flow_loss = flow_mse_weight * flow_mse
+                    if teacher_anchor_weight:
+                        flow_loss = flow_loss + (
+                            teacher_anchor_weight * teacher_anchor_loss
+                        )
                     if residual_huber_weight:
                         flow_loss = (
                             flow_loss + residual_huber_weight * residual_huber
@@ -5274,6 +5394,26 @@ def train_direct_reference_kv_delta_320(
                 running["human_flow/residual_cosine"].append(
                     float(residual_cosine.detach())
                 )
+                running["human_flow/teacher_anchor_weight"].append(
+                    teacher_anchor_weight
+                )
+                if teacher_anchor_weight:
+                    running["human_flow/teacher_anchor_loss"].append(
+                        float(teacher_anchor_loss.detach())
+                    )
+                    running["human_flow/teacher_anchor_huber"].append(
+                        float(teacher_anchor_huber.detach())
+                    )
+                    running["human_flow/teacher_anchor_cosine"].append(
+                        float(teacher_anchor_cosine.detach())
+                    )
+                    running["human_flow/teacher_anchor_weighted"].append(
+                        float(
+                            (
+                                teacher_anchor_weight * teacher_anchor_loss
+                            ).detach()
+                        )
+                    )
                 running["human_flow/prior_preservation"].append(
                     float(prior_preservation.detach())
                 )
@@ -7607,8 +7747,8 @@ def train_scheduled_expert_external_velocity_5k(
     return train_scheduled_direct_reference_kv_delta_320(
         config,
         destination,
-        config_key="kv_reference_expert_combined_dual_flow_1500",
-        sample_config_key="kv_reference_expert_combined_dual_flow_1500_sample",
+        config_key="kv_reference_expert_combined_dual_flow_anchor_1500",
+        sample_config_key="kv_reference_expert_combined_dual_flow_anchor_1500_sample",
     )
 
 
@@ -7618,7 +7758,7 @@ def sample_expert_external_velocity_5k(
     return sample_direct_reference_kv_delta_320(
         config,
         destination,
-        sample_config_key="kv_reference_expert_combined_dual_flow_1500_sample",
+        sample_config_key="kv_reference_expert_combined_dual_flow_anchor_1500_sample",
     )
 
 
