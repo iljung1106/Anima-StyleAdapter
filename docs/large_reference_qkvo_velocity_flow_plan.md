@@ -48,7 +48,8 @@ v24의 단순한 reference-conditioned 생성 방식을 확장하되, DiT 블록
 - Generator LR: 2e-6, warmup 300 steps, 3.5k까지 유지 후 5k까지 2e-7로 decay.
 - Reader LR: 3e-7~5e-7. 초반 적응 후 Generator보다 느리게 움직이게 한다.
 - 12억 파라미터 expert bank를 단일 80GB GPU에 유지하기 위해 optimizer는 factorized-state Adafactor를 사용하고 EMA는 사용하지 않는다.
-- batch 2 × gradient accumulation 2로 한 microbatch에서 두 작가를 비교하고, 한 optimizer update에는 네 작가 그룹을 포함한다.
+- 증류는 batch 2 × gradient accumulation 2로 한 microbatch에서 두 작가를 비교하고, 한 optimizer update에는 최대 네 작가를 포함한다.
+- Full-QKVO Flow는 80GB에서 target 두 장의 activation이 OOM이므로 batch 1 × accumulation 2로 두 작가를 순차적으로 본다.
 - 샘플: 2k까지 500 step마다, 이후 1k step마다 fixed reference와 기존 8장 panel을 모두 생성하고 W&B에 기록한다.
 
 ## 판단 기준
