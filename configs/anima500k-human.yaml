@@ -3321,6 +3321,66 @@ kv_reference_expert_external_synthetic_flow_1500_sample:
     reference_cache: civitai_external/synthetic_references_682x4_triggered_v1/dual_query_reference_tokens_v8_step10000
     source_manifest: civitai_external/synthetic_references_682x4_triggered_v1/manifest.parquet
 
+# v27 used the exact external-LoRA images as support/query flow data, but its
+# inherited flow objective optimized raw velocity MSE alone.  That loss is
+# dominated by the base-model target and left the adapter effect at only ~0.13x
+# the required RMS.  Keep every datum, model parameter, and update schedule
+# fixed while directly matching the normalized LoRA residual's magnitude and
+# direction.  This is a short causal run from the stable v24 step-500 EMA, not
+# a continuation of v27.
+kv_reference_expert_external_synthetic_residual_flow_1000:
+  extends_config_key: kv_reference_expert_external_synthetic_flow_1500
+  output_directory: kv_reference_expert_external_synthresflow_half_b4_w768_l3_1k_v28
+  initial_checkpoint: kv_reference_expert_combined_calibrated_b3_w768_l3_3k_v24/checkpoints/step-0000500.pt
+  initial_use_ema_model: true
+  initial_use_ema_reader: true
+  initial_step: 0
+  reset_initial_step: true
+  training:
+    steps: 1000
+    validation_every: 250
+    checkpoint_every: 250
+    sample_steps: [250, 500, 1000]
+    sample_output_root: diagnostics/kv-reference-expert-external-synthresflow-half-b4-w768-l3-1k-v28
+    generator_lr_schedule:
+      peak_lr: 0.0000002
+      warmup_steps: 25
+      decay_start_step: 500
+      decay_end_step: 1000
+      final_lr: 0.00000004
+      tail_decay_end_step: 1000
+      tail_final_lr: 0.00000004
+    reader_lr_schedule:
+      peak_lr: 0.00000005
+      warmup_steps: 25
+      decay_start_step: 250
+      decay_end_step: 750
+      final_lr: 0.000000005
+    human_flow:
+      phases:
+        - {end_step: 1000, cycle: 2, slots: [1]}
+      # Raw flow MSE remains the ordinary flow-matching objective.  The two
+      # normalized terms make the reference-conditioned change observable
+      # instead of letting the much larger base prediction dominate it.
+      flow_loss_weight: 1.0
+      flow_mse_weight: 1.0
+      residual_huber_weight: 0.5
+      direction_weight: 0.5
+    wandb:
+      enabled: true
+      project: anima-style-adapter
+      name: kv-reference-expert-external-synthresflow-half-b4-w768-l3-1k-v28
+      id: kv-reference-expert-external-synthresflow-half-b4-w768-l3-1k-v28
+      resume: allow
+
+kv_reference_expert_external_synthetic_residual_flow_1000_sample:
+  extends_config_key: kv_reference_expert_external_synthetic_flow_1500_sample
+  checkpoint: kv_reference_expert_external_synthresflow_half_b4_w768_l3_1k_v28/checkpoints/step-0001000.pt
+  output_directory: diagnostics/kv-reference-expert-external-synthresflow-half-b4-w768-l3-1k-v28-step1000
+  reference_seed: 20260920
+  external_panel:
+    reference_seed: 20260921
+
 # Reference-conditioned low-rank operator pilot. Unlike the direct activation
 # head above, the reference generates a fresh block-local linear operator and
 # applies it to every native text token.  Teacher factors remain offline
