@@ -3530,6 +3530,7 @@ kv_reference_expert_combined_dual_flow_anchor_1500:
   extends_config_key: kv_reference_expert_combined_dual_flow_1500
   output_directory: kv_reference_expert_combined_dualflow_anchor_b4_w768_l3_1500_v31
   training:
+    sample_output_root: diagnostics/kv-reference-expert-combined-dualflow-anchor-b4-w768-l3-1500-v31
     human_flow:
       training_sources:
         - name: external_synthetic
