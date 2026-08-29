@@ -4050,10 +4050,10 @@ def train_direct_reference_kv_delta_320(
                 "flow_only requires the human-flow schedule to cover every step"
             )
     flow_injector = None
-    flow_prefetched = None
+    flow_prefetched_by_source: dict[str, Any] = {}
+    flow_source_schedule = ["human"]
     flow_validation_batches: list[dict[str, Any]] = []
     external_flow_validation_batches: list[dict[str, Any]] = []
-    flow_source_name = "human"
     flow_update_index = 0
     anima = None
     if flow_enabled or whole_enabled:
@@ -4099,10 +4099,37 @@ def train_direct_reference_kv_delta_320(
                 )
             ),
         })
-        flow_loader_cfg = dict(human_flow_loader_cfg)
-        training_source_cfg = dict(human_flow.get("training_source", {}))
-        if training_source_cfg:
-            flow_source_name = str(training_source_cfg.get("name", "custom"))
+        if human_flow.get("style_manifest") is not None:
+            human_flow_loader_cfg["style_manifest"] = str(
+                human_flow["style_manifest"]
+            )
+        configured_training_sources = human_flow.get("training_sources")
+        if configured_training_sources is None:
+            training_source_cfgs = [
+                dict(human_flow.get("training_source", {}))
+            ]
+        else:
+            training_source_cfgs = [
+                dict(value) for value in configured_training_sources
+            ]
+            if not training_source_cfgs:
+                raise ValueError("human_flow.training_sources cannot be empty")
+        flow_loaders: dict[str, Any] = {}
+        flow_loader_configs: dict[str, dict[str, Any]] = {}
+        flow_loader_classes: dict[str, Any] = {}
+        for source_index, training_source_cfg in enumerate(
+            training_source_cfgs
+        ):
+            flow_source_name = str(
+                training_source_cfg.get(
+                    "name", "human" if source_index == 0 else f"source_{source_index}"
+                )
+            )
+            if flow_source_name in flow_loaders:
+                raise ValueError(
+                    f"Duplicate human-flow source name: {flow_source_name}"
+                )
+            flow_loader_cfg = dict(human_flow_loader_cfg)
             for key in (
                 "style_cache",
                 "style_manifest",
@@ -4135,44 +4162,53 @@ def train_direct_reference_kv_delta_320(
                 flow_loader_cfg["allowed_style_ids"] = sorted(
                     allowed_external_styles
                 )
-        flow_token_source = destination / str(flow_loader_cfg["resampler_token_cache"])
-        flow_loader_cfg["resampler_token_cache"] = str(
-            local_reference_root(flow_token_source, f"flow-{flow_source_name}")
-        )
-        if (
-            not training_source_cfg
-            and human_flow.get("style_manifest") is not None
-        ):
-            flow_loader_cfg["style_manifest"] = str(
-                human_flow["style_manifest"]
+            flow_token_source = destination / str(
+                flow_loader_cfg["resampler_token_cache"]
             )
-        if int(flow_loader_cfg.get("same_style_target_min", 1)) > 1:
-            flow_loader_cfg["prompt_modes"] = dict(
-                human_flow.get(
-                    "prompt_modes",
-                    {
-                        "full": 0.25,
-                        "tag_dropout": 0.45,
-                        "short": 0.30,
-                        "empty": 0.0,
-                    },
+            flow_loader_cfg["resampler_token_cache"] = str(
+                local_reference_root(
+                    flow_token_source, f"flow-{flow_source_name}"
                 )
             )
-        flow_loader_class = (
-            DualQueryCachedStyleLoader
-            if bool(training_source_cfg.get("single_prompt_cache", False))
-            else MultiPromptDualQueryCachedStyleLoader
-        )
-        flow_loader = flow_loader_class(destination, flow_loader_cfg)
+            if int(flow_loader_cfg.get("same_style_target_min", 1)) > 1:
+                flow_loader_cfg["prompt_modes"] = dict(
+                    human_flow.get(
+                        "prompt_modes",
+                        {
+                            "full": 0.25,
+                            "tag_dropout": 0.45,
+                            "short": 0.30,
+                            "empty": 0.0,
+                        },
+                    )
+                )
+            flow_loader_class = (
+                DualQueryCachedStyleLoader
+                if bool(training_source_cfg.get("single_prompt_cache", False))
+                else MultiPromptDualQueryCachedStyleLoader
+            )
+            flow_loaders[flow_source_name] = flow_loader_class(
+                destination, flow_loader_cfg
+            )
+            flow_loader_configs[flow_source_name] = flow_loader_cfg
+            flow_loader_classes[flow_source_name] = flow_loader_class
+        flow_source_schedule = [
+            str(value)
+            for value in human_flow.get(
+                "source_schedule", list(flow_loaders)
+            )
+        ]
+        if not flow_source_schedule or any(
+            value not in flow_loaders for value in flow_source_schedule
+        ):
+            raise ValueError(
+                "human_flow.source_schedule must name configured training sources"
+            )
         flow_validation_every = int(
             human_flow.get("fixed_validation_every", 0)
         )
         if flow_validation_every > 0:
             validation_cfg = dict(human_flow_loader_cfg)
-            if human_flow.get("style_manifest") is not None:
-                validation_cfg["style_manifest"] = str(
-                    human_flow["style_manifest"]
-                )
             human_validation_token_source = destination / str(
                 validation_cfg["resampler_token_cache"]
             )
@@ -4194,7 +4230,10 @@ def train_direct_reference_kv_delta_320(
             validation_loader = MultiPromptDualQueryCachedStyleLoader(
                 destination, validation_cfg
             )
-            overlapping_artists = set(flow_loader.by_style) & set(
+            training_style_ids = set().union(
+                *(set(loader.by_style) for loader in flow_loaders.values())
+            )
+            overlapping_artists = training_style_ids & set(
                 validation_loader.by_style
             )
             if overlapping_artists:
@@ -4210,39 +4249,56 @@ def train_direct_reference_kv_delta_320(
             ]
             print(
                 "Prepared fixed artist-disjoint flow validation: "
-                f"train_artists={len(flow_loader.by_style)} "
+                f"train_artists={len(training_style_ids)} "
                 f"validation_artists={len(validation_loader.by_style)} "
                 f"batches={len(flow_validation_batches)}",
                 flush=True,
             )
-            if bool(
-                training_source_cfg.get("validate_external_heldout", False)
-            ):
+            external_validation_source = next(
+                (
+                    value
+                    for value in training_source_cfgs
+                    if bool(value.get("validate_external_heldout", False))
+                ),
+                None,
+            )
+            if external_validation_source is not None:
+                external_source_name = str(
+                    external_validation_source.get("name", "custom")
+                )
                 heldout_style_ids = sorted(
                     str(row["mixture_style_id"])
                     for row in external_validation_singles
                 )
-                external_validation_cfg = dict(flow_loader_cfg)
+                external_validation_cfg = dict(
+                    flow_loader_configs[external_source_name]
+                )
                 external_validation_cfg.update(
                     {
                         "allowed_style_ids": heldout_style_ids,
                         "excluded_style_ids": [],
-                        "split": str(training_source_cfg.get("split", "train")),
+                        "split": str(
+                            external_validation_source.get("split", "train")
+                        ),
                         "batch_size": int(
-                            training_source_cfg.get("validation_batch_size", 4)
+                            external_validation_source.get(
+                                "validation_batch_size", 4
+                            )
                         ),
                         "same_style_target_min": 1,
                         "same_style_target_max": 1,
                     }
                 )
-                external_validation_loader = flow_loader_class(
+                external_validation_loader = flow_loader_classes[
+                    external_source_name
+                ](
                     destination, external_validation_cfg
                 )
                 external_flow_validation_batches = [
                     external_validation_loader.load_step(index)
                     for index in range(
                         int(
-                            training_source_cfg.get(
+                            external_validation_source.get(
                                 "validation_batches", 4
                             )
                         )
@@ -4265,12 +4321,25 @@ def train_direct_reference_kv_delta_320(
             )
             - flow_update_index
         )
-        flow_prefetched = flow_loader.prefetch(
-            flow_update_index,
-            remaining_flow_updates,
-            workers=int(human_flow.get("prefetch_workers", 2)),
-            depth=int(human_flow.get("prefetch_batches", 4)),
-        )
+        schedule_length = len(flow_source_schedule)
+        for source_name, loader in flow_loaders.items():
+            source_start = sum(
+                flow_source_schedule[index % schedule_length] == source_name
+                for index in range(flow_update_index)
+            )
+            source_count = sum(
+                flow_source_schedule[index % schedule_length] == source_name
+                for index in range(
+                    flow_update_index,
+                    flow_update_index + remaining_flow_updates,
+                )
+            )
+            flow_prefetched_by_source[source_name] = loader.prefetch(
+                source_start,
+                source_count,
+                workers=int(human_flow.get("prefetch_workers", 2)),
+                depth=int(human_flow.get("prefetch_batches", 4)),
+            )
 
     batch = int(training.get("batch_size", 8))
     blocks_per_step = int(training.get("blocks_per_step", 4))
@@ -4600,9 +4669,13 @@ def train_direct_reference_kv_delta_320(
             if hasattr(model, "set_routing_step"):
                 model.set_routing_step(relative_step)
             if _direct_delta_flow_due(relative_step, human_flow):
-                assert flow_prefetched is not None
                 assert flow_injector is not None
-                flow_batch = next(flow_prefetched)
+                active_flow_source = flow_source_schedule[
+                    flow_update_index % len(flow_source_schedule)
+                ]
+                flow_batch = next(
+                    flow_prefetched_by_source[active_flow_source]
+                )
                 flow_rng = torch.Generator(device=device).manual_seed(
                     seed ^ 0x464C4F57 ^ (micro_step * 100_003)
                 )
@@ -5315,7 +5388,7 @@ def train_direct_reference_kv_delta_320(
                 running["generator_grad_clip_threshold"].append(generator_clip_used)
                 running["reader_grad_clip_threshold"].append(reader_clip_used)
                 running["update/human_flow"].append(1.0)
-                running[f"flow_source/{flow_source_name}"].append(1.0)
+                running[f"flow_source/{active_flow_source}"].append(1.0)
                 if accumulation_last and step % log_every == 0:
                     row = {
                         key: sum(values) / len(values)
@@ -7534,8 +7607,8 @@ def train_scheduled_expert_external_velocity_5k(
     return train_scheduled_direct_reference_kv_delta_320(
         config,
         destination,
-        config_key="kv_reference_expert_external_synthetic_residual_flow_lr_1000",
-        sample_config_key="kv_reference_expert_external_synthetic_residual_flow_lr_1000_sample",
+        config_key="kv_reference_expert_combined_dual_flow_1500",
+        sample_config_key="kv_reference_expert_combined_dual_flow_1500_sample",
     )
 
 
@@ -7545,7 +7618,7 @@ def sample_expert_external_velocity_5k(
     return sample_direct_reference_kv_delta_320(
         config,
         destination,
-        sample_config_key="kv_reference_expert_external_synthetic_residual_flow_lr_1000_sample",
+        sample_config_key="kv_reference_expert_combined_dual_flow_1500_sample",
     )
 
 

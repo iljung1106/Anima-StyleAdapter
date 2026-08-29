@@ -3433,6 +3433,95 @@ kv_reference_expert_external_synthetic_residual_flow_lr_1000_sample:
   external_panel:
     reference_seed: 20260923
 
+# v29's stronger exact-synthetic flow begins improving the held-out external
+# flow at 250 updates, then memorizes its synthetic targets and overwrites
+# Artist/LoRA distillation by 500.  Train both true Human images and exact LoRA
+# synthetic images, spend two of every three optimizer updates on the complete
+# original+external+Artist teacher curriculum, and use the remaining flow slot
+# alternately for each image source.
+kv_reference_expert_combined_dual_flow_1500:
+  extends_config_key: kv_reference_expert_external_synthetic_residual_flow_lr_1000
+  output_directory: kv_reference_expert_combined_dualflow_b4_w768_l3_1500_v30
+  initial_checkpoint: kv_reference_expert_combined_calibrated_b3_w768_l3_3k_v24/checkpoints/step-0000500.pt
+  initial_use_ema_model: true
+  initial_use_ema_reader: true
+  initial_step: 0
+  reset_initial_step: true
+  training:
+    steps: 1500
+    validation_every: 250
+    checkpoint_every: 250
+    sample_steps: [250, 500, 1000, 1500]
+    sample_output_root: diagnostics/kv-reference-expert-combined-dualflow-b4-w768-l3-1500-v30
+    multi_domain_distillation:
+      schedule:
+        - external_single
+        - lora_synthetic
+        - artist_synthetic
+        - external_mixture
+        - lora_mixture
+        - external_single
+        - lora_human
+        - artist_human
+    generator_lr_schedule:
+      peak_lr: 0.000001
+      warmup_steps: 25
+      decay_start_step: 500
+      decay_end_step: 1500
+      final_lr: 0.0000002
+      tail_decay_end_step: 1500
+      tail_final_lr: 0.0000002
+    reader_lr_schedule:
+      peak_lr: 0.0000005
+      warmup_steps: 25
+      decay_start_step: 250
+      decay_end_step: 1000
+      final_lr: 0.0000001
+    human_flow:
+      phases:
+        - {end_step: 1500, cycle: 3, slots: [2]}
+      training_sources:
+        - name: external_synthetic
+          style_cache: civitai_external/synthetic_references_682x4_triggered_v1
+          style_manifest: civitai_external/synthetic_references_682x4_triggered_v1/manifest.parquet
+          latent_cache: civitai_external/synthetic_references_682x4_triggered_v1/latents
+          text_cache: civitai_external/synthetic_references_682x4_triggered_v1/flow_text_clean_content_v1
+          resampler_token_cache: civitai_external/synthetic_references_682x4_triggered_v1/dual_query_reference_tokens_v8_step10000
+          single_prompt_cache: true
+          split: train
+          batch_size: 4
+          min_references: 2
+          max_references: 3
+          same_style_target_min: 1
+          same_style_target_max: 1
+          artist_balanced: true
+          exclude_external_heldout: true
+          validate_external_heldout: true
+          validation_batch_size: 4
+          validation_batches: 4
+        - name: human_real
+          batch_size: 3
+          min_references: 1
+          max_references: 4
+          same_style_target_min: 2
+          same_style_target_max: 3
+          artist_balanced: true
+      source_schedule: [external_synthetic, human_real]
+    wandb:
+      enabled: true
+      project: anima-style-adapter
+      name: kv-reference-expert-combined-dualflow-b4-w768-l3-1500-v30
+      id: kv-reference-expert-combined-dualflow-b4-w768-l3-1500-v30
+      resume: allow
+
+kv_reference_expert_combined_dual_flow_1500_sample:
+  extends_config_key: kv_reference_expert_external_synthetic_residual_flow_lr_1000_sample
+  checkpoint: kv_reference_expert_combined_dualflow_b4_w768_l3_1500_v30/checkpoints/step-0001500.pt
+  output_directory: diagnostics/kv-reference-expert-combined-dualflow-b4-w768-l3-1500-v30-step1500
+  reference_seed: 20260924
+  external_panel:
+    reference_seed: 20260925
+
 # Reference-conditioned low-rank operator pilot. Unlike the direct activation
 # head above, the reference generates a fresh block-local linear operator and
 # applies it to every native text token.  Teacher factors remain offline
