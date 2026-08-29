@@ -285,6 +285,9 @@ class ReferenceConditionedKVActivationGenerator(nn.Module):
         self._routing_margins: dict[str, list[torch.Tensor]] = {
             "kv": [], "qo": [], "self": [], "block": [],
         }
+        self._routing_combinations: dict[
+            tuple[str, int, int], list[torch.Tensor]
+        ] = defaultdict(list)
         self._routing_record_enabled = True
         self._routing_population_records: list[
             tuple[str, int, int | None, torch.Tensor, torch.Tensor]
@@ -1378,6 +1381,11 @@ class ReferenceConditionedKVActivationGenerator(nn.Module):
         for values in self._routing_margins.values():
             values.clear()
 
+    def reset_routing_combination_window(self) -> None:
+        """Start a fresh population window after emitting training metrics."""
+
+        self._routing_combinations.clear()
+
     def _record_routing(
         self,
         name: str,
@@ -1430,6 +1438,18 @@ class ReferenceConditionedKVActivationGenerator(nn.Module):
             .sum(dim=-1)
             .mean()
         )
+        # A marginal load can look balanced even when only a few top-k sets
+        # repeat. Encode each unordered set as a bit mask and retain it only
+        # until the next logging reduction.
+        combination_codes = (
+            selections.detach().to(torch.int64)
+            * (1 << torch.arange(experts, device=selections.device))
+        ).sum(dim=-1)
+        first_kind = int(usage_kind or 0)
+        for offset in range(combination_codes.shape[1]):
+            self._routing_combinations[(name, int(block), first_kind + offset)].append(
+                combination_codes[:, offset]
+            )
         core_experts = self.output_core_experts if name == "kv" else (
             self.stream_core_experts if name in ("qo", "self") else 0
         )
@@ -1604,6 +1624,79 @@ class ReferenceConditionedKVActivationGenerator(nn.Module):
             ).float().mean()
         return metrics
 
+    def expert_operator_diversity(
+        self,
+        *,
+        block_index: int | None = None,
+        overlap_cap: float = 0.20,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        """Keep expert low-rank operator subspaces from becoming duplicates.
+
+        One block is evaluated per optimizer step. Similarity is measured on
+        the rank-one operator atoms (down[r] outer up[r]), so merely changing
+        the LoRA factor scale cannot satisfy the loss.
+        """
+
+        if not 0.0 <= float(overlap_cap) < 1.0:
+            raise ValueError("expert operator overlap cap must be in [0, 1)")
+        block = self._routing_step % self.blocks if block_index is None else int(
+            block_index
+        )
+        if not 0 <= block < self.blocks:
+            raise ValueError("expert diversity block is outside the model")
+        banks: list[tuple[torch.Tensor, torch.Tensor]] = []
+        if self.output_experts:
+            banks.extend(
+                (self.output_expert_down[block, kind], self.output_expert_up[block, kind])
+                for kind in range(2)
+            )
+        if self.enable_qo and self.stream_experts:
+            banks.extend(
+                (self.stream_expert_down[block, kind], self.stream_expert_up[block, kind])
+                for kind in range(2)
+                if self.stream_kind_enabled(kind)
+            )
+        if self.enable_self_vo and self.self_stream_experts:
+            banks.extend(
+                (
+                    self.self_stream_expert_down[block, kind],
+                    self.self_stream_expert_up[block, kind],
+                )
+                for kind in range(self.self_stream_kinds)
+                if self.self_stream_kind_enabled(kind)
+            )
+        zero = next(self.parameters()).new_zeros((), dtype=torch.float32)
+        if not banks:
+            return zero, {
+                "expert_operator_overlap": zero.detach(),
+                "expert_operator_over_cap": zero.detach(),
+            }
+
+        losses: list[torch.Tensor] = []
+        overlaps: list[torch.Tensor] = []
+        for down, up in banks:
+            down_unit = F.normalize(down.float(), dim=-1)
+            up_unit = F.normalize(up.float(), dim=-1)
+            atom_similarity = (
+                torch.einsum("eri,fsi->efrs", down_unit, down_unit)
+                * torch.einsum("ero,fso->efrs", up_unit, up_unit)
+            )
+            rank = int(down.shape[1])
+            subspace_overlap = atom_similarity.square().sum(dim=(-1, -2)) / rank
+            off_diagonal = ~torch.eye(
+                len(down), device=down.device, dtype=torch.bool
+            )
+            values = subspace_overlap[off_diagonal]
+            overlaps.append(values.mean())
+            losses.append(F.relu(values - float(overlap_cap)).square().mean())
+        loss = torch.stack(losses).mean()
+        overlap = torch.stack(overlaps).mean()
+        return loss, {
+            "expert_operator_overlap": overlap.detach(),
+            "expert_operator_over_cap": loss.detach(),
+            "expert_operator_diversity_block": zero.new_tensor(float(block)),
+        }
+
     def routing_auxiliary(
         self,
     ) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
@@ -1646,6 +1739,35 @@ class ReferenceConditionedKVActivationGenerator(nn.Module):
             metrics[f"{name}_core_margin_target"] = zero.new_tensor(
                 self._core_margin_target(name)
             )
+            combination_rows = [
+                torch.cat(rows)
+                for (route_name, _, _), rows in self._routing_combinations.items()
+                if route_name == name and rows
+            ]
+            if combination_rows:
+                top1_shares = []
+                effective_counts = []
+                unique_counts = []
+                for codes in combination_rows:
+                    _, counts = torch.unique(codes, return_counts=True)
+                    probabilities = counts.float() / counts.sum()
+                    top1_shares.append(probabilities.max())
+                    effective_counts.append(
+                        (-(probabilities * probabilities.log()).sum()).exp()
+                    )
+                    unique_counts.append(probabilities.new_tensor(len(counts)))
+                metrics[f"{name}_combination_top1_share"] = torch.stack(
+                    top1_shares
+                ).mean().detach()
+                metrics[f"{name}_combination_top1_share_max"] = torch.stack(
+                    top1_shares
+                ).max().detach()
+                metrics[f"{name}_effective_combinations"] = torch.stack(
+                    effective_counts
+                ).mean().detach()
+                metrics[f"{name}_observed_combinations"] = torch.stack(
+                    unique_counts
+                ).mean().detach()
         metrics["router_temperature"] = zero.new_tensor(
             self._router_temperature()
         )
@@ -2379,6 +2501,74 @@ def _timestep_metric_bucket(timestep: float) -> str:
     return "high"
 
 
+def _compact_direct_delta_metrics(row: dict[str, float]) -> dict[str, float]:
+    """Keep decision-relevant metrics out of the very wide legacy log row."""
+
+    exact = {
+        "loss",
+        "generator_grad_norm_unclipped",
+        "reader_grad_norm_unclipped",
+        "generator_grad_clip_threshold",
+        "reader_grad_clip_threshold",
+        "generator_lr",
+        "reader_lr",
+        "whole/loss",
+        "whole/normalized_huber",
+        "whole/cosine",
+        "whole/correct_minus_hardest_wrong_cosine",
+        "whole/retrieval_accuracy",
+        "whole/teacher_effect_rms",
+        "whole/rms_ratio",
+        "whole/rms_log_abs_error",
+        "whole/rms_lower_violation_rate",
+        "whole/rms_upper_violation_rate",
+        "whole/common_cap_weighted_loss",
+        "whole/relative_common_weighted_loss",
+        "whole/positive_pairwise_cosine",
+        "reader_reconstruction_loss",
+        "reader_reconstruction_weight",
+        "reader_reconstruction_weighted",
+        "human_flow/loss",
+        "human_flow/flow_mse",
+        "human_flow/base_mse",
+        "human_flow/correct_gain",
+        "human_flow/residual_huber",
+        "human_flow/residual_cosine",
+        "human_flow/prior_preservation_weighted",
+        "human_flow/final_effect_consistency_loss",
+        "human_flow/final_effect_consistency_weighted",
+        "human_flow/final_effect_cosine_std",
+        "human_flow/final_effect_cosine_min",
+        "human_flow/final_effect_log_rms_std",
+        "human_flow/reader_reconstruction_loss",
+        "human_flow/reader_reconstruction_weight",
+        "human_flow/reader_reconstruction_weighted",
+        "human_flow/expert_operator_diversity_weighted",
+        "human_flow/style_group_size",
+        "human_flow/unique_styles",
+        "human_flow/timestep",
+    }
+    prefixes = (
+        "routing/",
+        "human_flow/kv_",
+        "human_flow/qo_",
+        "human_flow/self_",
+        "human_flow/expert_operator_",
+        "whole/cosine_by_domain/",
+        "whole/rms_ratio_by_domain/",
+        "whole/correct_minus_hardest_wrong_cosine_by_domain/",
+        "whole/cosine_by_timestep/",
+        "whole/rms_ratio_by_timestep/",
+        "update/",
+        "flow_source/",
+    )
+    return {
+        key: value
+        for key, value in row.items()
+        if key in exact or key.startswith(prefixes)
+    }
+
+
 def _adapter_probe_signature(
     generator: ReferenceConditionedKVActivationGenerator,
     style_memory: torch.Tensor,
@@ -2548,6 +2738,86 @@ def _same_artist_memory_consistency(
         "reader_consistency_loss": loss.detach(),
         "reader_consistency_cosine": cosine.mean().detach(),
         "reader_consistency_log_rms_error": log_ratio.mean().detach(),
+    }
+
+
+def _reader_reconstruction_loss(output: Any) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Weakly preserve the frozen visual-token information read by the slots."""
+
+    pairs = (
+        (output.reconstruction, output.reconstruction_target),
+        (output.pooled_reconstruction, output.pooled_reconstruction_target),
+    )
+    losses: list[torch.Tensor] = []
+    cosines: list[torch.Tensor] = []
+    hubers: list[torch.Tensor] = []
+    for prediction, target in pairs:
+        if prediction is None or target is None:
+            raise RuntimeError("Reader reconstruction was not requested")
+        prediction_f = prediction.float()
+        target_f = target.detach().float()
+        cosine = 1.0 - F.cosine_similarity(
+            prediction_f, target_f, dim=-1
+        ).mean()
+        huber = F.smooth_l1_loss(prediction_f, target_f, beta=0.1)
+        losses.append(cosine + 0.1 * huber)
+        cosines.append(cosine)
+        hubers.append(huber)
+    loss = torch.stack(losses).mean()
+    return loss, {
+        "reader_reconstruction_loss": loss.detach(),
+        "reader_reconstruction_cosine_loss": torch.stack(cosines).mean().detach(),
+        "reader_reconstruction_huber_loss": torch.stack(hubers).mean().detach(),
+    }
+
+
+def _reader_reconstruction_weight(step: int, training: dict[str, Any]) -> float:
+    start = float(training.get("reader_reconstruction_weight", 0.0))
+    final = float(training.get("reader_reconstruction_final_weight", start))
+    hold = int(training.get("reader_reconstruction_hold_steps", 500))
+    decay = int(training.get("reader_reconstruction_decay_steps", 250))
+    if step <= hold:
+        return start
+    progress = min(1.0, (step - hold) / max(1, decay))
+    return start + progress * (final - start)
+
+
+def _same_factor_final_effect_consistency(
+    student: torch.Tensor,
+    target: torch.Tensor,
+    *,
+    direction_margin: float,
+    rms_ratio_tolerance: float,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Raise weak condition views without equating content-dependent velocities."""
+
+    zero = student.float().new_zeros(())
+    if len(student) < 2:
+        return zero, {
+            "final_effect_consistency_loss": zero.detach(),
+            "final_effect_cosine_std": zero.detach(),
+            "final_effect_log_rms_std": zero.detach(),
+        }
+    student_f = student.float().flatten(1)
+    target_f = target.detach().float().flatten(1)
+    cosine = F.cosine_similarity(student_f, target_f, dim=1)
+    target_rms = target_f.square().mean(dim=1).sqrt().clamp_min(1e-8)
+    student_rms = student_f.square().mean(dim=1).sqrt().clamp_min(1e-8)
+    log_ratio_error = (student_rms.log() - target_rms.log()).abs()
+    # Only lagging condition views are pulled toward the group performance;
+    # strong views are never degraded to make the scalar metrics equal.
+    direction_floor = cosine.mean().detach() - float(direction_margin)
+    direction = F.relu(direction_floor - cosine).square().mean()
+    rms_ceiling = (
+        log_ratio_error.mean().detach() + math.log(float(rms_ratio_tolerance))
+    )
+    magnitude = F.relu(log_ratio_error - rms_ceiling).square().mean()
+    loss = direction + 0.25 * magnitude
+    return loss, {
+        "final_effect_consistency_loss": loss.detach(),
+        "final_effect_cosine_std": cosine.std(unbiased=False).detach(),
+        "final_effect_cosine_min": cosine.min().detach(),
+        "final_effect_log_rms_std": log_ratio_error.std(unbiased=False).detach(),
     }
 
 
@@ -3826,12 +4096,14 @@ def _direct_delta_artist_split(
 
 def _open_direct_delta_reader(
     reader: DetailPreservingTypedSlotReader,
+    *,
+    reconstruction: bool = False,
 ) -> list[nn.Parameter]:
     """Fine-tune every Reader path used to produce style memory."""
 
     parameters = []
     for name, parameter in reader.named_parameters():
-        trainable = not name.startswith("reconstruction_")
+        trainable = reconstruction or not name.startswith("reconstruction_")
         parameter.requires_grad_(trainable)
         if trainable:
             parameters.append(parameter)
@@ -4031,7 +4303,12 @@ def train_direct_reference_kv_delta_320(
     output = destination / str(cfg["output_directory"])
     output.mkdir(parents=True, exist_ok=True)
     reader = _load_reader(config, destination, cfg, device)
-    reader_parameters = _open_direct_delta_reader(reader)
+    reader_parameters = _open_direct_delta_reader(
+        reader,
+        reconstruction=(
+            float(training.get("reader_reconstruction_weight", 0.0)) > 0
+        ),
+    )
     chunk = int(training.get("materialization_style_chunk", 16))
     token_lru = int(training.get("token_lru_shards", 8))
     contiguous_cache_value = training.get("materialized_reference_bank_cache")
@@ -5490,8 +5767,29 @@ def train_direct_reference_kv_delta_320(
                     if not bool(block_mask.any()):
                         block_mask[block_rng.randrange(model.blocks)] = True
                     block_strength = 1.0 / (1.0 - block_dropout)
+                reconstruction_weight = _reader_reconstruction_weight(
+                    relative_step, training
+                )
+                share_group_factor = bool(
+                    human_flow.get("share_style_factor_across_group", False)
+                )
+                if share_group_factor and len(set(flow_style_ids)) != 1:
+                    raise ValueError(
+                        "shared style factors require a single-style grouped batch"
+                    )
+                factor_references = (
+                    flow_references[:1] if share_group_factor else flow_references
+                )
+                factor_mask = flow_main_mask[:1] if share_group_factor else flow_main_mask
                 with torch.autocast("cuda", dtype=torch.bfloat16):
-                    flow_style = reader(flow_references, flow_main_mask).tokens
+                    flow_reader_output = reader(
+                        factor_references,
+                        factor_mask,
+                        reconstruct=reconstruction_weight > 0,
+                    )
+                    flow_style = flow_reader_output.tokens
+                    if share_group_factor:
+                        flow_style = flow_style.expand(len(latents), -1, -1)
                     flow_injector.set_style(
                         flow_style,
                         strength=block_strength,
@@ -5525,6 +5823,33 @@ def train_direct_reference_kv_delta_320(
                     residual_cosine = F.cosine_similarity(
                         student_effect.flatten(1), desired_effect.flatten(1), dim=-1
                     ).mean()
+                    final_consistency_weight = float(
+                        human_flow.get("final_effect_consistency_weight", 0.0)
+                    )
+                    (
+                        final_consistency,
+                        final_consistency_metrics,
+                    ) = _same_factor_final_effect_consistency(
+                        student_effect,
+                        desired_effect,
+                        direction_margin=float(
+                            human_flow.get(
+                                "final_effect_consistency_direction_margin", 0.05
+                            )
+                        ),
+                        rms_ratio_tolerance=float(
+                            human_flow.get(
+                                "final_effect_consistency_rms_tolerance", 1.25
+                            )
+                        ),
+                    )
+                    reader_reconstruction = student_effect.new_zeros(())
+                    reader_reconstruction_metrics: dict[str, torch.Tensor] = {}
+                    if reconstruction_weight > 0:
+                        (
+                            reader_reconstruction,
+                            reader_reconstruction_metrics,
+                        ) = _reader_reconstruction_loss(flow_reader_output)
                     flow_mse = correct_rows.mean()
                     constraint_progress = min(
                         1.0,
@@ -5581,21 +5906,26 @@ def train_direct_reference_kv_delta_320(
                     diversity_weight = float(
                         human_flow.get("cross_style_diversity_weight", 0.0)
                     )
-                    assert diversity_probe_context is not None
-                    assert diversity_probe_stream is not None
-                    diversity_signature = _adapter_probe_signature(
-                        model,
-                        flow_style,
-                        diversity_probe_context,
-                        diversity_probe_stream,
-                        [
-                            int(block)
-                            for block in human_flow.get(
-                                "diversity_probe_blocks", [0, 7, 14, 21, 27]
-                            )
-                        ],
-                        int(human_flow.get("diversity_signature_width", 64)),
+                    population_common_weight = float(
+                        human_flow.get("population_common_weight", 0.0)
                     )
+                    diversity_signature: torch.Tensor | None = None
+                    if diversity_weight or population_common_weight:
+                        assert diversity_probe_context is not None
+                        assert diversity_probe_stream is not None
+                        diversity_signature = _adapter_probe_signature(
+                            model,
+                            flow_style,
+                            diversity_probe_context,
+                            diversity_probe_stream,
+                            [
+                                int(block)
+                                for block in human_flow.get(
+                                    "diversity_probe_blocks", [0, 7, 14, 21, 27]
+                                )
+                            ],
+                            int(human_flow.get("diversity_signature_width", 64)),
+                        )
                     same_artist_loss = student_effect.new_zeros(())
                     same_artist_metrics: dict[str, torch.Tensor] | None = None
                     left_signature: torch.Tensor | None = None
@@ -5731,7 +6061,11 @@ def train_direct_reference_kv_delta_320(
                     diversity_min_styles = int(
                         human_flow.get("diversity_queue_min_styles", 16)
                     )
-                    if len(diversity_references) >= diversity_min_styles:
+                    if (
+                        diversity_weight
+                        and diversity_signature is not None
+                        and len(diversity_references) >= diversity_min_styles
+                    ):
                         diversity_loss, diversity_positive_cosine = (
                             _cross_style_queue_diversity(
                                 diversity_signature,
@@ -5747,14 +6081,12 @@ def train_direct_reference_kv_delta_320(
                     diversity_effective_weight = (
                         diversity_weight * constraint_progress
                     )
-                    population_common_weight = float(
-                        human_flow.get("population_common_weight", 0.0)
-                    )
                     population_common_min_styles = int(
                         human_flow.get("population_common_min_styles", 16)
                     )
                     if (
                         population_common_weight
+                        and diversity_signature is not None
                         and len(diversity_references)
                         >= population_common_min_styles
                     ):
@@ -5805,6 +6137,22 @@ def train_direct_reference_kv_delta_320(
                         routing_balance = flow_mse.new_zeros(())
                         routing_specialization = flow_mse.new_zeros(())
                         routing_metrics = {}
+                    expert_diversity_weight = float(
+                        training.get("expert_operator_diversity_weight", 0.0)
+                    )
+                    expert_diversity = flow_mse.new_zeros(())
+                    expert_diversity_metrics: dict[str, torch.Tensor] = {}
+                    if expert_diversity_weight:
+                        (
+                            expert_diversity,
+                            expert_diversity_metrics,
+                        ) = model.expert_operator_diversity(
+                            overlap_cap=float(
+                                training.get(
+                                    "expert_operator_diversity_overlap_cap", 0.20
+                                )
+                            )
+                        )
                     routing_balance_weight = float(
                         human_flow.get("expert_balance_weight", 0.0)
                     )
@@ -5861,6 +6209,10 @@ def train_direct_reference_kv_delta_320(
                             routing_specialization_weight
                             * routing_specialization
                         )
+                    if final_consistency_weight:
+                        flow_loss = flow_loss + (
+                            final_consistency_weight * final_consistency
+                        )
                     if same_artist_effective_weight:
                         flow_loss = flow_loss + (
                             same_artist_effective_weight * same_artist_loss
@@ -5877,12 +6229,15 @@ def train_direct_reference_kv_delta_320(
                     weighted_flow = (
                         float(human_flow.get("flow_loss_weight", 1.0))
                         * flow_loss
+                        + reconstruction_weight * reader_reconstruction
+                        + expert_diversity_weight * expert_diversity
                     )
                 (weighted_flow / accumulation_steps).backward()
                 if diversity_weight or population_common_weight:
                     # Updating an existing artist also refreshes its insertion
                     # order, so the bounded queue tracks the recent population.
                     cross_style_queue.pop(flow_style_id, None)
+                    assert diversity_signature is not None
                     cross_style_queue[flow_style_id] = diversity_signature.detach()
                     diversity_queue_size = int(
                         human_flow.get("diversity_queue_size", 128)
@@ -6048,6 +6403,24 @@ def train_direct_reference_kv_delta_320(
                 )
                 for name, value in routing_metrics.items():
                     running[f"human_flow/{name}"].append(float(value))
+                for name, value in final_consistency_metrics.items():
+                    running[f"human_flow/{name}"].append(float(value))
+                running["human_flow/final_effect_consistency_weighted"].append(
+                    float((final_consistency_weight * final_consistency).detach())
+                )
+                for name, value in reader_reconstruction_metrics.items():
+                    running[f"human_flow/{name}"].append(float(value))
+                running["human_flow/reader_reconstruction_weight"].append(
+                    reconstruction_weight
+                )
+                running["human_flow/reader_reconstruction_weighted"].append(
+                    float((reconstruction_weight * reader_reconstruction).detach())
+                )
+                for name, value in expert_diversity_metrics.items():
+                    running[f"human_flow/{name}"].append(float(value))
+                running["human_flow/expert_operator_diversity_weighted"].append(
+                    float((expert_diversity_weight * expert_diversity).detach())
+                )
                 running["human_flow/rms_band_outer_weighted"].append(
                     float((output_band_weight * residual_band).detach())
                 )
@@ -6125,6 +6498,8 @@ def train_direct_reference_kv_delta_320(
                         "block_residual"
                     )
                     row["reader_lr"] = optimizer_learning_rate("reader")
+                    if bool(training.get("compact_logging", False)):
+                        row = _compact_direct_delta_metrics(row)
                     print(
                         f"Direct reference flow-only step={step}/{steps} {row}",
                         flush=True,
@@ -6134,6 +6509,8 @@ def train_direct_reference_kv_delta_320(
                             {f"train/{key}": value for key, value in row.items()},
                             step=step,
                         )
+                    if hasattr(model, "reset_routing_combination_window"):
+                        model.reset_routing_combination_window()
                     running.clear()
                 if (
                     accumulation_last
@@ -6472,11 +6849,31 @@ def train_direct_reference_kv_delta_320(
             )
             if accumulation_index == 0:
                 optimizer.zero_grad(set_to_none=True)
+            reconstruction_weight = _reader_reconstruction_weight(
+                relative_step, training
+            )
             with torch.autocast("cuda", dtype=torch.bfloat16):
-                style = reader(references, reference_mask).tokens
+                reader_output = reader(
+                    references,
+                    reference_mask,
+                    reconstruct=reconstruction_weight > 0,
+                )
+                style = reader_output.tokens
+                reader_reconstruction = style.new_zeros((), dtype=torch.float32)
+                reader_reconstruction_metrics: dict[str, torch.Tensor] = {}
+                if reconstruction_weight > 0:
+                    (
+                        reader_reconstruction,
+                        reader_reconstruction_metrics,
+                    ) = _reader_reconstruction_loss(reader_output)
                 alternative_style = (
                     reader(alternative_references, alternative_mask).tokens
-                    if alternative_references is not None and alternative_mask is not None
+                    if (
+                        consistency_weight > 0
+                        and selected_blocks
+                        and alternative_references is not None
+                        and alternative_mask is not None
+                    )
                     else None
                 )
                 reader_consistency = style.new_zeros((), dtype=torch.float32)
@@ -7003,6 +7400,8 @@ def train_direct_reference_kv_delta_320(
                     )
                 else:
                     loss = block_loss + common_direction_weight * common_direction
+                if reconstruction_weight:
+                    loss = loss + reconstruction_weight * reader_reconstruction
                 routing_metrics: dict[str, torch.Tensor] = {}
                 routing_balance = loss.new_zeros(())
                 if whole_enabled and hasattr(model, "routing_auxiliary"):
@@ -7012,6 +7411,23 @@ def train_direct_reference_kv_delta_320(
                     loss = loss + float(
                         whole_model.get("expert_balance_weight", 0.0)
                     ) * routing_balance
+                expert_diversity_weight = float(
+                    training.get("expert_operator_diversity_weight", 0.0)
+                )
+                expert_diversity = loss.new_zeros(())
+                expert_diversity_metrics: dict[str, torch.Tensor] = {}
+                if expert_diversity_weight:
+                    (
+                        expert_diversity,
+                        expert_diversity_metrics,
+                    ) = model.expert_operator_diversity(
+                        overlap_cap=float(
+                            training.get(
+                                "expert_operator_diversity_overlap_cap", 0.20
+                            )
+                        )
+                    )
+                    loss = loss + expert_diversity_weight * expert_diversity
                 consistency = loss.new_zeros(())
                 if alternative_style is not None and selected_blocks:
                     assert first_student is not None and first_teacher is not None
@@ -7120,6 +7536,17 @@ def train_direct_reference_kv_delta_320(
             )
             for key, value in routing_metrics.items():
                 running[f"routing/{key}"].append(float(value))
+            for key, value in reader_reconstruction_metrics.items():
+                running[key].append(float(value))
+            running["reader_reconstruction_weight"].append(reconstruction_weight)
+            running["reader_reconstruction_weighted"].append(
+                float((reconstruction_weight * reader_reconstruction).detach())
+            )
+            for key, value in expert_diversity_metrics.items():
+                running[f"routing/{key}"].append(float(value))
+            running["routing/expert_operator_diversity_weighted"].append(
+                float((expert_diversity_weight * expert_diversity).detach())
+            )
             if accumulation_last and step % log_every == 0:
                 row = {key: sum(values) / len(values) for key, values in running.items()}
                 row["generator_lr"] = optimizer_learning_rate("generator")
@@ -7128,12 +7555,16 @@ def train_direct_reference_kv_delta_320(
                 )
                 row["reader_lr"] = optimizer_learning_rate("reader")
                 row["context_unique_fraction"] = len(set(context_indices.tolist())) / batch
+                if bool(training.get("compact_logging", False)):
+                    row = _compact_direct_delta_metrics(row)
                 print(f"Direct reference K/V delta step={step}/{steps} {row}", flush=True)
                 if wandb_run is not None:
                     wandb_run.log(
                         {f"train/{key}": value for key, value in row.items()},
                         step=step,
                     )
+                if hasattr(model, "reset_routing_combination_window"):
+                    model.reset_routing_combination_window()
                 running.clear()
 
             if accumulation_last and validation_every > 0 and step % validation_every == 0:
@@ -8523,6 +8954,33 @@ def sample_expert_dense64x16_full_qkvo_flow_logrms_lr2p5_5k(
         destination,
         sample_config_key=(
             "kv_reference_expert_dense64x16_full_qkvo_flow_5000_logrms_lr2p5_sample"
+        ),
+    )
+
+
+def train_scheduled_expert_dense32x16_kvo_selfvo_consistent_flow_5k(
+    config: dict[str, Any], destination: Path
+) -> dict[str, Any]:
+    return train_scheduled_direct_reference_kv_delta_320(
+        config,
+        destination,
+        config_key=(
+            "kv_reference_expert_dense32x16_kvo_selfvo_consistent_flow_5000"
+        ),
+        sample_config_key=(
+            "kv_reference_expert_dense32x16_kvo_selfvo_consistent_flow_5000_sample"
+        ),
+    )
+
+
+def sample_expert_dense32x16_kvo_selfvo_consistent_flow_5k(
+    config: dict[str, Any], destination: Path
+) -> dict[str, Any]:
+    return sample_direct_reference_kv_delta_320(
+        config,
+        destination,
+        sample_config_key=(
+            "kv_reference_expert_dense32x16_kvo_selfvo_consistent_flow_5000_sample"
         ),
     )
 

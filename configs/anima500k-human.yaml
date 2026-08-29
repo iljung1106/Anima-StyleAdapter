@@ -4011,6 +4011,83 @@ kv_reference_expert_dense64x16_full_qkvo_flow_5000_logrms_lr2p5_sample:
   external_panel:
     reference_seed: 20261007
 
+# Fresh compact expert run after v39 overfit its training retrieval while held-out
+# final effects regressed. Cross K/V/O and self V/O remain block-local; cross Q
+# and self Q/K are absent. One visual factor is shared by two content/noise/time
+# flow targets, and consistency raises only the weaker condition view rather than
+# forcing content-dependent velocity tensors to become identical.
+kv_reference_expert_dense32x16_kvo_selfvo_consistent_flow_5000:
+  extends_config_key: kv_reference_expert_dense64x16_full_qkvo_flow_5000_logrms_lr2p5
+  output_directory: kv_reference_expert_dense32x16_top4_kvo_selfvo_w1024_l4_consistent_flow_5k_v40
+  initial_checkpoint: null
+  initial_reader_checkpoint: null
+  initial_step: 0
+  reset_initial_step: true
+  seed: 20261008
+  model:
+    output_rank: 32
+    enable_q: false
+    stream_rank: 32
+    enable_self_qk: false
+    enable_self_q: false
+    enable_self_k: false
+    enable_self_v: true
+    enable_self_o: true
+    self_stream_rank: 32
+  training:
+    steps: 5000
+    compact_logging: true
+    reader_reconstruction_weight: 0.02
+    reader_reconstruction_final_weight: 0.001
+    reader_reconstruction_hold_steps: 500
+    reader_reconstruction_decay_steps: 250
+    expert_operator_diversity_weight: 0.05
+    expert_operator_diversity_overlap_cap: 0.10
+    sample_output_root: diagnostics/kv-reference-expert-dense32x16-top4-kvo-selfvo-w1024-l4-consistent-flow-5k-v40
+    sample_steps: [500, 1000, 1500, 2000, 3000, 4000, 5000]
+    multi_domain_distillation:
+      loss_by_domain:
+        lora_synthetic: {huber_weight: 2.0, direction_weight: 2.0, retrieval_weight: 0.0}
+        lora_human: {huber_weight: 0.8, direction_weight: 2.0, retrieval_weight: 0.0}
+        lora_mixture: {huber_weight: 2.0, direction_weight: 2.0, retrieval_weight: 0.0}
+        external_single: {huber_weight: 2.0, direction_weight: 2.0, retrieval_weight: 0.0}
+        external_mixture: {huber_weight: 2.0, direction_weight: 2.0, retrieval_weight: 0.0}
+    whole_model_functional:
+      retrieval_weight: 0.0
+      reader_consistency_weight: 0.0
+      reader_contrastive_weight: 0.0
+      functional_consistency_weight: 0.0
+      functional_contrastive_weight: 0.0
+      teacher_signature_weight: 0.0
+    human_flow:
+      batch_size: 2
+      same_style_target_min: 2
+      same_style_target_max: 2
+      share_style_factor_across_group: true
+      final_effect_consistency_weight: 0.25
+      final_effect_consistency_direction_margin: 0.05
+      final_effect_consistency_rms_tolerance: 1.25
+      wrong_reference_weight: 0.0
+      same_artist_consistency_weight: 0.0
+      same_artist_contrastive_weight: 0.0
+      cross_style_diversity_weight: 0.0
+      population_common_weight: 0.0
+      expert_specialization_weight: 0.0
+    wandb:
+      enabled: true
+      project: anima-style-adapter
+      name: kv-reference-expert-dense32x16-top4-kvo-selfvo-w1024-l4-consistent-flow-5k-v40
+      id: kv-reference-expert-dense32x16-top4-kvo-selfvo-w1024-l4-consistent-flow-5k-v40
+      resume: allow
+
+kv_reference_expert_dense32x16_kvo_selfvo_consistent_flow_5000_sample:
+  extends_config_key: kv_reference_expert_dense64x16_full_qkvo_flow_5000_logrms_lr2p5_sample
+  checkpoint: kv_reference_expert_dense32x16_top4_kvo_selfvo_w1024_l4_consistent_flow_5k_v40/checkpoints/step-0005000.pt
+  output_directory: diagnostics/kv-reference-expert-dense32x16-top4-kvo-selfvo-w1024-l4-consistent-flow-5k-v40-step5000
+  reference_seed: 20261008
+  external_panel:
+    reference_seed: 20261009
+
 # Reference-conditioned low-rank operator pilot. Unlike the direct activation
 # head above, the reference generates a fresh block-local linear operator and
 # applies it to every native text token.  Teacher factors remain offline
