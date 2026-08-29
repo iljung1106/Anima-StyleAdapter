@@ -3364,6 +3364,7 @@ def train_direct_reference_kv_delta_320(
     """Train styled-reference-only, text-conditioned full native K/V deltas."""
 
     from .detail_style_training import _loader_config
+    from .dual_query_style_tokenizer import DualQueryCachedStyleLoader
     from .global_query_style_tokenizer import MultiPromptDualQueryCachedStyleLoader
     from .kv_activation_sampling import NativeKVActivationInjector
     from .lora_functional_distillation import FunctionalLoRATeacherBank
@@ -4051,6 +4052,8 @@ def train_direct_reference_kv_delta_320(
     flow_injector = None
     flow_prefetched = None
     flow_validation_batches: list[dict[str, Any]] = []
+    external_flow_validation_batches: list[dict[str, Any]] = []
+    flow_source_name = "human"
     flow_update_index = 0
     anima = None
     if flow_enabled or whole_enabled:
@@ -4063,14 +4066,16 @@ def train_direct_reference_kv_delta_320(
         flow_injector = NativeKVActivationInjector(anima, model)
     if flow_enabled:
         detail_cfg = dict(config["detail_preserving_style_cross_attention"])
-        flow_loader_cfg = _loader_config(
+        human_flow_loader_cfg = _loader_config(
             config,
             detail_cfg,
             split=str(detail_cfg.get("train_split", "train")),
         )
-        flow_loader_cfg.update({
+        human_flow_loader_cfg.update({
             "style_cache": str(
-                human_flow.get("style_cache", flow_loader_cfg["style_cache"])
+                human_flow.get(
+                    "style_cache", human_flow_loader_cfg["style_cache"]
+                )
             ),
             "batch_size": int(human_flow.get("batch_size", 4)),
             "same_style_target_min": int(
@@ -4094,17 +4099,51 @@ def train_direct_reference_kv_delta_320(
                 )
             ),
         })
-        flow_token_source = destination / str(
-            flow_loader_cfg["resampler_token_cache"]
-        )
+        flow_loader_cfg = dict(human_flow_loader_cfg)
+        training_source_cfg = dict(human_flow.get("training_source", {}))
+        if training_source_cfg:
+            flow_source_name = str(training_source_cfg.get("name", "custom"))
+            for key in (
+                "style_cache",
+                "style_manifest",
+                "latent_cache",
+                "text_cache",
+                "resampler_token_cache",
+                "split",
+                "min_references",
+                "max_references",
+                "same_style_target_min",
+                "same_style_target_max",
+                "batch_size",
+                "artist_balanced",
+            ):
+                if key in training_source_cfg:
+                    flow_loader_cfg[key] = training_source_cfg[key]
+            if bool(training_source_cfg.get("exclude_external_heldout", False)):
+                if not external_train_singles:
+                    raise RuntimeError(
+                        "External synthetic flow requested without an external split"
+                    )
+                allowed_external_styles = {
+                    str(row["mixture_style_id"])
+                    for row in external_train_singles
+                }
+                for values in external_rows_by_kind.values():
+                    allowed_external_styles.update(
+                        str(row["mixture_style_id"]) for row in values
+                    )
+                flow_loader_cfg["allowed_style_ids"] = sorted(
+                    allowed_external_styles
+                )
+        flow_token_source = destination / str(flow_loader_cfg["resampler_token_cache"])
         flow_loader_cfg["resampler_token_cache"] = str(
-            local_reference_root(flow_token_source, "flow-human")
+            local_reference_root(flow_token_source, f"flow-{flow_source_name}")
         )
         if human_flow.get("style_manifest") is not None:
             flow_loader_cfg["style_manifest"] = str(
                 human_flow["style_manifest"]
             )
-        if int(human_flow.get("same_style_target_min", 1)) > 1:
+        if int(flow_loader_cfg.get("same_style_target_min", 1)) > 1:
             flow_loader_cfg["prompt_modes"] = dict(
                 human_flow.get(
                     "prompt_modes",
@@ -4116,14 +4155,25 @@ def train_direct_reference_kv_delta_320(
                     },
                 )
             )
-        flow_loader = MultiPromptDualQueryCachedStyleLoader(
-            destination, flow_loader_cfg
+        flow_loader_class = (
+            DualQueryCachedStyleLoader
+            if bool(training_source_cfg.get("single_prompt_cache", False))
+            else MultiPromptDualQueryCachedStyleLoader
         )
+        flow_loader = flow_loader_class(destination, flow_loader_cfg)
         flow_validation_every = int(
             human_flow.get("fixed_validation_every", 0)
         )
         if flow_validation_every > 0:
-            validation_cfg = dict(flow_loader_cfg)
+            validation_cfg = dict(human_flow_loader_cfg)
+            human_validation_token_source = destination / str(
+                validation_cfg["resampler_token_cache"]
+            )
+            validation_cfg["resampler_token_cache"] = str(
+                local_reference_root(
+                    human_validation_token_source, "flow-human"
+                )
+            )
             validation_cfg.update({
                 "split": str(detail_cfg.get("validation_split", "validation")),
                 "prompt_modes": {
@@ -4158,6 +4208,45 @@ def train_direct_reference_kv_delta_320(
                 f"batches={len(flow_validation_batches)}",
                 flush=True,
             )
+            if bool(
+                training_source_cfg.get("validate_external_heldout", False)
+            ):
+                heldout_style_ids = sorted(
+                    str(row["mixture_style_id"])
+                    for row in external_validation_singles
+                )
+                external_validation_cfg = dict(flow_loader_cfg)
+                external_validation_cfg.update(
+                    {
+                        "allowed_style_ids": heldout_style_ids,
+                        "excluded_style_ids": [],
+                        "split": str(training_source_cfg.get("split", "train")),
+                        "batch_size": int(
+                            training_source_cfg.get("validation_batch_size", 4)
+                        ),
+                        "same_style_target_min": 1,
+                        "same_style_target_max": 1,
+                    }
+                )
+                external_validation_loader = flow_loader_class(
+                    destination, external_validation_cfg
+                )
+                external_flow_validation_batches = [
+                    external_validation_loader.load_step(index)
+                    for index in range(
+                        int(
+                            training_source_cfg.get(
+                                "validation_batches", 4
+                            )
+                        )
+                    )
+                ]
+                print(
+                    "Prepared held-out external synthetic flow validation: "
+                    f"styles={len(external_validation_loader.by_style)} "
+                    f"batches={len(external_flow_validation_batches)}",
+                    flush=True,
+                )
         completed_relative = max(0, start_step - int(cfg.get("initial_step", 0)))
         accumulation = int(training.get("gradient_accumulation_steps", 1))
         flow_update_index = accumulation * _direct_delta_flow_updates_through(
@@ -4324,8 +4413,10 @@ def train_direct_reference_kv_delta_320(
         )
 
     @torch.no_grad()
-    def fixed_flow_validation() -> dict[str, float]:
-        if not flow_validation_batches:
+    def fixed_flow_validation(
+        batches: list[dict[str, Any]],
+    ) -> dict[str, float]:
+        if not batches:
             return {}
         assert anima is not None and flow_injector is not None
         model.eval()
@@ -4334,7 +4425,7 @@ def train_direct_reference_kv_delta_320(
         adapted_values: list[torch.Tensor] = []
         timestep_values: list[torch.Tensor] = []
         validation_rows = sum(
-            len(batch["latents"]) for batch in flow_validation_batches
+            len(batch["latents"]) for batch in batches
         )
         validation_quantile_order = torch.randperm(
             validation_rows,
@@ -4342,7 +4433,7 @@ def train_direct_reference_kv_delta_320(
         )
         validation_offset = 0
         try:
-            for index, validation_batch in enumerate(flow_validation_batches):
+            for index, validation_batch in enumerate(batches):
                 latents = validation_batch["latents"].to(
                     device=device, dtype=torch.bfloat16, non_blocking=True
                 )
@@ -4446,7 +4537,7 @@ def train_direct_reference_kv_delta_320(
         return metrics
 
     def log_fixed_flow_validation(step: int) -> None:
-        validation_metrics = fixed_flow_validation()
+        validation_metrics = fixed_flow_validation(flow_validation_batches)
         print(
             f"Fixed artist-disjoint flow validation step={step}: "
             f"{validation_metrics}",
@@ -4460,6 +4551,23 @@ def train_direct_reference_kv_delta_320(
                 },
                 step=step,
             )
+        if external_flow_validation_batches:
+            external_metrics = fixed_flow_validation(
+                external_flow_validation_batches
+            )
+            print(
+                f"Fixed external synthetic flow validation step={step}: "
+                f"{external_metrics}",
+                flush=True,
+            )
+            if wandb_run is not None:
+                wandb_run.log(
+                    {
+                        f"validation_external_flow/{key}": value
+                        for key, value in external_metrics.items()
+                    },
+                    step=step,
+                )
 
     running: dict[str, list[float]] = defaultdict(list)
     generator_grad_history: list[float] = []
@@ -5200,6 +5308,7 @@ def train_direct_reference_kv_delta_320(
                 running["generator_grad_clip_threshold"].append(generator_clip_used)
                 running["reader_grad_clip_threshold"].append(reader_clip_used)
                 running["update/human_flow"].append(1.0)
+                running[f"flow_source/{flow_source_name}"].append(1.0)
                 if accumulation_last and step % log_every == 0:
                     row = {
                         key: sum(values) / len(values)
@@ -5729,7 +5838,16 @@ def train_direct_reference_kv_delta_320(
                 teacher_signature_weight = float(
                     whole_model.get("teacher_signature_weight", 0.0)
                 )
-                if teacher_signature_weight > 0:
+                # This compact target is defined only for the original LoRA
+                # factor bank. External whole-model and native artist rows use
+                # separate effect indices; feeding their placeholder component
+                # zero here makes every teacher column identical and produces
+                # a constant, chance-level retrieval loss.
+                if (
+                    teacher_signature_weight > 0
+                    and not external_category
+                    and not native_category
+                ):
                     assert contexts is not None
                     probe_context = contexts[:1, :16]
                     probe_context_batch = probe_context.expand(batch, -1, -1)
@@ -7406,8 +7524,8 @@ def train_scheduled_expert_external_velocity_5k(
     return train_scheduled_direct_reference_kv_delta_320(
         config,
         destination,
-        config_key="kv_reference_expert_external_flow_alignment_1000",
-        sample_config_key="kv_reference_expert_external_flow_alignment_1000_sample",
+        config_key="kv_reference_expert_external_synthetic_flow_1500",
+        sample_config_key="kv_reference_expert_external_synthetic_flow_1500_sample",
     )
 
 
@@ -7417,7 +7535,7 @@ def sample_expert_external_velocity_5k(
     return sample_direct_reference_kv_delta_320(
         config,
         destination,
-        sample_config_key="kv_reference_expert_external_flow_alignment_1000_sample",
+        sample_config_key="kv_reference_expert_external_synthetic_flow_1500_sample",
     )
 
 

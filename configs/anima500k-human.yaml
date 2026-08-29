@@ -3213,6 +3213,114 @@ kv_reference_expert_external_flow_alignment_1000_sample:
     reference_cache: civitai_external/synthetic_references_682x4_triggered_v1/dual_query_reference_tokens_v8_step10000
     source_manifest: civitai_external/synthetic_references_682x4_triggered_v1/manifest.parquet
 
+# v26 shows that increasing noisy Human flow frequency weakens teacher
+# alignment without improving artist-disjoint flow.  The exact external LoRA
+# images were previously used only as support references.  Here one of each
+# style's four content-diverse synthetic images becomes a normal flow target,
+# while 2--3 disjoint images provide the reference. Query text excludes the
+# LoRA trigger, so the reference must explain the exact synthetic style.
+kv_reference_expert_external_synthetic_flow_1500:
+  extends_config_key: kv_reference_expert_combined_calibrated_3000
+  output_directory: kv_reference_expert_external_synthflow_half_b4_w768_l3_1500_v27
+  initial_checkpoint: kv_reference_expert_combined_calibrated_b3_w768_l3_3k_v24/checkpoints/step-0000500.pt
+  initial_use_ema_model: true
+  initial_use_ema_reader: true
+  initial_step: 0
+  reset_initial_step: true
+  seed: 20260909
+  training:
+    steps: 1500
+    validation_every: 250
+    checkpoint_every: 250
+    sample_steps: [250, 500, 1000, 1500]
+    sample_output_root: diagnostics/kv-reference-expert-external-synthflow-half-b4-w768-l3-1500-v27
+    generator_learning_rate: 0.0000002
+    reader_learning_rate: 0.00000005
+    generator_lr_schedule:
+      peak_lr: 0.0000002
+      warmup_steps: 25
+      decay_start_step: 750
+      decay_end_step: 1500
+      final_lr: 0.00000004
+      tail_decay_end_step: 1500
+      tail_final_lr: 0.00000004
+    reader_lr_schedule:
+      peak_lr: 0.00000005
+      warmup_steps: 25
+      decay_start_step: 250
+      decay_end_step: 1000
+      final_lr: 0.000000005
+    multi_domain_distillation:
+      schedule: [external_single, artist_synthetic, external_mixture, artist_human]
+    whole_model_functional:
+      # Compact K/V teacher signatures are not defined for external/native
+      # effect indices. Their former chance-level constant is intentionally off.
+      teacher_signature_weight: 0.0
+      reader_consistency_weight: 0.05
+      reader_contrastive_weight: 0.25
+      functional_consistency_weight: 0.25
+      functional_contrastive_weight: 0.50
+    human_flow:
+      phases:
+        - {end_step: 1500, cycle: 2, slots: [1]}
+      flow_loss_weight: 1.5
+      prior_preservation_weight: 0.10
+      fixed_validation_every: 250
+      fixed_validation_batches: 4
+      training_source:
+        name: external_synthetic
+        style_cache: civitai_external/synthetic_references_682x4_triggered_v1
+        style_manifest: civitai_external/synthetic_references_682x4_triggered_v1/manifest.parquet
+        latent_cache: civitai_external/synthetic_references_682x4_triggered_v1/latents
+        text_cache: civitai_external/synthetic_references_682x4_triggered_v1/flow_text_clean_content_v1
+        resampler_token_cache: civitai_external/synthetic_references_682x4_triggered_v1/dual_query_reference_tokens_v8_step10000
+        single_prompt_cache: true
+        split: train
+        batch_size: 4
+        min_references: 2
+        max_references: 3
+        same_style_target_min: 1
+        same_style_target_max: 1
+        artist_balanced: true
+        exclude_external_heldout: true
+        validate_external_heldout: true
+        validation_batch_size: 4
+        validation_batches: 4
+    ema:
+      enabled: true
+      decay: 0.995
+      sample: true
+    wandb:
+      enabled: true
+      project: anima-style-adapter
+      name: kv-reference-expert-external-synthflow-half-b4-w768-l3-1500-v27
+      id: kv-reference-expert-external-synthflow-half-b4-w768-l3-1500-v27
+      resume: allow
+
+kv_reference_expert_external_synthetic_flow_1500_sample:
+  checkpoint: kv_reference_expert_external_synthflow_half_b4_w768_l3_1500_v27/checkpoints/step-0001500.pt
+  output_directory: diagnostics/kv-reference-expert-external-synthflow-half-b4-w768-l3-1500-v27-step1500
+  device: cuda
+  artists: 8
+  references: 4
+  reference_seed: 20260918
+  strengths: [1.0, 2.0]
+  batch_size: 4
+  panel_tile_width: 384
+  panel_style_cache: "."
+  panel_style_manifest: final_manifest.parquet
+  external_panel:
+    enabled: true
+    training_seed: 20260909
+    validation_single_styles: 32
+    styles: 8
+    references: 4
+    reference_seed: 20260919
+    minimum_effect_rms: 0.001
+    functional_teacher_cache: civitai_external/functional_teacher_298_mix384_clean24x8_trigger4x4_v1
+    reference_cache: civitai_external/synthetic_references_682x4_triggered_v1/dual_query_reference_tokens_v8_step10000
+    source_manifest: civitai_external/synthetic_references_682x4_triggered_v1/manifest.parquet
+
 # Reference-conditioned low-rank operator pilot. Unlike the direct activation
 # head above, the reference generates a fresh block-local linear operator and
 # applies it to every native text token.  Teacher factors remain offline
@@ -10190,3 +10298,8 @@ external_civitai_lora_references:
     preprocess:
       max_side: 512
       max_pixels: 262144
+  flow_cache:
+    text_output_directory: flow_text_clean_content_v1
+    device: cuda
+    text_batch_size: 32
+    shard_rows: 256

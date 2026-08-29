@@ -454,6 +454,114 @@ def _prepare_trigger_contexts(
     gc.collect()
 
 
+def cache_external_lora_flow_inputs(
+    config: dict[str, Any], destination: Path
+) -> dict[str, Any]:
+    """Materialize clean-query text and latent manifests for synthetic flow.
+
+    External references were rendered with their trigger words, but the flow
+    query deliberately uses ``content_prompt``.  The reference images must
+    therefore carry the style signal instead of letting the text trigger solve
+    the training example.  Existing VAE latents and frozen reference tokens are
+    reused without copying their tensor shards.
+    """
+
+    reference_cfg = dict(config["external_civitai_lora_references"])
+    flow_cfg = dict(reference_cfg.get("flow_cache", {}))
+    reference_root = destination / str(reference_cfg["output_directory"])
+    source_manifest = reference_root / "manifest.parquet"
+    rows = sorted(read_records(source_manifest), key=lambda row: int(row["id"]))
+    if not rows:
+        raise RuntimeError(f"External reference manifest is empty: {source_manifest}")
+
+    text_root = reference_root / str(
+        flow_cfg.get("text_output_directory", "flow_text_clean_content_v1")
+    )
+    latent_root = reference_root / "latents"
+    summary_path = text_root / "summary.json"
+    expected_images = len(rows)
+    if summary_path.exists() and (text_root / "manifest.parquet").exists():
+        previous = json.loads(summary_path.read_text(encoding="utf-8"))
+        if int(previous.get("images", -1)) == expected_images:
+            return {**previous, "reused": True}
+
+    text_root.mkdir(parents=True, exist_ok=True)
+    latent_root.mkdir(parents=True, exist_ok=True)
+    latent_rows = [
+        {
+            **row,
+            "cache_shard": str(row["latent_shard"]),
+            "row_index": int(row["latent_row"]),
+        }
+        for row in rows
+    ]
+    write_records(latent_root / "manifest.parquet", latent_rows)
+
+    started = time.perf_counter()
+    encoded = _encode_prompts(
+        config,
+        destination,
+        [str(row["content_prompt"]) for row in rows],
+        str(flow_cfg.get("device", reference_cfg.get("device", "cuda"))),
+        batch_size=int(flow_cfg.get("text_batch_size", 32)),
+    )
+    shard_rows = int(flow_cfg.get("shard_rows", 256))
+    output_rows: list[dict[str, Any]] = []
+    storage_bytes = 0
+    for shard_index, offset in enumerate(range(0, len(rows), shard_rows)):
+        end = min(offset + shard_rows, len(rows))
+        shard = encoded[offset:end]
+        lengths = shard.abs().amax(dim=-1).ne(0).sum(dim=-1).clamp_min(1)
+        conditions = [
+            shard[index, : int(length)].contiguous()
+            for index, length in enumerate(lengths.tolist())
+        ]
+        offsets = [0]
+        for condition in conditions:
+            offsets.append(offsets[-1] + int(condition.shape[0]))
+        path = text_root / f"part-{shard_index:05d}.safetensors"
+        temporary = path.with_suffix(path.suffix + ".tmp")
+        save_file(
+            {
+                "conditioning": torch.cat(conditions, dim=0),
+                "offsets": torch.tensor(offsets, dtype=torch.int64),
+                "ids": torch.tensor(
+                    [int(row["id"]) for row in rows[offset:end]],
+                    dtype=torch.int64,
+                ),
+                "variants": torch.zeros(end - offset, dtype=torch.int16),
+            },
+            temporary,
+        )
+        temporary.replace(path)
+        storage_bytes += path.stat().st_size
+        for local_index, row in enumerate(rows[offset:end]):
+            output_rows.append(
+                {
+                    "id": int(row["id"]),
+                    "variant": 0,
+                    "variant_name": "full",
+                    "cache_shard": path.name,
+                    "token_offset": offsets[local_index],
+                    "token_length": int(lengths[local_index]),
+                    "prompt": str(row["content_prompt"]),
+                }
+            )
+    write_records(text_root / "manifest.parquet", output_rows)
+    summary = {
+        "images": expected_images,
+        "text_rows": len(output_rows),
+        "shards": (expected_images + shard_rows - 1) // shard_rows,
+        "prompt_policy": "content_prompt_without_external_trigger",
+        "latent_manifest": str(latent_root / "manifest.parquet"),
+        "text_manifest": str(text_root / "manifest.parquet"),
+        "storage_bytes": storage_bytes,
+        "elapsed_s": time.perf_counter() - started,
+    }
+    write_json(summary_path, summary)
+    return summary
+
+
 def cache_external_lora_functional_teacher(
     config: dict[str, Any], destination: Path
 ) -> dict[str, Any]:

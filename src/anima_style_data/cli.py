@@ -120,6 +120,7 @@ def build_parser() -> argparse.ArgumentParser:
         ("external-civitai-lora-validate", "Validate each external LoRA storage format"),
         ("external-civitai-lora-reference-generate", "Generate triggered external LoRA references"),
         ("external-civitai-lora-reference-token-cache", "Cache external LoRA reference tokens"),
+        ("external-civitai-lora-flow-cache", "Cache clean-query external LoRA flow inputs"),
         ("kv-lora-functional-teacher-cache", "Cache K/V-only LoRA effects"),
         ("kv-lora-functional-teacher-320-cache", "Cache all 320 K/V-only LoRA and mixture effects"),
         ("kv-lora-fixed-teacher-compare", "Compare K/V LoRAs on one prompt and seed"),
@@ -552,6 +553,10 @@ def main() -> None:
         from .synthetic_reference_pipeline import cache_external_lora_dual_query_tokens
 
         _run(cache_external_lora_dual_query_tokens, config, destination)
+    elif args.command == "external-civitai-lora-flow-cache":
+        from .external_lora_teacher import cache_external_lora_flow_inputs
+
+        _run(cache_external_lora_flow_inputs, config, destination)
     elif args.command in {
         "artist-lora-diverse-plan",
         "artist-lora-diverse-train",
