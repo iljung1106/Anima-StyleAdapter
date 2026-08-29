@@ -4169,6 +4169,10 @@ def train_direct_reference_kv_delta_320(
         )
         if flow_validation_every > 0:
             validation_cfg = dict(human_flow_loader_cfg)
+            if human_flow.get("style_manifest") is not None:
+                validation_cfg["style_manifest"] = str(
+                    human_flow["style_manifest"]
+                )
             human_validation_token_source = destination / str(
                 validation_cfg["resampler_token_cache"]
             )
