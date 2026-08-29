@@ -87,6 +87,7 @@ class ReferenceConditionedKVActivationGenerator(nn.Module):
         output_rank: int = 0,
         output_experts: int = 0,
         output_top_k: int = 0,
+        output_dense_control: bool = False,
         output_init_scale: float = 0.02,
         normalize_style: bool = True,
         normalize_attended: bool = True,
@@ -99,6 +100,9 @@ class ReferenceConditionedKVActivationGenerator(nn.Module):
         stream_experts: int = 0,
         stream_top_k: int = 0,
         enable_self_vo: bool = False,
+        enable_self_qk: bool = False,
+        enable_self_q: bool = True,
+        enable_self_k: bool = True,
         enable_self_v: bool = True,
         enable_self_o: bool = True,
         self_stream_rank: int = 16,
@@ -166,6 +170,7 @@ class ReferenceConditionedKVActivationGenerator(nn.Module):
         self.output_rank = int(output_rank)
         self.output_experts = int(output_experts)
         self.output_top_k = int(output_top_k)
+        self.output_dense_control = bool(output_dense_control)
         self.enable_qo = bool(enable_qo)
         self.enable_q = bool(enable_q) and self.enable_qo
         self.enable_o = bool(enable_o) and self.enable_qo
@@ -175,11 +180,20 @@ class ReferenceConditionedKVActivationGenerator(nn.Module):
         self.stream_rank = int(stream_rank)
         self.stream_experts = int(stream_experts)
         self.stream_top_k = int(stream_top_k)
-        self.enable_self_vo = bool(enable_self_vo)
+        self.enable_self_qk = bool(enable_self_qk)
+        self.enable_self_q = bool(enable_self_q) and self.enable_self_qk
+        self.enable_self_k = bool(enable_self_k) and self.enable_self_qk
+        self.enable_self_vo = bool(enable_self_vo) or self.enable_self_qk
         self.enable_self_v = bool(enable_self_v) and self.enable_self_vo
         self.enable_self_o = bool(enable_self_o) and self.enable_self_vo
-        if self.enable_self_vo and not (self.enable_self_v or self.enable_self_o):
-            raise ValueError("self-attention V/O modulation requires an enabled path")
+        self.self_stream_kinds = 4 if self.enable_self_qk else 2
+        if self.enable_self_vo and not (
+            self.enable_self_q
+            or self.enable_self_k
+            or self.enable_self_v
+            or self.enable_self_o
+        ):
+            raise ValueError("self-attention modulation requires an enabled path")
         self.self_stream_rank = int(self_stream_rank)
         self.self_stream_experts = int(self_stream_experts)
         self.self_stream_top_k = int(self_stream_top_k)
@@ -265,6 +279,9 @@ class ReferenceConditionedKVActivationGenerator(nn.Module):
         self._routing_entropies: dict[str, list[torch.Tensor]] = {
             "kv": [], "qo": [], "self": [], "block": [],
         }
+        self._routing_topk_mass: dict[str, list[torch.Tensor]] = {
+            "kv": [], "qo": [], "self": [], "block": [],
+        }
         self._routing_margins: dict[str, list[torch.Tensor]] = {
             "kv": [], "qo": [], "self": [], "block": [],
         }
@@ -276,7 +293,7 @@ class ReferenceConditionedKVActivationGenerator(nn.Module):
             raise ValueError("stream_rank must be positive when Q/O is enabled")
         if self.enable_self_vo and self.self_stream_rank <= 0:
             raise ValueError(
-                "self_stream_rank must be positive when self V/O is enabled"
+                "self_stream_rank must be positive when self attention is enabled"
             )
         self.style_norm = (
             nn.LayerNorm(style_dim) if bool(normalize_style) else nn.Identity()
@@ -323,6 +340,24 @@ class ReferenceConditionedKVActivationGenerator(nn.Module):
             self.output_expert_up = nn.Parameter(torch.empty(
                 blocks, 2, self.output_experts, self.output_rank, output_dim
             ))
+            if self.output_dense_control:
+                self.output_channel_gates = nn.ModuleList(
+                    nn.ModuleList(
+                        nn.Linear(
+                            hidden_dim,
+                            self.output_experts * self.output_rank,
+                            bias=True,
+                        )
+                        for _ in range(2)
+                    )
+                    for _ in range(blocks)
+                )
+                self.output_reference_gain = nn.ModuleList(
+                    nn.ModuleList(
+                        nn.Linear(hidden_dim, 1, bias=True) for _ in range(2)
+                    )
+                    for _ in range(blocks)
+                )
             self.register_buffer(
                 "output_expert_usage",
                 torch.full(
@@ -442,25 +477,28 @@ class ReferenceConditionedKVActivationGenerator(nn.Module):
                     for _ in range(blocks)
                 )
         if self.enable_self_vo:
-            # Self-attention V and O act on live image tokens. They use their
+            # Self-attention Q/K/V/O act on live image tokens. They use their
             # own reference codes and expert banks rather than sharing the
             # cross-attention O basis, so the two attention domains can learn
-            # different style operators while Q/K remain frozen.
+            # different style functions. Older V/O-only configs retain their
+            # compact two-kind layout; full QKVO configs use four kinds.
             self.self_stream_style_queries = nn.Parameter(
-                torch.empty(blocks, 2, hidden_dim)
+                torch.empty(blocks, self.self_stream_kinds, hidden_dim)
             )
             self.self_stream_code_norm = nn.LayerNorm(hidden_dim)
             if self.self_stream_experts:
                 self.self_stream_style_key = nn.ModuleList(
-                    nn.Linear(style_dim, hidden_dim, bias=False) for _ in range(2)
+                    nn.Linear(style_dim, hidden_dim, bias=False)
+                    for _ in range(self.self_stream_kinds)
                 )
                 self.self_stream_style_value = nn.ModuleList(
-                    nn.Linear(style_dim, hidden_dim, bias=False) for _ in range(2)
+                    nn.Linear(style_dim, hidden_dim, bias=False)
+                    for _ in range(self.self_stream_kinds)
                 )
                 self.self_stream_routers = nn.ModuleList(
                     nn.ModuleList(
                         nn.Linear(hidden_dim, self.self_stream_experts, bias=True)
-                        for _ in range(2)
+                        for _ in range(self.self_stream_kinds)
                     )
                     for _ in range(blocks)
                 )
@@ -471,26 +509,27 @@ class ReferenceConditionedKVActivationGenerator(nn.Module):
                             self.self_stream_experts * self.self_stream_rank,
                             bias=True,
                         )
-                        for _ in range(2)
+                        for _ in range(self.self_stream_kinds)
                     )
                     for _ in range(blocks)
                 )
                 self.self_stream_gain = nn.ModuleList(
                     nn.ModuleList(
-                        nn.Linear(hidden_dim, 1, bias=True) for _ in range(2)
+                        nn.Linear(hidden_dim, 1, bias=True)
+                        for _ in range(self.self_stream_kinds)
                     )
                     for _ in range(blocks)
                 )
                 self.self_stream_expert_down = nn.Parameter(torch.empty(
                     blocks,
-                    2,
+                    self.self_stream_kinds,
                     self.self_stream_experts,
                     self.self_stream_rank,
                     stream_dim,
                 ))
                 self.self_stream_expert_up = nn.Parameter(torch.empty(
                     blocks,
-                    2,
+                    self.self_stream_kinds,
                     self.self_stream_experts,
                     self.self_stream_rank,
                     stream_dim,
@@ -498,40 +537,42 @@ class ReferenceConditionedKVActivationGenerator(nn.Module):
                 self.register_buffer(
                     "self_stream_expert_usage",
                     torch.full(
-                        (blocks, 2, self.self_stream_experts),
+                        (blocks, self.self_stream_kinds, self.self_stream_experts),
                         1.0 / self.self_stream_experts,
                     ),
                 )
                 self.register_buffer(
                     "self_stream_expert_load",
                     torch.full(
-                        (blocks, 2, self.self_stream_experts),
+                        (blocks, self.self_stream_kinds, self.self_stream_experts),
                         self.self_stream_top_k / self.self_stream_experts,
                     ),
                 )
                 self.register_buffer(
                     "self_stream_expert_selection_bias",
-                    torch.zeros(blocks, 2, self.self_stream_experts),
+                    torch.zeros(
+                        blocks, self.self_stream_kinds, self.self_stream_experts
+                    ),
                 )
             else:
                 self.self_stream_gates = nn.ModuleList(
                     nn.ModuleList(
                         nn.Linear(hidden_dim, self.self_stream_rank, bias=True)
-                        for _ in range(2)
+                        for _ in range(self.self_stream_kinds)
                     )
                     for _ in range(blocks)
                 )
                 self.self_stream_down = nn.ModuleList(
                     nn.ModuleList(
                         nn.Linear(stream_dim, self.self_stream_rank, bias=False)
-                        for _ in range(2)
+                        for _ in range(self.self_stream_kinds)
                     )
                     for _ in range(blocks)
                 )
                 self.self_stream_up = nn.ModuleList(
                     nn.ModuleList(
                         nn.Linear(self.self_stream_rank, stream_dim, bias=False)
-                        for _ in range(2)
+                        for _ in range(self.self_stream_kinds)
                     )
                     for _ in range(blocks)
                 )
@@ -687,7 +728,7 @@ class ReferenceConditionedKVActivationGenerator(nn.Module):
                     std=self.self_stream_rank**-0.5 * output_init_scale,
                 )
                 for block in range(self.blocks):
-                    for kind in range(2):
+                    for kind in range(self.self_stream_kinds):
                         nn.init.zeros_(
                             self.self_stream_routers[block][kind].bias
                         )
@@ -726,6 +767,18 @@ class ReferenceConditionedKVActivationGenerator(nn.Module):
                     nn.init.zeros_(router.bias)
                     with torch.no_grad():
                         router.weight.mul_(self.router_init_scale)
+            if self.output_dense_control:
+                for block in range(self.blocks):
+                    for kind in range(2):
+                        nn.init.zeros_(
+                            self.output_channel_gates[block][kind].bias
+                        )
+                        nn.init.zeros_(
+                            self.output_reference_gain[block][kind].weight
+                        )
+                        nn.init.zeros_(
+                            self.output_reference_gain[block][kind].bias
+                        )
         elif not self.output_rank:
             for head in self.output_head:
                 with torch.no_grad():
@@ -833,6 +886,34 @@ class ReferenceConditionedKVActivationGenerator(nn.Module):
             low_rank = torch.einsum(
                 "bnh,bekrh->beknr", hidden, selected_down
             )
+            reference_gain = None
+            if self.output_dense_control:
+                channels = torch.stack([
+                    torch.tanh(
+                        self.output_channel_gates[block][kind](
+                            router_code[:, kind]
+                        ).reshape(
+                            batch, self.output_experts, self.output_rank
+                        )
+                    )
+                    for kind in range(2)
+                ], dim=1)
+                batch_rows = torch.arange(batch, device=hidden.device)[
+                    :, None, None
+                ]
+                kind_rows = torch.arange(2, device=hidden.device)[
+                    None, :, None
+                ]
+                selected_channels = channels[batch_rows, kind_rows, indices]
+                low_rank = low_rank * selected_channels[:, :, :, None, :]
+                reference_gain = torch.stack([
+                    2.0 * torch.sigmoid(
+                        self.output_reference_gain[block][kind](
+                            router_code[:, kind]
+                        ).float()
+                    ).squeeze(-1)
+                    for kind in range(2)
+                ], dim=1).to(hidden.dtype)
             output = torch.einsum(
                 "beknr,bekro,bek->bneo", low_rank, selected_up, weights
             )
@@ -842,7 +923,10 @@ class ReferenceConditionedKVActivationGenerator(nn.Module):
             output = output.reshape(batch, text_tokens, 2, self.output_dim)
         output = output.transpose(1, 2)
         gain = self.log_gain[block].float().clamp(-4.0, 4.0).exp().to(output.dtype)
-        return output * gain[None, :, None, None]
+        output = output * gain[None, :, None, None]
+        if self.output_experts and self.output_dense_control:
+            output = output * reference_gain[:, :, None, None]
+        return output
 
     def prepare_stream_codes(self, style_memory: torch.Tensor) -> torch.Tensor:
         """Read reference memory once for all block-local Q/O adapters."""
@@ -976,14 +1060,14 @@ class ReferenceConditionedKVActivationGenerator(nn.Module):
     def prepare_self_stream_codes(
         self, style_memory: torch.Tensor
     ) -> torch.Tensor:
-        """Read reference memory once for self-attention V/O adapters."""
+        """Read reference memory once for self-attention Q/K/V/O adapters."""
         if not self.enable_self_vo:
             raise RuntimeError("self-attention V/O modulation is disabled")
         style = self.style_norm(style_memory)
         batch = int(style.shape[0])
         if self.self_stream_experts:
             rows = []
-            for kind in range(2):
+            for kind in range(self.self_stream_kinds):
                 if not self.self_stream_kind_enabled(kind):
                     rows.append(
                         style.new_zeros(
@@ -1005,16 +1089,19 @@ class ReferenceConditionedKVActivationGenerator(nn.Module):
                 code = F.scaled_dot_product_attention(queries, key, value)
                 rows.append(code.transpose(1, 2))
             codes = torch.stack(rows, dim=2).reshape(
-                batch, self.blocks, 2, self.hidden_dim
+                batch, self.blocks, self.self_stream_kinds, self.hidden_dim
             )
         else:
             key = self.style_key(style)
             value = self.style_value(style)
             queries = self.self_stream_style_queries.reshape(
-                self.blocks * 2, self.hidden_dim
+                self.blocks * self.self_stream_kinds, self.hidden_dim
             )[None].expand(batch, -1, -1)
             queries = queries.reshape(
-                batch, self.blocks * 2, self.heads, self.head_dim
+                batch,
+                self.blocks * self.self_stream_kinds,
+                self.heads,
+                self.head_dim,
             ).transpose(1, 2)
             key = key.reshape(
                 batch, style.shape[1], self.heads, self.head_dim
@@ -1024,11 +1111,21 @@ class ReferenceConditionedKVActivationGenerator(nn.Module):
             ).transpose(1, 2)
             codes = F.scaled_dot_product_attention(queries, key, value)
             codes = codes.transpose(1, 2).reshape(
-                batch, self.blocks, 2, self.hidden_dim
+                batch, self.blocks, self.self_stream_kinds, self.hidden_dim
             )
         return self.self_stream_code_norm(codes)
 
     def self_stream_kind_enabled(self, kind: int) -> bool:
+        if self.enable_self_qk:
+            if int(kind) == 0:
+                return self.enable_self_q
+            if int(kind) == 1:
+                return self.enable_self_k
+            if int(kind) == 2:
+                return self.enable_self_v
+            if int(kind) == 3:
+                return self.enable_self_o
+            raise ValueError("self stream kind must be Q=0, K=1, V=2, or O=3")
         if int(kind) == 0:
             return self.enable_self_v
         if int(kind) == 1:
@@ -1042,7 +1139,7 @@ class ReferenceConditionedKVActivationGenerator(nn.Module):
         block_index: int,
         kind: int,
     ) -> torch.Tensor:
-        """Apply a reference-gated low-rank delta to self V (0) or O (1)."""
+        """Apply a reference-gated low-rank delta to one self-attention path."""
         if not self.enable_self_vo:
             raise RuntimeError("self-attention V/O modulation is disabled")
         if not self.self_stream_kind_enabled(kind):
@@ -1276,6 +1373,8 @@ class ReferenceConditionedKVActivationGenerator(nn.Module):
         self._routing_specialization_terms.clear()
         for values in self._routing_entropies.values():
             values.clear()
+        for values in self._routing_topk_mass.values():
+            values.clear()
         for values in self._routing_margins.values():
             values.clear()
 
@@ -1326,6 +1425,11 @@ class ReferenceConditionedKVActivationGenerator(nn.Module):
             * probabilities.float()
         ).sum(dim=-1).mean()
         self._routing_entropies[name].append(entropy)
+        self._routing_topk_mass[name].append(
+            (dense_probabilities.float() * selections.float())
+            .sum(dim=-1)
+            .mean()
+        )
         core_experts = self.output_core_experts if name == "kv" else (
             self.stream_core_experts if name in ("qo", "self") else 0
         )
@@ -1474,7 +1578,16 @@ class ReferenceConditionedKVActivationGenerator(nn.Module):
             if name == "qo" and self.enable_qo and not self.enable_q:
                 load = load[:, 1:2]
             if name == "self" and self.enable_self_vo:
-                enabled = [self.enable_self_v, self.enable_self_o]
+                enabled = (
+                    [
+                        self.enable_self_q,
+                        self.enable_self_k,
+                        self.enable_self_v,
+                        self.enable_self_o,
+                    ]
+                    if self.enable_self_qk
+                    else [self.enable_self_v, self.enable_self_o]
+                )
                 load = load[:, enabled]
             target = float(top_k) / experts
             router_max = load.float().amax(dim=-1).flatten()
@@ -1511,6 +1624,10 @@ class ReferenceConditionedKVActivationGenerator(nn.Module):
             entropy = torch.stack(values).mean() if values else zero
             metrics[f"{name}_router_entropy"] = entropy.detach()
             metrics[f"{name}_effective_experts"] = entropy.detach().exp()
+            topk_mass = self._routing_topk_mass[name]
+            metrics[f"{name}_topk_mass_kept"] = (
+                torch.stack(topk_mass).mean().detach() if topk_mass else zero
+            )
             top_k = self.output_top_k if name == "kv" else (
                 self.stream_top_k
                 if name == "qo"
@@ -2229,7 +2346,7 @@ def _adapter_probe_signature(
                         stream_input, self_stream_codes, block, kind
                     )
                 )
-                for kind in range(2)
+                for kind in range(generator.self_stream_kinds)
                 if generator.self_stream_kind_enabled(kind)
             )
     signature = torch.cat(parts)
@@ -2277,7 +2394,7 @@ def _adapter_probe_signatures(
                         stream_input, self_stream_codes, block, kind
                     )
                 )
-                for kind in range(2)
+                for kind in range(generator.self_stream_kinds)
                 if generator.self_stream_kind_enabled(kind)
             )
     signatures = torch.cat(parts, dim=1)
@@ -8184,6 +8301,31 @@ def sample_expert_external_kvo_selfvo_5k(
         config,
         destination,
         sample_config_key="kv_reference_expert_external_kvo_selfvo_5000_sample",
+    )
+
+
+def train_scheduled_expert_dense64x16_full_qkvo_flow_5k(
+    config: dict[str, Any], destination: Path
+) -> dict[str, Any]:
+    return train_scheduled_direct_reference_kv_delta_320(
+        config,
+        destination,
+        config_key="kv_reference_expert_dense64x16_full_qkvo_flow_5000",
+        sample_config_key=(
+            "kv_reference_expert_dense64x16_full_qkvo_flow_5000_sample"
+        ),
+    )
+
+
+def sample_expert_dense64x16_full_qkvo_flow_5k(
+    config: dict[str, Any], destination: Path
+) -> dict[str, Any]:
+    return sample_direct_reference_kv_delta_320(
+        config,
+        destination,
+        sample_config_key=(
+            "kv_reference_expert_dense64x16_full_qkvo_flow_5000_sample"
+        ),
     )
 
 

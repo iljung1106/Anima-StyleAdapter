@@ -3810,6 +3810,142 @@ kv_reference_expert_external_kvo_selfvo_5000_sample:
   external_panel:
     reference_seed: 20261003
 
+# Large fresh student with block-local, projection-local conditional experts.
+# Every cross/self QKVO path stores 16 independent rank-64 bases and activates
+# four. Selected experts retain signed per-rank reference control; K/V receives
+# the same dense channel modulation already used by the live-stream paths.
+# Original and external LoRA singles/mixtures provide final-velocity teachers;
+# every sixth optimizer step is stronger real-image flow with prior preservation.
+kv_reference_expert_dense64x16_full_qkvo_flow_5000:
+  extends_config_key: kv_reference_expert_lora_only_20000
+  output_directory: kv_reference_expert_dense64x16_top4_fullqkvo_w1024_l4_flow_5k_v35
+  initial_checkpoint: null
+  initial_reader_checkpoint: null
+  initial_step: 0
+  reset_initial_step: true
+  seed: 20261004
+  model:
+    hidden_dim: 1024
+    heads: 16
+    ff_dim: 4096
+    ff_layers: 4
+    output_rank: 64
+    output_experts: 16
+    output_top_k: 4
+    output_dense_control: true
+    enable_qo: true
+    enable_q: true
+    enable_o: true
+    stream_rank: 64
+    stream_experts: 16
+    stream_top_k: 4
+    enable_self_vo: true
+    enable_self_qk: true
+    enable_self_q: true
+    enable_self_k: true
+    enable_self_v: true
+    enable_self_o: true
+    self_stream_rank: 64
+    self_stream_experts: 16
+    self_stream_top_k: 4
+    expert_usage_decay: 0.95
+    expert_balance_cap: 2.0
+    router_init_scale: 0.05
+    router_jitter: 0.001
+    router_jitter_steps: 200
+    expert_bias_update_rate: 0.001
+    expert_bias_decay: 1.0
+    expert_bias_max: 0.5
+    expert_bias_update_steps: 0
+    expert_bias_decay_end_step: 0
+    expert_bias_population_update: true
+    expert_bias_deadband: 0.25
+    expert_specialization_steps: 0
+  training:
+    steps: 5000
+    # The expert bank is roughly four times the active rank. Accumulation keeps
+    # four distinct style groups per optimizer update without retaining a
+    # batch-four full-DiT activation graph.
+    batch_size: 1
+    gradient_accumulation_steps: 4
+    reader_master_dtype: float32
+    max_grad_norm: 150000.0
+    reader_max_grad_norm: 100.0
+    adaptive_clip:
+      generator: {minimum_history: 50, window: 1000, quantile: 0.99, multiplier: 1.25, floor: 30000.0}
+      reader: {minimum_history: 50, window: 500, quantile: 0.99, multiplier: 1.5, floor: 20.0}
+    validation_every: 500
+    checkpoint_every: 500
+    sample_every: 0
+    sample_steps: [500, 1000, 1500, 2000, 3000, 4000, 5000]
+    sample_output_root: diagnostics/kv-reference-expert-dense64x16-top4-fullqkvo-w1024-l4-flow-5k-v35
+    multi_domain_distillation:
+      enabled: true
+      schedule: [external_single, lora_synthetic, external_mixture, lora_mixture, lora_human]
+      mixture_kind_schedule: [pair, triple, pair, amplified, signed]
+      loss_by_domain:
+        lora_synthetic: {huber_weight: 2.0, direction_weight: 2.0, retrieval_weight: 0.25}
+        lora_human: {huber_weight: 0.8, direction_weight: 2.0, retrieval_weight: 0.25}
+        lora_mixture: {huber_weight: 2.0, direction_weight: 2.0, retrieval_weight: 0.25}
+        external_single: {huber_weight: 2.0, direction_weight: 2.0, retrieval_weight: 0.25}
+        external_mixture: {huber_weight: 2.0, direction_weight: 2.0, retrieval_weight: 0.25}
+    whole_model_functional:
+      block_weight_scale: 0.0
+      whole_weight_override: 1.0
+      huber_beta: 0.10
+      direction_weight: 2.0
+      retrieval_weight: 0.25
+      reader_consistency_weight: 0.05
+      reader_contrastive_weight: 0.05
+      functional_consistency_weight: 0.25
+      functional_contrastive_weight: 0.10
+      teacher_signature_weight: 0.0
+      expert_balance_weight: 0.001
+    human_flow:
+      enabled: true
+      batch_size: 1
+      distinct_style_groups_per_optimizer_update: true
+      phases:
+        - {end_step: 5000, cycle: 6, slots: [5]}
+      flow_loss_weight: 3.0
+      prior_preservation_weight: 0.10
+      fixed_validation_every: 500
+      fixed_validation_batches: 4
+    generator_learning_rate: 0.000002
+    reader_learning_rate: 0.0000005
+    generator_lr_schedule:
+      peak_lr: 0.000002
+      warmup_steps: 300
+      decay_start_step: 3500
+      decay_end_step: 5000
+      final_lr: 0.0000002
+      tail_decay_end_step: 5000
+      tail_final_lr: 0.0000002
+    reader_lr_schedule:
+      peak_lr: 0.0000005
+      warmup_steps: 300
+      decay_start_step: 1000
+      decay_end_step: 4000
+      final_lr: 0.00000005
+    ema:
+      enabled: true
+      decay: 0.999
+      sample: true
+    wandb:
+      enabled: true
+      project: anima-style-adapter
+      name: kv-reference-expert-dense64x16-top4-fullqkvo-w1024-l4-flow-5k-v35
+      id: kv-reference-expert-dense64x16-top4-fullqkvo-w1024-l4-flow-5k-v35
+      resume: allow
+
+kv_reference_expert_dense64x16_full_qkvo_flow_5000_sample:
+  extends_config_key: kv_reference_expert_combined_calibrated_3000_sample
+  checkpoint: kv_reference_expert_dense64x16_top4_fullqkvo_w1024_l4_flow_5k_v35/checkpoints/step-0005000.pt
+  output_directory: diagnostics/kv-reference-expert-dense64x16-top4-fullqkvo-w1024-l4-flow-5k-v35-step5000
+  reference_seed: 20261004
+  external_panel:
+    reference_seed: 20261005
+
 # Reference-conditioned low-rank operator pilot. Unlike the direct activation
 # head above, the reference generates a fresh block-local linear operator and
 # applies it to every native text token.  Teacher factors remain offline

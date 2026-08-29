@@ -223,45 +223,60 @@ class NativeKVActivationInjector:
                         f"self-attention O widths {output_dimensions} do not "
                         f"match configured stream_dim={stream_dim}"
                     )
-                if bool(getattr(model, "enable_self_v", True)):
-                    if hasattr(self_attention, "qkv_proj"):
-                        qkv_dimensions = (
-                            int(self_attention.qkv_proj.in_features),
-                            int(self_attention.qkv_proj.out_features),
+                full_qkvo = bool(getattr(model, "enable_self_qk", False))
+                qkv_enabled = (
+                    bool(getattr(model, "enable_self_q", False))
+                    or bool(getattr(model, "enable_self_k", False))
+                    or bool(getattr(model, "enable_self_v", True))
+                )
+                if qkv_enabled and hasattr(self_attention, "qkv_proj"):
+                    qkv_dimensions = (
+                        int(self_attention.qkv_proj.in_features),
+                        int(self_attention.qkv_proj.out_features),
+                    )
+                    if qkv_dimensions != (stream_dim, 3 * stream_dim):
+                        raise ValueError(
+                            f"self-attention QKV widths {qkv_dimensions} do "
+                            f"not match configured stream_dim={stream_dim}"
                         )
-                        if qkv_dimensions != (stream_dim, 3 * stream_dim):
+                    self.handles.append(
+                        self_attention.qkv_proj.register_forward_hook(
+                            self._self_qkv_fused_hook(block_index)
+                        )
+                    )
+                elif qkv_enabled:
+                    projection_kinds = (
+                        (("q_proj", 0), ("k_proj", 1), ("v_proj", 2))
+                        if full_qkvo
+                        else (("v_proj", 0),)
+                    )
+                    for name, kind in projection_kinds:
+                        if not model.self_stream_kind_enabled(kind):
+                            continue
+                        if not hasattr(self_attention, name):
+                            raise TypeError(
+                                f"self-attention exposes no {name} projection"
+                            )
+                        projection = getattr(self_attention, name)
+                        dimensions = (
+                            int(projection.in_features),
+                            int(projection.out_features),
+                        )
+                        if dimensions != (stream_dim, stream_dim):
                             raise ValueError(
-                                f"self-attention QKV widths {qkv_dimensions} do "
+                                f"self-attention {name} widths {dimensions} do "
                                 f"not match configured stream_dim={stream_dim}"
                             )
                         self.handles.append(
-                            self_attention.qkv_proj.register_forward_hook(
-                                self._self_v_fused_hook(block_index)
+                            projection.register_forward_hook(
+                                self._self_stream_hook(block_index, kind)
                             )
-                        )
-                    elif hasattr(self_attention, "v_proj"):
-                        v_dimensions = (
-                            int(self_attention.v_proj.in_features),
-                            int(self_attention.v_proj.out_features),
-                        )
-                        if v_dimensions != (stream_dim, stream_dim):
-                            raise ValueError(
-                                f"self-attention V widths {v_dimensions} do not "
-                                f"match configured stream_dim={stream_dim}"
-                            )
-                        self.handles.append(
-                            self_attention.v_proj.register_forward_hook(
-                                self._self_stream_hook(block_index, 0)
-                            )
-                        )
-                    else:
-                        raise TypeError(
-                            "self-attention exposes neither qkv_proj nor v_proj"
                         )
                 if bool(getattr(model, "enable_self_o", True)):
+                    output_kind = 3 if full_qkvo else 1
                     self.handles.append(
                         self_attention.output_proj.register_forward_hook(
-                            self._self_stream_hook(block_index, 1)
+                            self._self_stream_hook(block_index, output_kind)
                         )
                     )
             if bool(getattr(model, "enable_block_residual", False)):
@@ -401,17 +416,27 @@ class NativeKVActivationInjector:
 
         return hook
 
-    def _self_v_fused_hook(self, block_index: int):
+    def _self_qkv_fused_hook(self, block_index: int):
         def hook(module, inputs, output):
             if not self.enabled or not self._block_enabled(block_index):
                 return output
-            delta = self._self_stream_delta(inputs[0], block_index, 0)
-            zero = torch.zeros_like(delta)
-            return output + torch.cat((zero, zero, delta), dim=-1).to(
-                output.dtype
-            )
+            if bool(getattr(self.model, "enable_self_qk", False)):
+                deltas = [
+                    self._self_stream_delta(inputs[0], block_index, kind)
+                    if self.model.self_stream_kind_enabled(kind)
+                    else torch.zeros_like(inputs[0])
+                    for kind in range(3)
+                ]
+            else:
+                value = self._self_stream_delta(inputs[0], block_index, 0)
+                deltas = [torch.zeros_like(value), torch.zeros_like(value), value]
+            return output + torch.cat(deltas, dim=-1).to(output.dtype)
 
         return hook
+
+    def _self_v_fused_hook(self, block_index: int):
+        """Compatibility alias for older callers and V/O-only checkpoints."""
+        return self._self_qkv_fused_hook(block_index)
 
     def _block_residual_hook(self, block_index: int):
         def hook(module, inputs, output):

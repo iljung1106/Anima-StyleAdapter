@@ -212,6 +212,63 @@ def test_sparse_expert_generator_routes_kv_and_independent_qo_paths() -> None:
     assert model.stream_style_key[1].weight.grad is not None
 
 
+def test_dense_controlled_experts_cover_cross_and_self_qkvo() -> None:
+    torch.manual_seed(31)
+    model = ReferenceConditionedKVActivationGenerator(
+        style_dim=32,
+        context_dim=24,
+        output_dim=40,
+        blocks=2,
+        hidden_dim=32,
+        heads=4,
+        ff_dim=64,
+        output_rank=8,
+        output_experts=4,
+        output_top_k=2,
+        output_dense_control=True,
+        output_init_scale=1e-3,
+        enable_qo=True,
+        stream_dim=40,
+        stream_rank=8,
+        stream_experts=4,
+        stream_top_k=2,
+        enable_self_vo=True,
+        enable_self_qk=True,
+        self_stream_rank=8,
+        self_stream_experts=4,
+        self_stream_top_k=2,
+        expert_bias_population_update=True,
+    )
+    style = torch.randn(2, 7, 32)
+    context = torch.randn(2, 9, 24)
+    stream = torch.randn(2, 11, 40)
+
+    kv = model(style, context, 1)
+    cross_codes = model.prepare_stream_codes(style)
+    self_codes = model.prepare_self_stream_codes(style)
+    cross = [model.stream_delta(stream, cross_codes, 1, kind) for kind in range(2)]
+    self_paths = [
+        model.self_stream_delta(stream, self_codes, 1, kind)
+        for kind in range(4)
+    ]
+    _, _, routing_metrics = model.routing_auxiliary()
+    population_metrics = model.apply_routing_population_update()
+
+    assert kv.shape == (2, 2, 9, 40)
+    assert self_codes.shape == (2, 2, 4, 32)
+    assert all(value.shape == stream.shape for value in cross + self_paths)
+    assert 0 < routing_metrics["self_topk_mass_kept"] <= 1
+    assert "self_ema_max_load" in population_metrics
+    sum(value.square().mean() for value in [kv, *cross, *self_paths]).backward()
+    assert model.output_channel_gates[1][0].weight.grad is not None
+    assert model.stream_expert_up.grad is not None
+    assert model.self_stream_expert_up.grad is not None
+    assert all(
+        model.self_stream_routers[1][kind].weight.grad is not None
+        for kind in range(4)
+    )
+
+
 def test_sparse_expert_generator_can_disable_q_and_keep_o() -> None:
     torch.manual_seed(29)
     model = ReferenceConditionedKVActivationGenerator(
@@ -885,11 +942,19 @@ class _FakeCrossAttention(nn.Module):
         self.output_proj = nn.Linear(8, 8, bias=False)
 
 
+class _FakeSelfAttention(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.qkv_proj = nn.Linear(8, 24, bias=False)
+        self.output_proj = nn.Linear(8, 8, bias=False)
+
+
 class _FakeAnima(nn.Module):
     def __init__(self) -> None:
         super().__init__()
         block = nn.Module()
         block.cross_attn = _FakeCrossAttention()
+        block.self_attn = _FakeSelfAttention()
         self.blocks = nn.ModuleList([block])
 
 
@@ -916,6 +981,34 @@ class _ConstantKVOQDelta(_ConstantDelta):
         kind: int,
     ) -> torch.Tensor:
         assert codes.shape == (len(values), 1, 2, 1)
+        return torch.full_like(values, float(kind + 1))
+
+
+class _ConstantFullQKVODelta(_ConstantDelta):
+    enable_qo = False
+    enable_self_vo = True
+    enable_self_qk = True
+    enable_self_q = True
+    enable_self_k = True
+    enable_self_v = True
+    enable_self_o = True
+    stream_dim = 8
+
+    def prepare_self_stream_codes(self, style: torch.Tensor) -> torch.Tensor:
+        return style.new_zeros(len(style), 1, 4, 1)
+
+    @staticmethod
+    def self_stream_kind_enabled(kind: int) -> bool:
+        return 0 <= kind < 4
+
+    def self_stream_delta(
+        self,
+        values: torch.Tensor,
+        codes: torch.Tensor,
+        block: int,
+        kind: int,
+    ) -> torch.Tensor:
+        assert codes.shape == (len(values), 1, 4, 1)
         return torch.full_like(values, float(kind + 1))
 
 
@@ -982,6 +1075,26 @@ def test_native_activation_injector_can_ablate_stream_without_changing_kv() -> N
     )
     torch.testing.assert_close(
         anima.blocks[0].cross_attn.output_proj(values), baseline_o
+    )
+    injector.close()
+
+
+def test_native_activation_injector_adds_full_self_attention_qkvo() -> None:
+    anima = _FakeAnima()
+    injector = NativeKVActivationInjector(anima, _ConstantFullQKVODelta())
+    values = torch.randn(2, 5, 8)
+    baseline_qkv = anima.blocks[0].self_attn.qkv_proj(values)
+    baseline_o = anima.blocks[0].self_attn.output_proj(values)
+    injector.set_style(torch.randn(2, 3, 7))
+
+    delta_qkv = anima.blocks[0].self_attn.qkv_proj(values) - baseline_qkv
+    q_delta, k_delta, v_delta = delta_qkv.chunk(3, dim=-1)
+    torch.testing.assert_close(q_delta, torch.ones_like(q_delta))
+    torch.testing.assert_close(k_delta, torch.full_like(k_delta, 2.0))
+    torch.testing.assert_close(v_delta, torch.full_like(v_delta, 3.0))
+    torch.testing.assert_close(
+        anima.blocks[0].self_attn.output_proj(values) - baseline_o,
+        torch.full_like(baseline_o, 4.0),
     )
     injector.close()
 
