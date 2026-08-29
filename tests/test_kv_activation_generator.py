@@ -17,6 +17,7 @@ from anima_style_data.kv_activation_generator import (
     _final_effect_constraints,
     _final_effect_direction_loss,
     _final_effect_retrieval_loss,
+    _teacher_relative_final_effect_discrimination,
     _mean_teacher_operator,
     _mixture_target,
     _population_common_occupancy,
@@ -70,6 +71,44 @@ def test_final_effect_retrieval_loss_rewards_correct_style_matching() -> None:
     assert matched["retrieval_accuracy"] == 1
     assert matched["correct_minus_hardest_wrong_cosine"] > 0
     assert mismatched["retrieval_accuracy"] == 0
+
+
+def test_teacher_relative_discrimination_uses_teacher_geometry() -> None:
+    teacher = torch.eye(4).reshape(4, 1, 2, 2)
+    matched_loss, matched = _teacher_relative_final_effect_discrimination(
+        teacher.clone(),
+        teacher,
+        margin_scale=0.25,
+        margin_cap=0.20,
+        minimum_teacher_distance=0.05,
+        rms_floor=1e-4,
+    )
+    mismatched_loss, mismatched = _teacher_relative_final_effect_discrimination(
+        teacher.roll(1, dims=0),
+        teacher,
+        margin_scale=0.25,
+        margin_cap=0.20,
+        minimum_teacher_distance=0.05,
+        rms_floor=1e-4,
+    )
+    identical = teacher[:1].expand(2, -1, -1, -1)
+    identical_loss, identical_metrics = (
+        _teacher_relative_final_effect_discrimination(
+            identical.clone(),
+            identical,
+            margin_scale=0.25,
+            margin_cap=0.20,
+            minimum_teacher_distance=0.05,
+            rms_floor=1e-4,
+        )
+    )
+
+    assert matched_loss == 0
+    assert mismatched_loss > matched_loss
+    assert matched["teacher_relative_margin"] > 0
+    assert mismatched["teacher_relative_active_fraction"] > 0
+    assert identical_loss == 0
+    assert identical_metrics["teacher_relative_valid_pairs"] == 0
 
 
 def test_same_artist_memory_consistency_is_rowwise() -> None:

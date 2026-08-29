@@ -2360,6 +2360,86 @@ def _final_effect_retrieval_loss(
     }
 
 
+def _teacher_relative_final_effect_discrimination(
+    student: torch.Tensor,
+    teacher: torch.Tensor,
+    *,
+    margin_scale: float,
+    margin_cap: float,
+    minimum_teacher_distance: float,
+    rms_floor: float,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Separate final effects only as much as their teachers are separated.
+
+    All rows must share content, noise, and timestep. Unlike unconditional
+    contrastive repulsion, near-identical teacher effects are ignored and the
+    required correct-vs-wrong margin grows with teacher angular distance. No
+    batch centering or batch-mean subtraction is performed.
+    """
+
+    student_flat = student.float().flatten(1)
+    teacher_flat = teacher.detach().float().flatten(1)
+    zero = student_flat.new_zeros(())
+    batch = int(student_flat.shape[0])
+    if batch < 2:
+        return zero, {
+            "teacher_relative_discrimination_loss": zero.detach(),
+            "teacher_relative_active_fraction": zero.detach(),
+            "teacher_relative_valid_pairs": zero.detach(),
+            "teacher_relative_margin": zero.detach(),
+            "teacher_relative_correct_minus_wrong_cosine": zero.detach(),
+        }
+
+    student_unit = F.normalize(student_flat, dim=-1)
+    teacher_unit = F.normalize(teacher_flat, dim=-1)
+    student_teacher_cosine = student_unit @ teacher_unit.T
+    teacher_cosine = teacher_unit @ teacher_unit.T
+    teacher_distance = (1.0 - teacher_cosine).clamp_min(0.0)
+    teacher_rms = teacher_flat.square().mean(dim=1).sqrt()
+    off_diagonal = ~torch.eye(batch, device=student.device, dtype=torch.bool)
+    valid = (
+        off_diagonal
+        & (teacher_distance >= float(minimum_teacher_distance))
+        & (teacher_rms[:, None] >= float(rms_floor))
+        & (teacher_rms[None, :] >= float(rms_floor))
+    )
+    if not bool(valid.any()):
+        return zero, {
+            "teacher_relative_discrimination_loss": zero.detach(),
+            "teacher_relative_active_fraction": zero.detach(),
+            "teacher_relative_valid_pairs": valid.sum().detach(),
+            "teacher_relative_margin": zero.detach(),
+            "teacher_relative_correct_minus_wrong_cosine": zero.detach(),
+        }
+
+    margin = (
+        teacher_distance * float(margin_scale)
+    ).clamp_max(float(margin_cap)).detach()
+    correct = student_teacher_cosine.diagonal()
+    row_violation = F.relu(
+        student_teacher_cosine - correct[:, None] + margin
+    )[valid]
+    column_violation = F.relu(
+        student_teacher_cosine - correct[None, :] + margin
+    )[valid]
+    loss = 0.5 * (row_violation.mean() + column_violation.mean())
+    active = 0.5 * (
+        (row_violation > 0).float().mean()
+        + (column_violation > 0).float().mean()
+    )
+    gap = 0.5 * (
+        (correct[:, None] - student_teacher_cosine)[valid].mean()
+        + (correct[None, :] - student_teacher_cosine)[valid].mean()
+    )
+    return loss, {
+        "teacher_relative_discrimination_loss": loss.detach(),
+        "teacher_relative_active_fraction": active.detach(),
+        "teacher_relative_valid_pairs": valid.sum().detach(),
+        "teacher_relative_margin": margin[valid].mean().detach(),
+        "teacher_relative_correct_minus_wrong_cosine": gap.detach(),
+    }
+
+
 def _final_effect_constraints(
     student: torch.Tensor,
     teacher: torch.Tensor,
@@ -2524,6 +2604,13 @@ def _compact_direct_delta_metrics(row: dict[str, float]) -> dict[str, float]:
         "whole/rms_upper_violation_rate",
         "whole/common_cap_weighted_loss",
         "whole/relative_common_weighted_loss",
+        "whole/teacher_relative_discrimination_loss",
+        "whole/teacher_relative_discrimination_weight",
+        "whole/teacher_relative_discrimination_weighted",
+        "whole/teacher_relative_active_fraction",
+        "whole/teacher_relative_valid_pairs",
+        "whole/teacher_relative_margin",
+        "whole/teacher_relative_correct_minus_wrong_cosine",
         "whole/positive_pairwise_cosine",
         "reader_reconstruction_loss",
         "reader_reconstruction_weight",
@@ -7246,6 +7333,49 @@ def train_direct_reference_kv_delta_320(
                             whole_model.get("retrieval_weight", 0.0),
                         )
                     ) * retrieval_loss
+                    teacher_relative_weight_target = float(
+                        whole_model.get(
+                            "teacher_relative_discrimination_weight", 0.0
+                        )
+                    )
+                    teacher_relative_ramp_steps = int(
+                        whole_model.get(
+                            "teacher_relative_discrimination_ramp_steps", 0
+                        )
+                    )
+                    teacher_relative_weight = teacher_relative_weight_target
+                    if teacher_relative_ramp_steps > 0:
+                        teacher_relative_weight *= min(
+                            1.0,
+                            relative_step / teacher_relative_ramp_steps,
+                        )
+                    (
+                        teacher_relative_loss,
+                        teacher_relative_metrics,
+                    ) = _teacher_relative_final_effect_discrimination(
+                        final_student,
+                        final_teacher,
+                        margin_scale=float(
+                            whole_model.get(
+                                "teacher_relative_discrimination_margin_scale", 0.25
+                            )
+                        ),
+                        margin_cap=float(
+                            whole_model.get(
+                                "teacher_relative_discrimination_margin_cap", 0.20
+                            )
+                        ),
+                        minimum_teacher_distance=float(
+                            whole_model.get(
+                                "teacher_relative_discrimination_minimum_teacher_distance",
+                                0.05,
+                            )
+                        ),
+                        rms_floor=float(whole_model.get("rms_floor", 1e-4)),
+                    )
+                    teacher_relative_weighted = (
+                        teacher_relative_weight * teacher_relative_loss
+                    )
                     domain_loss = dict(
                         dict(multi_domain.get("loss_by_domain", {})).get(
                             distillation_domain, {}
@@ -7265,6 +7395,7 @@ def train_direct_reference_kv_delta_320(
                         * constraint_loss
                         + relative_common_weighted
                         + retrieval_weighted
+                        + teacher_relative_weighted
                         + float(whole_model.get("reader_consistency_weight", 0.0))
                         * reader_consistency
                         + float(whole_model.get("reader_contrastive_weight", 0.0))
@@ -7292,6 +7423,16 @@ def train_direct_reference_kv_delta_320(
                         "whole/relative_common_weighted_loss": (
                             relative_common_weighted.detach()
                         ),
+                        "whole/teacher_relative_discrimination_weight": (
+                            final_huber.new_tensor(teacher_relative_weight)
+                        ),
+                        "whole/teacher_relative_discrimination_weighted": (
+                            teacher_relative_weighted.detach()
+                        ),
+                        **{
+                            f"whole/{key}": value
+                            for key, value in teacher_relative_metrics.items()
+                        },
                         **{
                             f"whole/{key}": value
                             for key, value in retrieval_metrics.items()
@@ -8981,6 +9122,33 @@ def sample_expert_dense32x16_kvo_selfvo_consistent_flow_5k(
         destination,
         sample_config_key=(
             "kv_reference_expert_dense32x16_kvo_selfvo_consistent_flow_5000_sample"
+        ),
+    )
+
+
+def train_scheduled_expert_dense32x16_kvo_selfvo_teacher_relative_2k(
+    config: dict[str, Any], destination: Path
+) -> dict[str, Any]:
+    return train_scheduled_direct_reference_kv_delta_320(
+        config,
+        destination,
+        config_key=(
+            "kv_reference_expert_dense32x16_kvo_selfvo_teacher_relative_2000"
+        ),
+        sample_config_key=(
+            "kv_reference_expert_dense32x16_kvo_selfvo_teacher_relative_2000_sample"
+        ),
+    )
+
+
+def sample_expert_dense32x16_kvo_selfvo_teacher_relative_2k(
+    config: dict[str, Any], destination: Path
+) -> dict[str, Any]:
+    return sample_direct_reference_kv_delta_320(
+        config,
+        destination,
+        sample_config_key=(
+            "kv_reference_expert_dense32x16_kvo_selfvo_teacher_relative_2000_sample"
         ),
     )
 

@@ -4088,6 +4088,60 @@ kv_reference_expert_dense32x16_kvo_selfvo_consistent_flow_5000_sample:
   external_panel:
     reference_seed: 20261009
 
+# Fresh v40 architecture with teacher-geometry-calibrated final-effect
+# discrimination. Distinct styles share content/noise/timestep in each
+# distillation micro-batch; no batch mean is subtracted. Similar teacher effects
+# are left close, while genuinely different effects receive a proportional
+# correct-vs-wrong margin.
+kv_reference_expert_dense32x16_kvo_selfvo_teacher_relative_2000:
+  extends_config_key: kv_reference_expert_dense32x16_kvo_selfvo_consistent_flow_5000
+  output_directory: kv_reference_expert_dense32x16_top4_kvo_selfvo_w1024_l4_teacher_relative_2k_v41
+  initial_checkpoint: null
+  initial_reader_checkpoint: null
+  initial_step: 0
+  reset_initial_step: true
+  seed: 20261010
+  training:
+    steps: 2000
+    validation_every: 500
+    checkpoint_every: 500
+    sample_output_root: diagnostics/kv-reference-expert-dense32x16-top4-kvo-selfvo-w1024-l4-teacher-relative-2k-v41
+    sample_steps: [500, 1000, 1500, 2000]
+    whole_model_functional:
+      teacher_relative_discrimination_weight: 0.5
+      teacher_relative_discrimination_ramp_steps: 500
+      teacher_relative_discrimination_margin_scale: 0.25
+      teacher_relative_discrimination_margin_cap: 0.20
+      teacher_relative_discrimination_minimum_teacher_distance: 0.05
+    generator_lr_schedule:
+      peak_lr: 0.000005
+      warmup_steps: 300
+      decay_start_step: 1400
+      decay_end_step: 2000
+      final_lr: 0.0000015
+      tail_decay_end_step: 2000
+      tail_final_lr: 0.0000015
+    reader_lr_schedule:
+      peak_lr: 0.00000125
+      warmup_steps: 300
+      decay_start_step: 500
+      decay_end_step: 1500
+      final_lr: 0.000000125
+    wandb:
+      enabled: true
+      project: anima-style-adapter
+      name: kv-reference-expert-dense32x16-top4-kvo-selfvo-w1024-l4-teacher-relative-2k-v41
+      id: kv-reference-expert-dense32x16-top4-kvo-selfvo-w1024-l4-teacher-relative-2k-v41
+      resume: never
+
+kv_reference_expert_dense32x16_kvo_selfvo_teacher_relative_2000_sample:
+  extends_config_key: kv_reference_expert_dense32x16_kvo_selfvo_consistent_flow_5000_sample
+  checkpoint: kv_reference_expert_dense32x16_top4_kvo_selfvo_w1024_l4_teacher_relative_2k_v41/checkpoints/step-0002000.pt
+  output_directory: diagnostics/kv-reference-expert-dense32x16-top4-kvo-selfvo-w1024-l4-teacher-relative-2k-v41-step2000
+  reference_seed: 20261010
+  external_panel:
+    reference_seed: 20261011
+
 # Reference-conditioned low-rank operator pilot. Unlike the direct activation
 # head above, the reference generates a fresh block-local linear operator and
 # applies it to every native text token.  Teacher factors remain offline
