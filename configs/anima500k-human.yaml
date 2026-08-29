@@ -3818,13 +3818,16 @@ kv_reference_expert_external_kvo_selfvo_5000_sample:
 # every sixth optimizer step is stronger real-image flow with prior preservation.
 kv_reference_expert_dense64x16_full_qkvo_flow_5000:
   extends_config_key: kv_reference_expert_lora_only_20000
-  output_directory: kv_reference_expert_dense64x16_top4_fullqkvo_w1024_l4_flow_5k_v37
+  output_directory: kv_reference_expert_dense64x16_top4_fullqkvo_w1024_l4_flow_5k_v38
   initial_checkpoint: null
   initial_reader_checkpoint: null
   initial_step: 0
   reset_initial_step: true
   seed: 20261004
   model:
+    # Keep the base-preserving tiny output initialization intentionally. The
+    # Adafactor scale floor below makes the configured LR an absolute update.
+    output_init_scale: 0.000001
     hidden_dim: 1024
     heads: 16
     ff_dim: 4096
@@ -3871,7 +3874,9 @@ kv_reference_expert_dense64x16_full_qkvo_flow_5000:
     reader_master_dtype: float32
     optimizer: adafactor
     adafactor_beta2_decay: -0.8
-    adafactor_eps2: 0.001
+    # PyTorch Adafactor multiplies LR by max(eps2, parameter RMS). A unit floor
+    # restores conventional absolute-LR updates for the tiny expert-up tensors.
+    adafactor_eps2: 1.0
     adafactor_d: 1.0
     max_grad_norm: 150000.0
     reader_max_grad_norm: 100.0
@@ -3882,7 +3887,7 @@ kv_reference_expert_dense64x16_full_qkvo_flow_5000:
     checkpoint_every: 500
     sample_every: 0
     sample_steps: [500, 1000, 1500, 2000, 3000, 4000, 5000]
-    sample_output_root: diagnostics/kv-reference-expert-dense64x16-top4-fullqkvo-w1024-l4-flow-5k-v37
+    sample_output_root: diagnostics/kv-reference-expert-dense64x16-top4-fullqkvo-w1024-l4-flow-5k-v38
     multi_domain_distillation:
       enabled: true
       schedule: [external_single, lora_synthetic, external_mixture, lora_mixture, lora_human]
@@ -3941,14 +3946,14 @@ kv_reference_expert_dense64x16_full_qkvo_flow_5000:
     wandb:
       enabled: true
       project: anima-style-adapter
-      name: kv-reference-expert-dense64x16-top4-fullqkvo-w1024-l4-flow-5k-v37
-      id: kv-reference-expert-dense64x16-top4-fullqkvo-w1024-l4-flow-5k-v37
+      name: kv-reference-expert-dense64x16-top4-fullqkvo-w1024-l4-flow-5k-v38
+      id: kv-reference-expert-dense64x16-top4-fullqkvo-w1024-l4-flow-5k-v38
       resume: allow
 
 kv_reference_expert_dense64x16_full_qkvo_flow_5000_sample:
   extends_config_key: kv_reference_expert_combined_calibrated_3000_sample
-  checkpoint: kv_reference_expert_dense64x16_top4_fullqkvo_w1024_l4_flow_5k_v37/checkpoints/step-0005000.pt
-  output_directory: diagnostics/kv-reference-expert-dense64x16-top4-fullqkvo-w1024-l4-flow-5k-v37-step5000
+  checkpoint: kv_reference_expert_dense64x16_top4_fullqkvo_w1024_l4_flow_5k_v38/checkpoints/step-0005000.pt
+  output_directory: diagnostics/kv-reference-expert-dense64x16-top4-fullqkvo-w1024-l4-flow-5k-v38-step5000
   reference_seed: 20261004
   external_panel:
     reference_seed: 20261005
