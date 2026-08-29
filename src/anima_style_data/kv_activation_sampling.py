@@ -149,8 +149,10 @@ class NativeKVActivationInjector:
         self.style_memory: torch.Tensor | None = None
         self.kv_factors: tuple[torch.Tensor, torch.Tensor] | None = None
         self.stream_codes: torch.Tensor | None = None
+        self.block_residual_codes: torch.Tensor | None = None
         self.strength = 1.0
         self.stream_strength = 1.0
+        self.block_residual_strength = 1.0
         self.enabled = False
         self.block_mask: torch.Tensor | None = None
         self.handles: list[Any] = []
@@ -204,6 +206,12 @@ class NativeKVActivationInjector:
                             self._stream_hook(block_index, 1)
                         )
                     )
+            if bool(getattr(model, "enable_block_residual", False)):
+                self.handles.append(
+                    block.register_forward_hook(
+                        self._block_residual_hook(block_index)
+                    )
+                )
 
     def set_style(
         self,
@@ -211,6 +219,7 @@ class NativeKVActivationInjector:
         *,
         strength: float = 1.0,
         stream_strength: float | None = None,
+        block_residual_strength: float | None = None,
         block_mask: torch.Tensor | None = None,
     ) -> None:
         if style_memory.ndim != 3:
@@ -228,11 +237,21 @@ class NativeKVActivationInjector:
             if bool(getattr(self.model, "enable_qo", False))
             else None
         )
+        self.block_residual_codes = (
+            self.model.prepare_block_residual_codes(style_memory)
+            if bool(getattr(self.model, "enable_block_residual", False))
+            else None
+        )
         self.strength = float(strength)
         self.stream_strength = (
             self.strength
             if stream_strength is None
             else float(stream_strength)
+        )
+        self.block_residual_strength = (
+            self.strength
+            if block_residual_strength is None
+            else float(block_residual_strength)
         )
         if block_mask is not None and block_mask.ndim != 1:
             raise ValueError("block_mask must be one-dimensional")
@@ -244,6 +263,7 @@ class NativeKVActivationInjector:
         self.block_mask = None
         self.kv_factors = None
         self.stream_codes = None
+        self.block_residual_codes = None
 
     def _block_enabled(self, block_index: int) -> bool:
         return self.block_mask is None or bool(self.block_mask[block_index].item())
@@ -292,6 +312,22 @@ class NativeKVActivationInjector:
             return output + self._stream_delta(
                 inputs[0], block_index, kind
             ).to(output.dtype)
+
+        return hook
+
+    def _block_residual_hook(self, block_index: int):
+        def hook(module, inputs, output):
+            if not self.enabled or not self._block_enabled(block_index):
+                return output
+            if self.block_residual_codes is None:
+                raise RuntimeError("No active block residual codes")
+            codes = _repeat_factor_rows(
+                self.block_residual_codes, int(output.shape[0])
+            )
+            delta = self.model.block_residual_delta(
+                output, codes, block_index
+            )
+            return output + delta.to(output.dtype) * self.block_residual_strength
 
         return hook
 

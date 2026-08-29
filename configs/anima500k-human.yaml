@@ -3041,6 +3041,97 @@ kv_reference_expert_combined_calibrated_3000_sample:
     reference_cache: civitai_external/synthetic_references_682x4_triggered_v1/dual_query_reference_tokens_v8_step10000
     source_manifest: civitai_external/synthetic_references_682x4_triggered_v1/manifest.parquet
 
+# v24 peaks around step 500 because a cross-attention-only student is asked to
+# reproduce full external LoRAs: all 298 external adapters also modify
+# self-attention and/or MLP projections. Warm-start the stable v24 EMA and add
+# a sparse low-rank residual after each complete DiT block. This path acts on
+# live image tokens, so it can represent the aggregate content-dependent effect
+# of those missing internal LoRA sites without cloning every vendor topology.
+kv_reference_expert_external_block_residual_2000:
+  extends_config_key: kv_reference_expert_combined_calibrated_3000
+  output_directory: kv_reference_expert_external_block16x16_top4_b3_w768_l3_2k_v25
+  initial_checkpoint: kv_reference_expert_combined_calibrated_b3_w768_l3_3k_v24/checkpoints/step-0000500.pt
+  initial_use_ema_model: true
+  initial_use_ema_reader: true
+  initial_checkpoint_allow_new_parameters: true
+  initial_step: 0
+  reset_initial_step: true
+  seed: 20260909
+  model:
+    enable_block_residual: true
+    block_residual_rank: 16
+    block_residual_experts: 16
+    block_residual_top_k: 4
+    block_residual_init_scale: 0.000001
+  training:
+    steps: 2000
+    validation_every: 250
+    checkpoint_every: 250
+    sample_steps: [250, 500, 1000, 1500, 2000]
+    sample_output_root: diagnostics/kv-reference-expert-external-block16x16-top4-b3-w768-l3-2k-v25
+    # Keep the stable inherited K/V function nearly fixed while the new
+    # block path receives the learning rate needed to leave its zero-function
+    # initialization. Reader calibration moves only on a very slow tail.
+    generator_learning_rate: 0.0000002
+    block_residual_lr_multiplier: 10.0
+    reader_learning_rate: 0.00000005
+    generator_lr_schedule:
+      peak_lr: 0.0000002
+      warmup_steps: 50
+      decay_start_step: 1000
+      decay_end_step: 2000
+      final_lr: 0.00000004
+      tail_decay_end_step: 2000
+      tail_final_lr: 0.00000004
+    reader_lr_schedule:
+      peak_lr: 0.00000005
+      warmup_steps: 50
+      decay_start_step: 250
+      decay_end_step: 1000
+      final_lr: 0.00000001
+    multi_domain_distillation:
+      # This causal run removes the original K/V-only LoRA domains. Exact
+      # synthetic/human artist tags remain, and external singles/mixtures
+      # directly supervise the newly broadened full-block intervention.
+      schedule: [external_single, artist_synthetic, external_mixture, external_single, artist_human, external_mixture]
+    human_flow:
+      phases:
+        - {end_step: 2000, cycle: 6, slots: [5]}
+      flow_loss_weight: 2.5
+      prior_preservation_weight: 0.10
+      fixed_validation_every: 250
+      fixed_validation_batches: 4
+    wandb:
+      enabled: true
+      project: anima-style-adapter
+      name: kv-reference-expert-external-block16x16-top4-b3-w768-l3-2k-v25
+      id: kv-reference-expert-external-block16x16-top4-b3-w768-l3-2k-v25
+      resume: allow
+
+kv_reference_expert_external_block_residual_2000_sample:
+  checkpoint: kv_reference_expert_external_block16x16_top4_b3_w768_l3_2k_v25/checkpoints/step-0002000.pt
+  output_directory: diagnostics/kv-reference-expert-external-block16x16-top4-b3-w768-l3-2k-v25-step2000
+  device: cuda
+  artists: 8
+  references: 4
+  reference_seed: 20260914
+  strengths: [1.0, 2.0]
+  batch_size: 4
+  panel_tile_width: 384
+  panel_style_cache: "."
+  panel_style_manifest: final_manifest.parquet
+  external_panel:
+    enabled: true
+    training_seed: 20260909
+    validation_single_styles: 32
+    styles: 8
+    references: 4
+    reference_seed: 20260915
+    minimum_effect_rms: 0.001
+    functional_teacher_cache: civitai_external/functional_teacher_298_mix384_clean24x8_trigger4x4_v1
+    reference_cache: civitai_external/synthetic_references_682x4_triggered_v1/dual_query_reference_tokens_v8_step10000
+    source_manifest: civitai_external/synthetic_references_682x4_triggered_v1/manifest.parquet
+
 # Reference-conditioned low-rank operator pilot. Unlike the direct activation
 # head above, the reference generates a fresh block-local linear operator and
 # applies it to every native text token.  Teacher factors remain offline

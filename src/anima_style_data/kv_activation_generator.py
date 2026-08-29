@@ -98,6 +98,11 @@ class ReferenceConditionedKVActivationGenerator(nn.Module):
         stream_rank: int = 32,
         stream_experts: int = 0,
         stream_top_k: int = 0,
+        enable_block_residual: bool = False,
+        block_residual_rank: int = 16,
+        block_residual_experts: int = 0,
+        block_residual_top_k: int = 0,
+        block_residual_init_scale: float = 1e-6,
         expert_usage_decay: float = 0.99,
         expert_balance_cap: float = 1.5,
         router_init_scale: float = 1.0,
@@ -126,12 +131,14 @@ class ReferenceConditionedKVActivationGenerator(nn.Module):
             raise ValueError("hidden_dim must be divisible by heads")
         if ff_layers <= 0 or output_rank < 0:
             raise ValueError("ff_layers must be positive and output_rank non-negative")
-        if output_experts < 0 or stream_experts < 0:
+        if output_experts < 0 or stream_experts < 0 or block_residual_experts < 0:
             raise ValueError("expert counts must be non-negative")
         if output_experts and not 0 < output_top_k <= output_experts:
             raise ValueError("output_top_k must select existing experts")
         if stream_experts and not 0 < stream_top_k <= stream_experts:
             raise ValueError("stream_top_k must select existing experts")
+        if block_residual_experts and not 0 < block_residual_top_k <= block_residual_experts:
+            raise ValueError("block_residual_top_k must select existing experts")
         if not 0.0 <= expert_usage_decay < 1.0 or expert_balance_cap < 1.0:
             raise ValueError("expert usage controls are invalid")
         if output_init_scale < 0:
@@ -155,6 +162,19 @@ class ReferenceConditionedKVActivationGenerator(nn.Module):
         self.stream_rank = int(stream_rank)
         self.stream_experts = int(stream_experts)
         self.stream_top_k = int(stream_top_k)
+        self.enable_block_residual = bool(enable_block_residual)
+        self.block_residual_rank = int(block_residual_rank)
+        self.block_residual_experts = int(block_residual_experts)
+        self.block_residual_top_k = int(block_residual_top_k)
+        self.block_residual_init_scale = float(block_residual_init_scale)
+        if self.enable_block_residual and (
+            self.block_residual_rank <= 0 or self.block_residual_experts <= 0
+        ):
+            raise ValueError(
+                "block residuals require positive rank and expert count"
+            )
+        if self.block_residual_init_scale < 0:
+            raise ValueError("block_residual_init_scale must be non-negative")
         self.expert_usage_decay = float(expert_usage_decay)
         self.expert_balance_cap = float(expert_balance_cap)
         self.router_init_scale = float(router_init_scale)
@@ -222,10 +242,10 @@ class ReferenceConditionedKVActivationGenerator(nn.Module):
         self._routing_balance_terms: list[torch.Tensor] = []
         self._routing_specialization_terms: list[torch.Tensor] = []
         self._routing_entropies: dict[str, list[torch.Tensor]] = {
-            "kv": [], "qo": [],
+            "kv": [], "qo": [], "block": [],
         }
         self._routing_margins: dict[str, list[torch.Tensor]] = {
-            "kv": [], "qo": [],
+            "kv": [], "qo": [], "block": [],
         }
         self._routing_record_enabled = True
         self._routing_population_records: list[
@@ -396,6 +416,68 @@ class ReferenceConditionedKVActivationGenerator(nn.Module):
                     )
                     for _ in range(blocks)
                 )
+        if self.enable_block_residual:
+            # A full external LoRA changes self-attention, MLP, and sometimes
+            # AdaLN in addition to cross-attention.  One style-conditioned
+            # low-rank update after each complete DiT block is an efficient
+            # first-order surrogate for that aggregate local effect.  It keeps
+            # native content/timestep dependence because it acts on the live
+            # block output rather than emitting a constant style vector.
+            self.block_residual_queries = nn.Parameter(
+                torch.empty(blocks, hidden_dim)
+            )
+            self.block_residual_key = nn.Linear(
+                style_dim, hidden_dim, bias=False
+            )
+            self.block_residual_value = nn.Linear(
+                style_dim, hidden_dim, bias=False
+            )
+            self.block_residual_code_norm = nn.LayerNorm(hidden_dim)
+            self.block_residual_routers = nn.ModuleList(
+                nn.Linear(hidden_dim, self.block_residual_experts, bias=True)
+                for _ in range(blocks)
+            )
+            self.block_residual_channel_gates = nn.ModuleList(
+                nn.Linear(
+                    hidden_dim,
+                    self.block_residual_experts * self.block_residual_rank,
+                    bias=True,
+                )
+                for _ in range(blocks)
+            )
+            self.block_residual_gain = nn.ModuleList(
+                nn.Linear(hidden_dim, 1, bias=True) for _ in range(blocks)
+            )
+            self.block_residual_down = nn.Parameter(torch.empty(
+                blocks,
+                self.block_residual_experts,
+                self.block_residual_rank,
+                stream_dim,
+            ))
+            self.block_residual_up = nn.Parameter(torch.empty(
+                blocks,
+                self.block_residual_experts,
+                self.block_residual_rank,
+                stream_dim,
+            ))
+            self.register_buffer(
+                "block_residual_expert_usage",
+                torch.full(
+                    (blocks, 1, self.block_residual_experts),
+                    1.0 / self.block_residual_experts,
+                ),
+            )
+            self.register_buffer(
+                "block_residual_expert_load",
+                torch.full(
+                    (blocks, 1, self.block_residual_experts),
+                    self.block_residual_top_k / self.block_residual_experts,
+                ),
+            )
+            self.register_buffer(
+                "block_residual_expert_selection_bias",
+                torch.zeros(blocks, 1, self.block_residual_experts),
+            )
         self.reset_parameters(float(output_init_scale))
 
     def _load_from_state_dict(
@@ -416,6 +498,8 @@ class ReferenceConditionedKVActivationGenerator(nn.Module):
             "output_expert_selection_bias",
             "stream_expert_load",
             "stream_expert_selection_bias",
+            "block_residual_expert_load",
+            "block_residual_expert_selection_bias",
         ):
             if hasattr(self, name) and prefix + name not in state_dict:
                 state_dict[prefix + name] = getattr(self, name).detach().clone()
@@ -487,6 +571,28 @@ class ReferenceConditionedKVActivationGenerator(nn.Module):
             for head in self.output_head:
                 with torch.no_grad():
                     head.weight.mul_(output_init_scale)
+        if self.enable_block_residual:
+            nn.init.normal_(
+                self.block_residual_queries, std=self.hidden_dim**-0.5
+            )
+            nn.init.normal_(
+                self.block_residual_down, std=self.stream_dim**-0.5
+            )
+            nn.init.normal_(
+                self.block_residual_up,
+                std=(
+                    self.block_residual_rank**-0.5
+                    * self.block_residual_init_scale
+                ),
+            )
+            for block in range(self.blocks):
+                router = self.block_residual_routers[block]
+                nn.init.zeros_(router.bias)
+                with torch.no_grad():
+                    router.weight.mul_(self.router_init_scale)
+                nn.init.zeros_(self.block_residual_channel_gates[block].bias)
+                nn.init.zeros_(self.block_residual_gain[block].weight)
+                nn.init.zeros_(self.block_residual_gain[block].bias)
 
     def forward(
         self,
@@ -708,6 +814,92 @@ class ReferenceConditionedKVActivationGenerator(nn.Module):
         hidden = self.stream_down[block_index][kind](stream_input)
         return self.stream_up[block_index][kind](hidden * gate[:, None, :])
 
+    def prepare_block_residual_codes(
+        self, style_memory: torch.Tensor
+    ) -> torch.Tensor:
+        """Read one reference code for each complete DiT block."""
+
+        if not self.enable_block_residual:
+            raise RuntimeError("Block residual modulation is disabled")
+        style = self.style_norm(style_memory)
+        batch, style_tokens, _ = style.shape
+        queries = self.block_residual_queries[None].expand(batch, -1, -1)
+        queries = queries.reshape(
+            batch, self.blocks, self.heads, self.head_dim
+        ).transpose(1, 2)
+        key = self.block_residual_key(style).reshape(
+            batch, style_tokens, self.heads, self.head_dim
+        ).transpose(1, 2)
+        value = self.block_residual_value(style).reshape(
+            batch, style_tokens, self.heads, self.head_dim
+        ).transpose(1, 2)
+        codes = F.scaled_dot_product_attention(queries, key, value)
+        codes = codes.transpose(1, 2).reshape(
+            batch, self.blocks, self.hidden_dim
+        )
+        return self.block_residual_code_norm(codes)
+
+    def block_residual_delta(
+        self,
+        block_output: torch.Tensor,
+        block_codes: torch.Tensor,
+        block_index: int,
+    ) -> torch.Tensor:
+        """Apply a sparse style-conditioned low-rank block-output update."""
+
+        if not self.enable_block_residual:
+            raise RuntimeError("Block residual modulation is disabled")
+        if block_output.shape[-1] != self.stream_dim:
+            raise ValueError(
+                f"Expected block width {self.stream_dim}, "
+                f"got {block_output.shape[-1]}"
+            )
+        original_shape = block_output.shape
+        values = block_output.reshape(len(block_output), -1, self.stream_dim)
+        code = block_codes[:, block_index]
+        logits = self.block_residual_routers[block_index](code)
+        indices, weights, sparse, dense, selected = self._sparse_router(
+            logits[:, None],
+            self.block_residual_top_k,
+            self.block_residual_expert_selection_bias[block_index],
+        )
+        indices = indices[:, 0]
+        weights = weights[:, 0]
+        self._record_routing(
+            "block",
+            self.block_residual_expert_usage,
+            self.block_residual_expert_load,
+            self.block_residual_expert_selection_bias,
+            block_index,
+            sparse,
+            dense,
+            selected,
+            self.block_residual_top_k,
+            logits[:, None],
+            usage_kind=0,
+        )
+        channels = torch.tanh(
+            self.block_residual_channel_gates[block_index](code).reshape(
+                len(code),
+                self.block_residual_experts,
+                self.block_residual_rank,
+            )
+        )
+        batch_rows = torch.arange(len(code), device=code.device)[:, None]
+        selected_channels = channels[batch_rows, indices]
+        selected_down = self.block_residual_down[block_index][indices]
+        selected_up = self.block_residual_up[block_index][indices]
+        hidden = torch.einsum(
+            "bnc,bkrc->bknr", values, selected_down
+        ) * selected_channels[:, :, None]
+        delta = torch.einsum(
+            "bknr,bkro,bk->bno", hidden, selected_up, weights
+        )
+        gain = 2.0 * torch.sigmoid(
+            self.block_residual_gain[block_index](code).float()
+        ).to(delta.dtype)
+        return (delta * gain[:, None]).reshape(original_shape)
+
     def _sparse_router(
         self,
         logits: torch.Tensor,
@@ -767,18 +959,16 @@ class ReferenceConditionedKVActivationGenerator(nn.Module):
         return 1.0 + progress * (self.router_temperature_end - 1.0)
 
     def _core_margin_target(self, name: str) -> float:
-        target = (
-            self.output_core_margin if name == "kv" else self.stream_core_margin
+        target = self.output_core_margin if name == "kv" else (
+            self.stream_core_margin if name == "qo" else 0.0
         )
         elapsed = max(0, self._routing_step - self.expert_specialization_start_step)
         progress = min(1.0, elapsed / max(1, self.expert_specialization_steps))
         return target * progress
 
     def _entropy_cap(self, name: str, top_k: int) -> float:
-        target = (
-            self.output_entropy_target
-            if name == "kv"
-            else self.stream_entropy_target
+        target = self.output_entropy_target if name == "kv" else (
+            self.stream_entropy_target if name == "qo" else -1.0
         )
         maximum = math.log(max(1, int(top_k)))
         if target < 0:
@@ -844,8 +1034,8 @@ class ReferenceConditionedKVActivationGenerator(nn.Module):
             * probabilities.float()
         ).sum(dim=-1).mean()
         self._routing_entropies[name].append(entropy)
-        core_experts = (
-            self.output_core_experts if name == "kv" else self.stream_core_experts
+        core_experts = self.output_core_experts if name == "kv" else (
+            self.stream_core_experts if name == "qo" else 0
         )
         if core_experts:
             ordered = router_logits.float().sort(dim=-1, descending=True).values
@@ -917,7 +1107,7 @@ class ReferenceConditionedKVActivationGenerator(nn.Module):
                 bias_rows = self.output_expert_selection_bias[block]
                 top_k = self.output_top_k
                 experts = self.output_experts
-            else:
+            elif name == "qo":
                 assert kind is not None
                 usage_rows = self.stream_expert_usage[block, kind : kind + 1]
                 load_rows = self.stream_expert_load[block, kind : kind + 1]
@@ -926,6 +1116,17 @@ class ReferenceConditionedKVActivationGenerator(nn.Module):
                 ]
                 top_k = self.stream_top_k
                 experts = self.stream_experts
+            else:
+                assert name == "block" and kind == 0
+                usage_rows = self.block_residual_expert_usage[
+                    block, 0:1
+                ]
+                load_rows = self.block_residual_expert_load[block, 0:1]
+                bias_rows = self.block_residual_expert_selection_bias[
+                    block, 0:1
+                ]
+                top_k = self.block_residual_top_k
+                experts = self.block_residual_experts
             usage_rows.mul_(self.expert_usage_decay).add_(
                 current_usage, alpha=1.0 - self.expert_usage_decay
             )
@@ -950,6 +1151,12 @@ class ReferenceConditionedKVActivationGenerator(nn.Module):
         for name, load, top_k, experts in (
             ("kv", getattr(self, "output_expert_load", None), self.output_top_k, self.output_experts),
             ("qo", getattr(self, "stream_expert_load", None), self.stream_top_k, self.stream_experts),
+            (
+                "block",
+                getattr(self, "block_residual_expert_load", None),
+                self.block_residual_top_k,
+                self.block_residual_experts,
+            ),
         ):
             if load is None or not experts:
                 continue
@@ -990,7 +1197,11 @@ class ReferenceConditionedKVActivationGenerator(nn.Module):
             entropy = torch.stack(values).mean() if values else zero
             metrics[f"{name}_router_entropy"] = entropy.detach()
             metrics[f"{name}_effective_experts"] = entropy.detach().exp()
-            top_k = self.output_top_k if name == "kv" else self.stream_top_k
+            top_k = self.output_top_k if name == "kv" else (
+                self.stream_top_k
+                if name == "qo"
+                else self.block_residual_top_k
+            )
             metrics[f"{name}_entropy_cap"] = zero.new_tensor(
                 self._entropy_cap(name, top_k)
             )
@@ -1016,6 +1227,17 @@ class ReferenceConditionedKVActivationGenerator(nn.Module):
             metrics["qo_expert_bias_span"] = (
                 self.stream_expert_selection_bias.amax(dim=-1)
                 - self.stream_expert_selection_bias.amin(dim=-1)
+            ).max().detach() * self._selection_bias_scale()
+        if self.enable_block_residual:
+            metrics["block_expert_max_usage"] = (
+                self.block_residual_expert_usage.max().detach()
+            )
+            metrics["block_expert_max_load"] = (
+                self.block_residual_expert_load.max().detach()
+            )
+            metrics["block_expert_bias_span"] = (
+                self.block_residual_expert_selection_bias.amax(dim=-1)
+                - self.block_residual_expert_selection_bias.amin(dim=-1)
             ).max().detach() * self._selection_bias_scale()
         self.reset_routing_records()
         return balance, specialization, metrics
@@ -3645,11 +3867,40 @@ def train_direct_reference_kv_delta_320(
         del teacher_down, teacher_up
     generator_lr = float(training.get("generator_learning_rate", 2e-4))
     reader_lr = float(training.get("reader_learning_rate", generator_lr * 0.2))
+    block_residual_lr_multiplier = float(
+        training.get("block_residual_lr_multiplier", 1.0)
+    )
+    if block_residual_lr_multiplier <= 0:
+        raise ValueError("block_residual_lr_multiplier must be positive")
+    named_model_parameters = list(model.named_parameters())
+    block_residual_parameters = [
+        parameter
+        for name, parameter in named_model_parameters
+        if name.startswith("block_residual_")
+    ]
+    base_generator_parameters = [
+        parameter
+        for name, parameter in named_model_parameters
+        if not name.startswith("block_residual_")
+    ]
+    optimizer_groups = [
+        {
+            "name": "generator",
+            "params": base_generator_parameters,
+            "lr": generator_lr,
+        }
+    ]
+    if block_residual_parameters:
+        optimizer_groups.append({
+            "name": "block_residual",
+            "params": block_residual_parameters,
+            "lr": generator_lr * block_residual_lr_multiplier,
+        })
+    optimizer_groups.append({
+        "name": "reader", "params": reader_parameters, "lr": reader_lr
+    })
     optimizer = torch.optim.AdamW(
-        [
-            {"name": "generator", "params": list(model.parameters()), "lr": generator_lr},
-            {"name": "reader", "params": reader_parameters, "lr": reader_lr},
-        ],
+        optimizer_groups,
         betas=tuple(training.get("betas", [0.9, 0.95])),
         eps=float(training.get("adam_eps", 1e-8)),
         weight_decay=float(training.get("weight_decay", 0.01)),
@@ -3684,11 +3935,32 @@ def train_direct_reference_kv_delta_320(
         use_initial_ema_reader = bool(
             cfg.get("initial_use_ema_reader", use_initial_ema)
         )
-        model.load_state_dict(
+        initial_model_state = (
             initial.get("ema_model", initial["model"])
-            if use_initial_ema_model else initial["model"],
-            strict=True,
+            if use_initial_ema_model else initial["model"]
         )
+        allow_new_parameters = bool(
+            cfg.get("initial_checkpoint_allow_new_parameters", False)
+        )
+        incompatible = model.load_state_dict(
+            initial_model_state, strict=not allow_new_parameters
+        )
+        if allow_new_parameters:
+            unexpected = list(incompatible.unexpected_keys)
+            invalid_missing = [
+                name for name in incompatible.missing_keys
+                if not name.startswith("block_residual_")
+            ]
+            if unexpected or invalid_missing:
+                raise RuntimeError(
+                    "Warm-start mismatch outside the new block residual path: "
+                    f"missing={invalid_missing}, unexpected={unexpected}"
+                )
+            print(
+                "initialized new block residual path while warm-starting "
+                f"{len(incompatible.missing_keys)} tensors",
+                flush=True,
+            )
         reader.load_state_dict(
             initial.get("ema_reader", initial["reader"])
             if use_initial_ema_reader else initial["reader"],
@@ -4001,6 +4273,26 @@ def train_direct_reference_kv_delta_320(
             1, decay_end - decay_start
         )
         return peak * (final / peak) ** progress
+
+    def set_optimizer_learning_rates(
+        generator_value: float, reader_value: float
+    ) -> None:
+        for group in optimizer.param_groups:
+            name = str(group.get("name", ""))
+            if name == "generator":
+                group["lr"] = generator_value
+            elif name == "block_residual":
+                group["lr"] = (
+                    generator_value * block_residual_lr_multiplier
+                )
+            elif name == "reader":
+                group["lr"] = reader_value
+
+    def optimizer_learning_rate(name: str) -> float:
+        for group in optimizer.param_groups:
+            if str(group.get("name", "")) == name:
+                return float(group["lr"])
+        return 0.0
     adaptive_clip = dict(training.get("adaptive_clip", {}))
     generator_adaptive_clip = dict(adaptive_clip.get("generator", {}))
     reader_adaptive_clip = dict(adaptive_clip.get("reader", {}))
@@ -4751,11 +5043,9 @@ def train_direct_reference_kv_delta_320(
                     )
                     generator_grad_history.append(float(generator_grad))
                     reader_grad_history.append(float(reader_grad))
-                    optimizer.param_groups[0]["lr"] = flow_generator_lr(
-                        relative_step
-                    )
-                    optimizer.param_groups[1]["lr"] = flow_reader_lr(
-                        relative_step
+                    set_optimizer_learning_rates(
+                        flow_generator_lr(relative_step),
+                        flow_reader_lr(relative_step),
                     )
                     if hasattr(model, "apply_routing_population_update"):
                         routing_metrics.update(
@@ -4915,8 +5205,11 @@ def train_direct_reference_kv_delta_320(
                         key: sum(values) / len(values)
                         for key, values in running.items()
                     }
-                    row["generator_lr"] = optimizer.param_groups[0]["lr"]
-                    row["reader_lr"] = optimizer.param_groups[1]["lr"]
+                    row["generator_lr"] = optimizer_learning_rate("generator")
+                    row["block_residual_lr"] = optimizer_learning_rate(
+                        "block_residual"
+                    )
+                    row["reader_lr"] = optimizer_learning_rate("reader")
                     print(
                         f"Direct reference flow-only step={step}/{steps} {row}",
                         flush=True,
@@ -5806,11 +6099,9 @@ def train_direct_reference_kv_delta_320(
                 distill_lr = float(
                     human_flow.get("distillation_lr_multiplier", 1.0)
                 )
-                optimizer.param_groups[0]["lr"] = (
-                    flow_generator_lr(relative_step) * distill_lr
-                )
-                optimizer.param_groups[1]["lr"] = (
-                    flow_reader_lr(relative_step) * distill_lr
+                set_optimizer_learning_rates(
+                    flow_generator_lr(relative_step) * distill_lr,
+                    flow_reader_lr(relative_step) * distill_lr,
                 )
                 if hasattr(model, "apply_routing_population_update"):
                     routing_metrics.update(
@@ -5869,8 +6160,11 @@ def train_direct_reference_kv_delta_320(
                 running[f"routing/{key}"].append(float(value))
             if accumulation_last and step % log_every == 0:
                 row = {key: sum(values) / len(values) for key, values in running.items()}
-                row["generator_lr"] = optimizer.param_groups[0]["lr"]
-                row["reader_lr"] = optimizer.param_groups[1]["lr"]
+                row["generator_lr"] = optimizer_learning_rate("generator")
+                row["block_residual_lr"] = optimizer_learning_rate(
+                    "block_residual"
+                )
+                row["reader_lr"] = optimizer_learning_rate("reader")
                 row["context_unique_fraction"] = len(set(context_indices.tolist())) / batch
                 print(f"Direct reference K/V delta step={step}/{steps} {row}", flush=True)
                 if wandb_run is not None:
@@ -6160,8 +6454,24 @@ def train_direct_reference_kv_delta_320(
                     if external_functional_bank is not None:
                         assert external_reference_bank is not None
                         assert flow_injector is not None
-                        external_selected = external_validation_singles[
-                            : min(8, len(external_validation_singles))
+                        external_panel_count = min(
+                            8, len(external_validation_singles)
+                        )
+                        external_positions = (
+                            [0]
+                            if external_panel_count == 1
+                            else [
+                                round(
+                                    index
+                                    * (len(external_validation_singles) - 1)
+                                    / (external_panel_count - 1)
+                                )
+                                for index in range(external_panel_count)
+                            ]
+                        )
+                        external_selected = [
+                            external_validation_singles[index]
+                            for index in external_positions
                         ]
                         external_positions = [
                             external_reference_position[
@@ -6710,8 +7020,18 @@ def sample_direct_reference_kv_delta_320(
         panel_count = min(
             int(external_panel_cfg.get("styles", 8)), len(validation_indices)
         )
+        panel_positions = (
+            [0]
+            if panel_count == 1
+            else [
+                round(
+                    index * (len(validation_indices) - 1) / (panel_count - 1)
+                )
+                for index in range(panel_count)
+            ]
+        )
         selected_rows = [
-            single_rows[index] for index in validation_indices[:panel_count]
+            single_rows[validation_indices[index]] for index in panel_positions
         ]
         selected_style_ids = [
             str(row["mixture_style_id"]) for row in selected_rows
@@ -7086,8 +7406,8 @@ def train_scheduled_expert_external_velocity_5k(
     return train_scheduled_direct_reference_kv_delta_320(
         config,
         destination,
-        config_key="kv_reference_expert_combined_calibrated_3000",
-        sample_config_key="kv_reference_expert_combined_calibrated_3000_sample",
+        config_key="kv_reference_expert_external_block_residual_2000",
+        sample_config_key="kv_reference_expert_external_block_residual_2000_sample",
     )
 
 
@@ -7097,7 +7417,7 @@ def sample_expert_external_velocity_5k(
     return sample_direct_reference_kv_delta_320(
         config,
         destination,
-        sample_config_key="kv_reference_expert_combined_calibrated_3000_sample",
+        sample_config_key="kv_reference_expert_external_block_residual_2000_sample",
     )
 
 
