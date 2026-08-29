@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import random
+
 import torch
 from torch import nn
 
@@ -17,6 +19,9 @@ from anima_style_data.kv_activation_generator import (
     _final_effect_constraints,
     _final_effect_direction_loss,
     _final_effect_retrieval_loss,
+    _cross_view_teacher_geometry_loss,
+    _same_teacher_final_effect_view_loss,
+    _select_disjoint_reference_token_views,
     _teacher_relative_final_effect_discrimination,
     _mean_teacher_operator,
     _mixture_target,
@@ -111,6 +116,64 @@ def test_teacher_relative_discrimination_uses_teacher_geometry() -> None:
     assert identical_metrics["teacher_relative_valid_pairs"] == 0
 
 
+def test_disjoint_reference_views_do_not_share_images() -> None:
+    bank = torch.arange(8, dtype=torch.float32).reshape(2, 4, 1, 1)
+    left, left_mask, right, right_mask, counts = (
+        _select_disjoint_reference_token_views(
+            bank,
+            [0, 1],
+            reference_counts=[4, 1],
+            reference_start=0,
+            reference_stop=4,
+            rng=random.Random(7),
+        )
+    )
+
+    assert counts == [2, 1]
+    assert left_mask.sum(dim=1).tolist() == counts
+    assert right_mask.sum(dim=1).tolist() == counts
+    for row, count in enumerate(counts):
+        assert set(left[row, :count].flatten().tolist()).isdisjoint(
+            right[row, :count].flatten().tolist()
+        )
+
+
+def test_paired_final_effect_losses_preserve_teacher_geometry() -> None:
+    teacher = torch.eye(3).reshape(3, 1, 1, 3)
+    matched_view, matched_metrics = _same_teacher_final_effect_view_loss(
+        teacher,
+        teacher.clone(),
+        magnitude_weight=0.25,
+        rms_floor=1e-4,
+    )
+    mismatched_view, _ = _same_teacher_final_effect_view_loss(
+        teacher,
+        teacher.roll(1, dims=0),
+        magnitude_weight=0.25,
+        rms_floor=1e-4,
+    )
+    matched_geometry, _ = _cross_view_teacher_geometry_loss(
+        teacher,
+        teacher.clone(),
+        teacher,
+        tolerance=0.02,
+    )
+    collapsed = torch.ones_like(teacher)
+    collapsed_geometry, collapsed_metrics = _cross_view_teacher_geometry_loss(
+        teacher,
+        collapsed,
+        teacher,
+        tolerance=0.02,
+    )
+
+    assert matched_view == 0
+    assert matched_metrics["paired_view_cosine"] == 1
+    assert mismatched_view > matched_view
+    assert matched_geometry == 0
+    assert collapsed_geometry > matched_geometry
+    assert collapsed_metrics["paired_geometry_active_fraction"] > 0
+
+
 def test_same_artist_memory_consistency_is_rowwise() -> None:
     memory = torch.randn(3, 4, 8)
     matched, matched_metrics = _same_artist_memory_consistency(
@@ -129,7 +192,9 @@ def test_same_artist_memory_consistency_is_rowwise() -> None:
     )
 
     assert matched == 0
-    assert matched_metrics["reader_consistency_cosine"] == 1
+    torch.testing.assert_close(
+        matched_metrics["reader_consistency_cosine"], torch.tensor(1.0)
+    )
     assert mismatched > matched
 
 

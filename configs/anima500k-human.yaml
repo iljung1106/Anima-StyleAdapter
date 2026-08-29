@@ -4144,6 +4144,65 @@ kv_reference_expert_dense32x16_kvo_selfvo_teacher_relative_2000_sample:
   external_panel:
     reference_seed: 20261011
 
+# Fresh disjoint-reference experiment. Most updates use one randomly sampled
+# view; every third distillation update adds a sequential second final-effect
+# pass from a non-overlapping reference subset. Both views share the exact
+# content/noise/timestep and teacher effect. No batch mean is used.
+kv_reference_expert_dense32x16_kvo_selfvo_disjoint_paired_10000:
+  extends_config_key: kv_reference_expert_dense32x16_kvo_selfvo_teacher_relative_2000
+  output_directory: kv_reference_expert_dense32x16_top4_kvo_selfvo_w1024_l4_disjoint_paired_10k_v42
+  initial_checkpoint: null
+  initial_reader_checkpoint: null
+  initial_step: 0
+  reset_initial_step: true
+  seed: 20261012
+  training:
+    steps: 10000
+    batch_size: 3
+    gradient_accumulation_steps: 2
+    validation_every: 500
+    checkpoint_every: 500
+    sample_output_root: diagnostics/kv-reference-expert-dense32x16-top4-kvo-selfvo-w1024-l4-disjoint-paired-10k-v42
+    sample_steps: [500, 1000, 1500, 2000, 3000, 4000, 5000, 6000, 7000, 8000, 9000, 10000]
+    whole_model_functional:
+      teacher_relative_discrimination_weight: 0.5
+      teacher_relative_discrimination_ramp_steps: 500
+      paired_reference_every: 3
+      paired_reference_alt_fit_weight: 0.5
+      paired_reference_discrimination_weight: 0.25
+      paired_reference_view_weight: 0.10
+      paired_reference_view_magnitude_weight: 0.25
+      paired_reference_geometry_weight: 0.5
+      paired_reference_geometry_tolerance: 0.02
+    generator_lr_schedule:
+      peak_lr: 0.000005
+      warmup_steps: 300
+      decay_start_step: 4000
+      decay_end_step: 8000
+      final_lr: 0.0000015
+      tail_decay_end_step: 10000
+      tail_final_lr: 0.0000005
+    reader_lr_schedule:
+      peak_lr: 0.00000125
+      warmup_steps: 300
+      decay_start_step: 500
+      decay_end_step: 3000
+      final_lr: 0.000000125
+    wandb:
+      enabled: true
+      project: anima-style-adapter
+      name: kv-reference-expert-dense32x16-top4-kvo-selfvo-w1024-l4-disjoint-paired-10k-v42
+      id: kv-reference-expert-dense32x16-top4-kvo-selfvo-w1024-l4-disjoint-paired-10k-v42
+      resume: allow
+
+kv_reference_expert_dense32x16_kvo_selfvo_disjoint_paired_10000_sample:
+  extends_config_key: kv_reference_expert_dense32x16_kvo_selfvo_teacher_relative_2000_sample
+  checkpoint: kv_reference_expert_dense32x16_top4_kvo_selfvo_w1024_l4_disjoint_paired_10k_v42/checkpoints/step-0010000.pt
+  output_directory: diagnostics/kv-reference-expert-dense32x16-top4-kvo-selfvo-w1024-l4-disjoint-paired-10k-v42-step10000
+  reference_seed: 20261012
+  external_panel:
+    reference_seed: 20261013
+
 # Reference-conditioned low-rank operator pilot. Unlike the direct activation
 # head above, the reference generates a fresh block-local linear operator and
 # applies it to every native text token.  Teacher factors remain offline

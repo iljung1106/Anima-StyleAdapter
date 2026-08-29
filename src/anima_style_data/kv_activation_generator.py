@@ -2440,6 +2440,75 @@ def _teacher_relative_final_effect_discrimination(
     }
 
 
+def _same_teacher_final_effect_view_loss(
+    first: torch.Tensor,
+    second: torch.Tensor,
+    *,
+    magnitude_weight: float,
+    rms_floor: float,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Keep disjoint reference views equivalent at the final velocity effect."""
+
+    first_flat = first.detach().float().flatten(1)
+    second_flat = second.float().flatten(1)
+    cosine = F.cosine_similarity(second_flat, first_flat, dim=1)
+    first_rms = first_flat.square().mean(dim=1).sqrt().clamp_min(rms_floor)
+    second_rms = second_flat.square().mean(dim=1).sqrt().clamp_min(rms_floor)
+    log_rms_difference = (second_rms.log() - first_rms.log()).abs()
+    direction = (1.0 - cosine).mean()
+    magnitude = log_rms_difference.mean()
+    loss = direction + float(magnitude_weight) * magnitude
+    return loss, {
+        "paired_view_loss": loss.detach(),
+        "paired_view_cosine": cosine.mean().detach(),
+        "paired_view_log_rms_difference": magnitude.detach(),
+    }
+
+
+def _cross_view_teacher_geometry_loss(
+    first: torch.Tensor,
+    second: torch.Tensor,
+    teacher: torch.Tensor,
+    *,
+    tolerance: float,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Prevent cross-view artist collapse beyond the teacher geometry."""
+
+    first_unit = F.normalize(first.detach().float().flatten(1), dim=-1)
+    second_unit = F.normalize(second.float().flatten(1), dim=-1)
+    teacher_unit = F.normalize(teacher.detach().float().flatten(1), dim=-1)
+    batch = int(first_unit.shape[0])
+    zero = second_unit.new_zeros(())
+    if batch < 2:
+        return zero, {
+            "paired_geometry_loss": zero.detach(),
+            "paired_geometry_active_fraction": zero.detach(),
+            "paired_cross_artist_cosine": zero.detach(),
+            "paired_teacher_cross_artist_cosine": zero.detach(),
+        }
+    off_diagonal = ~torch.eye(
+        batch, device=second.device, dtype=torch.bool
+    )
+    student_similarity = second_unit @ first_unit.T
+    teacher_similarity = teacher_unit @ teacher_unit.T
+    violation = F.relu(
+        student_similarity - teacher_similarity - float(tolerance)
+    )[off_diagonal]
+    loss = violation.mean()
+    return loss, {
+        "paired_geometry_loss": loss.detach(),
+        "paired_geometry_active_fraction": (
+            violation > 0
+        ).float().mean().detach(),
+        "paired_cross_artist_cosine": (
+            student_similarity[off_diagonal].mean().detach()
+        ),
+        "paired_teacher_cross_artist_cosine": (
+            teacher_similarity[off_diagonal].mean().detach()
+        ),
+    }
+
+
 def _final_effect_constraints(
     student: torch.Tensor,
     teacher: torch.Tensor,
@@ -2611,6 +2680,22 @@ def _compact_direct_delta_metrics(row: dict[str, float]) -> dict[str, float]:
         "whole/teacher_relative_valid_pairs",
         "whole/teacher_relative_margin",
         "whole/teacher_relative_correct_minus_wrong_cosine",
+        "whole/paired_reference_update",
+        "whole/paired_alt_fit_loss",
+        "whole/paired_alt_fit_weighted",
+        "whole/paired_alt_cosine",
+        "whole/paired_alt_discrimination_loss",
+        "whole/paired_alt_discrimination_weighted",
+        "whole/paired_alt_discrimination_gap",
+        "whole/paired_view_loss",
+        "whole/paired_view_weighted",
+        "whole/paired_view_cosine",
+        "whole/paired_view_log_rms_difference",
+        "whole/paired_geometry_loss",
+        "whole/paired_geometry_weighted",
+        "whole/paired_geometry_active_fraction",
+        "whole/paired_cross_artist_cosine",
+        "whole/paired_teacher_cross_artist_cosine",
         "whole/positive_pairwise_cosine",
         "reader_reconstruction_loss",
         "reader_reconstruction_weight",
@@ -4147,6 +4232,52 @@ def _select_reference_tokens(
         rows.append(values)
         mask[row, :count] = True
     return torch.stack(rows), mask
+
+
+def _select_disjoint_reference_token_views(
+    bank: torch.Tensor,
+    artist_indices: list[int],
+    *,
+    reference_counts: list[int],
+    reference_start: int,
+    reference_stop: int,
+    rng: random.Random,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, list[int]]:
+    """Select two non-overlapping reference subsets for every style row."""
+
+    available = reference_stop - reference_start
+    maximum_per_view = available // 2
+    if maximum_per_view < 1:
+        raise ValueError("Disjoint reference views require at least two images")
+    counts = [min(int(count), maximum_per_view) for count in reference_counts]
+    maximum = max(counts)
+    left_rows = []
+    right_rows = []
+    left_mask = torch.zeros(
+        len(artist_indices), maximum, device=bank.device, dtype=torch.bool
+    )
+    right_mask = torch.zeros_like(left_mask)
+    for row, (artist, count) in enumerate(
+        zip(artist_indices, counts, strict=True)
+    ):
+        choices = rng.sample(range(reference_start, reference_stop), 2 * count)
+        left = bank[artist, choices[:count]]
+        right = bank[artist, choices[count:]]
+        if count < maximum:
+            padding = left.new_zeros(maximum - count, *left.shape[1:])
+            left = torch.cat([left, padding])
+            right = torch.cat([right, padding.clone()])
+        left_rows.append(left)
+        right_rows.append(right)
+        left_mask[row, :count] = True
+        right_mask[row, :count] = True
+    return (
+        torch.stack(left_rows),
+        left_mask,
+        torch.stack(right_rows),
+        right_mask,
+        counts,
+    )
 
 
 def _direct_delta_artist_split(
@@ -6634,11 +6765,11 @@ def train_direct_reference_kv_delta_320(
             native_category = False
             external_category = False
             distillation_domain = "legacy"
+            distillation_index = (
+                relative_step
+                - _direct_delta_flow_updates_through(relative_step, human_flow)
+            )
             if multi_domain_enabled:
-                distillation_index = (
-                    relative_step
-                    - _direct_delta_flow_updates_through(relative_step, human_flow)
-                )
                 schedule_entry = distillation_schedule[
                     (distillation_index - 1) % len(distillation_schedule)
                 ]
@@ -6681,6 +6812,14 @@ def train_direct_reference_kv_delta_320(
                 category = rng.choices(
                     categories, weights=category_weights, k=1
                 )[0]
+            paired_reference_every = int(
+                whole_model.get("paired_reference_every", 0)
+            )
+            paired_reference_step = (
+                whole_enabled
+                and paired_reference_every > 0
+                and distillation_index % paired_reference_every == 0
+            )
             alternative_references = None
             alternative_mask = None
             consistency_left = None
@@ -6741,22 +6880,30 @@ def train_direct_reference_kv_delta_320(
                     external_reference_position[str(row["mixture_style_id"])]
                     for row in selected
                 ]
-                references, reference_mask = _select_reference_tokens(
-                    external_reference_bank,
-                    local_styles,
-                    reference_counts=counts,
-                    reference_start=0,
-                    reference_stop=single_images,
-                    rng=rng,
-                )
-                alternative_references, alternative_mask = _select_reference_tokens(
-                    external_reference_bank,
-                    local_styles,
-                    reference_counts=counts,
-                    reference_start=0,
-                    reference_stop=single_images,
-                    rng=random.Random(seed ^ (step * 97_409)),
-                )
+                if paired_reference_step:
+                    (
+                        references,
+                        reference_mask,
+                        alternative_references,
+                        alternative_mask,
+                        counts,
+                    ) = _select_disjoint_reference_token_views(
+                        external_reference_bank,
+                        local_styles,
+                        reference_counts=counts,
+                        reference_start=0,
+                        reference_stop=single_images,
+                        rng=rng,
+                    )
+                else:
+                    references, reference_mask = _select_reference_tokens(
+                        external_reference_bank,
+                        local_styles,
+                        reference_counts=counts,
+                        reference_start=0,
+                        reference_stop=single_images,
+                        rng=rng,
+                    )
                 if (
                     float(whole_model.get("reader_consistency_weight", 0.0)) > 0
                     or float(
@@ -6801,15 +6948,27 @@ def train_direct_reference_kv_delta_320(
                     for index in local_artists
                 ]
                 counts = rng.choices(single_counts, weights=single_count_weights, k=batch)
-                references, reference_mask = _select_reference_tokens(
-                    native_reference_bank, local_artists, reference_counts=counts,
-                    reference_start=0, reference_stop=single_images, rng=rng,
-                )
-                alternative_references, alternative_mask = _select_reference_tokens(
-                    native_reference_bank, local_artists, reference_counts=counts,
-                    reference_start=0, reference_stop=single_images,
-                    rng=random.Random(seed ^ (step * 97_409)),
-                )
+                if paired_reference_step:
+                    (
+                        references,
+                        reference_mask,
+                        alternative_references,
+                        alternative_mask,
+                        counts,
+                    ) = _select_disjoint_reference_token_views(
+                        native_reference_bank,
+                        local_artists,
+                        reference_counts=counts,
+                        reference_start=0,
+                        reference_stop=single_images,
+                        rng=rng,
+                    )
+                else:
+                    references, reference_mask = _select_reference_tokens(
+                        native_reference_bank, local_artists,
+                        reference_counts=counts, reference_start=0,
+                        reference_stop=single_images, rng=rng,
+                    )
                 if (
                     float(whole_model.get("reader_consistency_weight", 0.0)) > 0
                     or float(
@@ -6845,15 +7004,26 @@ def train_direct_reference_kv_delta_320(
                 if multi_domain_enabled:
                     lora_domain = distillation_domain.removeprefix("lora_")
                     selected_single_bank = single_banks[lora_domain]
-                references, reference_mask = _select_reference_tokens(
-                    selected_single_bank, artists, reference_counts=counts,
-                    reference_start=0, reference_stop=single_images, rng=rng,
-                )
-                alternative_references, alternative_mask = _select_reference_tokens(
-                    selected_single_bank, artists, reference_counts=counts,
-                    reference_start=0, reference_stop=single_images,
-                    rng=random.Random(seed ^ (step * 97_409)),
-                )
+                if paired_reference_step:
+                    (
+                        references,
+                        reference_mask,
+                        alternative_references,
+                        alternative_mask,
+                        counts,
+                    ) = _select_disjoint_reference_token_views(
+                        selected_single_bank,
+                        artists,
+                        reference_counts=counts,
+                        reference_start=0,
+                        reference_stop=single_images,
+                        rng=rng,
+                    )
+                else:
+                    references, reference_mask = _select_reference_tokens(
+                        selected_single_bank, artists, reference_counts=counts,
+                        reference_start=0, reference_stop=single_images, rng=rng,
+                    )
                 if (
                     float(whole_model.get("reader_consistency_weight", 0.0)) > 0
                     or float(
@@ -6883,11 +7053,27 @@ def train_direct_reference_kv_delta_320(
                 source_rows = rows_by_kind[category]
                 selected_rows = rng.sample(range(len(source_rows)), batch)
                 counts = rng.choices(mixture_counts, weights=mixture_count_weights, k=batch)
-                references, reference_mask = _select_reference_tokens(
-                    mixture_banks[category], selected_rows,
-                    reference_counts=counts, reference_start=0,
-                    reference_stop=mixture_images, rng=rng,
-                )
+                if paired_reference_step:
+                    (
+                        references,
+                        reference_mask,
+                        alternative_references,
+                        alternative_mask,
+                        counts,
+                    ) = _select_disjoint_reference_token_views(
+                        mixture_banks[category],
+                        selected_rows,
+                        reference_counts=counts,
+                        reference_start=0,
+                        reference_stop=mixture_images,
+                        rng=rng,
+                    )
+                else:
+                    references, reference_mask = _select_reference_tokens(
+                        mixture_banks[category], selected_rows,
+                        reference_counts=counts, reference_start=0,
+                        reference_stop=mixture_images, rng=rng,
+                    )
                 selected = [source_rows[index] for index in selected_rows]
                 functional_effect_indices = [
                     functional_index_by_style[str(row["mixture_style_id"])]
@@ -7463,6 +7649,9 @@ def train_direct_reference_kv_delta_320(
                         },
                         **{f"whole/{key}": value for key, value in constraint_metrics.items()},
                     }
+                    whole_metrics["whole/paired_reference_update"] = (
+                        final_huber.new_tensor(float(paired_reference_step))
+                    )
                 block_losses = []
                 block_metrics = []
                 common_direction_losses = []
@@ -7585,6 +7774,208 @@ def train_direct_reference_kv_delta_320(
                         curriculum["block_weight"] if whole_enabled else 1.0
                     )
             (loss / accumulation_steps).backward()
+            if paired_reference_step:
+                if not whole_enabled:
+                    raise RuntimeError(
+                        "Paired reference final effects require whole-model supervision"
+                    )
+                if alternative_references is None or alternative_mask is None:
+                    raise RuntimeError(
+                        "Paired reference update is missing its disjoint view"
+                    )
+                with torch.autocast("cuda", dtype=torch.bfloat16):
+                    paired_style = reader(
+                        alternative_references,
+                        alternative_mask,
+                    ).tokens
+                    flow_injector.set_style(paired_style)
+                    if hasattr(model, "set_routing_recording"):
+                        model.set_routing_recording(True)
+                    paired_prediction = anima(
+                        final_noisy.unsqueeze(2),
+                        final_t,
+                        context=final_context,
+                        padding_mask=final_padding,
+                        target_input_ids=None,
+                    ).squeeze(2).float()
+                    if hasattr(model, "set_routing_recording"):
+                        model.set_routing_recording(False)
+                    flow_injector.disable()
+                    paired_student = paired_prediction - final_base
+                    paired_huber = F.smooth_l1_loss(
+                        paired_student / final_scale,
+                        final_teacher / final_scale,
+                        beta=float(whole_model.get("huber_beta", 0.1)),
+                    )
+                    paired_direction, paired_direction_metrics = (
+                        _final_effect_direction_loss(
+                            paired_student,
+                            final_teacher,
+                            reliability_full_rms=float(
+                                whole_model.get(
+                                    "direction_reliability_full_rms", 0.0
+                                )
+                            ),
+                            reliability_min_weight=float(
+                                whole_model.get(
+                                    "direction_reliability_min_weight", 1.0
+                                )
+                            ),
+                        )
+                    )
+                    paired_constraint, _ = _final_effect_constraints(
+                        paired_student,
+                        final_teacher,
+                        common_cap=float(
+                            dict(whole_model.get("common_cap_by_kind", {})).get(
+                                category, whole_model.get("common_cap", 0.55)
+                            )
+                        ),
+                        rms_lower=curriculum["rms_lower"],
+                        rms_upper=curriculum["rms_upper"],
+                        common_cap_weight=float(
+                            whole_model.get("common_cap_weight", 1.0)
+                        ),
+                        rms_band_weight=float(
+                            whole_model.get("rms_band_weight", 1.0)
+                        ),
+                        rms_floor=float(whole_model.get("rms_floor", 1e-4)),
+                        rms_ratio_tolerance=(
+                            float(whole_model["rms_ratio_tolerance"])
+                            if "rms_ratio_tolerance" in whole_model
+                            else None
+                        ),
+                    )
+                    paired_common = _excess_common_direction_loss(
+                        paired_student, final_teacher
+                    )
+                    paired_alt_fit = (
+                        huber_weight * paired_huber
+                        + direction_domain_weight * paired_direction
+                        + float(whole_model.get("constraint_weight", 1.0))
+                        * paired_constraint
+                        + float(whole_model.get("relative_common_weight", 0.5))
+                        * paired_common
+                    )
+                    paired_alt_fit_weight = float(
+                        whole_model.get("paired_reference_alt_fit_weight", 0.5)
+                    )
+                    paired_alt_fit_weighted = (
+                        paired_alt_fit_weight * paired_alt_fit
+                    )
+                    (
+                        paired_discrimination,
+                        paired_discrimination_metrics,
+                    ) = _teacher_relative_final_effect_discrimination(
+                        paired_student,
+                        final_teacher,
+                        margin_scale=float(
+                            whole_model.get(
+                                "teacher_relative_discrimination_margin_scale", 0.25
+                            )
+                        ),
+                        margin_cap=float(
+                            whole_model.get(
+                                "teacher_relative_discrimination_margin_cap", 0.20
+                            )
+                        ),
+                        minimum_teacher_distance=float(
+                            whole_model.get(
+                                "teacher_relative_discrimination_minimum_teacher_distance",
+                                0.05,
+                            )
+                        ),
+                        rms_floor=float(whole_model.get("rms_floor", 1e-4)),
+                    )
+                    paired_discrimination_weight = float(
+                        whole_model.get(
+                            "paired_reference_discrimination_weight", 0.25
+                        )
+                    )
+                    if teacher_relative_ramp_steps > 0:
+                        paired_discrimination_weight *= min(
+                            1.0,
+                            relative_step / teacher_relative_ramp_steps,
+                        )
+                    paired_discrimination_weighted = (
+                        paired_discrimination_weight * paired_discrimination
+                    )
+                    paired_view, paired_view_metrics = (
+                        _same_teacher_final_effect_view_loss(
+                            final_student,
+                            paired_student,
+                            magnitude_weight=float(
+                                whole_model.get(
+                                    "paired_reference_view_magnitude_weight", 0.25
+                                )
+                            ),
+                            rms_floor=float(whole_model.get("rms_floor", 1e-4)),
+                        )
+                    )
+                    paired_view_weight = float(
+                        whole_model.get("paired_reference_view_weight", 0.10)
+                    )
+                    paired_view_weighted = paired_view_weight * paired_view
+                    paired_geometry, paired_geometry_metrics = (
+                        _cross_view_teacher_geometry_loss(
+                            final_student,
+                            paired_student,
+                            final_teacher,
+                            tolerance=float(
+                                whole_model.get(
+                                    "paired_reference_geometry_tolerance", 0.02
+                                )
+                            ),
+                        )
+                    )
+                    paired_geometry_weight = float(
+                        whole_model.get("paired_reference_geometry_weight", 0.5)
+                    )
+                    paired_geometry_weighted = (
+                        paired_geometry_weight * paired_geometry
+                    )
+                    paired_loss = (
+                        paired_alt_fit_weighted
+                        + paired_discrimination_weighted
+                        + paired_view_weighted
+                        + paired_geometry_weighted
+                    )
+                (paired_loss / accumulation_steps).backward()
+                loss = loss.detach() + paired_loss.detach()
+                whole_metrics.update(
+                    {
+                        "whole/paired_alt_fit_loss": paired_alt_fit.detach(),
+                        "whole/paired_alt_fit_weighted": (
+                            paired_alt_fit_weighted.detach()
+                        ),
+                        "whole/paired_alt_cosine": paired_direction_metrics[
+                            "cosine"
+                        ],
+                        "whole/paired_alt_discrimination_loss": (
+                            paired_discrimination.detach()
+                        ),
+                        "whole/paired_alt_discrimination_weighted": (
+                            paired_discrimination_weighted.detach()
+                        ),
+                        "whole/paired_alt_discrimination_gap": (
+                            paired_discrimination_metrics[
+                                "teacher_relative_correct_minus_wrong_cosine"
+                            ]
+                        ),
+                        "whole/paired_view_weighted": paired_view_weighted.detach(),
+                        "whole/paired_geometry_weighted": (
+                            paired_geometry_weighted.detach()
+                        ),
+                        **{
+                            f"whole/{key}": value
+                            for key, value in paired_view_metrics.items()
+                        },
+                        **{
+                            f"whole/{key}": value
+                            for key, value in paired_geometry_metrics.items()
+                        },
+                    }
+                )
             if accumulation_last:
                 generator_grad, generator_clip_used = _clip_outlier_grad_norm(
                     model.parameters(), generator_grad_history,
@@ -9149,6 +9540,33 @@ def sample_expert_dense32x16_kvo_selfvo_teacher_relative_2k(
         destination,
         sample_config_key=(
             "kv_reference_expert_dense32x16_kvo_selfvo_teacher_relative_2000_sample"
+        ),
+    )
+
+
+def train_scheduled_expert_dense32x16_kvo_selfvo_disjoint_paired_10k(
+    config: dict[str, Any], destination: Path
+) -> dict[str, Any]:
+    return train_scheduled_direct_reference_kv_delta_320(
+        config,
+        destination,
+        config_key=(
+            "kv_reference_expert_dense32x16_kvo_selfvo_disjoint_paired_10000"
+        ),
+        sample_config_key=(
+            "kv_reference_expert_dense32x16_kvo_selfvo_disjoint_paired_10000_sample"
+        ),
+    )
+
+
+def sample_expert_dense32x16_kvo_selfvo_disjoint_paired_10k(
+    config: dict[str, Any], destination: Path
+) -> dict[str, Any]:
+    return sample_direct_reference_kv_delta_320(
+        config,
+        destination,
+        sample_config_key=(
+            "kv_reference_expert_dense32x16_kvo_selfvo_disjoint_paired_10000_sample"
         ),
     )
 
