@@ -4391,13 +4391,30 @@ def train_direct_reference_kv_delta_320(
     optimizer_groups.append({
         "name": "reader", "params": reader_parameters, "lr": reader_lr
     })
-    optimizer = torch.optim.AdamW(
-        optimizer_groups,
-        betas=tuple(training.get("betas", [0.9, 0.95])),
-        eps=float(training.get("adam_eps", 1e-8)),
-        weight_decay=float(training.get("weight_decay", 0.01)),
-        fused=bool(training.get("fused_adamw", True)),
-    )
+    optimizer_name = str(training.get("optimizer", "adamw")).lower()
+    if optimizer_name == "adamw":
+        optimizer = torch.optim.AdamW(
+            optimizer_groups,
+            betas=tuple(training.get("betas", [0.9, 0.95])),
+            eps=float(training.get("adam_eps", 1e-8)),
+            weight_decay=float(training.get("weight_decay", 0.01)),
+            fused=bool(training.get("fused_adamw", True)),
+        )
+    elif optimizer_name == "adafactor":
+        optimizer = torch.optim.Adafactor(
+            optimizer_groups,
+            lr=generator_lr,
+            beta2_decay=float(training.get("adafactor_beta2_decay", -0.8)),
+            eps=(
+                None,
+                float(training.get("adafactor_eps2", 1e-3)),
+            ),
+            d=float(training.get("adafactor_d", 1.0)),
+            weight_decay=float(training.get("weight_decay", 0.01)),
+            foreach=False,
+        )
+    else:
+        raise ValueError(f"Unsupported optimizer: {optimizer_name}")
     checkpoints = output / "checkpoints"
     checkpoints.mkdir(parents=True, exist_ok=True)
     state_path = output / "training_state.pt"

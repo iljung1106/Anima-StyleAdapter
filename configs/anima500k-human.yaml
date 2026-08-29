@@ -3866,9 +3866,13 @@ kv_reference_expert_dense64x16_full_qkvo_flow_5000:
     # The expert bank is roughly four times the active rank. Accumulation keeps
     # four distinct style groups per optimizer update without retaining a
     # batch-four full-DiT activation graph.
-    batch_size: 1
-    gradient_accumulation_steps: 4
+    batch_size: 2
+    gradient_accumulation_steps: 2
     reader_master_dtype: float32
+    optimizer: adafactor
+    adafactor_beta2_decay: -0.8
+    adafactor_eps2: 0.001
+    adafactor_d: 1.0
     max_grad_norm: 150000.0
     reader_max_grad_norm: 100.0
     adaptive_clip:
@@ -3903,7 +3907,7 @@ kv_reference_expert_dense64x16_full_qkvo_flow_5000:
       expert_balance_weight: 0.001
     human_flow:
       enabled: true
-      batch_size: 1
+      batch_size: 2
       distinct_style_groups_per_optimizer_update: true
       phases:
         - {end_step: 5000, cycle: 6, slots: [5]}
@@ -3928,9 +3932,8 @@ kv_reference_expert_dense64x16_full_qkvo_flow_5000:
       decay_end_step: 4000
       final_lr: 0.00000005
     ema:
-      enabled: true
-      decay: 0.999
-      sample: true
+      enabled: false
+      sample: false
     wandb:
       enabled: true
       project: anima-style-adapter
