@@ -6951,7 +6951,10 @@ def sample_direct_reference_kv_delta_320(
     from .synthetic_teacher import _sample_anima_batch
     from .dual_query_external_samples import load_dual_query_external_sample
 
-    sample_cfg = dict(config[sample_config_key])
+    # Scheduled experiments may extend a historical sample contract just as
+    # their training configs do.  Resolve it here so checkpoint/output
+    # overrides do not silently discard panel manifests and external panels.
+    sample_cfg = _resolved_experiment_config(config, sample_config_key)
     device = str(sample_cfg.get("device", "cuda"))
     checkpoint_path = destination / str(sample_cfg["checkpoint"])
     checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
