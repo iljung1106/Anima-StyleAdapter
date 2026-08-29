@@ -4139,7 +4139,10 @@ def train_direct_reference_kv_delta_320(
         flow_loader_cfg["resampler_token_cache"] = str(
             local_reference_root(flow_token_source, f"flow-{flow_source_name}")
         )
-        if human_flow.get("style_manifest") is not None:
+        if (
+            not training_source_cfg
+            and human_flow.get("style_manifest") is not None
+        ):
             flow_loader_cfg["style_manifest"] = str(
                 human_flow["style_manifest"]
             )
