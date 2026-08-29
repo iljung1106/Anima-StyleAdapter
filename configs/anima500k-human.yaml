@@ -3381,6 +3381,58 @@ kv_reference_expert_external_synthetic_residual_flow_1000_sample:
   external_panel:
     reference_seed: 20260921
 
+# v28 proved that the normalized residual terms are wired correctly, but its
+# 2e-7 / 5e-8 generator/Reader rates left held-out flow and rendered samples
+# indistinguishable from v27 after 125 flow updates.  The successful historical
+# flow-only v4 used 3e-6 for both modules.  Use a conservative fraction of that
+# rate and full-strength normalized residual supervision while preserving the
+# exact v28 data, architecture, and 1:1 flow/distillation update ratio.
+kv_reference_expert_external_synthetic_residual_flow_lr_1000:
+  extends_config_key: kv_reference_expert_external_synthetic_residual_flow_1000
+  output_directory: kv_reference_expert_external_synthresflow_lr_b4_w768_l3_1k_v29
+  initial_checkpoint: kv_reference_expert_combined_calibrated_b3_w768_l3_3k_v24/checkpoints/step-0000500.pt
+  initial_use_ema_model: true
+  initial_use_ema_reader: true
+  initial_step: 0
+  reset_initial_step: true
+  training:
+    steps: 1000
+    sample_steps: [250, 500, 1000]
+    sample_output_root: diagnostics/kv-reference-expert-external-synthresflow-lr-b4-w768-l3-1k-v29
+    generator_learning_rate: 0.000001
+    reader_learning_rate: 0.0000005
+    generator_lr_schedule:
+      peak_lr: 0.000001
+      warmup_steps: 25
+      decay_start_step: 500
+      decay_end_step: 1000
+      final_lr: 0.0000002
+      tail_decay_end_step: 1000
+      tail_final_lr: 0.0000002
+    reader_lr_schedule:
+      peak_lr: 0.0000005
+      warmup_steps: 25
+      decay_start_step: 250
+      decay_end_step: 750
+      final_lr: 0.0000001
+    human_flow:
+      residual_huber_weight: 1.0
+      direction_weight: 1.0
+    wandb:
+      enabled: true
+      project: anima-style-adapter
+      name: kv-reference-expert-external-synthresflow-lr-b4-w768-l3-1k-v29
+      id: kv-reference-expert-external-synthresflow-lr-b4-w768-l3-1k-v29
+      resume: allow
+
+kv_reference_expert_external_synthetic_residual_flow_lr_1000_sample:
+  extends_config_key: kv_reference_expert_external_synthetic_residual_flow_1000_sample
+  checkpoint: kv_reference_expert_external_synthresflow_lr_b4_w768_l3_1k_v29/checkpoints/step-0001000.pt
+  output_directory: diagnostics/kv-reference-expert-external-synthresflow-lr-b4-w768-l3-1k-v29-step1000
+  reference_seed: 20260922
+  external_panel:
+    reference_seed: 20260923
+
 # Reference-conditioned low-rank operator pilot. Unlike the direct activation
 # head above, the reference generates a fresh block-local linear operator and
 # applies it to every native text token.  Teacher factors remain offline
