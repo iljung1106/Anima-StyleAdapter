@@ -3559,7 +3559,7 @@ def train_direct_reference_kv_delta_320(
     native_reference_teacher_indices: dict[str, list[int]] = {}
     external_reference_bank = None
     external_reference_position: dict[str, int] = {}
-    external_single_effect_index: dict[str, int] = {}
+    external_effect_index_by_style: dict[str, int] = {}
     external_train_singles: list[dict[str, Any]] = []
     external_validation_singles: list[dict[str, Any]] = []
     external_rows_by_kind: dict[str, list[dict[str, Any]]] = {}
@@ -3812,10 +3812,6 @@ def train_direct_reference_kv_delta_320(
             if bool(row.get("enabled", True))
             and float(row.get("effect_rms", 0.0)) >= minimum_effect_rms
         ]
-        external_single_effect_index = {
-            str(row["mixture_style_id"]): int(row["index"])
-            for row in single_rows
-        }
         excluded_single_rows = len(single_rows_all) - len(single_rows)
         if excluded_single_rows:
             print(
@@ -3855,6 +3851,17 @@ def train_direct_reference_kv_delta_320(
                 and float(row.get("effect_rms", 0.0)) >= minimum_effect_rms
             ]
             for kind in ("pair", "triple", "amplified", "signed")
+        }
+        external_effect_index_by_style = {
+            str(row["mixture_style_id"]): int(row["index"])
+            for row in (
+                external_train_singles
+                + [
+                    mixture_row
+                    for kind_rows in external_rows_by_kind.values()
+                    for mixture_row in kind_rows
+                ]
+            )
         }
         if not external_train_singles or any(
             not rows for rows in external_rows_by_kind.values()
@@ -4786,12 +4793,12 @@ def train_direct_reference_kv_delta_320(
                         )
                     missing_anchor_styles = [
                         style_id for style_id in flow_style_ids
-                        if style_id not in external_single_effect_index
+                        if style_id not in external_effect_index_by_style
                     ]
                     if missing_anchor_styles:
                         raise RuntimeError(
                             "Flow teacher anchoring has no exact external "
-                            "single teacher for: "
+                            "teacher effect for: "
                             + ", ".join(sorted(set(missing_anchor_styles))[:8])
                         )
                     anchor_rng = random.Random(
@@ -4830,7 +4837,7 @@ def train_direct_reference_kv_delta_320(
                         device=device, dtype=torch.bfloat16,
                     )
                     anchor_indices = [
-                        external_single_effect_index[style_id]
+                        external_effect_index_by_style[style_id]
                         for style_id in flow_style_ids
                     ]
                     anchor_teacher = external_functional_bank.effect_rows(
