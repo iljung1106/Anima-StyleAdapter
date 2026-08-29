@@ -15,6 +15,7 @@ from anima_style_data.kv_activation_generator import (
     _direct_delta_flow_updates_through,
     _functional_centered_attention_loss,
     _final_effect_constraints,
+    _final_effect_direction_loss,
     _final_effect_retrieval_loss,
     _mean_teacher_operator,
     _mixture_target,
@@ -565,6 +566,35 @@ def test_final_effect_constraints_only_penalize_rms_outside_band() -> None:
     assert small_metrics["rms_lower_violation_rate"] == 1
     assert large_metrics["rms_upper_violation_rate"] == 1
     assert small > 0 and large > 0
+
+
+def test_final_effect_log_rms_band_is_multiplicatively_symmetric() -> None:
+    teacher = torch.ones(1, 1, 2, 4)
+    small, small_metrics = _final_effect_constraints(
+        teacher * 0.5, teacher, common_cap=1.0,
+        rms_lower=0.75, rms_upper=1.25, rms_ratio_tolerance=1.25,
+    )
+    large, large_metrics = _final_effect_constraints(
+        teacher * 2.0, teacher, common_cap=1.0,
+        rms_lower=0.75, rms_upper=1.25, rms_ratio_tolerance=1.25,
+    )
+    torch.testing.assert_close(small, large)
+    assert small_metrics["rms_lower_violation_rate"] == 1
+    assert large_metrics["rms_upper_violation_rate"] == 1
+
+
+def test_final_effect_direction_softens_only_weak_teacher_rows() -> None:
+    teacher = torch.tensor([1.0, 0.0, 0.001, 0.0]).reshape(2, 1, 1, 2)
+    student = torch.tensor([1.0, 0.0, -0.001, 0.0]).reshape(2, 1, 1, 2)
+    loss, metrics = _final_effect_direction_loss(
+        student,
+        teacher,
+        reliability_full_rms=0.01,
+        reliability_min_weight=0.25,
+    )
+    assert 0 < loss < 1
+    assert metrics["teacher_effect_reliability"] < 1
+    assert metrics["reliability_weighted_cosine"] > metrics["cosine"]
 
 
 def test_cross_style_queue_diversity_only_penalizes_cosine_above_cap() -> None:

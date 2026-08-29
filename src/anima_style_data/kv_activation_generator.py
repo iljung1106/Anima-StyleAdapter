@@ -2248,6 +2248,7 @@ def _final_effect_constraints(
     common_cap_weight: float = 1.0,
     rms_band_weight: float = 1.0,
     rms_floor: float = 1e-4,
+    rms_ratio_tolerance: float | None = None,
     pair_mask: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """Absolute common-direction cap and an output-RMS hinge band.
@@ -2284,17 +2285,38 @@ def _final_effect_constraints(
     teacher_rms = teacher_f.square().mean(dim=dimensions).sqrt()
     denominator = teacher_rms.clamp_min(float(rms_floor))
     ratio = student_rms / denominator
-    lower_rows = teacher_rms >= float(rms_floor)
-    lower_violation = F.relu(float(rms_lower) - ratio)
-    if bool(lower_rows.any()):
-        lower_loss = lower_violation[lower_rows].square().mean()
-        lower_rate = (lower_violation[lower_rows] > 0).float().mean()
+    valid_rows = teacher_rms >= float(rms_floor)
+    log_ratio = ratio.clamp_min(1e-8).log()
+    if rms_ratio_tolerance is not None:
+        tolerance = float(rms_ratio_tolerance)
+        if tolerance <= 1.0:
+            raise ValueError("rms_ratio_tolerance must be greater than 1")
+        log_tolerance = math.log(tolerance)
+        symmetric_violation = F.relu(log_ratio.abs() - log_tolerance)
+        if bool(valid_rows.any()):
+            band_loss = symmetric_violation[valid_rows].square().mean()
+            lower_rate = (
+                log_ratio[valid_rows] < -log_tolerance
+            ).float().mean()
+            upper_rate = (
+                log_ratio[valid_rows] > log_tolerance
+            ).float().mean()
+        else:
+            band_loss = zero
+            lower_rate = zero
+            upper_rate = zero
     else:
-        lower_loss = zero
-        lower_rate = zero
-    upper_violation = F.relu(ratio - float(rms_upper))
-    upper_loss = upper_violation.square().mean()
-    band_loss = lower_loss + upper_loss
+        lower_violation = F.relu(float(rms_lower) - ratio)
+        if bool(valid_rows.any()):
+            lower_loss = lower_violation[valid_rows].square().mean()
+            lower_rate = (lower_violation[valid_rows] > 0).float().mean()
+        else:
+            lower_loss = zero
+            lower_rate = zero
+        upper_violation = F.relu(ratio - float(rms_upper))
+        upper_loss = upper_violation.square().mean()
+        band_loss = lower_loss + upper_loss
+        upper_rate = (upper_violation > 0).float().mean()
     weighted_common_cap = float(common_cap_weight) * common_cap_loss
     weighted_rms_band = float(rms_band_weight) * band_loss
     return weighted_common_cap + weighted_rms_band, {
@@ -2305,9 +2327,56 @@ def _final_effect_constraints(
         "rms_band_loss": band_loss.detach(),
         "rms_band_weighted_loss": weighted_rms_band.detach(),
         "rms_ratio": ratio.mean().detach(),
+        "rms_log_abs_error": log_ratio.abs().mean().detach(),
         "rms_lower_violation_rate": lower_rate.detach(),
-        "rms_upper_violation_rate": (upper_violation > 0).float().mean().detach(),
+        "rms_upper_violation_rate": upper_rate.detach(),
     }
+
+
+def _final_effect_direction_loss(
+    student: torch.Tensor,
+    teacher: torch.Tensor,
+    *,
+    reliability_full_rms: float = 0.0,
+    reliability_min_weight: float = 1.0,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Match final-effect direction while softening numerically weak teachers."""
+
+    student_f = student.float().flatten(1)
+    teacher_f = teacher.detach().float().flatten(1)
+    cosine = F.cosine_similarity(student_f, teacher_f, dim=-1)
+    teacher_rms = teacher_f.square().mean(dim=-1).sqrt()
+    full_rms = float(reliability_full_rms)
+    minimum = float(reliability_min_weight)
+    if not 0.0 <= minimum <= 1.0:
+        raise ValueError("reliability_min_weight must be in [0, 1]")
+    if full_rms > 0.0:
+        reliability = minimum + (1.0 - minimum) * (
+            teacher_rms / full_rms
+        ).clamp(0.0, 1.0)
+    else:
+        reliability = torch.ones_like(teacher_rms)
+    direction = ((1.0 - cosine) * reliability).sum() / reliability.sum().clamp_min(
+        1e-8
+    )
+    weighted_cosine = (cosine * reliability).sum() / reliability.sum().clamp_min(
+        1e-8
+    )
+    return direction, {
+        "cosine": cosine.mean().detach(),
+        "reliability_weighted_cosine": weighted_cosine.detach(),
+        "direction_loss": direction.detach(),
+        "teacher_effect_rms": teacher_rms.mean().detach(),
+        "teacher_effect_reliability": reliability.mean().detach(),
+    }
+
+
+def _timestep_metric_bucket(timestep: float) -> str:
+    if timestep < 1.0 / 3.0:
+        return "low"
+    if timestep < 2.0 / 3.0:
+        return "mid"
+    return "high"
 
 
 def _adapter_probe_signature(
@@ -6719,9 +6788,22 @@ def train_direct_reference_kv_delta_320(
                         final_teacher / final_scale,
                         beta=float(whole_model.get("huber_beta", 0.1)),
                     )
-                    final_cosine = F.cosine_similarity(
-                        final_student.flatten(1), final_teacher.flatten(1), dim=-1
-                    ).mean()
+                    final_direction, direction_metrics = (
+                        _final_effect_direction_loss(
+                            final_student,
+                            final_teacher,
+                            reliability_full_rms=float(
+                                whole_model.get(
+                                    "direction_reliability_full_rms", 0.0
+                                )
+                            ),
+                            reliability_min_weight=float(
+                                whole_model.get(
+                                    "direction_reliability_min_weight", 1.0
+                                )
+                            ),
+                        )
+                    )
                     constraint_loss, constraint_metrics = _final_effect_constraints(
                         final_student, final_teacher,
                         common_cap=float(
@@ -6738,6 +6820,11 @@ def train_direct_reference_kv_delta_320(
                             whole_model.get("rms_band_weight", 1.0)
                         ),
                         rms_floor=float(whole_model.get("rms_floor", 1e-4)),
+                        rms_ratio_tolerance=(
+                            float(whole_model["rms_ratio_tolerance"])
+                            if "rms_ratio_tolerance" in whole_model
+                            else None
+                        ),
                     )
                     relative_common = _excess_common_direction_loss(
                         final_student, final_teacher
@@ -6776,8 +6863,7 @@ def train_direct_reference_kv_delta_320(
                     )
                     whole_loss = (
                         huber_weight * final_huber
-                        + direction_domain_weight
-                        * (1.0 - final_cosine)
+                        + direction_domain_weight * final_direction
                         + float(whole_model.get("constraint_weight", 1.0))
                         * constraint_loss
                         + relative_common_weighted
@@ -6803,7 +6889,6 @@ def train_direct_reference_kv_delta_320(
                         "whole/direction_weight": final_huber.new_tensor(
                             direction_domain_weight
                         ),
-                        "whole/cosine": final_cosine.detach(),
                         "whole/retrieval_weighted_loss": (
                             retrieval_weighted.detach()
                         ),
@@ -6833,6 +6918,10 @@ def train_direct_reference_kv_delta_320(
                         **{
                             f"whole/{key}": value
                             for key, value in teacher_signature_metrics.items()
+                        },
+                        **{
+                            f"whole/{key}": value
+                            for key, value in direction_metrics.items()
                         },
                         **{f"whole/{key}": value for key, value in constraint_metrics.items()},
                     }
@@ -7000,6 +7089,24 @@ def train_direct_reference_kv_delta_320(
                 running[f"{key}_by_domain/{distillation_domain}"].append(
                     float(value)
                 )
+            if whole_enabled:
+                timestep_bucket = _timestep_metric_bucket(
+                    float(functional_base["timesteps"][functional_timestep])
+                )
+                for key in (
+                    "whole/cosine",
+                    "whole/reliability_weighted_cosine",
+                    "whole/teacher_effect_rms",
+                    "whole/teacher_effect_reliability",
+                    "whole/rms_ratio",
+                    "whole/rms_log_abs_error",
+                    "whole/rms_lower_violation_rate",
+                    "whole/rms_upper_violation_rate",
+                ):
+                    if key in whole_metrics:
+                        running[f"{key}_by_timestep/{timestep_bucket}"].append(
+                            float(whole_metrics[key])
+                        )
             running["routing/balance_loss"].append(
                 float(routing_balance.detach())
             )
@@ -7132,9 +7239,20 @@ def train_direct_reference_kv_delta_320(
                         ).squeeze(2).float()
                         flow_injector.disable()
                         final_student = final_prediction - final_base
-                        final_cosine = F.cosine_similarity(
-                            final_student.flatten(1), final_teacher.flatten(1), dim=-1
-                        ).mean()
+                        _, final_direction_values = _final_effect_direction_loss(
+                            final_student,
+                            final_teacher,
+                            reliability_full_rms=float(
+                                whole_model.get(
+                                    "direction_reliability_full_rms", 0.0
+                                )
+                            ),
+                            reliability_min_weight=float(
+                                whole_model.get(
+                                    "direction_reliability_min_weight", 1.0
+                                )
+                            ),
+                        )
                         _, final_retrieval_values = _final_effect_retrieval_loss(
                             final_student,
                             final_teacher,
@@ -7152,8 +7270,14 @@ def train_direct_reference_kv_delta_320(
                             rms_lower=curriculum["rms_lower"],
                             rms_upper=curriculum["rms_upper"],
                             rms_floor=float(whole_model.get("rms_floor", 1e-4)),
+                            rms_ratio_tolerance=(
+                                float(whole_model["rms_ratio_tolerance"])
+                                if "rms_ratio_tolerance" in whole_model
+                                else None
+                            ),
                         )
-                        validation_rows["whole/cosine"].append(float(final_cosine))
+                        for key, value in final_direction_values.items():
+                            validation_rows[f"whole/{key}"].append(float(value))
                         for key, value in final_retrieval_values.items():
                             validation_rows[f"whole/{key}"].append(float(value))
                         for key, value in final_values.items():
@@ -7402,11 +7526,20 @@ def train_direct_reference_kv_delta_320(
                         ).squeeze(2).float()
                         flow_injector.disable()
                         external_student = external_prediction - external_base
-                        external_cosine = F.cosine_similarity(
-                            external_student.flatten(1),
-                            external_teacher.flatten(1),
-                            dim=-1,
-                        ).mean()
+                        _, external_direction = _final_effect_direction_loss(
+                            external_student,
+                            external_teacher,
+                            reliability_full_rms=float(
+                                whole_model.get(
+                                    "direction_reliability_full_rms", 0.0
+                                )
+                            ),
+                            reliability_min_weight=float(
+                                whole_model.get(
+                                    "direction_reliability_min_weight", 1.0
+                                )
+                            ),
+                        )
                         _, external_retrieval = _final_effect_retrieval_loss(
                             external_student,
                             external_teacher,
@@ -7425,10 +7558,16 @@ def train_direct_reference_kv_delta_320(
                             rms_floor=float(
                                 whole_model.get("rms_floor", 1e-4)
                             ),
+                            rms_ratio_tolerance=(
+                                float(whole_model["rms_ratio_tolerance"])
+                                if "rms_ratio_tolerance" in whole_model
+                                else None
+                            ),
                         )
-                        validation_rows["external/heldout_cosine"].append(
-                            float(external_cosine)
-                        )
+                        for key, value in external_direction.items():
+                            validation_rows[f"external/heldout_{key}"].append(
+                                float(value)
+                            )
                         for key, value in external_retrieval.items():
                             validation_rows[f"external/{key}"].append(
                                 float(value)
@@ -7488,11 +7627,20 @@ def train_direct_reference_kv_delta_320(
                             ).squeeze(2).float()
                             flow_injector.disable()
                             kind_student = kind_prediction - kind_base
-                            kind_cosine = F.cosine_similarity(
-                                kind_student.flatten(1),
-                                kind_teacher.flatten(1),
-                                dim=-1,
-                            ).mean()
+                            _, kind_direction = _final_effect_direction_loss(
+                                kind_student,
+                                kind_teacher,
+                                reliability_full_rms=float(
+                                    whole_model.get(
+                                        "direction_reliability_full_rms", 0.0
+                                    )
+                                ),
+                                reliability_min_weight=float(
+                                    whole_model.get(
+                                        "direction_reliability_min_weight", 1.0
+                                    )
+                                ),
+                            )
                             _, kind_constraints = _final_effect_constraints(
                                 kind_student,
                                 kind_teacher,
@@ -7504,10 +7652,16 @@ def train_direct_reference_kv_delta_320(
                                 rms_floor=float(
                                     whole_model.get("rms_floor", 1e-4)
                                 ),
+                                rms_ratio_tolerance=(
+                                    float(whole_model["rms_ratio_tolerance"])
+                                    if "rms_ratio_tolerance" in whole_model
+                                    else None
+                                ),
                             )
-                            validation_rows[
-                                f"external_{external_kind}/cosine"
-                            ].append(float(kind_cosine))
+                            for key, value in kind_direction.items():
+                                validation_rows[
+                                    f"external_{external_kind}/{key}"
+                                ].append(float(value))
                             for key, value in kind_constraints.items():
                                 validation_rows[
                                     f"external_{external_kind}/{key}"
@@ -8342,6 +8496,33 @@ def sample_expert_dense64x16_full_qkvo_flow_5k(
         destination,
         sample_config_key=(
             "kv_reference_expert_dense64x16_full_qkvo_flow_5000_sample"
+        ),
+    )
+
+
+def train_scheduled_expert_dense64x16_full_qkvo_flow_logrms_lr2p5_5k(
+    config: dict[str, Any], destination: Path
+) -> dict[str, Any]:
+    return train_scheduled_direct_reference_kv_delta_320(
+        config,
+        destination,
+        config_key=(
+            "kv_reference_expert_dense64x16_full_qkvo_flow_5000_logrms_lr2p5"
+        ),
+        sample_config_key=(
+            "kv_reference_expert_dense64x16_full_qkvo_flow_5000_logrms_lr2p5_sample"
+        ),
+    )
+
+
+def sample_expert_dense64x16_full_qkvo_flow_logrms_lr2p5_5k(
+    config: dict[str, Any], destination: Path
+) -> dict[str, Any]:
+    return sample_direct_reference_kv_delta_320(
+        config,
+        destination,
+        sample_config_key=(
+            "kv_reference_expert_dense64x16_full_qkvo_flow_5000_logrms_lr2p5_sample"
         ),
     )
 

@@ -3958,6 +3958,59 @@ kv_reference_expert_dense64x16_full_qkvo_flow_5000_sample:
   external_panel:
     reference_seed: 20261005
 
+# Fresh v38 architecture with multiplicatively symmetric final-effect scale
+# supervision. Weak teacher effects retain normalized-Huber supervision while
+# their noisy direction term is softly downweighted. Both optimizer groups use
+# 2.5x the v38 absolute learning rate; no v38 checkpoint or optimizer is reused.
+kv_reference_expert_dense64x16_full_qkvo_flow_5000_logrms_lr2p5:
+  extends_config_key: kv_reference_expert_dense64x16_full_qkvo_flow_5000
+  output_directory: kv_reference_expert_dense64x16_top4_fullqkvo_w1024_l4_flow_5k_v39
+  initial_checkpoint: null
+  initial_reader_checkpoint: null
+  initial_step: 0
+  reset_initial_step: true
+  seed: 20261006
+  training:
+    sample_output_root: diagnostics/kv-reference-expert-dense64x16-top4-fullqkvo-w1024-l4-flow-5k-v39
+    whole_model_functional:
+      # |log(student_rms / teacher_rms)| <= log(1.25), equivalent to the
+      # reciprocal and therefore symmetric [0.8, 1.25] multiplicative band.
+      rms_ratio_tolerance: 1.25
+      # Both teacher banks have median effect RMS above 0.03. Only the weak
+      # tail below 0.01 receives a smoothly reduced direction weight.
+      direction_reliability_full_rms: 0.01
+      direction_reliability_min_weight: 0.25
+    generator_learning_rate: 0.000005
+    reader_learning_rate: 0.00000125
+    generator_lr_schedule:
+      peak_lr: 0.000005
+      warmup_steps: 300
+      decay_start_step: 3500
+      decay_end_step: 5000
+      final_lr: 0.0000005
+      tail_decay_end_step: 5000
+      tail_final_lr: 0.0000005
+    reader_lr_schedule:
+      peak_lr: 0.00000125
+      warmup_steps: 300
+      decay_start_step: 1000
+      decay_end_step: 4000
+      final_lr: 0.000000125
+    wandb:
+      enabled: true
+      project: anima-style-adapter
+      name: kv-reference-expert-dense64x16-top4-fullqkvo-w1024-l4-flow-5k-v39
+      id: kv-reference-expert-dense64x16-top4-fullqkvo-w1024-l4-flow-5k-v39
+      resume: allow
+
+kv_reference_expert_dense64x16_full_qkvo_flow_5000_logrms_lr2p5_sample:
+  extends_config_key: kv_reference_expert_dense64x16_full_qkvo_flow_5000_sample
+  checkpoint: kv_reference_expert_dense64x16_top4_fullqkvo_w1024_l4_flow_5k_v39/checkpoints/step-0005000.pt
+  output_directory: diagnostics/kv-reference-expert-dense64x16-top4-fullqkvo-w1024-l4-flow-5k-v39-step5000
+  reference_seed: 20261006
+  external_panel:
+    reference_seed: 20261007
+
 # Reference-conditioned low-rank operator pilot. Unlike the direct activation
 # head above, the reference generates a fresh block-local linear operator and
 # applies it to every native text token.  Teacher factors remain offline
