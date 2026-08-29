@@ -4132,7 +4132,9 @@ kv_reference_expert_dense32x16_kvo_selfvo_teacher_relative_2000:
       project: anima-style-adapter
       name: kv-reference-expert-dense32x16-top4-kvo-selfvo-w1024-l4-teacher-relative-2k-v41
       id: kv-reference-expert-dense32x16-top4-kvo-selfvo-w1024-l4-teacher-relative-2k-v41
-      resume: never
+      # Scheduled training reopens the same run after each sample boundary.
+      # Fresh model state is guaranteed by the null initial checkpoint above.
+      resume: allow
 
 kv_reference_expert_dense32x16_kvo_selfvo_teacher_relative_2000_sample:
   extends_config_key: kv_reference_expert_dense32x16_kvo_selfvo_consistent_flow_5000_sample
